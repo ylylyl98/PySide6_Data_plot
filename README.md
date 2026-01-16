@@ -1,6 +1,6 @@
 # Streamlit Data Plot App (Multipage)
 
-This is a refactor of your PyQt6 data plot app into a Streamlit multipage UI.
+This is a Streamlit multipage UI.
 
 ## Run
 
