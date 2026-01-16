@@ -15,7 +15,7 @@ streamlit run app.py
 - `pages/2_Compare.py`: 2-up / 4-up compare viewer (KK/KKp/KpK/KpKp)
 - `pages/3_Log.py`: session log viewer
 
-Processing core is in `core/processing_run.py` (copied from your provided `processing_run.py`).
+Processing core is in `core/processing_run.py`.
 
 ## Notes
 - This Streamlit version focuses on reliable, non-GUI plotting (Agg backend).
