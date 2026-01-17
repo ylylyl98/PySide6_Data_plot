@@ -40,11 +40,41 @@ def load_pl(user_folder: str, file_name: str, *, log_scale: bool = False) -> Dat
 
 
 def build_external_baseline(user_folder: str, files: Sequence[str], *, which: str = "last") -> dict:
-    # Returns dict with keys: energy, I0
+    """
+    Returns dict with keys: energy, I0
+
+    which:
+      - "first" : use first frame in each file
+      - "last"  : use last frame in each file
+      - "all"   : average ALL frames within each file, then average across files
+    """
+    if not files:
+        raise ValueError("build_external_baseline: 'files' is empty.")
+
+    w = (which or "last").strip().lower()
+    alias = {
+        "first": "first",
+        "1st": "first",
+        "start": "first",
+
+        "last": "last",
+        "end": "last",
+
+        "all": "all",
+        "avg": "all",
+        "mean": "all",
+        "all_frames": "all",
+        "all frames": "all",
+        "frames": "all",
+    }
+    w = alias.get(w, w)
+    if w not in ("first", "last", "all"):
+        raise ValueError(f"Unknown which='{which}'. Use 'first', 'last', or 'all'.")
+
     energy, I0 = P.build_external_baseline_avg(
         user_folder=user_folder,
         files_zero=list(files),
-        which=which,
+        which=w,
         save_npz=None,
     )
     return {"energy": np.asarray(energy), "I0": np.asarray(I0)}

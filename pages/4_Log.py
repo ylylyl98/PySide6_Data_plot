@@ -9,7 +9,16 @@ sidebar_folder_picker()
 
 st.title("🧾 Log")
 
-if st.button("Clear log"):
-    st.session_state.log = []
+c1, c2 = st.columns([1, 3])
+with c1:
+    if st.button("Clear log", width="stretch"):
+        st.session_state.log = []
+with c2:
+    st.download_button(
+        "Download log.txt",
+        data="\n".join(st.session_state.log).encode("utf-8"),
+        file_name="log.txt",
+        mime="text/plain",
+    )
 
 st.text_area("Session log", value="\n".join(st.session_state.log), height=600)

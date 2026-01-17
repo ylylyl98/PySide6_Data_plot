@@ -11,6 +11,14 @@ from ui.plotting import HeatmapConfig, build_heatmap_fig, save_fig_png
 from core.file_ops import list_root_csvs
 from core.loader import load_pl
 
+
+def _st_pyplot(fig):
+    try:
+        st.pyplot(fig, width="stretch")
+    except TypeError:
+        st.pyplot(fig, use_container_width=True)
+
+
 st.set_page_config(page_title="Compare", page_icon="🧩", layout="wide")
 init_session_state()
 sidebar_folder_picker()
@@ -50,19 +58,13 @@ def auto_match(tol: float = 0.5):
         io = parse_in_out(fn)
         if io is None:
             continue
-        p = Path(folder) / fn
-        try:
-            mtime = p.stat().st_mtime
-        except Exception:
-            mtime = 0.0
-        parsed.append((fn, io[0], io[1], mtime))
+        parsed.append((fn, io[0], io[1]))
 
-    # fallback mapping for legacy
     def near(a, b):
         return abs(a - b) <= max(tol, 1.0)
 
     out = {}
-    for fn, i, o, _ in parsed:
+    for fn, i, o in parsed:
         if near(i, 0) and near(o, 0):
             out.setdefault("KK", fn)
         if near(i, 0) and near(o, 90):
@@ -90,7 +92,12 @@ cols = st.columns(2)
 for i, k in enumerate(keys):
     with cols[i % 2]:
         default = st.session_state.get(f"cmp_{k}", files[0])
-        sel[k] = st.selectbox(f"{k} file", options=files, index=files.index(default) if default in files else 0, key=f"sel_{k}")
+        sel[k] = st.selectbox(
+            f"{k} file",
+            options=files,
+            index=files.index(default) if default in files else 0,
+            key=f"sel_{k}",
+        )
 
 scale = st.selectbox("PL scale", options=["linear", "log"], index=0)
 log_scale = (scale == "log")
@@ -112,7 +119,7 @@ with st.expander("Shared plot controls", expanded=True):
     st.session_state.vmin = None if vmin.strip() == "" else float(vmin)
     st.session_state.vmax = None if vmax.strip() == "" else float(vmax)
 
-# Render as 2-up or 2x2
+# Render
 if want4:
     grid = st.columns(2)
     order = ["KK", "KKp", "KpK", "KpKp"]
@@ -128,7 +135,7 @@ if want4:
                 log_scale=log_scale,
             )
             fig = build_heatmap_fig(c.energy, c.gate, c.Z, cfg)
-            st.pyplot(fig, use_container_width=True)
+            _st_pyplot(fig)
 else:
     c1, c2 = st.columns(2)
     for col, k in zip([c1, c2], ["KK", "KKp"]):
@@ -143,10 +150,10 @@ else:
                 log_scale=log_scale,
             )
             fig = build_heatmap_fig(c.energy, c.gate, c.Z, cfg)
-            st.pyplot(fig, use_container_width=True)
+            _st_pyplot(fig)
 
 st.divider()
-if st.button("Save all panels to Processed Data"):
+if st.button("Save all panels to processed data"):
     out_dir = Path(folder) / st.session_state.processed_name
     out_dir.mkdir(parents=True, exist_ok=True)
     for k in keys:

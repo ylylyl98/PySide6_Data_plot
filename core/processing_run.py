@@ -760,9 +760,9 @@ def _load_canonical(user_folder: str, origin_name: str) -> Dict:
         # Both vary OR both constant -> fall back to tag if present, else default to TG
         ratio = _extract_tg_bg_ratio(gate_tag) or 1.0
         if "TG+BG" in gate_tag:
-            gate_label, gate_axis = f"{ratio}Tg+Bg (V)", ratio * vtg - vbg  # FIXED sign
+            gate_label, gate_axis = f"{ratio}Tg-Bg (V)", ratio * vtg - vbg  # FIXED sign
         elif "TG-BG" in gate_tag:
-            gate_label, gate_axis = f"{ratio}Tg-Bg (V)", ratio * vtg + vbg  # FIXED sign
+            gate_label, gate_axis = f"{ratio}Tg+Bg (V)", ratio * vtg + vbg  # FIXED sign
         else:
             # Default: keep previous behavior, but prefer a meaningful label
             gate_label, gate_axis = ("Top gate (V)", vtg) if not tg_const else ("Back gate (V)", vbg)
@@ -1171,6 +1171,9 @@ def process_ref_avg(
 # -------------------------------------------------
 # Baseline builder (average first/last frame)
 # -------------------------------------------------
+# -------------------------------------------------
+# Baseline builder (average first/last/all frames)
+# -------------------------------------------------
 def build_external_baseline_avg(
     user_folder: str,
     files_zero: Sequence[str],
@@ -1181,46 +1184,59 @@ def build_external_baseline_avg(
         raise ValueError("Need at least one baseline file.")
     if which not in ("first", "last", "all"):
         raise ValueError("which must be 'first', 'last', or 'all'.")
+
     d0 = _load_canonical(user_folder, files_zero[0])
     energy0 = np.asarray(d0["energy"]).ravel()
     gate0   = np.asarray(d0["gate_axis"]).ravel()
     Z0      = np.asarray(d0["Z"])
+
     if Z0.ndim != 2 or Z0.shape[1] != energy0.size:
-        raise ValueError(f"First file Z has shape {Z0.shape}; expected (gN, eN) with eN={energy0.size}.")
-    I0_list_1d = []
-    all_frames = []
-    if which == "first":
-        I0_list_1d.append(Z0[0, :].astype(float, copy=False))
-    elif which == "last":
-        I0_list_1d.append(Z0[-1, :].astype(float, copy=False))
-    else:
-        all_frames.append(Z0.astype(float, copy=False))
+        raise ValueError(
+            f"First file Z has shape {Z0.shape}; expected (gN, eN) with eN={energy0.size}."
+        )
+
+    I0_list_1d: list[np.ndarray] = []
+
+    def _pick_I0_from_Z(Z: np.ndarray) -> np.ndarray:
+        Zf = Z.astype(float, copy=False)
+        if which == "first":
+            return Zf[0, :]
+        if which == "last":
+            return Zf[-1, :]
+        # which == "all": average ALL frames within THIS file (equal weight per file later)
+        return np.nanmean(Zf, axis=0)
+
+    # first file
+    I0_list_1d.append(_pick_I0_from_Z(Z0))
+
+    # remaining files
     for f in files_zero[1:]:
         d = _load_canonical(user_folder, f)
         energy = np.asarray(d["energy"]).ravel()
         gate   = np.asarray(d["gate_axis"]).ravel()
+
         if not (np.allclose(energy, energy0) and np.allclose(gate, gate0)):
             raise ValueError(f"Grid mismatch in {f} vs {files_zero[0]}.")
+
         Z = np.asarray(d["Z"])
         if Z.ndim != 2 or Z.shape[1] != energy0.size:
-            raise ValueError(f"{f}: Z has shape {Z.shape}; expected (gN, eN) with eN={energy0.size}.")
-        if which == "first":
-            I0_list_1d.append(Z[0, :].astype(float, copy=False))
-        elif which == "last":
-            I0_list_1d.append(Z[-1, :].astype(float, copy=False))
-        else:
-            all_frames.append(Z.astype(float, copy=False))
-    if which in ("first", "last"):
-        I0_stack = np.stack(I0_list_1d, axis=0)
-        I0_avg   = np.nanmean(I0_stack, axis=0)
-    else:
-        big = np.concatenate(all_frames, axis=0)
-        I0_avg = np.nanmean(big, axis=0)
+            raise ValueError(
+                f"{f}: Z has shape {Z.shape}; expected (gN, eN) with eN={energy0.size}."
+            )
+
+        I0_list_1d.append(_pick_I0_from_Z(Z))
+
+    # Average across files (each file contributes one 1D baseline)
+    I0_stack = np.stack(I0_list_1d, axis=0)  # shape: (n_files, eN)
+    I0_avg   = np.nanmean(I0_stack, axis=0)
+
     save_background_global(energy0, I0_avg)
     if save_npz:
         np.savez(save_npz, energy=energy0, I0=I0_avg)
+
     print(f"[baseline] External baseline from {len(files_zero)} file(s); frame='{which}'.")
     return energy0, I0_avg
+
 
 # -------------------------------------------------
 # Folder drivers (average by condition in chunks)

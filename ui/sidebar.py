@@ -1,37 +1,32 @@
 import streamlit as st
-from pathlib import Path
 from ui.logger import log
+from ui.local_dialogs import pick_directory_dialog
+
+
+def _browse_pick_folder() -> None:
+    """Pick a folder via native dialog and update session_state safely."""
+    picked = pick_directory_dialog(initialdir=st.session_state.get("user_folder") or None)
+    if picked:
+        st.session_state["user_folder"] = picked
+        log(f"User folder set (dialog): {picked}")
 
 
 def sidebar_folder_picker() -> None:
     with st.sidebar:
         st.header("⚙️ Settings")
 
-        folder = st.text_input(
+        # Show current folder as read-only text (no manual editing)
+        current = st.session_state.get("user_folder", "")
+        st.text_input(
             "User folder (local path)",
-            value=st.session_state.user_folder,
-            placeholder=r"e.g. C:\\data\\YZD320\\2026-01-15",
+            value=current,
+            disabled=True,
         )
 
-        archive_name = st.text_input(
-            "Archive folder name",
-            value=st.session_state.archive_name,
-        )
-        processed_name = st.text_input(
-            "Processed folder name",
-            value=st.session_state.processed_name,
-        )
+        # Browse-only
+        st.button("Browse...", width="stretch", on_click=_browse_pick_folder)
 
-        if st.button("Apply"):
-            st.session_state.user_folder = folder.strip()
-            st.session_state.archive_name = archive_name.strip() or st.session_state.archive_name
-            st.session_state.processed_name = processed_name.strip() or st.session_state.processed_name
-            if st.session_state.user_folder:
-                p = Path(st.session_state.user_folder)
-                if p.exists() and p.is_dir():
-                    log(f"User folder set: {p}")
-                else:
-                    log(f"Warning: folder does not exist: {p}")
+        st.caption("Tip: 'Browse...' opens a native folder dialog on the machine running Streamlit.")
 
         st.divider()
-        st.caption("Navigation is on the left: Classic / Compare / Log")
+        st.caption("Navigation is on the left: PL / DRR / Compare / Log")
