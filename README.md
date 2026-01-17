@@ -1,6 +1,6 @@
 # Streamlit Data Plot App (Multipage)
 
-This is a Streamlit multipage UI.
+This is a Streamlit multipage UI for CSV Data processing.
 
 ## Installation
 First, clone the project to your local machine:
