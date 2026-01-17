@@ -2,21 +2,13 @@
 
 This is a Streamlit multipage UI.
 
-## Run
-
+## Installation
+First, clone the project to your local machine:
 ```bash
-pip install -r requirements.txt
-streamlit run app.py
+git clone https://github.com/ylylyl98/streamlit-data-plot-app.git
+cd streamlit-data-plot-app
 ```
 
-## Folder layout
-- `app.py`: landing page + shared sidebar folder selector
-- `pages/1_Classic.py`: PL + DR/R processing & plotting
-- `pages/2_Compare.py`: 2-up / 4-up compare viewer (KK/KKp/KpK/KpKp)
-- `pages/3_Log.py`: session log viewer
+## Run the Application
 
-Processing core is in `core/processing_run.py`.
-
-## Notes
-- This Streamlit version focuses on reliable, non-GUI plotting (Agg backend).
-- Interactive drag-cursors from Qt are replaced with a stable slider-based Y cursor.
+Double-click the Data_Plot_App batch file in the root folder.
