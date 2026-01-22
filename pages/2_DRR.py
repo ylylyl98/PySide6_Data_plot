@@ -20,6 +20,49 @@ from core.processing_run import save_as_dat
 # ----------------------------
 # Streamlit width API compatibility helpers
 # ----------------------------
+import numpy as np
+import matplotlib.ticker as mticker
+
+def _fmt_sci0(x: float) -> str:
+    """0-decimal scientific like -7e4 (not -7e+04)."""
+    if not np.isfinite(x):
+        return ""
+    x = float(x)
+    if x == 0.0:
+        return "0"
+    s = f"{x:.0e}"          # e.g. -7e+04
+    mant, exp = s.split("e")
+    exp_i = int(exp)        # remove +00 padding
+    return f"{mant}e{exp_i}"  # e.g. -7e4
+
+def _format_drr_colorbar(fig, *, is_deriv: bool):
+    """
+    Force colorbar tick labels:
+      - DR/R: 2 decimals
+      - dE/d2E: sci 0 decimals (-7e4)
+    Works with your build_heatmap_fig (3 ticks already set).
+    """
+    if not getattr(fig, "axes", None) or len(fig.axes) < 2:
+        return
+
+    # colorbar axes are everything after the main heatmap axis
+    for cax in fig.axes[1:]:
+        ticks = list(cax.get_xticks())
+        if not ticks:
+            continue
+
+        if is_deriv:
+            labels = [_fmt_sci0(t) for t in ticks]
+        else:
+            labels = [f"{float(t):.2f}" if np.isfinite(t) else "" for t in ticks]
+
+        # Lock ticks + labels (no surprises from mpl auto-formatting)
+        cax.xaxis.set_major_locator(mticker.FixedLocator(ticks))
+        cax.xaxis.set_major_formatter(mticker.FixedFormatter(labels))
+
+        # kill any offset text if mpl tries to add it
+        cax.xaxis.get_offset_text().set_visible(False)
+
 def _st_pyplot(fig):
     try:
         st.pyplot(fig, width="stretch")
@@ -704,11 +747,15 @@ cfg = HeatmapConfig(
     ylim=ylim,
     cmap=st.session_state.get("drr_cmap", "RdBu_r"),
     # ✅ use sci for dE / d2E, otherwise keep DR/R decimals
-    cbar_tick_format=("sci" if derivative is not None else "%.2f"),
+    # cbar_tick_format=("sci" if derivative is not None else "%.2f"),
     cbar_integer=False,
 )
 
 fig = build_heatmap_fig(cube.energy, cube.gate, Z_plot, cfg)
+
+is_deriv = (st.session_state.get("drr_deriv_mode", "None") != "None")
+_format_drr_colorbar(fig, is_deriv=is_deriv)
+
 
 with left:
     _st_pyplot(fig)

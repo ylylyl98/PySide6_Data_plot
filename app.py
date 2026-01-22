@@ -46,6 +46,6 @@ Use the page navigation (left sidebar) to open:
 - **Compare**: KK / KKp (and optional KpK / KpKp) compare
 - **Log**: session log
 
-Tip: keep your CSVs in the *root* of the chosen folder (same as the PyQt app).
+Tip: keep your CSVs in the *root* of the chosen folder.
 """
 )
