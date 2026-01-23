@@ -8,42 +8,31 @@ echo   Folder: %CD%
 echo ==========================================
 echo.
 
-REM --- Step 0: Auto-Update ---
+REM --- Step 0: Auto-Update (Force Overwrite) ---
 echo [Step 0] Checking for updates...
 
-REM 1. Check if this is a valid git repo
-if not exist ".git" (
-    echo    [!] ERROR: .git folder not found.
-    echo    [!] Did you delete the hidden .git folder?
-    goto SKIP_UPDATE
-)
+REM Check if .git exists
+if not exist ".git" goto NO_GIT
 
-REM 2. Attempt to pull and capture success/failure
-echo    - Pulling latest changes from GitHub...
+REM 1. Fetch the latest info from GitHub without merging yet
+git fetch --all
+
+REM 2. Force your local computer to match GitHub exactly
+REM (This discards your local changes to Data_Plot_App.bat)
+git reset --hard origin/main
+
+REM 3. Pull (just to be sure everything is synced)
 git pull
-if %ERRORLEVEL% NEQ 0 (
-    echo.
-    echo    =======================================================
-    echo    [!] UPDATE FAILED
-    echo    =======================================================
-    echo    Git cannot pull because you have local changes.
-    echo.
-    echo    OPTIONS:
-    echo    1. To KEEP your changes:
-    echo       Close this, run "git stash", then run this script.
-    echo.
-    echo    2. To FORCE update (Delete your changes):
-    echo       Close this, run "git reset --hard", then run this script.
-    echo.
-    echo    (Continuing with current version for now...)
-    echo    =======================================================
-    timeout /t 5 >nul
-) else (
-    echo    (Project is up to date)
-)
 
-:SKIP_UPDATE
+echo    - Update successful (Local changes discarded).
 echo.
+goto END_UPDATE
+
+:NO_GIT
+echo    [!] .git folder missing. Skipping update.
+goto END_UPDATE
+
+:END_UPDATE
 
 REM --- Step 1: Find Python 3.13 (or older) ---
 echo [Step 1] Searching for Python 3.13 (or older)...
