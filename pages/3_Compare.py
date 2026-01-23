@@ -19,12 +19,27 @@ from core.loader import load_pl
 # ----------------------------
 # Small UI helpers
 # ----------------------------
+import hashlib
+def _name_no_csv_ext(fn: str) -> str:
+    """Return filename without trailing .csv only (preserve decimals like 50.952)."""
+    s = Path(fn).name  # don't touch dots inside the name
+    return s[:-4] if s.lower().endswith(".csv") else s
+
+def _hash8(s: str) -> str:
+    return hashlib.md5(s.encode("utf-8", errors="ignore")).hexdigest()[:8]
+
+def _sample_and_hash(fn: str) -> tuple[str, str]:
+    stem = Path(fn).stem
+    sample = stem.split("~", 1)[0]  # e.g. "YZD72"
+    return sample, _hash8(stem)
+
 def _safe_stem(fn: str, max_len: int = 140) -> str:
     """
     Turn a filename into a Windows-safe stem.
     Keep it mostly readable; truncate if too long (keep head+tail).
     """
-    s = Path(fn).stem
+    s = _name_no_csv_ext(fn)
+
 
     # your filenames often contain "$" separators -> remove
     s = s.replace("$", "")
@@ -41,6 +56,29 @@ def _safe_stem(fn: str, max_len: int = 140) -> str:
     tail = max_len - head - 2
     return s[:head] + "__" + s[-tail:]  # ASCII only
 
+def _vp_firstfile_tag(fn: str, max_len: int = 115) -> str:
+    """
+    Use ONLY the first file's stem, remove angle info (In/Out half ... degree),
+    keep everything else (including trailing _001), then sanitize+truncate.
+    """
+    s = _name_no_csv_ext(fn)
+
+
+    # remove Inhalf14.1degree / In14.1deg / etc
+    s = re.sub(r'In(?:half)?\s*[-+]?\d+(?:\.\d+)?\s*(?:deg(?:ree)?s?)', "", s, flags=re.I)
+    # remove Outhalf95degree / Out95deg / etc
+    s = re.sub(r'Out(?:half)?\s*[-+]?\d+(?:\.\d+)?\s*(?:deg(?:ree)?s?)', "", s, flags=re.I)
+
+    # cleanup leftovers around separators
+    s = s.replace("~_~", "~")
+    s = re.sub(r"~_+", "~", s)
+    s = re.sub(r"_+~", "~", s)
+    s = re.sub(r"_{2,}", "_", s)
+    s = re.sub(r"~{2,}", "~", s)
+    s = s.strip("_~")
+
+    # sanitize + truncate using your existing helper
+    return _safe_stem(s, max_len=max_len)
 
 def _unique_path(out_dir: Path, base: str, ext: str = ".png") -> Path:
     """
@@ -54,6 +92,50 @@ def _unique_path(out_dir: Path, base: str, ext: str = ".png") -> Path:
         if not p2.exists():
             return p2
     return p  # fallback
+
+def save_heatmap_dat(
+    out_path: Path,
+    energy: np.ndarray,
+    gate: np.ndarray,
+    Z: np.ndarray,
+    *,
+    header_lines: list[str] | None = None,
+):
+    """
+    Save heatmap as a matrix .dat:
+      - first row: [nan, E1, E2, ...]  (energy in eV)
+      - first col: [G1,  Z11, Z12, ...] (gate in V)
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    E = np.asarray(energy, float).ravel()
+    G = np.asarray(gate, float).ravel()
+    Zm = np.asarray(Z, float)
+
+    if Zm.shape != (G.size, E.size):
+        raise ValueError(f"Z shape {Zm.shape} != (len(gate), len(energy)) = {(G.size, E.size)}")
+
+    arr = np.empty((G.size + 1, E.size + 1), dtype=float)
+    arr[0, 0] = np.nan
+    arr[0, 1:] = E
+    arr[1:, 0] = G
+    arr[1:, 1:] = Zm
+
+    hdr = []
+    hdr.append("format: first row = energy_eV, first col = gate_V, body = Z")
+    if header_lines:
+        hdr.extend(header_lines)
+
+    np.savetxt(
+        out_path,
+        arr,
+        fmt="%.10g",
+        delimiter="\t",
+        header="\n".join(hdr),
+        comments="# ",
+    )
+
+
 
 def _trapz(y, x=None, axis=-1):
     """
@@ -778,6 +860,26 @@ if st.button("Save all panels to processed data", key="cmp_save_all_btn"):
         out_path = _unique_path(out_dir, base, ".png")
 
         save_fig_png(fig, out_path)
+        # ✅ NEW: save heatmap .dat (NOT curves)
+        save_heatmap_dat(
+            out_path.with_suffix(".dat"),
+            c.energy,
+            c.gate,
+            Z_plot,
+            header_lines=[
+                f"panel={k}",
+                f"source_csv={sel[k]}",
+                f"title={c.title}",
+                f"scale={scale_tag}",
+                f"log_scale={log_scale}",
+                f"clip_outliers={st.session_state.get('cmp_clip_outliers', True)}",
+                f"vmin={vmin}",
+                f"vmax={vmax}",
+                f"xlim={xlim}",
+                f"ylim={ylim}",
+            ],
+        )
+
 
     # save VP (if enabled)
     vp_mode = st.session_state.get("cmp_vp_mode", "Off")
@@ -817,6 +919,10 @@ if st.button("Save all panels to processed data", key="cmp_save_all_btn"):
                 ZB = _subtract_background(B.Z, B.energy, method=bg_method, p_low=p_low, roi=roi, clip_to_zero=clip0)
                 vp2d = _vp_map(ZA, ZB)
 
+                # filenames include source stems + unique suffix if needed
+                a_stem = _safe_stem(sel[Akey])
+                b_stem = _safe_stem(sel[Bkey])
+
                 if vp_mode in ("Heatmap (E vs gate)", "Both"):
                     cfg = HeatmapConfig(
                         title=f"VP {label}: ({Akey} vs {Bkey})",
@@ -833,12 +939,33 @@ if st.button("Save all panels to processed data", key="cmp_save_all_btn"):
                     )
                     fig = build_heatmap_fig(A.energy, A.gate, vp2d, cfg)
                     _format_colorbar_ticks_only(fig, fmt="%.2f")
-                    save_fig_png(fig, out_dir / f"VP_{label}_{scale_tag}.png")
+                    src_tag = _vp_firstfile_tag(sel[Akey], max_len=160)  # ONLY first file
+                    base = f"VP_{Akey}_{Bkey}_{src_tag}"                 # e.g. VP_KK_KKp_<KK filename>
+                    vp_png = _unique_path(out_dir, base, ".png")
+                    save_fig_png(fig, vp_png)
+
+                    save_heatmap_dat(
+                        vp_png.with_suffix(".dat"),
+                        A.energy, A.gate, vp2d,
+                        header_lines=[
+                            f"source_csv_A={sel[Akey]}",
+                            f"source_csv_B={sel[Bkey]}",
+                            f"title_A={A.title}",
+                            f"title_B={B.title}",
+                            f"bg_method={bg_method}",
+                            f"roi_eV={roi}",
+                        ],
+                    )
 
                 if vp_mode in ("Curve (vs gate)", "Both"):
                     g, vp_g = _vp_curve_vs_gate(A.energy, A.gate, ZA, ZB, roi=roi)
                     fig2 = _build_vp_curve_fig(g, vp_g, title=f"VP {label} (ROI {min(roi):.4g}–{max(roi):.4g} eV)")
-                    save_fig_png(fig2, out_dir / f"VPcurve_{label}_{scale_tag}.png")
+
+                    base = f"VPcurve_{Akey}_vs_{Bkey}__{a_stem}__{b_stem}_{scale_tag}"
+                    curve_png = _unique_path(out_dir, base, ".png")
+                    save_fig_png(fig2, curve_png)
+                    # ❌ no .dat for curves (per your request)
+
 
             _save_vp_pair("KK_KKp", "KK", "KKp")
             if want4:
