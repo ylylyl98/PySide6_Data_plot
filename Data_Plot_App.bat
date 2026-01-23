@@ -10,13 +10,41 @@ echo.
 
 REM --- Step 0: Auto-Update ---
 echo [Step 0] Checking for updates...
-git pull
-if errorlevel 1 (
-    echo    (Update skipped: Git not found or local changes detected)
-) else (
-    echo    (Project is up to date)
+
+REM 1. Check if Git is installed
+where git >nul 2>nul
+if %errorlevel% neq 0 (
+    echo    [!] WARNING: Git is not installed or not found in PATH.
+    echo        Skipping auto-update.
+    goto END_UPDATE
 )
+
+REM 2. Check if this is a Git repository (Clone vs ZIP)
+if not exist ".git" (
+    echo    [!] WARNING: This folder is not a linked Git repository.
+    echo        (If you downloaded a ZIP, auto-update cannot work.)
+    echo        To fix: Delete this, install Git, and run:
+    echo        git clone [YOUR_REPO_URL]
+    goto END_UPDATE
+)
+
+REM 3. Attempt to Pull
+echo    - Contacting GitHub...
+git pull
+if %errorlevel% neq 0 (
+    echo.
+    echo    [!] UPDATE FAILED.
+    echo        Possible reasons:
+    echo        1. You changed files locally (Git won't overwrite them).
+    echo        2. No internet connection.
+    echo        3. Authentication issues (private repo).
+) else (
+    echo    - Success: Project is synchronized.
+)
+
+:END_UPDATE
 echo.
+
 
 REM --- Step 1: Find Python 3.13 (or older) ---
 echo [Step 1] Searching for Python 3.13 (or older)...
