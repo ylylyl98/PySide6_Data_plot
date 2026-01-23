@@ -11,40 +11,39 @@ echo.
 REM --- Step 0: Auto-Update ---
 echo [Step 0] Checking for updates...
 
-REM 1. Check if Git is installed
-where git >nul 2>nul
-if %errorlevel% neq 0 (
-    echo    [!] WARNING: Git is not installed or not found in PATH.
-    echo        Skipping auto-update.
-    goto END_UPDATE
-)
-
-REM 2. Check if this is a Git repository (Clone vs ZIP)
+REM 1. Check if this is a valid git repo
 if not exist ".git" (
-    echo    [!] WARNING: This folder is not a linked Git repository.
-    echo        (If you downloaded a ZIP, auto-update cannot work.)
-    echo        To fix: Delete this, install Git, and run:
-    echo        git clone [YOUR_REPO_URL]
-    goto END_UPDATE
+    echo    [!] ERROR: .git folder not found.
+    echo    [!] Did you delete the hidden .git folder?
+    goto SKIP_UPDATE
 )
 
-REM 3. Attempt to Pull
-echo    - Contacting GitHub...
+REM 2. Attempt to pull and capture success/failure
+echo    - Pulling latest changes from GitHub...
 git pull
-if %errorlevel% neq 0 (
+if %ERRORLEVEL% NEQ 0 (
     echo.
-    echo    [!] UPDATE FAILED.
-    echo        Possible reasons:
-    echo        1. You changed files locally (Git won't overwrite them).
-    echo        2. No internet connection.
-    echo        3. Authentication issues (private repo).
+    echo    =======================================================
+    echo    [!] UPDATE FAILED
+    echo    =======================================================
+    echo    Git cannot pull because you have local changes.
+    echo.
+    echo    OPTIONS:
+    echo    1. To KEEP your changes:
+    echo       Close this, run "git stash", then run this script.
+    echo.
+    echo    2. To FORCE update (Delete your changes):
+    echo       Close this, run "git reset --hard", then run this script.
+    echo.
+    echo    (Continuing with current version for now...)
+    echo    =======================================================
+    timeout /t 5 >nul
 ) else (
-    echo    - Success: Project is synchronized.
+    echo    (Project is up to date)
 )
 
-:END_UPDATE
+:SKIP_UPDATE
 echo.
-
 
 REM --- Step 1: Find Python 3.13 (or older) ---
 echo [Step 1] Searching for Python 3.13 (or older)...
