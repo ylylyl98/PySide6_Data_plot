@@ -25,21 +25,12 @@ def _name_no_csv_ext(fn: str) -> str:
     s = Path(fn).name  # don't touch dots inside the name
     return s[:-4] if s.lower().endswith(".csv") else s
 
-def _hash8(s: str) -> str:
-    return hashlib.md5(s.encode("utf-8", errors="ignore")).hexdigest()[:8]
-
-def _sample_and_hash(fn: str) -> tuple[str, str]:
-    stem = Path(fn).stem
-    sample = stem.split("~", 1)[0]  # e.g. "YZD72"
-    return sample, _hash8(stem)
-
 def _safe_stem(fn: str, max_len: int = 140) -> str:
     """
     Turn a filename into a Windows-safe stem.
     Keep it mostly readable; truncate if too long (keep head+tail).
     """
     s = _name_no_csv_ext(fn)
-
 
     # your filenames often contain "$" separators -> remove
     s = s.replace("$", "")
@@ -207,6 +198,34 @@ def _format_colorbar_ticks_only(fig, fmt="%.2f"):
         cax.xaxis.set_major_formatter(formatter)
         cax.yaxis.set_major_formatter(formatter)
 
+def _nearest_from_list(val: float, gates: np.ndarray) -> float:
+    gates = np.asarray(gates, float).ravel()
+    if gates.size == 0 or not np.isfinite(val):
+        return float("nan")
+    idx = int(np.nanargmin(np.abs(gates - val)))
+    return float(gates[idx])
+
+def _trace_snap_gate_to_nearest():
+    """When user types a value, snap to nearest available gate and update the slider too."""
+    gates = np.asarray(st.session_state.get("_cmp_trace_gates", []), float)
+    if gates.size == 0:
+        return
+    req = st.session_state.get("cmp_trace_gate_req", None)
+    if req is None:
+        req = float(gates[len(gates)//2])
+    try:
+        req = float(req)
+    except Exception:
+        req = float(gates[len(gates)//2])
+
+    nearest = _nearest_from_list(req, gates)
+    if np.isfinite(nearest):
+        st.session_state["cmp_trace_gate_in"] = nearest
+        st.session_state["cmp_trace_gate_req"] = nearest  # overwrite typed value with snapped value
+
+def _trace_sync_req_from_slider():
+    """If user changes the discrete slider, keep the typed box consistent."""
+    st.session_state["cmp_trace_gate_req"] = st.session_state.get("cmp_trace_gate_in", None)
 
 # ----------------------------
 # Angle parsing + auto-match
@@ -296,7 +315,7 @@ def _subtract_background(
     Background subtraction for PL intensity before VP.
     method:
       - "none"
-      - "per_energy_percentile"  (recommended) bg(E)=percentile across gate
+      - "per_energy_percentile"  bg(E)=percentile across gate
       - "scalar_percentile"      bg=percentile over entire matrix
       - "roi_median_scalar"      bg=median over ROI (energy range), scalar
     """
@@ -374,6 +393,57 @@ def _build_vp_curve_fig(gate: np.ndarray, vp: np.ndarray, title: str):
     fig.tight_layout()
     return fig
 
+def _build_spectra_compare_fig(
+    cubes_by_tag: dict[str, object],
+    gate_req: float,
+    *,
+    xlim=None,
+    title: str = "",
+    apply_bg: bool = False,
+    bg_method: str = "per_energy_percentile",
+    p_low: float = 1.0,
+    roi: tuple[float, float] | None = None,
+    clip0: bool = True,
+):
+
+    """Plot raw spectra (no subtraction) at the nearest gate for each cube in ONE axes."""
+    fig = plt.figure(figsize=(7.2, 4.2), dpi=150)
+    ax = fig.add_subplot(111)
+
+    for tag, c in cubes_by_tag.items():
+        E = np.asarray(c.energy, float).ravel()
+        G = np.asarray(c.gate, float).ravel()
+        Z = np.asarray(c.Z, float)
+
+        if Z.ndim != 2 or G.size != Z.shape[0] or E.size != Z.shape[1]:
+            continue
+
+        idx = int(np.nanargmin(np.abs(G - gate_req)))
+        g_used = float(G[idx])
+        if apply_bg:
+            Z2 = _subtract_background(Z, E, method=bg_method, p_low=p_low, roi=roi, clip_to_zero=clip0)
+            y = Z2[idx, :]
+        else:
+            y = Z[idx, :]
+
+        mE = np.isfinite(E) & np.isfinite(y)
+        if xlim is not None:
+            lo, hi = (float(xlim[0]), float(xlim[1]))
+            if lo > hi:
+                lo, hi = hi, lo
+            mE = mE & (E >= lo) & (E <= hi)
+
+        ax.plot(E[mE], y[mE], linewidth=1.2, label=f"{tag} @ {g_used:.4g} V")
+
+    mode = "BG-subtracted (VP settings)" if apply_bg else "Raw"
+    ax.set_title(title or f"Spectra compare [{mode}] (nearest gate to {gate_req:.4g} V)", fontsize=11, fontweight="bold")
+
+    ax.set_xlabel("Photon Energy (eV)")
+    ax.set_ylabel("Intensity (raw)")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    return fig
 
 # ----------------------------
 # Page setup
@@ -407,6 +477,13 @@ st.session_state.setdefault("cmp_out_kp_deg", 5.0)
 
 # VP defaults
 st.session_state.setdefault("cmp_vp_mode", "Off")  # Off / Heatmap / Curve / Both
+# Spectra compare defaults
+st.session_state.setdefault("cmp_trace_enable", True)
+st.session_state.setdefault("cmp_trace_gate_in", None)
+st.session_state.setdefault("cmp_trace_gate_req", None)  # user-typed gate request (will snap)
+
+st.session_state.setdefault("cmp_trace_apply_vp_bg", False)
+
 st.session_state.setdefault("cmp_vp_bg_method", "Per-energy low percentile (recommended)")
 st.session_state.setdefault("cmp_vp_bg_p", 1.0)
 st.session_state.setdefault("cmp_vp_clip0", True)
@@ -506,7 +583,9 @@ with right:
             )
 
         limits_slot = st.container()    # limits will be rendered later here
+        trace_slot  = st.container()    # spectra compare controls rendered later
         vp_slot     = st.container()    # VP controls will be rendered later here
+
 
 
 # ----------------------------
@@ -642,6 +721,153 @@ if log_scale:
     vmin = max(vmin, 1e-12)
     vmax = max(vmax, vmin * 1.01)
 
+# ----------------------------
+# Spectra compare controls (rendered in Plot controls tab)
+# ----------------------------
+with trace_slot:
+    with st.expander("Spectra compare (raw line traces)", expanded=False):
+        st.checkbox("Show spectra compare", key="cmp_trace_enable")
+        st.checkbox("Apply VP background subtraction", key="cmp_trace_apply_vp_bg")
+        st.caption("If enabled, uses the VP background subtraction settings (method/p/ROI/clip).")
+
+        gate_ref = np.asarray(cubes[keys[0]].gate, float).ravel()
+        gates = np.unique(gate_ref[np.isfinite(gate_ref)])
+        gates = np.sort(gates)
+
+        # store for callbacks
+        st.session_state["_cmp_trace_gates"] = gates.tolist()
+
+        # init defaults (snap to nearest actual gate)
+        if st.session_state.get("cmp_trace_gate_in") is None:
+            default_gate = float(gates[len(gates)//2]) if gates.size else 0.0
+            st.session_state["cmp_trace_gate_in"] = default_gate
+        if st.session_state.get("cmp_trace_gate_req") is None:
+            st.session_state["cmp_trace_gate_req"] = st.session_state["cmp_trace_gate_in"]
+
+        # user can type any value → will snap to nearest available gate
+        st.number_input(
+            "Gate request (V) (auto-snap to nearest)",
+            key="cmp_trace_gate_req",
+            format="%.6g",
+            on_change=_trace_snap_gate_to_nearest,
+        )
+
+        # discrete selector that steps ONLY through real gate values (arrow keys / slider steps)
+        st.select_slider(
+            "Nearest available gate (V)",
+            options=[float(x) for x in gates],
+            key="cmp_trace_gate_in",
+            format_func=lambda v: f"{float(v):.6g}",
+            on_change=_trace_sync_req_from_slider,
+        )
+
+        st.caption("One plot, raw spectra at the nearest gate.")
+
+# ----------------------------
+# VP heatmap limits (auto-seed then editable)
+# ----------------------------
+st.session_state.setdefault("_cmp_vp_limits_src", None)
+st.session_state.setdefault("cmp_vp_limits_dirty", False)
+
+# ensure ROI keys exist BEFORE computing limits
+st.session_state.setdefault("cmp_vp_e1", float(xlim[0]))
+st.session_state.setdefault("cmp_vp_e2", float(xlim[1]))
+
+def _vp_mark_dirty():
+    st.session_state["cmp_vp_limits_dirty"] = True
+
+def _vp_autofill_limits():
+    need_keys = ["KK", "KKp"] + (["KpK", "KpKp"] if want4 else [])
+    try:
+        cubes_lin_local = (
+            {k: load_pl(folder, sel[k], log_scale=False) for k in need_keys}
+            if log_scale else {k: cubes[k] for k in need_keys}
+        )
+    except Exception:
+        cubes_lin_local = {k: cubes[k] for k in need_keys if k in cubes}
+
+    bg_method_ui = st.session_state.get("cmp_vp_bg_method", "Scalar low percentile")
+    p_low_local = float(st.session_state.get("cmp_vp_bg_p", 1.0))
+    clip0_local = bool(st.session_state.get("cmp_vp_clip0", True))
+    roi_local = (float(st.session_state.get("cmp_vp_e1", xlim[0])), float(st.session_state.get("cmp_vp_e2", xlim[1])))
+
+    method_map = {
+        "Scalar low percentile": "scalar_percentile",
+        "Per-energy low percentile": "per_energy_percentile",
+        "ROI median (scalar)": "roi_median_scalar",
+        "None": "none",
+    }
+    bg_method_local = method_map.get(bg_method_ui, "per_energy_percentile")
+
+    pairs = [("KK", "KKp")] + ([("KpK", "KpKp")] if want4 else [])
+    vals = []
+
+    for Akey, Bkey in pairs:
+        if Akey not in cubes_lin_local or Bkey not in cubes_lin_local:
+            continue
+        A = cubes_lin_local[Akey]
+        B = cubes_lin_local[Bkey]
+        if not (np.allclose(A.energy, B.energy) and np.allclose(A.gate, B.gate)):
+            continue
+
+        ZA = _subtract_background(A.Z, A.energy, method=bg_method_local, p_low=p_low_local, roi=roi_local, clip_to_zero=clip0_local)
+        ZB = _subtract_background(B.Z, B.energy, method=bg_method_local, p_low=p_low_local, roi=roi_local, clip_to_zero=clip0_local)
+        vp2d_local = _vp_map(ZA, ZB)
+
+        E = np.asarray(A.energy, float).ravel()
+        G = np.asarray(A.gate, float).ravel()
+        mE = (E >= min(xlim)) & (E <= max(xlim))
+        mG = (G >= min(ylim)) & (G <= max(ylim))
+        sub = vp2d_local[np.ix_(mG, mE)] if (mE.any() and mG.any()) else vp2d_local
+
+        vv = sub[np.isfinite(sub)]
+        if vv.size:
+            vals.append(vv)
+
+    if not vals:
+        v0, v1 = -1.0, 1.0
+    else:
+        cat = np.concatenate(vals)
+        v0, v1 = np.nanpercentile(cat, [0.5, 99.5])
+        v0 = float(np.clip(v0, -1.0, 1.0))
+        v1 = float(np.clip(v1, -1.0, 1.0))
+        if v0 > v1:
+            v0, v1 = v1, v0
+        if (v1 - v0) < 1e-6:
+            v1 = min(1.0, v0 + 0.01)
+
+    st.session_state["cmp_vp_vmin_in"] = v0
+    st.session_state["cmp_vp_vmax_in"] = v1
+    st.session_state["cmp_vp_limits_dirty"] = False
+
+vp_src_id = (
+    folder,
+    tuple((k, sel[k]) for k in (["KK", "KKp"] + (["KpK", "KpKp"] if want4 else []))),
+    st.session_state.get("cmp_vp_bg_method"),
+    float(st.session_state.get("cmp_vp_bg_p", 1.0)),
+    bool(st.session_state.get("cmp_vp_clip0", True)),
+    float(st.session_state.get("cmp_vp_e1", xlim[0])),
+    float(st.session_state.get("cmp_vp_e2", xlim[1])),
+    xlim, ylim,
+)
+if st.session_state.get("_cmp_vp_limits_src") != vp_src_id:
+    st.session_state["_cmp_vp_limits_src"] = vp_src_id
+    st.session_state["cmp_vp_limits_dirty"] = False
+
+vp_mode_now = st.session_state.get("cmp_vp_mode", "Off")
+if vp_mode_now in ("Heatmap (E vs gate)", "Both"):
+    if ("cmp_vp_vmin_in" not in st.session_state) or ("cmp_vp_vmax_in" not in st.session_state) or (not st.session_state.get("cmp_vp_limits_dirty", False)):
+        _vp_autofill_limits()
+
+vp_vmin = float(st.session_state.get("cmp_vp_vmin_in", -1.0))
+vp_vmax = float(st.session_state.get("cmp_vp_vmax_in", 1.0))
+vp_vmin = float(np.clip(vp_vmin, -1.0, 1.0))
+vp_vmax = float(np.clip(vp_vmax, -1.0, 1.0))
+if vp_vmin > vp_vmax:
+    vp_vmin, vp_vmax = vp_vmax, vp_vmin
+if (vp_vmax - vp_vmin) < 1e-6:
+    vp_vmax = min(1.0, vp_vmin + 0.01)
+
 
 # ----------------------------
 # VP controls (inside Plot controls tab)
@@ -653,14 +879,37 @@ with vp_slot:
             options=["Off", "Heatmap (E vs gate)", "Curve (vs gate)", "Both"],
             key="cmp_vp_mode",
         )
+        # VP heatmap limits (auto-seeded, then editable)
+        if st.session_state.get("cmp_vp_mode", "Off") in ("Heatmap (E vs gate)", "Both"):
+            st.markdown("**VP color limits**")
+            rr = st.columns(2, gap="small")
+            with rr[0]:
+                st.caption("vmin")
+                st.number_input(
+                    "VP vmin", key="cmp_vp_vmin_in", label_visibility="collapsed",
+                    min_value=-1.0, max_value=1.0, format="%.6g",
+                    on_change=_vp_mark_dirty
+                )
+            with rr[1]:
+                st.caption("vmax")
+                st.number_input(
+                    "VP vmax", key="cmp_vp_vmax_in", label_visibility="collapsed",
+                    min_value=-1.0, max_value=1.0, format="%.6g",
+                    on_change=_vp_mark_dirty
+                )
+
+            st.button(
+                "Auto VP limits", use_container_width=True,
+                on_click=_vp_autofill_limits, key="cmp_vp_auto_limits_btn"
+            )
 
         st.caption("VP uses **linear intensity** (even if PL display is log)")
 
         st.selectbox(
             "Background subtraction (before VP)",
             options=[
-                "Per-energy low percentile (recommended)",
                 "Scalar low percentile",
+                "Per-energy low percentile",
                 "ROI median (scalar)",
                 "None",
             ],
@@ -726,6 +975,52 @@ with left:
             with col:
                 _plot_panel_heatmap(k, cubes[k])
 
+    # --- spectra compare (raw line traces; not saved) ---
+    if st.session_state.get("cmp_trace_enable", True):
+        st.markdown("### Spectra compare (raw line traces)")
+
+        gate_req = float(st.session_state.get("cmp_trace_gate_in"))
+        trace_keys = (["KK", "KKp", "KpK", "KpKp"] if want4 else ["KK", "KKp"])
+
+        # Use linear/original data for traces (even if display is log)
+        if log_scale:
+            try:
+                cubes_trace = {k: load_pl(folder, sel[k], log_scale=False) for k in trace_keys}
+            except Exception as e:
+                st.warning(f"Spectra compare: linear load failed, using displayed data. ({e})")
+                cubes_trace = {k: cubes[k] for k in trace_keys}
+        else:
+            cubes_trace = {k: cubes[k] for k in trace_keys}
+
+        # Use the SAME subtraction settings as VP panel (if enabled)
+        apply_bg = bool(st.session_state.get("cmp_trace_apply_vp_bg", False))
+
+        bg_method_ui = st.session_state.get("cmp_vp_bg_method", "Scalar low percentile")
+        p_low = float(st.session_state.get("cmp_vp_bg_p", 1.0))
+        clip0 = bool(st.session_state.get("cmp_vp_clip0", True))
+        roi = (float(st.session_state.get("cmp_vp_e1", xlim[0])), float(st.session_state.get("cmp_vp_e2", xlim[1])))
+
+        method_map = {
+            "Scalar low percentile": "scalar_percentile",
+            "Per-energy low percentile": "per_energy_percentile",
+            "ROI median (scalar)": "roi_median_scalar",
+            "None": "none",
+        }
+        bg_method = method_map.get(bg_method_ui, "per_energy_percentile")
+
+        fig_trace = _build_spectra_compare_fig(
+            {k: cubes_trace[k] for k in trace_keys if k in cubes_trace},
+            gate_req,
+            xlim=xlim,
+            apply_bg=apply_bg,
+            bg_method=bg_method,
+            p_low=p_low,
+            roi=roi,
+            clip0=clip0,
+        )
+
+        _st_pyplot(fig_trace)
+
     # --- VP section under heatmaps (optional) ---
     vp_mode = st.session_state.get("cmp_vp_mode", "Off")
     want_vp = (vp_mode != "Off")
@@ -750,14 +1045,14 @@ with left:
 
         if cubes_lin is not None:
             # background subtraction settings
-            bg_method_ui = st.session_state.get("cmp_vp_bg_method", "Per-energy low percentile (recommended)")
+            bg_method_ui = st.session_state.get("cmp_vp_bg_method", "Scalar low percentile")
             p_low = float(st.session_state.get("cmp_vp_bg_p", 1.0))
             clip0 = bool(st.session_state.get("cmp_vp_clip0", True))
             roi = (float(st.session_state.get("cmp_vp_e1", xlim[0])), float(st.session_state.get("cmp_vp_e2", xlim[1])))
 
             method_map = {
-                "Per-energy low percentile (recommended)": "per_energy_percentile",
                 "Scalar low percentile": "scalar_percentile",
+                "Per-energy low percentile": "per_energy_percentile",
                 "ROI median (scalar)": "roi_median_scalar",
                 "None": "none",
             }
@@ -790,7 +1085,7 @@ with left:
                         xlabel="Photon Energy (eV)",
                         ylabel=A.gate_label,
                         cbar_label="VP",
-                        vmin=-1.0, vmax=1.0,
+                        vmin=vp_vmin, vmax=vp_vmax,
                         center_zero=True,
                         log_scale=False,
                         xlim=xlim, ylim=ylim,
@@ -894,14 +1189,14 @@ if st.button("Save all panels to processed data", key="cmp_save_all_btn"):
             cubes_lin = None
 
         if cubes_lin is not None:
-            bg_method_ui = st.session_state.get("cmp_vp_bg_method", "Per-energy low percentile (recommended)")
+            bg_method_ui = st.session_state.get("cmp_vp_bg_method", "Scalar low percentile")
             p_low = float(st.session_state.get("cmp_vp_bg_p", 1.0))
             clip0 = bool(st.session_state.get("cmp_vp_clip0", True))
             roi = (float(st.session_state.get("cmp_vp_e1", xlim[0])), float(st.session_state.get("cmp_vp_e2", xlim[1])))
 
             method_map = {
-                "Per-energy low percentile (recommended)": "per_energy_percentile",
                 "Scalar low percentile": "scalar_percentile",
+                "Per-energy low percentile": "per_energy_percentile",
                 "ROI median (scalar)": "roi_median_scalar",
                 "None": "none",
             }
@@ -929,7 +1224,7 @@ if st.button("Save all panels to processed data", key="cmp_save_all_btn"):
                         xlabel="Photon Energy (eV)",
                         ylabel=A.gate_label,
                         cbar_label="VP",
-                        vmin=-1.0, vmax=1.0,
+                        vmin=vp_vmin, vmax=vp_vmax,
                         center_zero=True,
                         log_scale=False,
                         xlim=xlim, ylim=ylim,
