@@ -704,6 +704,17 @@ def _drr_auto_limits():
 
 with t_controls:
     with st.expander("Axis / Color limits", expanded=True):
+
+        # ✅ Put the auto button BEFORE the widgets that use those keys
+        if _btn("Auto limits (v/x/y)", key="drr_auto_limits_btn"):
+            st.session_state["drr_vmin_in"] = vmin_auto
+            st.session_state["drr_vmax_in"] = vmax_auto
+            st.session_state["drr_x1_in"] = emin
+            st.session_state["drr_x2_in"] = emax
+            st.session_state["drr_y1_in"] = gmin
+            st.session_state["drr_y2_in"] = gmax
+            # no _rerun() needed
+
         rr = st.columns(3, gap="small")
         with rr[0]:
             st.caption("x left")
@@ -721,9 +732,6 @@ with t_controls:
             st.caption("vmax")
             st.number_input("vmax", key="drr_vmax_in", label_visibility="collapsed", format="%.6g")
 
-        if _btn("Auto limits (v/x/y)", key="drr_auto_limits_btn"):
-            _drr_auto_limits()
-            _rerun()
 
 vmin = float(st.session_state["drr_vmin_in"])
 vmax = float(st.session_state["drr_vmax_in"])
