@@ -131,20 +131,51 @@ def _select_all_and_request_build(sel_key: str, matches: list[str], which: str):
 # ----------------------------
 # Grouping helper
 # ----------------------------
-RUN_SUFFIX_RE = re.compile(r"(?:\$_|_)(\d{3,})$")
+# Supports:
+#   ..._001              or ...$_001
+#   ..._rep03_001        or ...$_rep03$_001
+#   ..._rep03            (optional)
+#
+# Grouping rule:
+#   - If name ends with _repXX_YYY, we group by "<prefix>_YYY" and use run=XX
+#     so rep01/02/03 become "runs" of the same group.
+#   - Else if name ends with _YYY, we group by "<prefix>" and use run=YYY (old behavior).
+
+REP_RUN_SUFFIX_RE  = re.compile(r"(?:\$_|_)rep(?P<rep>\d{1,3})(?:\$_|_)(?P<seq>\d{3,})$", re.IGNORECASE)
+REP_ONLY_SUFFIX_RE = re.compile(r"(?:\$_|_)rep(?P<rep>\d{1,3})$", re.IGNORECASE)
+RUN_SUFFIX_RE      = re.compile(r"(?:\$_|_)(?P<run>\d{3,})$")
 
 
 def split_group_and_run(filename: str):
     """
-    Group by filename stem with trailing run suffix removed.
-    Supports suffix:  _001   or   $_001
     Returns (group_key, run_index_int_or_None).
+
+    Examples:
+      AAA_rep03_001 -> (AAA_001, 3)   # group across rep01/02/03, sorted by rep#
+      AAA_002       -> (AAA, 2)       # old behavior
     """
     stem = Path(filename).stem
+
+    m = REP_RUN_SUFFIX_RE.search(stem)
+    if m:
+        prefix = stem[: m.start()]
+        rep_i = int(m.group("rep"))
+        seq = m.group("seq")
+        group_key = f"{prefix}_{seq}"     # keep the _001/_002 as the "shot" id
+        return group_key, rep_i
+
+    m = REP_ONLY_SUFFIX_RE.search(stem)
+    if m:
+        prefix = stem[: m.start()]
+        return prefix, int(m.group("rep"))
+
     m = RUN_SUFFIX_RE.search(stem)
-    if not m:
-        return stem, None
-    return stem[: m.start()], int(m.group(1))
+    if m:
+        prefix = stem[: m.start()]
+        return prefix, int(m.group("run"))
+
+    return stem, None
+
 
 
 # ----------------------------
