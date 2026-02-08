@@ -17,6 +17,19 @@ class DataCube:
     title: str
     cbar_label: str
 
+def peek_y_axis_options(user_folder: str, file_name: str):
+    # Preferred: use the implementation that owns _load_canonical (processing_run)
+    if hasattr(P, "peek_y_axis_options"):
+        return P.peek_y_axis_options(user_folder, file_name)
+
+    # Fallback: derive from _load_canonical if it exists there
+    d = P._load_canonical(user_folder, file_name, y_axis="auto")  # type: ignore[attr-defined]
+    opts = d.get("available_axes", ["Vbg", "Vtg"])
+    default = d.get("default_axis", opts[0] if opts else "Vtg")
+    if default not in opts and opts:
+        default = opts[0]
+    return opts, default
+
 
 def load_pl(user_folder: str, file_name: str, *, log_scale: bool = False) -> DataCube:
     res = P.process_pl(
@@ -85,6 +98,7 @@ def load_drr_avg(
     files: Sequence[str],
     *,
     bg_mode: str,
+    y_axis: str = "auto",  # ✅ NEW
     external_vector: Optional[np.ndarray] = None,
     derivative: Optional[int] = None,
     dE_window_pts: int = 20,
@@ -96,6 +110,7 @@ def load_drr_avg(
         user_folder=user_folder,
         files=list(files),
         bg_mode=bg_mode,
+        y_axis=y_axis,  # ✅ NEW
         external_vector=external_vector,
         use_global_background=False,
         plot_interactive=False,
@@ -109,6 +124,7 @@ def load_drr_avg(
         dE_interp_kind=dE_interp_kind,
         center_zero=True,
     )
+
 
     # use Z_out (DR/R or derivative)
     cbar = "DR/R" if derivative is None else ("d(DR/R)/dE" if derivative == 1 else "d²(DR/R)/dE²")

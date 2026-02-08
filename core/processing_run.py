@@ -718,7 +718,93 @@ def plot_heat_interactive_locked(
 # ------------------------------------------------------
 # CSV loader → canonical axes + block (rows=gate, cols=energy)
 # ------------------------------------------------------
-def _load_canonical(user_folder: str, origin_name: str) -> Dict:
+def _guess_sep_from_first_line(path: Path) -> str:
+    """Guess delimiter from the first non-empty line."""
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            s = line.strip()
+            if s:
+                # simple heuristic
+                c = s.count(",")
+                t = s.count("\t")
+                sc = s.count(";")
+                if t > c and t > sc:
+                    return "\t"
+                if sc > c and sc > t:
+                    return ";"
+                return ","
+    return ","
+
+
+def _token_is_float(tok: str) -> bool:
+    tok = tok.strip()
+    if not tok:
+        return True  # ignore empties when deciding header
+    try:
+        float(tok)
+        return True
+    except Exception:
+        return False
+
+
+def _csv_has_header_row(path: Path, sep: str) -> bool:
+    """
+    Decide whether first row is a header by checking if it contains non-float tokens.
+    Works for your two formats reliably.
+    """
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            toks = s.split(sep)
+            # If ANY non-empty token is not float-like -> header exists
+            return any((t.strip() != "") and (not _token_is_float(t)) for t in toks)
+    return False
+
+
+def _norm_colname(c) -> str:
+    s = str(c).strip().lower()
+    # remove common punctuation/units separators
+    s = re.sub(r"\(.*?\)", "", s)          # drop "(V)" etc
+    s = s.replace(" ", "").replace("_", "")
+    s = s.replace("/", "").replace("\\", "")
+    s = s.replace("-", "")
+    return s
+
+
+def _find_col_by_priority(cols: list, candidates: list[str]) -> Optional[str]:
+    """
+    Find the first column whose normalized name matches one of candidates (normalized).
+    candidates should be like ["vbgset", "vbg", "bg", ...]
+    """
+    cols_norm = {c: _norm_colname(c) for c in cols}
+    cand_norm = [_norm_colname(x) for x in candidates]
+    for want in cand_norm:
+        for c, cn in cols_norm.items():
+            if cn == want:
+                return c
+    return None
+
+
+_SPEC_COL_RE = re.compile(
+    r"^\s*([+-]?\d+(?:\.\d+)?)(?:\.\d+)?\s*(nm|ev|eV)?\s*$"
+)
+#                      ^^^^^^^^^^^
+# this optional (?:\.\d+)? allows pandas duplicate suffix like "703.177.1"
+
+def _parse_spec_axis_from_colname(col) -> Optional[float]:
+    s = str(col).strip()
+    m = _SPEC_COL_RE.match(s)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except Exception:
+        return None
+
+
+# def _load_canonical(user_folder: str, origin_name: str) -> Dict:
     """
     Read a CSV from root, compute energy/gate axes and Z (rows=gate, cols=energy),
     canonicalize to energy↑ and gate↑. Returns dict with:
@@ -782,6 +868,264 @@ def _load_canonical(user_folder: str, origin_name: str) -> Dict:
         "stem": stem,
         "title_name": title_full   # <= full title propagated downstream
     }
+
+def _load_canonical(user_folder: str, origin_name: str, *, y_axis: str = "auto") -> Dict:
+    """
+    Supports BOTH CSV formats:
+
+    (A) Legacy matrix (no header row):
+        row0 has wavelength/energy starting after some meta columns,
+        rows 1.. are gate points.
+
+    (B) Header table:
+        columns include gate variables (Vbg/Vtg/...) and many spectrum columns
+        whose *column names* are numeric (e.g. 703.177, 703.238, ...).
+
+    Returns dict with:
+      energy, gate_axis, Z (rows=gate, cols=energy), gate_label, parts, stem, title_name
+    """
+    p_user = Path(user_folder)
+    csv_path = _require_csv_in_root(p_user, origin_name)
+
+    sep = _guess_sep_from_first_line(csv_path)
+    has_header = _csv_has_header_row(csv_path, sep)
+
+    parts = re.findall(r"\$(.*?)\$", origin_name)
+    stem  = Path(origin_name).stem
+    title_full = "~".join(parts) if parts else stem
+
+    # --------------------------
+    # (B) Header-table format
+    # --------------------------
+    if has_header:
+        df = pd.read_csv(csv_path, sep=sep)
+        # normalize column names (strip only; keep originals for indexing)
+        df.columns = [str(c).strip() for c in df.columns]
+        cols = list(df.columns)
+
+        # Prefer *_set if present (your screenshot has Vbg_set / Vtg_set)
+        bg_col = _find_col_by_priority(cols, ["vbg_set", "vbgset", "vbg", "bg", "backgate", "backg"])
+        tg_col = _find_col_by_priority(cols, ["vtg_set", "vtgset", "vtg", "tg", "topgate", "topg"])
+        bias_col = _find_col_by_priority(cols, ["vbias_set", "vbiasset", "vbias", "bias", "vds", "vd"])
+        vbias = None if bias_col is None else pd.to_numeric(df[bias_col], errors="coerce").to_numpy(dtype=float)
+
+        if bg_col is None or tg_col is None:
+            raise ValueError(
+                "Header CSV detected but could not find gate columns.\n"
+                f"Found columns: {cols}\n"
+                "Expected something like Vbg/Vbg_set and Vtg/Vtg_set."
+            )
+
+        # Spectrum columns: numeric column names (e.g. 703.177, 1.72, etc.)
+        spec_cols = []
+        spec_vals = []
+        for c in cols:
+            v = _parse_spec_axis_from_colname(c)
+            if v is not None:
+                spec_cols.append(c)
+                spec_vals.append(v)
+
+        if not spec_cols:
+            raise ValueError(
+                "Header CSV detected but no spectrum columns found.\n"
+                "Spectrum columns must have numeric names like '703.177' or '1.742 eV'."
+            )
+
+        spec_vals = np.asarray(spec_vals, float)
+
+        # ===================== NEW: DEDUPE spectrum columns =====================
+        # Fixes cases like pandas auto-renaming duplicate headers: "703.177" and "703.177.1"
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for c, v in zip(spec_cols, spec_vals):
+            groups[round(float(v), 9)].append(c)
+
+        spec_cols_u = []
+        spec_vals_u = []
+        for vkey, col_list in groups.items():
+            if len(col_list) == 1:
+                best = col_list[0]
+            else:
+                # choose the column with the most finite points
+                def _finite_count(cc):
+                    arr = pd.to_numeric(df[cc], errors="coerce").to_numpy()
+                    return int(np.isfinite(arr).sum())
+                best = max(col_list, key=_finite_count)
+
+            spec_cols_u.append(best)
+            spec_vals_u.append(float(vkey))
+
+        spec_cols = spec_cols_u
+        spec_vals = np.asarray(spec_vals_u, float)
+        # =======================================================================
+
+        # Heuristic: if the numeric headers look like wavelength (nm), convert to energy
+        # (703 nm -> ~1.76 eV). If they look like eV already (~1-3), keep as energy.
+        if np.nanmedian(spec_vals) > 20.0:
+            energy = 1240.0 / spec_vals
+        else:
+            energy = spec_vals.copy()
+
+        # Sort columns so energy increases left->right
+        order = np.argsort(energy)
+        energy = energy[order]
+        spec_cols_sorted = [spec_cols[i] for i in order]
+
+        # Z: rows are gate points
+        Z_gateE = (
+            df[spec_cols_sorted]
+            .apply(pd.to_numeric, errors="coerce")
+            .to_numpy(dtype=float)
+        )
+
+        # Gate vectors
+        vbg = pd.to_numeric(df[bg_col], errors="coerce").to_numpy(dtype=float)
+        vtg = pd.to_numeric(df[tg_col], errors="coerce").to_numpy(dtype=float)
+
+    # --------------------------
+    # (A) Legacy matrix format
+    # --------------------------
+    else:
+        df0 = pd.read_csv(csv_path, header=None, sep=sep)
+        A = df0.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+
+        if A.shape[0] < 2 or A.shape[1] < 5:
+            raise ValueError(f"CSV has unexpected shape {A.shape}; need at least (2 rows, 5 cols).")
+
+        row0 = A[0, :]
+        # Find where spectrum starts: first big positive number (wavelength ~600-900nm)
+        idxs = np.where(np.isfinite(row0) & (row0 > 50.0))[0]
+        spec_start = int(idxs[0]) if idxs.size else 4  # fallback to old behavior
+
+        spec_axis = row0[spec_start:]
+        if spec_axis.size < 2:
+            raise ValueError("Legacy CSV: could not find spectrum axis in first row.")
+
+        # If looks like wavelength -> convert; else treat as energy already
+        if np.nanmedian(spec_axis) > 20.0:
+            energy = 1240.0 / spec_axis
+        else:
+            energy = spec_axis.copy()
+
+        # Z block
+        Z_gateE = A[1:, spec_start:]
+
+        # Gate columns (legacy convention)
+        vbg = A[1:, 0].astype(float)
+        vtg = A[1:, 1].astype(float)
+        vbias = A[1:, 2].astype(float) if A.shape[1] > 2 else None
+
+        # Sort energy increasing
+        if energy[0] > energy[-1]:
+            energy = energy[::-1]
+            Z_gateE = Z_gateE[:, ::-1]
+
+    # --------------------------
+    # Decide Y axis (same logic as your original)
+    # --------------------------
+    def _is_constant(v, atol=1e-12, rtol=1e-9):
+        v = np.asarray(v, float)
+        if v.size == 0:
+            return True
+        vmin, vmax = np.nanmin(v), np.nanmax(v)
+        span = vmax - vmin
+        return (span <= atol) or (span <= rtol * max(1.0, abs(vmin), abs(vmax)))
+
+    def _is_varying(v) -> bool:
+        if v is None:
+            return False
+        v = np.asarray(v, float)
+        if v.size == 0:
+            return False
+        return not _is_constant(v)
+
+    # build axis candidates
+    axes = {
+        "Vbg": np.asarray(vbg, float),
+        "Vtg": np.asarray(vtg, float),
+    }
+    if vbias is not None:
+        axes["Vbias"] = np.asarray(vbias, float)
+
+    # only offer Vbias if it actually varies
+    available_axes = ["Vbg", "Vtg"]
+    if _is_varying(axes.get("Vbias")):
+        available_axes.append("Vbias")
+
+    # ---- AUTO default axis ----
+    bg_const = _is_constant(vbg)
+    tg_const = _is_constant(vtg)
+    vbias_var = _is_varying(axes.get("Vbias"))
+
+    default_axis = None
+    default_label = None
+
+    if vbias_var and bg_const and tg_const:
+        # NEW: bias varies but gates are constant -> use Vbias by default
+        default_axis = "Vbias"
+        default_label = "Bias (V)"
+    elif (not bg_const) and tg_const:
+        default_axis = "Vbg"
+        default_label = "Back gate (V)"
+    elif (not tg_const) and bg_const:
+        default_axis = "Vtg"
+        default_label = "Top gate (V)"
+    else:
+        # fallback to your existing tag-based combined axis logic
+        gate_tag = next((p for p in parts if ("TG" in p or "BG" in p)), "")
+        ratio = _extract_tg_bg_ratio(gate_tag) or 1.0
+        if "TG+BG" in gate_tag:
+            axes["TG+BG"] = ratio * axes["Vtg"] - axes["Vbg"]
+            available_axes.append("TG+BG")
+            default_axis = "TG+BG"
+            default_label = f"{ratio}Tg-Bg (V)"
+        elif "TG-BG" in gate_tag:
+            axes["TG-BG"] = ratio * axes["Vtg"] + axes["Vbg"]
+            available_axes.append("TG-BG")
+            default_axis = "TG-BG"
+            default_label = f"{ratio}Tg+Bg (V)"
+        else:
+            default_axis = "Vtg"
+            default_label = "Top gate (V)"
+
+    # ---- choose axis with override ----
+    # IMPORTANT: add y_axis parameter to _load_canonical signature, default "auto"
+    # def _load_canonical(..., y_axis: str = "auto") -> Dict:
+
+    chosen = default_axis if (y_axis is None or str(y_axis).lower() == "auto") else str(y_axis)
+
+    if chosen not in axes:
+        raise ValueError(f"Requested y_axis='{chosen}' not available. Have: {sorted(axes.keys())}")
+
+    gate_axis = np.asarray(axes[chosen], float)
+
+    if chosen == "Vbg":
+        gate_label = "Back gate (V)"
+    elif chosen == "Vtg":
+        gate_label = "Top gate (V)"
+    elif chosen == "Vbias":
+        gate_label = "Bias (V)"
+    else:
+        gate_label = default_label or chosen
+
+    # canonicalize gate increasing
+    if gate_axis[0] > gate_axis[-1]:
+        gate_axis = gate_axis[::-1]
+        Z_gateE   = Z_gateE[::-1, :]
+
+    return {
+        "energy": np.asarray(energy, float),
+        "gate_axis": gate_axis,
+        "gate_label": gate_label,
+        "Z": np.asarray(Z_gateE, float),
+        "stem": stem,
+        "parts": parts,
+        "title_name": title_full,
+        # NEW: expose axis options to UI
+        "available_axes": available_axes,
+        "default_axis": default_axis,
+    }
+
 
 # ----------------------------
 # PL (no DR/R, no averaging)
@@ -1045,6 +1389,7 @@ def process_ref_avg(
     clim: tuple[float, float] | None = None,
     xlim: tuple[float, float] | None = None,
     ylim: tuple[float, float] | None = None,
+    y_axis: str = "auto",
     save_png: bool = True,
     save_dat_file: bool = True,
     move_original: bool = True,
@@ -1060,7 +1405,7 @@ def process_ref_avg(
     if derivative not in (None, 1, 2):
         raise ValueError("derivative must be None, 1, or 2")
     p_user = Path(user_folder)
-    d0 = _load_canonical(user_folder, files[0])
+    d0 = _load_canonical(user_folder, files[0], y_axis=y_axis)
     energy0, gate0, Z0 = d0["energy"], d0["gate_axis"], d0["Z"]
     gate_label, title0, stem0 = d0["gate_label"], d0["title_name"], d0["stem"]
     eN, gN = len(energy0), len(gate0)
@@ -1082,7 +1427,7 @@ def process_ref_avg(
     stack = [ _drr_from_Z(Z0, dmode, I0_ext) ]
     stack_raw = [ Z0 ]
     for f in files[1:]:
-        d = _load_canonical(user_folder, f)
+        d = _load_canonical(user_folder, f, y_axis=y_axis)
         if not (np.allclose(d["energy"], energy0) and np.allclose(d["gate_axis"], gate0)):
             raise ValueError(f"Grid mismatch in {f}")
         stack.append(_drr_from_Z(d["Z"], dmode, I0_ext))

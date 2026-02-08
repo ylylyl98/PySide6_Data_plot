@@ -13,7 +13,7 @@ from ui.logger import log
 from ui.plotting import HeatmapConfig, build_heatmap_fig, build_spectrum_fig, save_fig_png
 
 from core.file_ops import list_root_csvs, archive_all, restore_all
-from core.loader import load_drr_avg, build_external_baseline
+from core.loader import load_drr_avg, build_external_baseline, peek_y_axis_options
 from core.processing_run import save_as_dat
 
 
@@ -437,6 +437,25 @@ with colC:
 if not sel_files:
     st.warning("No files selected for averaging.")
     st.stop()
+# ----------------------------
+# Y-axis options (Vbg/Vtg/Vbias if varying)
+# ----------------------------
+_ensure("_drr_yaxis_src", None)
+src_y = (folder, sel_files[0])  # peek from the first selected file
+
+if st.session_state["_drr_yaxis_src"] != src_y:
+    st.session_state["_drr_yaxis_src"] = src_y
+    try:
+        y_opts, y_def = peek_y_axis_options(folder, sel_files[0])
+    except Exception:
+        y_opts, y_def = ["Vbg", "Vtg"], "Vtg"
+    st.session_state["drr_yaxis_options"] = list(y_opts)
+    st.session_state["drr_yaxis_default"] = str(y_def)
+
+# ensure choice exists
+opts = st.session_state.get("drr_yaxis_options", ["Vbg", "Vtg"])
+default = st.session_state.get("drr_yaxis_default", opts[0])
+_ensure_choice("drr_y_axis", opts, default)
 
 st.divider()
 
@@ -467,7 +486,7 @@ _ensure("drr_oversample", 1.0)
 external_vec = None
 
 with t_controls:
-    r0 = st.columns([1.0, 1.0, 1.4], gap="small")
+    r0 = st.columns([1.0, 1.0, 1.4, 1.0], gap="small")
     with r0[0]:
         st.checkbox("center=0", key="center_zero")
     with r0[1]:
@@ -478,6 +497,12 @@ with t_controls:
             options=["RdBu_r", "coolwarm", "seismic", "Spectral", "viridis", "plasma", "inferno", "magma", "cividis", "turbo"],
             key="drr_cmap",
         )
+    with r0[3]:
+        # options come from the first selected file (same folder/root)
+        opts, default = peek_y_axis_options(folder, sel_files[0])
+        _ensure_choice("drr_y_axis", opts, default)
+        st.selectbox("Y axis", options=opts, key="drr_y_axis")
+
 
     st.markdown("#### Plot controls")
 
@@ -650,12 +675,15 @@ with t_controls:
 # Compute DR/R cube
 # =========================
 try:
+    y_axis_choice = st.session_state.get("drr_y_axis", "auto")
+
     if mode == "DR/R Self":
         bg_mode = "self_first" if st.session_state["drr_self_which"] == "first" else "self_last"
         cube = load_drr_avg(
             folder,
             sel_files,
             bg_mode=bg_mode,
+            y_axis=y_axis_choice,   
             derivative=derivative,
             dE_window_pts=int(dE_window_pts),
             dE_polyorder=int(dE_polyorder),
@@ -666,12 +694,14 @@ try:
             folder,
             sel_files,
             bg_mode="external",
+            y_axis=y_axis_choice,   
             external_vector=external_vec,
             derivative=derivative,
             dE_window_pts=int(dE_window_pts),
             dE_polyorder=int(dE_polyorder),
             dE_oversample=float(dE_oversample),
         )
+
 except Exception as e:
     st.error(f"Compute failed: {e}")
     log(f"ERROR DRR compute: {e}")
@@ -705,7 +735,8 @@ emin, emax = float(np.nanmin(E)), float(np.nanmax(E))
 gmin, gmax = float(np.nanmin(G)), float(np.nanmax(G))
 
 _ensure("_drr_limits_src", None)
-src_id = (folder, tuple(sel_files), mode, bool(st.session_state.get("center_zero", False)), derivative)
+src_id = (folder, tuple(sel_files), mode, y_axis_choice, bool(st.session_state.get("center_zero", False)), derivative)
+
 
 _ensure("drr_vmin_in", vmin_auto)
 _ensure("drr_vmax_in", vmax_auto)
@@ -830,7 +861,7 @@ with right:
     _ensure("drr_export_seq", 0)
     _ensure("_drr_prev_export_scope", None)
 
-    export_scope = (sel_group, tuple(sel_files), mode)
+    export_scope = (sel_group, tuple(sel_files), mode, y_axis_choice)
     if st.session_state["_drr_prev_export_scope"] != export_scope:
         st.session_state["_drr_prev_export_scope"] = export_scope
         st.session_state["drr_export_seq"] += 1
