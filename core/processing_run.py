@@ -1532,7 +1532,6 @@ def build_external_baseline_avg(
 
     d0 = _load_canonical(user_folder, files_zero[0])
     energy0 = np.asarray(d0["energy"]).ravel()
-    gate0   = np.asarray(d0["gate_axis"]).ravel()
     Z0      = np.asarray(d0["Z"])
 
     if Z0.ndim != 2 or Z0.shape[1] != energy0.size:
@@ -1555,21 +1554,42 @@ def build_external_baseline_avg(
     I0_list_1d.append(_pick_I0_from_Z(Z0))
 
     # remaining files
+    def _interp_to_energy0(E_src: np.ndarray, y_src: np.ndarray, E_tgt: np.ndarray) -> np.ndarray:
+        E_src = np.asarray(E_src, float).ravel()
+        y_src = np.asarray(y_src, float).ravel()
+        E_tgt = np.asarray(E_tgt, float).ravel()
+
+        m = np.isfinite(E_src) & np.isfinite(y_src)
+        if m.sum() < 2:
+            return np.full_like(E_tgt, np.nan, float)
+
+        Es = E_src[m]
+        ys = y_src[m]
+
+        # ensure increasing energy for np.interp
+        order = np.argsort(Es)
+        Es = Es[order]
+        ys = ys[order]
+
+        # outside overlap -> NaN (so averaging won’t invent values)
+        return np.interp(E_tgt, Es, ys, left=np.nan, right=np.nan)
+
+
     for f in files_zero[1:]:
         d = _load_canonical(user_folder, f)
-        energy = np.asarray(d["energy"]).ravel()
-        gate   = np.asarray(d["gate_axis"]).ravel()
-
-        if not (np.allclose(energy, energy0) and np.allclose(gate, gate0)):
-            raise ValueError(f"Grid mismatch in {f} vs {files_zero[0]}.")
+        energy_i = np.asarray(d["energy"]).ravel()
 
         Z = np.asarray(d["Z"])
-        if Z.ndim != 2 or Z.shape[1] != energy0.size:
-            raise ValueError(
-                f"{f}: Z has shape {Z.shape}; expected (gN, eN) with eN={energy0.size}."
-            )
+        I0_i = _pick_I0_from_Z(Z)
 
-        I0_list_1d.append(_pick_I0_from_Z(Z))
+        # ✅ Baseline only cares about energy grid. Ignore gate_axis entirely.
+        # If energy grid differs (length or values), interpolate onto energy0.
+        if (energy_i.shape != energy0.shape) or (not np.allclose(energy_i, energy0, rtol=1e-6, atol=1e-9)):
+            print(f"[baseline][warn] energy grid mismatch in {f}; interpolating to reference grid.")
+            I0_i = _interp_to_energy0(energy_i, I0_i, energy0)
+
+        I0_list_1d.append(I0_i)
+
 
     # Average across files (each file contributes one 1D baseline)
     I0_stack = np.stack(I0_list_1d, axis=0)  # shape: (n_files, eN)
