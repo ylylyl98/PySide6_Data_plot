@@ -241,7 +241,7 @@ if finite.size == 0:
     st.error("Data contains no finite values.")
     st.stop()
 
-P_LOW, P_HIGH = 0.5, 99.5
+P_LOW, P_HIGH = 0.01, 99.99
 
 
 def _auto_limits_for_mode(Z_in: np.ndarray, E_in: np.ndarray, G_in: np.ndarray, log_mode: bool):
