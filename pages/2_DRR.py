@@ -505,9 +505,11 @@ with t_controls:
 
 
     st.markdown("#### Plot controls")
+    _ensure_choice("drr_sg_mode", ["More correct (regrid)", "Origin-like"], "More correct (regrid)")
 
     with st.expander("Derivative (optional)", expanded=False):
-        r2 = st.columns([2, 2, 2, 2], gap="small")
+        r2 = st.columns([2, 2, 2, 2, 2], gap="small")
+
         with r2[0]:
             deriv_mode = st.selectbox(
                 "Derivative",
@@ -518,10 +520,23 @@ with t_controls:
 
         with r2[1]:
             st.number_input("SG window_pts", min_value=5, max_value=401, step=1, key="drr_sg_win")
+
         with r2[2]:
             st.number_input("SG polyorder", min_value=1, max_value=6, step=1, key="drr_sg_poly")
+
         with r2[3]:
             st.number_input("Oversample", min_value=1.0, max_value=10.0, step=0.5, key="drr_oversample")
+
+        with r2[4]:
+            st.selectbox(
+                "SG mode",
+                options=["More correct (regrid)", "Origin-like"],
+                key="drr_sg_mode",
+                help=(
+                    "More correct (regrid): interpolate to uniform energy grid then SG derivative.\n"
+                    "Origin-like: assumes energy is evenly spaced (matches Origin behavior better when Origin warns)."
+                ),
+            )
 
     dE_window_pts = int(st.session_state["drr_sg_win"])
     dE_polyorder = int(st.session_state["drr_sg_poly"])
@@ -674,6 +689,9 @@ with t_controls:
 # =========================
 # Compute DR/R cube
 # =========================
+
+dE_origin_like = (st.session_state.get("drr_sg_mode", "More correct (regrid)") == "Origin-like")
+
 try:
     y_axis_choice = st.session_state.get("drr_y_axis", "auto")
 
@@ -688,6 +706,8 @@ try:
             dE_window_pts=int(dE_window_pts),
             dE_polyorder=int(dE_polyorder),
             dE_oversample=float(dE_oversample),
+            dE_origin_like=bool(dE_origin_like),
+            dE_pad_flat_edges=True,
         )
     else:
         cube = load_drr_avg(
@@ -700,6 +720,8 @@ try:
             dE_window_pts=int(dE_window_pts),
             dE_polyorder=int(dE_polyorder),
             dE_oversample=float(dE_oversample),
+            dE_origin_like=bool(dE_origin_like),
+            dE_pad_flat_edges=True,
         )
 
 except Exception as e:
@@ -871,6 +893,19 @@ with right:
 
     safe_stem = Path(sel_files[0]).stem + f"_avg{len(sel_files)}"
     suffix = mode.replace("/", "_").replace(" ", "_")
+
+    # --- NEW: derivative tag for filenames ---
+    deriv_mode_label = st.session_state.get("drr_deriv_mode", "None")  # "None" | "dE" | "d2E"
+    deriv_tag = "" if deriv_mode_label == "None" else f"_{deriv_mode_label}"
+
+    # (optional but useful) also tag the SG mode when using derivatives
+    sg_mode_label = st.session_state.get("drr_sg_mode", "More correct (regrid)")  # if you added this UI
+    sg_tag = ""
+    if deriv_mode_label != "None":
+        sg_tag = "_OriginLike" if sg_mode_label == "Origin-like" else "_Regrid"
+
+    export_base = f"{safe_stem}_{suffix}{deriv_tag}{sg_tag}"
+
     out_dir = Path(folder) / st.session_state.processed_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -883,7 +918,7 @@ with right:
 
         # Save PNG
         try:
-            out_path = out_dir / f"{safe_stem}_{suffix}.png"
+            out_path = out_dir / f"{export_base}.png"
             save_fig_png(fig, out_path)
             st.session_state["drr_last_png_path"] = str(out_path)
             log(f"Saved PNG: {out_path}")
@@ -901,7 +936,7 @@ with right:
                 cube.Z,
                 user_folder=folder,
                 subfolder=st.session_state.processed_name,
-                basename_override=base,
+                basename_override=export_base,
                 name_suffix="",
                 energy_label="Photon energy",
                 energy_unit="eV",

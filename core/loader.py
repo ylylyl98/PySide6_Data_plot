@@ -98,19 +98,21 @@ def load_drr_avg(
     files: Sequence[str],
     *,
     bg_mode: str,
-    y_axis: str = "auto",  # ✅ NEW
+    y_axis: str = "auto",  
     external_vector: Optional[np.ndarray] = None,
     derivative: Optional[int] = None,
     dE_window_pts: int = 20,
     dE_polyorder: int = 2,
     dE_oversample: float = 1.0,
     dE_interp_kind: str = "cubic",
+    dE_origin_like: bool = False,        
+    dE_pad_flat_edges: bool = True,      
 ) -> DataCube:
     res = P.process_ref_avg(
         user_folder=user_folder,
         files=list(files),
         bg_mode=bg_mode,
-        y_axis=y_axis,  # ✅ NEW
+        y_axis=y_axis,  
         external_vector=external_vector,
         use_global_background=False,
         plot_interactive=False,
@@ -122,6 +124,8 @@ def load_drr_avg(
         dE_polyorder=dE_polyorder,
         dE_oversample=dE_oversample,
         dE_interp_kind=dE_interp_kind,
+        dE_origin_like=dE_origin_like,
+        dE_pad_flat_edges=dE_pad_flat_edges,
         center_zero=True,
     )
 

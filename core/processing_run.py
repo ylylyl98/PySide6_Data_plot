@@ -1322,48 +1322,93 @@ from scipy.interpolate import CubicSpline
 def _odd(n: int) -> int:
     return n if n % 2 else n + 1
 
+from scipy.signal import savgol_filter
+import numpy as np
+
 def sg_derivative_origin_1d(
     E, y, *,
     deriv: int = 2,
     window_pts: int = 20,
     polyorder: int = 2,
     oversample: float = 1.0,
-    interp_kind: str = "cubic"
+    interp_kind: str = "cubic",
+    origin_like: bool = False,     # NEW
+    pad_flat_edges: bool = True     # NEW (optional)
 ):
     E = np.asarray(E, float); y = np.asarray(y, float)
-    nU = max(len(E), int(math.ceil(len(E)*oversample)))
+
+    # ---------- Origin-like path: pretend X is evenly spaced ----------
+    if origin_like:
+        dE = float(np.nanmean(np.diff(E)))
+        if (not np.isfinite(dE)) or dE == 0:
+            return np.full_like(y, np.nan, float)
+
+        win = int(window_pts)
+        if win % 2 == 0:
+            win += 1  # SciPy needs odd; Origin's "20" often effectively becomes 21
+
+        yd = savgol_filter(y, window_length=win, polyorder=polyorder,
+                           deriv=deriv, delta=dE, mode="interp")
+
+        # optional: mimic flat-ish edges seen in some tools
+        if pad_flat_edges:
+            m = win // 2
+            if len(yd) > (m + 2):
+                yd[:m+1] = yd[m+1]
+                yd[-(m+1):] = yd[-(m+2)]
+        return yd
+
+    # ---------- Your current “more correct for uneven E” path ----------
+    nU = max(len(E), int(np.ceil(len(E) * float(oversample))))
     Eu = np.linspace(E[0], E[-1], nU)
-    dEu = Eu[1]-Eu[0]
+    dEu = Eu[1] - Eu[0]
+
     m = np.isfinite(E) & np.isfinite(y)
     if m.sum() < polyorder + 2:
         return np.full_like(y, np.nan, float)
+
     if interp_kind == "cubic" and m.sum() >= 4:
+        from scipy.interpolate import CubicSpline
         yu = CubicSpline(E[m], y[m], extrapolate=False)(Eu)
     else:
         yu = np.interp(Eu, E[m], y[m])
-    if np.any(~np.isfinite(yu)):
-        good = np.isfinite(yu)
+
+    good = np.isfinite(yu)
+    if good.sum() >= 2 and not np.all(good):
         yu = np.interp(Eu, Eu[good], yu[good])
-    win = _odd(int(window_pts))
-    if win >= len(Eu): win = len(Eu) - (1 - len(Eu)%2)
+
+    win = int(window_pts)
+    if win % 2 == 0:
+        win += 1
     win = max(win, polyorder + 3)
-    y_deriv_u = savgol_filter(
-        yu, window_length=win, polyorder=polyorder,
-        deriv=deriv, delta=dEu, mode="interp"
-    )
-    return np.interp(E, Eu, y_deriv_u)
+    if win >= len(Eu):
+        win = len(Eu) - (1 - len(Eu) % 2)
+
+    ydu = savgol_filter(yu, window_length=win, polyorder=polyorder,
+                        deriv=deriv, delta=dEu, mode="interp")
+    return np.interp(E, Eu, ydu)
 
 def sg_derivative_origin_rows(
-    Z_gateE, energy, *, deriv=2, window_pts=20, polyorder=2,
-    oversample=1.0, interp_kind="cubic"
+    Z_gateE, energy, *,
+    deriv=2, window_pts=20, polyorder=2,
+    oversample=1.0, interp_kind="cubic",
+    origin_like: bool = False,
+    pad_flat_edges: bool = True
 ):
-    Z = np.asarray(Z_gateE, float); E = np.asarray(energy, float)
+    Z = np.asarray(Z_gateE, float)
+    E = np.asarray(energy, float)
     out = np.empty_like(Z, float)
+
     for i in range(Z.shape[0]):
         out[i] = sg_derivative_origin_1d(
             E, Z[i],
-            deriv=deriv, window_pts=window_pts, polyorder=polyorder,
-            oversample=oversample, interp_kind=interp_kind
+            deriv=deriv,
+            window_pts=window_pts,
+            polyorder=polyorder,
+            oversample=oversample,
+            interp_kind=interp_kind,
+            origin_like=origin_like,
+            pad_flat_edges=pad_flat_edges,
         )
     return out
 
@@ -1383,6 +1428,8 @@ def process_ref_avg(
     dE_polyorder: int = 2,
     dE_oversample: float = 1.0,
     dE_interp_kind: str = "cubic",
+    dE_origin_like: bool = False,        # NEW
+    dE_pad_flat_edges: bool = True,      # NEW
     processed_subfolder: str = "Processed Data",
     plot_interactive: bool = True,
     center_zero: bool | None = None,
@@ -1441,13 +1488,15 @@ def process_ref_avg(
     cbar_lbl = "DR/R"
     if derivative in (1, 2):
         Z_out = sg_derivative_origin_rows(
-                Z_avg, energy0,
-                deriv=derivative,
-                window_pts=dE_window_pts,
-                polyorder=dE_polyorder,
-                oversample=dE_oversample,
-                interp_kind=dE_interp_kind
-            )
+            Z_avg, energy0,
+            deriv=derivative,
+            window_pts=dE_window_pts,
+            polyorder=dE_polyorder,
+            oversample=dE_oversample,
+            interp_kind=dE_interp_kind,
+            origin_like=dE_origin_like,
+            pad_flat_edges=dE_pad_flat_edges,
+        )
         suffix += ("_dE" if derivative == 1 else "_d2E")
         cbar_lbl = "d(DR/R)/dE" if derivative == 1 else "d²(DR/R)/dE²"
     save_base = f"{stem0}{suffix}"
