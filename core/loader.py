@@ -17,6 +17,21 @@ class DataCube:
     title: str
     cbar_label: str
 
+
+def _validate_cube_arrays(energy: np.ndarray, gate: np.ndarray, Z: np.ndarray, *, context: str) -> None:
+    e = np.asarray(energy).ravel()
+    g = np.asarray(gate).ravel()
+    z = np.asarray(Z)
+
+    if e.size == 0 or g.size == 0 or z.size == 0:
+        raise ValueError(f"{context}: empty energy/gate/Z data.")
+    if z.ndim != 2:
+        raise ValueError(f"{context}: Z must be 2D, got shape {z.shape}.")
+    if z.shape not in {(g.size, e.size), (e.size, g.size)}:
+        raise ValueError(
+            f"{context}: Z shape {z.shape} does not match gate ({g.size}) x energy ({e.size})."
+        )
+
 def peek_y_axis_options(user_folder: str, file_name: str):
     # Preferred: use the implementation that owns _load_canonical (processing_run)
     if hasattr(P, "peek_y_axis_options"):
@@ -42,6 +57,7 @@ def load_pl(user_folder: str, file_name: str, *, log_scale: bool = False) -> Dat
         pl_scales=("log" if log_scale else "linear",),
         open_both_interactive=False,
     )
+    _validate_cube_arrays(res["energy"], res["gate_axis"], res["Z"], context="PL load")
     return DataCube(
         energy=res["energy"],
         gate=res["gate_axis"],
@@ -129,6 +145,7 @@ def load_drr_avg(
         center_zero=True,
     )
 
+    _validate_cube_arrays(res["energy"], res["gate_axis"], res["Z_out"], context="DRR load")
 
     # use Z_out (DR/R or derivative)
     cbar = "DR/R" if derivative is None else ("d(DR/R)/dE" if derivative == 1 else "d²(DR/R)/dE²")

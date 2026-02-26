@@ -10,50 +10,12 @@ import streamlit as st
 from ui.state import init_session_state
 from ui.sidebar import sidebar_folder_picker
 from ui.logger import log
+from ui.widgets import st_pyplot, btn, btn_click, dl_btn, rerun
 from ui.plotting import HeatmapConfig, build_heatmap_fig, build_spectrum_fig, save_fig_png
 
 from core.file_ops import list_root_csvs, archive_all, restore_all
 from core.loader import load_pl
 from core.processing_run import save_as_dat
-
-
-# ----------------------------
-# Streamlit width API compatibility helpers
-# ----------------------------
-def _st_pyplot(fig):
-    try:
-        st.pyplot(fig, width="stretch")
-    except TypeError:
-        st.pyplot(fig, use_container_width=True)
-
-
-def _btn(label: str, *, key: str, disabled: bool = False):
-    try:
-        return st.button(label, key=key, width="stretch", disabled=disabled)
-    except TypeError:
-        return st.button(label, key=key, use_container_width=True, disabled=disabled)
-
-
-def _btn_click(label: str, *, key: str, on_click=None, args=None, disabled: bool = False):
-    """Button with width='stretch' fallback, supports on_click."""
-    try:
-        return st.button(label, key=key, width="stretch", on_click=on_click, args=args, disabled=disabled)
-    except TypeError:
-        return st.button(label, key=key, use_container_width=True, on_click=on_click, args=args, disabled=disabled)
-
-
-def _dl_btn(label: str, *, data: bytes, file_name: str, mime: str, key: str):
-    try:
-        return st.download_button(label, data=data, file_name=file_name, mime=mime, key=key, width="stretch")
-    except TypeError:
-        return st.download_button(label, data=data, file_name=file_name, mime=mime, key=key, use_container_width=True)
-
-
-def _rerun():
-    try:
-        st.rerun()
-    except Exception:
-        st.experimental_rerun()
 
 
 # ----------------------------
@@ -115,11 +77,18 @@ def _request_autolimits():
 # ----------------------------
 # Page setup
 # ----------------------------
-st.set_page_config(page_title="PL", page_icon="📈", layout="wide")
+st.set_page_config(page_title="PL", page_icon="PL", layout="wide")
 init_session_state()
 sidebar_folder_picker()
 
-st.title("📈 PL")
+st.title("PL")
+
+with st.expander("Workflow steps (quick)"):
+    st.markdown(
+        "- Select a folder in the sidebar.\n"
+        "- Choose a CSV from the root list.\n"
+        "- Adjust limits if needed, then save PNG + DAT."
+    )
 
 folder = st.session_state.user_folder
 archive_name = st.session_state.get("archive_name", "archive")
@@ -158,19 +127,22 @@ with colA:
         st.session_state["pl_log"] = bool(pending_log)
     st.caption(f"{files.index(file_name)+1} / {len(files)} in root")
 
+def _log_pl(msg: str) -> None:
+    log(f"[PL][{file_name}] {msg}")
+
 with colB:
-    if _btn("Archive all CSVs", key="pl_archive_all_btn"):
+    if btn("Archive all CSVs", key="pl_archive_all_btn"):
         n = archive_all(folder, archive_name)
 
-        log(f"Archived {n} CSV(s) -> {st.session_state.archive_name}")
-        _rerun()
+        _log_pl(f"Archived {n} CSV(s) -> {st.session_state.archive_name}")
+        rerun()
     st.caption(f"Move ALL root CSVs into '{archive_name}/' ...")
 
 with colC:
-    if _btn("Restore CSVs", key="pl_restore_all_btn"):
+    if btn("Restore CSVs", key="pl_restore_all_btn"):
         n = restore_all(folder, st.session_state.archive_name)
-        log(f"Restored {n} CSV(s) <- {st.session_state.archive_name}")
-        _rerun()
+        _log_pl(f"Restored {n} CSV(s) <- {st.session_state.archive_name}")
+        rerun()
     st.caption("Restore archived CSVs back to the folder root.")
 
 st.divider()
@@ -229,7 +201,7 @@ try:
     cube = load_pl(folder, file_name, log_scale=False)  # always load linear intensities
 except Exception as e:
     st.error(f"Load failed: {e}")
-    log(f"ERROR PL load: {e}")
+    _log_pl(f"ERROR PL load: {e}")
     st.stop()
 
 Z = np.asarray(cube.Z, float)
@@ -402,7 +374,7 @@ fig = build_heatmap_fig(cube.energy, cube.gate, Z_plot, cfg)
 left, right = st.columns([3.2, 2.0], gap="large")
 
 with left:
-    _st_pyplot(fig)
+    st_pyplot(fig)
 
 with right:
     tab_ctrl, tab_cursor = st.tabs(["Controls", "Cursor & Spectrum"])
@@ -444,7 +416,7 @@ with right:
                 st.caption("vmax")
                 st.number_input("vmax", key="pl_vmax_in", label_visibility="collapsed", format="%.6g")
 
-            _btn_click(
+            btn_click(
                 "Auto limits (v/x/y)",
                 key="pl_auto_limits_btn",
                 on_click=_request_autolimits,
@@ -461,7 +433,7 @@ with right:
         safe_stem = Path(file_name).stem
 
         # 1) Button FIRST (so everything else appears underneath)
-        clicked = _btn("Save PNG + DAT (forces both scales)", key="pl_save_both_btn")
+        clicked = btn("Save PNG + DAT (forces both scales)", key="pl_save_both_btn")
 
         if clicked:
             ok_png = False
@@ -476,7 +448,7 @@ with right:
                 png_path = out_dir / f"{safe_stem}_{suffix}.png"
                 save_fig_png(fig, png_path)
                 st.session_state["pl_last_png_path"] = str(png_path)
-                log(f"Saved PNG: {png_path}")
+                _log_pl(f"Saved PNG: {png_path}")
                 ok_png = True
 
                 if is_log:
@@ -485,7 +457,7 @@ with right:
                     st.session_state["pl__saved_png_linear"] = True
 
             except Exception as e:
-                log(f"ERROR saving PNG: {e}")
+                _log_pl(f"ERROR saving PNG: {e}")
                 st.error(f"Save PNG failed: {e}")
 
             # ---------- Save DAT (only once per file; scale-independent) ----------
@@ -508,17 +480,17 @@ with right:
                     st.session_state["pl_last_dat_path"] = str(dat_path)
                     st.session_state["pl__saved_dat"] = True
                     did_save_dat_now = True
-                    log(f"Saved DAT: {dat_path}")
+                    _log_pl(f"Saved DAT: {dat_path}")
                     ok_dat = True
                 except Exception as e:
-                    log(f"ERROR saving DAT: {e}")
+                    _log_pl(f"ERROR saving DAT: {e}")
                     st.error(f"Save DAT failed: {e}")
             else:
                 ok_dat = True
 
             if not ok_png:
                 st.session_state["pl_last_notice"] = {"headline": "Save failed", "file": file_name}
-                _rerun()
+                rerun()
 
             done_linear = bool(st.session_state.get("pl__saved_png_linear", False))
             done_log = bool(st.session_state.get("pl__saved_png_log", False))
@@ -539,9 +511,9 @@ with right:
                     "file": file_name,
                     "png_name": (out_dir / f"{safe_stem}_{suffix}.png").name,
                     "dat_name": Path(st.session_state["pl_last_dat_path"]).name if st.session_state.get("pl_last_dat_path") else "",
-                    "moved_msg": f"Switched to {next_mode} view — click Save again to complete both PNGs.",
+                    "moved_msg": f"Switched to {next_mode} view - click Save again to complete both PNGs.",
                 }
-                _rerun()
+                rerun()
 
             # Finalize only when BOTH PNGs + DAT done
             if bool(st.session_state.get("pl_auto_advance_file", True)):
@@ -553,7 +525,7 @@ with right:
                 moved_msg = f"auto-moved {moved} CSV -> '{archive_name}/'"
                 if replaced:
                     moved_msg += f" (overwrote {replaced})"
-                log(moved_msg)
+                _log_pl(moved_msg)
 
             st.session_state["pl_last_notice"] = {
                 "headline": "Saved BOTH PNG scales + DAT",
@@ -562,19 +534,19 @@ with right:
                 "dat_name": Path(st.session_state["pl_last_dat_path"]).name if st.session_state.get("pl_last_dat_path") else "",
                 "moved_msg": moved_msg,
             }
-            _rerun()
+            rerun()
 
         # 2) Everything below is INFO and will appear UNDER the button
 
         # Progress (always visible)
         st.caption(
             "Per file required: "
-            f"DAT={'✅' if st.session_state['pl__saved_dat'] else '⬜'}  |  "
-            f"PNG linear={'✅' if st.session_state['pl__saved_png_linear'] else '⬜'}  |  "
-            f"PNG log={'✅' if st.session_state['pl__saved_png_log'] else '⬜'}"
+            f"DAT={'OK' if st.session_state['pl__saved_dat'] else '--'}  |  "
+            f"PNG linear={'OK' if st.session_state['pl__saved_png_linear'] else '--'}  |  "
+            f"PNG log={'OK' if st.session_state['pl__saved_png_log'] else '--'}"
         )
 
-        # Notice (display once) — use st.code to avoid weird $ _ formatting
+        # Notice (display once) - use st.code to avoid weird $ _ formatting
         notice = st.session_state.get("pl_last_notice")
         if notice:
             headline = "Saved"
@@ -621,7 +593,7 @@ with right:
         )
 
         # Manual move button (same behavior as auto-move)
-        if _btn(f"Move current CSV to '{st.session_state.archive_name}/' now", key="pl_manual_move_btn"):
+        if btn(f"Move current CSV to '{st.session_state.archive_name}/' now", key="pl_manual_move_btn"):
             if bool(st.session_state.get("pl_auto_advance_file", True)):
                 _advance_file_request(file_name, files)
 
@@ -629,9 +601,9 @@ with right:
             msg = f"Manually moved {moved} CSV -> '{st.session_state.archive_name}/'"
             if replaced:
                 msg += f" (overwrote {replaced})"
-            log(msg)
+            _log_pl(msg)
             st.session_state["pl_last_notice"] = msg
-            _rerun()
+            rerun()
 
 
     # =========================
@@ -656,4 +628,10 @@ with right:
                 title=f"Spectrum @ {gate_vals[idx]:g} V",
                 ylabel=cube.cbar_label,
             )
-            _st_pyplot(spec)
+            st_pyplot(spec)
+
+
+
+
+
+

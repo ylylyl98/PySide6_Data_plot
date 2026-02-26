@@ -1,8 +1,8 @@
 import streamlit as st
 
 # Fixed (not user-editable)
-DEFAULT_ARCHIVE = "initial data after processing"
-DEFAULT_PROCESSED = "processed data"
+DEFAULT_ARCHIVE = "Initial data after processing"
+DEFAULT_PROCESSED = "Processed Data"
 
 
 def init_session_state() -> None:

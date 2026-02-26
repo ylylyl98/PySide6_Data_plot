@@ -10,6 +10,7 @@ import streamlit as st
 from ui.state import init_session_state
 from ui.sidebar import sidebar_folder_picker
 from ui.logger import log
+from ui.widgets import st_pyplot, btn, btn_click, dl_btn, rerun
 from ui.plotting import HeatmapConfig, build_heatmap_fig, build_spectrum_fig, save_fig_png
 
 from core.file_ops import list_root_csvs, archive_all, restore_all
@@ -17,9 +18,6 @@ from core.loader import load_drr_avg, build_external_baseline, peek_y_axis_optio
 from core.processing_run import save_as_dat
 
 
-# ----------------------------
-# Streamlit width API compatibility helpers
-# ----------------------------
 import numpy as np
 import matplotlib.ticker as mticker
 
@@ -62,42 +60,6 @@ def _format_drr_colorbar(fig, *, is_deriv: bool):
 
         # kill any offset text if mpl tries to add it
         cax.xaxis.get_offset_text().set_visible(False)
-
-def _st_pyplot(fig):
-    try:
-        st.pyplot(fig, width="stretch")
-    except TypeError:
-        st.pyplot(fig, use_container_width=True)
-
-
-def _btn(label: str, *, key: str, disabled: bool = False):
-    try:
-        return st.button(label, key=key, width="stretch", disabled=disabled)
-    except TypeError:
-        return st.button(label, key=key, use_container_width=True, disabled=disabled)
-
-
-def _dl_btn(label: str, *, data: bytes, file_name: str, mime: str, key: str):
-    try:
-        return st.download_button(label, data=data, file_name=file_name, mime=mime, key=key, width="stretch")
-    except TypeError:
-        return st.download_button(label, data=data, file_name=file_name, mime=mime, key=key, use_container_width=True)
-
-
-def _btn_click(label: str, *, key: str, on_click=None, args=None, disabled: bool = False):
-    """Button with width='stretch' fallback, supports on_click."""
-    try:
-        return st.button(label, key=key, width="stretch", on_click=on_click, args=args, disabled=disabled)
-    except TypeError:
-        return st.button(label, key=key, use_container_width=True, on_click=on_click, args=args, disabled=disabled)
-
-
-def _rerun():
-    try:
-        st.rerun()
-    except Exception:
-        st.experimental_rerun()
-
 
 # ----------------------------
 # Session-state helpers (avoid KeyError + avoid widget/value conflicts)
@@ -228,7 +190,7 @@ def _advance_group_request(current_group: str, group_keys: list[str]) -> None:
 
 
 # ---- page setup
-st.set_page_config(page_title="DRR", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="DRR", page_icon="DRR", layout="wide")
 init_session_state()
 sidebar_folder_picker()
 
@@ -242,7 +204,10 @@ div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stHorizontalBloc
     unsafe_allow_html=True,
 )
 
-st.title("🧪 DR/R")
+st.title("DR/R")
+
+with st.expander("Workflow steps (quick)"):
+    st.markdown("- Select a folder in the sidebar.\n- Choose a measurement group (and baseline mode).\n- Adjust limits if needed, then save PNG + DAT.")
 
 folder = st.session_state.user_folder
 if not folder:
@@ -282,6 +247,11 @@ if mode == "DR/R Self":
     st.caption("Self mode computes DR/R per file using its own first/last frame, then averages runs within the group.")
 else:
     st.caption("External mode uses baseline CSV(s) you select/build; recommended: one measurement group + its baseline files per folder.")
+
+def _log_drr(msg: str) -> None:
+    mode_ctx = st.session_state.get("drr_mode_radio", "DR/R")
+    group_ctx = st.session_state.get("drr_meas_group_key", "group?")
+    log(f"[DRR][{mode_ctx}][{group_ctx}] {msg}")
 
 
 if mode == "DR/R External":
@@ -332,7 +302,7 @@ if not groups_sorted:
     # show a reset button here (we haven't rendered the Controls panel yet).
     if mode == "DR/R External" and baseline_used:
         st.caption("External mode excludes files used as baseline. Clear baseline state to regroup.")
-        if _btn("Clear external baseline (reset)", key="drr_clear_external_baseline_top"):
+        if btn("Clear external baseline (reset)", key="drr_clear_external_baseline_top"):
             for k in [
                 "external_baseline",
                 "drr_baseline_files_used",
@@ -343,8 +313,8 @@ if not groups_sorted:
                 "drr__autobuild_request",
             ]:
                 st.session_state.pop(k, None)
-            log("Cleared external baseline state.")
-            _rerun()
+            _log_drr("Cleared external baseline state.")
+            rerun()
 
     st.stop()
 
@@ -408,15 +378,15 @@ with colA:
     sel_files = runs_in_group[: int(use_n)]
 
     if mode == "DR/R External":
-        st.caption(f"Using {len(sel_files)} run(s) in this group · excluding {len(baseline_used)} baseline file(s).")
+        st.caption(f"Using {len(sel_files)} run(s) in this group  -  excluding {len(baseline_used)} baseline file(s).")
     else:
         st.caption(f"Using {len(sel_files)} run(s) in this group (Self mode includes all files).")
 
 with colB:
-    if _btn("Archive all CSVs", key="drr_archive_all_btn"):
+    if btn("Archive all CSVs", key="drr_archive_all_btn"):
         n = archive_all(folder, st.session_state.archive_name)
-        log(f"Archived {n} CSV(s) -> {st.session_state.archive_name}")
-        _rerun()
+        _log_drr(f"Archived {n} CSV(s) -> {st.session_state.archive_name}")
+        rerun()
     st.caption(f"Move ALL root CSVs into '{st.session_state.archive_name}/' ")
 
     st.selectbox(
@@ -428,10 +398,10 @@ with colB:
     )
 
 with colC:
-    if _btn("Restore CSVs", key="drr_restore_all_btn"):
+    if btn("Restore CSVs", key="drr_restore_all_btn"):
         n = restore_all(folder, st.session_state.archive_name)
-        log(f"Restored {n} CSV(s) <- {st.session_state.archive_name}")
-        _rerun()
+        _log_drr(f"Restored {n} CSV(s) <- {st.session_state.archive_name}")
+        rerun()
     st.caption("Restore archived CSVs back to the folder root.")
 
 if not sel_files:
@@ -467,7 +437,7 @@ with right:
 # =========================
 # CONTROLS TAB
 # =========================
-_ensure("center_zero", False)
+_ensure("center_zero", True)
 _ensure("drr_clip_outliers", True)
 _ensure_choice(
     "drr_cmap",
@@ -488,7 +458,7 @@ external_vec = None
 with t_controls:
     r0 = st.columns([1.0, 1.0, 1.4, 1.0], gap="small")
     with r0[0]:
-        st.checkbox("center=0", key="center_zero")
+        st.checkbox("center=0", key="center_zero", help="Recommended for DR/R. Uses a diverging color map centered at zero.")
     with r0[1]:
         st.checkbox("Clip outliers", key="drr_clip_outliers")
     with r0[2]:
@@ -547,8 +517,13 @@ with t_controls:
         with st.expander("External baseline", expanded=True):
             _ensure("external_baseline", None)
 
+            active_files = st.session_state.get("drr_baseline_files_used", [])
+            active_which = st.session_state.get("drr_baseline_which_used", "")
+            if st.session_state.get("external_baseline") is not None and active_files:
+                st.caption(f"Active baseline: {len(active_files)} file(s), frame='{active_which}'")
+
             # --- Reset button: clears baseline state so grouping isn't empty
-            if _btn("Clear external baseline (reset)", key="drr_clear_external_baseline"):
+            if btn("Clear external baseline (reset)", key="drr_clear_external_baseline"):
                 for k in [
                     "external_baseline",
                     "drr_baseline_files_used",
@@ -559,8 +534,8 @@ with t_controls:
                     "drr__autobuild_request",
                 ]:
                     st.session_state.pop(k, None)
-                log("Cleared external baseline state.")
-                _rerun()
+                _log_drr("Cleared external baseline state.")
+                rerun()
 
             tab_auto, tab_manual = st.tabs(["Auto find", "Manual select"])
 
@@ -597,31 +572,31 @@ with t_controls:
 
                 b1, b2, b3 = st.columns([1, 1, 1], gap="small")
                 with b1:
-                    _btn_click(
+                    btn_click(
                         "Select all",
                         key="drr_select_all_matched",
                         on_click=_select_all_and_request_build,
                         args=(SEL_KEY, matches, which_label_auto),
                     )
                 with b2:
-                    _btn_click(
+                    btn_click(
                         "Clear",
                         key="drr_clear_matched",
                         on_click=_set_list_state,
                         args=(SEL_KEY, []),
                     )
                 with b3:
-                    rebuild_clicked = _btn_click("Rebuild", key="drr_build_baseline_auto")
+                    rebuild_clicked = btn_click("Rebuild", key="drr_build_baseline_auto")
 
                 baseline_files = st.multiselect(
                     "Matched baseline CSV(s)",
                     options=matches,
                     key=SEL_KEY,
                     label_visibility="collapsed",
-                    placeholder="Matched baseline CSV(s)…",
+                    placeholder="Matched baseline CSV(s)...",
                 )
 
-                st.caption(f"{len(matches)} matched · {len(baseline_files)} selected")
+                st.caption(f"{len(matches)} matched  -  {len(baseline_files)} selected")
 
                 # A) If Select all was clicked -> build request appears here
                 req = st.session_state.pop("drr__autobuild_request", None)
@@ -635,8 +610,8 @@ with t_controls:
                         st.session_state["external_baseline"] = bg
                         st.session_state["drr_baseline_files_used"] = list(files_to_build)
                         st.session_state["drr_baseline_which_used"] = which_to_build
-                        log(f"Built external baseline from {len(files_to_build)} file(s), frame='{which_to_build}'.")
-                        _rerun()
+                        _log_drr(f"Built external baseline from {len(files_to_build)} file(s), frame='{which_to_build}'.")
+                        rerun()
 
                 # B) Manual rebuild
                 if rebuild_clicked:
@@ -647,8 +622,8 @@ with t_controls:
                         st.session_state["external_baseline"] = bg
                         st.session_state["drr_baseline_files_used"] = list(baseline_files)
                         st.session_state["drr_baseline_which_used"] = which_label_auto
-                        log(f"Built external baseline from {len(baseline_files)} file(s), frame='{which_label_auto}'.")
-                        _rerun()
+                        _log_drr(f"Built external baseline from {len(baseline_files)} file(s), frame='{which_label_auto}'.")
+                        rerun()
 
             # ---------- Manual select ----------
             with tab_manual:
@@ -669,7 +644,7 @@ with t_controls:
                 )
                 which_label_manual = st.session_state["drr_baseline_manual_which"]
 
-                if _btn("Build", key="drr_build_baseline_manual"):
+                if btn("Build", key="drr_build_baseline_manual"):
                     if not baseline_files_manual:
                         st.warning("Pick at least one baseline CSV.")
                     else:
@@ -677,8 +652,8 @@ with t_controls:
                         st.session_state["external_baseline"] = bg
                         st.session_state["drr_baseline_files_used"] = list(baseline_files_manual)
                         st.session_state["drr_baseline_which_used"] = which_label_manual
-                        log(f"Built external baseline from {len(baseline_files_manual)} file(s), frame='{which_label_manual}'.")
-                        _rerun()
+                        _log_drr(f"Built external baseline from {len(baseline_files_manual)} file(s), frame='{which_label_manual}'.")
+                        rerun()
 
             if st.session_state.get("external_baseline") is None:
                 st.info("No external baseline yet. Build one above.")
@@ -726,7 +701,7 @@ try:
 
 except Exception as e:
     st.error(f"Compute failed: {e}")
-    log(f"ERROR DRR compute: {e}")
+    _log_drr(f"ERROR DRR compute: {e}")
     st.stop()
 
 # =========================
@@ -789,15 +764,15 @@ def _drr_auto_limits():
 with t_controls:
     with st.expander("Axis / Color limits", expanded=True):
 
-        # ✅ Put the auto button BEFORE the widgets that use those keys
-        if _btn("Auto limits (v/x/y)", key="drr_auto_limits_btn"):
+        # OK Put the auto button BEFORE the widgets that use those keys
+        if btn("Auto limits (v/x/y)", key="drr_auto_limits_btn"):
             st.session_state["drr_vmin_in"] = vmin_auto
             st.session_state["drr_vmax_in"] = vmax_auto
             st.session_state["drr_x1_in"] = emin
             st.session_state["drr_x2_in"] = emax
             st.session_state["drr_y1_in"] = gmin
             st.session_state["drr_y2_in"] = gmax
-            # no _rerun() needed
+            # no rerun() needed
 
         rr = st.columns(3, gap="small")
         with rr[0]:
@@ -838,7 +813,7 @@ cfg = HeatmapConfig(
     xlim=xlim,
     ylim=ylim,
     cmap=st.session_state.get("drr_cmap", "RdBu_r"),
-    # ✅ use sci for dE / d2E, otherwise keep DR/R decimals
+    # OK use sci for dE / d2E, otherwise keep DR/R decimals
     # cbar_tick_format=("sci" if derivative is not None else "%.2f"),
     cbar_integer=False,
 )
@@ -850,7 +825,7 @@ _format_drr_colorbar(fig, is_deriv=is_deriv)
 
 
 with left:
-    _st_pyplot(fig)
+    st_pyplot(fig)
 
 with t_cursor:
     gate_vals = np.asarray(cube.gate, float).ravel()
@@ -866,7 +841,7 @@ with t_cursor:
         idx = int(np.argmin(np.abs(gate_vals - gsel)))
         Zrow = np.asarray(cube.Z, float)[idx, :]
         spec = build_spectrum_fig(cube.energy, Zrow, title=f"Spectrum @ {gate_vals[idx]:g} V", ylabel=cube.cbar_label)
-        _st_pyplot(spec)
+        st_pyplot(spec)
 
 with right:
     st.markdown("---")
@@ -912,7 +887,7 @@ with right:
     # ----------------------------
     # PRIMARY ACTION (first)
     # ----------------------------
-    if _btn("Save PNG + DAT", key="drr_save_both_btn"):
+    if btn("Save PNG + DAT", key="drr_save_both_btn"):
         ok_png = False
         ok_dat = False
 
@@ -921,10 +896,10 @@ with right:
             out_path = out_dir / f"{export_base}.png"
             save_fig_png(fig, out_path)
             st.session_state["drr_last_png_path"] = str(out_path)
-            log(f"Saved PNG: {out_path}")
+            _log_drr(f"Saved PNG: {out_path}")
             ok_png = True
         except Exception as e:
-            log(f"ERROR saving PNG: {e}")
+            _log_drr(f"ERROR saving PNG: {e}")
             st.error(f"Save PNG failed: {e}")
 
         # Save DAT
@@ -942,10 +917,10 @@ with right:
                 energy_unit="eV",
             )
             st.session_state["drr_last_dat_path"] = str(dat_path)
-            log(f"Saved DAT: {dat_path}")
+            _log_drr(f"Saved DAT: {dat_path}")
             ok_dat = True
         except Exception as e:
-            log(f"ERROR saving DAT: {e}")
+            _log_drr(f"ERROR saving DAT: {e}")
             st.error(f"Save DAT failed: {e}")
 
         if ok_png and ok_dat:
@@ -984,7 +959,7 @@ with right:
                 f"This moves the current group CSVs into '{st.session_state.archive_name}/'. "
                 f"(External mode also moves the baseline CSVs you selected.)"
             )
-            if _btn("Move CSVs now", key="drr_manual_move_btn"):
+            if btn("Move CSVs now", key="drr_manual_move_btn"):
                 try:
                     files_to_move = list(sel_files)
 
@@ -1000,7 +975,7 @@ with right:
                     msg = f"Moved {moved} CSV(s) -> '{st.session_state.archive_name}/'"
                     if replaced:
                         msg += f" (overwrote {replaced})"
-                    log(msg)
+                    _log_drr(msg)
                     st.success(msg)
 
                     # If we moved baseline files, clear baseline state so next build is clean
@@ -1016,9 +991,9 @@ with right:
                         ]:
                             st.session_state.pop(k, None)
 
-                    _rerun()
+                    rerun()
                 except Exception as e:
-                    log(f"ERROR manual move CSVs: {e}")
+                    _log_drr(f"ERROR manual move CSVs: {e}")
                     st.error(f"Manual move failed: {e}")
 
     # ----------------------------
@@ -1050,7 +1025,7 @@ with right:
                 msg = f"Auto-moved {moved} CSV(s) -> '{st.session_state.archive_name}/'"
                 if replaced:
                     msg += f" (overwrote {replaced})"
-                log(msg)
+                _log_drr(msg)
                 moved_any = True
 
                 # If we moved baseline files, clear baseline state so next group can rebuild cleanly
@@ -1067,7 +1042,7 @@ with right:
                         st.session_state.pop(k, None)
 
             except Exception as e:
-                log(f"ERROR auto-move CSVs: {e}")
+                _log_drr(f"ERROR auto-move CSVs: {e}")
                 st.error(f"Auto-move failed: {e}")
 
         if bool(st.session_state.get("drr_auto_advance_group", False)):
@@ -1075,7 +1050,7 @@ with right:
             advanced_any = True
 
         if moved_any or advanced_any:
-            _rerun()
+            rerun()
 
     # ----------------------------
     # Downloads (last)
@@ -1085,9 +1060,12 @@ with right:
     pngp = st.session_state.get("drr_last_png_path")
     if pngp and Path(pngp).exists():
         p = Path(pngp)
-        _dl_btn("Download PNG", data=p.read_bytes(), file_name=p.name, mime="image/png", key="drr_download_png_btn")
+        dl_btn("Download PNG", data=p.read_bytes(), file_name=p.name, mime="image/png", key="drr_download_png_btn")
 
     datp = st.session_state.get("drr_last_dat_path")
     if datp and Path(datp).exists():
         p = Path(datp)
-        _dl_btn("Download DAT", data=p.read_bytes(), file_name=p.name, mime="text/plain", key="drr_download_dat_btn")
+        dl_btn("Download DAT", data=p.read_bytes(), file_name=p.name, mime="text/plain", key="drr_download_dat_btn")
+
+
+

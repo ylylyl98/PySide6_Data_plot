@@ -1,6 +1,7 @@
 import streamlit as st
 from ui.logger import log
 from ui.local_dialogs import pick_directory_dialog
+from core.file_ops import list_root_csvs
 
 
 def _browse_pick_folder() -> None:
@@ -13,7 +14,7 @@ def _browse_pick_folder() -> None:
 
 def sidebar_folder_picker() -> None:
     with st.sidebar:
-        st.header("⚙️ Settings")
+        st.header("Settings")
 
         # Show current folder as read-only text (no manual editing)
         current = st.session_state.get("user_folder", "")
@@ -29,4 +30,15 @@ def sidebar_folder_picker() -> None:
         st.caption("Tip: 'Browse...' opens a native folder dialog on the machine running Streamlit.")
 
         st.divider()
+        # Lightweight status panel
+        folder = st.session_state.get("user_folder", "")
+        if folder:
+            files = list_root_csvs(folder)
+            st.caption(f"Folder: {folder}")
+            st.caption(f"Root CSVs: {len(files)}")
+            st.caption(f"Archive: {st.session_state.get('archive_name', '')}")
+            st.caption(f"Processed: {st.session_state.get('processed_name', '')}")
+
+        st.divider()
         st.caption("Navigation is on the left: PL / DRR / Compare / Log")
+

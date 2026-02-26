@@ -12,3 +12,10 @@ cd streamlit-data-plot-app
 ## Run the Application
 
 Double-click the Data_Plot_App batch file in the root folder.
+
+## Usage Notes
+- Place your CSV files in the root of the selected folder (not subfolders).
+- DRR External mode expects a curated folder with baseline CSVs for that measurement group.
+- Outputs are written to:
+  - `Processed Data` for plots and DAT files
+  - `Initial data after processing` for archived CSVs

@@ -31,8 +31,8 @@ def _prettify_title(text: str) -> str:
     # separators -> spaces
     t = t.replace("~", " ").replace("_", " ")
 
-    # 14.1degree / 42degree -> 14.1° / 42°
-    t = re.sub(r'(\d+(?:\.\d+)?)\s*degree\b', r'\1°', t, flags=re.IGNORECASE)
+    # 14.1degree / 42degree -> 14.1 deg / 42 deg
+    t = re.sub(r'(\d+(?:\.\d+)?)\s*degree\b', r'\1 deg', t, flags=re.IGNORECASE)
 
     # 1000ms -> 1s, 500ms -> 0.5s, keep others reasonable
     def _ms_to_s(m):
@@ -329,3 +329,4 @@ def save_fig_png(fig, out_path: Union[str, Path], *, dpi: Optional[int] = None) 
         pad_inches=0.005,
     )
     return str(out_path)
+

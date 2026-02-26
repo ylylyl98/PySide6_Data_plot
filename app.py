@@ -6,15 +6,15 @@ from ui.sidebar import sidebar_folder_picker
 from core.file_ops import list_root_csvs
 
 st.set_page_config(
-    page_title="DPTK — Streamlit",
-    page_icon="📈",
+    page_title="DPTK - Streamlit",
+    page_icon="DPTK",
     layout="wide",
 )
 
 init_session_state()
 sidebar_folder_picker()
 
-st.title("📈 DPTK — Streamlit (Multipage)")
+st.title("DPTK - Streamlit (Multipage)")
 
 c1, c2 = st.columns(2)
 with c1:

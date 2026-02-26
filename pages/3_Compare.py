@@ -35,8 +35,8 @@ def _safe_stem(fn: str, max_len: int = 140) -> str:
     # your filenames often contain "$" separators -> remove
     s = s.replace("$", "")
 
-    # Windows-illegal: <>:"/\|?*  + also collapse whitespace
-    s = re.sub(r'[<>:"/\\|?*]+', "_", s)
+    # Windows-illegal: <>:"/\|x*  + also collapse whitespace
+    s = re.sub(r'[<>:"/\\|x*]+', "_", s)
     s = re.sub(r"\s+", " ", s).strip()
     s = s.replace(" ", "_")
 
@@ -56,9 +56,9 @@ def _vp_firstfile_tag(fn: str, max_len: int = 115) -> str:
 
 
     # remove Inhalf14.1degree / In14.1deg / etc
-    s = re.sub(r'In(?:half)?\s*[-+]?\d+(?:\.\d+)?\s*(?:deg(?:ree)?s?)', "", s, flags=re.I)
+    s = re.sub(r'In(x:half)x\s*[-+]x\d+(x:\.\d+)x\s*(x:deg(x:ree)xsx)', "", s, flags=re.I)
     # remove Outhalf95degree / Out95deg / etc
-    s = re.sub(r'Out(?:half)?\s*[-+]?\d+(?:\.\d+)?\s*(?:deg(?:ree)?s?)', "", s, flags=re.I)
+    s = re.sub(r'Out(x:half)x\s*[-+]x\d+(x:\.\d+)x\s*(x:deg(x:ree)xsx)', "", s, flags=re.I)
 
     # cleanup leftovers around separators
     s = s.replace("~_~", "~")
@@ -160,7 +160,7 @@ def _short_fn(fn: str, max_len: int = 58) -> str:
         return s
     head = 26
     tail = max_len - head - 1
-    return s[:head] + "…" + s[-tail:]
+    return s[:head] + "..." + s[-tail:]
 
 
 def _ensure_state_choice(key: str, options: list[str], default: str):
@@ -184,7 +184,7 @@ def _autofill_notice(found: dict[str, str], needed_keys: list[str]):
 
     with st.expander("Show matched files", expanded=False):
         for k in hit:
-            st.write(f"**{k}** → `{_short_fn(found[k])}`")
+            st.write(f"**{k}** -> `{_short_fn(found[k])}`")
 
 
 def _format_colorbar_ticks_only(fig, fmt="%.2f"):
@@ -230,8 +230,8 @@ def _trace_sync_req_from_slider():
 # ----------------------------
 # Angle parsing + auto-match
 # ----------------------------
-in_pat = re.compile(r"In(?:half)?\s*([-+]?\d+(?:\.\d+)?)\s*(?:deg(?:ree)?s?)", re.I)
-out_pat = re.compile(r"Out(?:half)?\s*([-+]?\d+(?:\.\d+)?)\s*(?:deg(?:ree)?s?)", re.I)
+in_pat = re.compile(r"In(x:half)x\s*([-+]x\d+(x:\.\d+)x)\s*(x:deg(x:ree)xsx)", re.I)
+out_pat = re.compile(r"Out(x:half)x\s*([-+]x\d+(x:\.\d+)x)\s*(x:deg(x:ree)xsx)", re.I)
 
 
 def parse_in_out(name: str):
@@ -246,7 +246,7 @@ def parse_in_out(name: str):
 
 
 def _ang_diff(a: float, b: float, period: float = 180.0) -> float:
-    """Smallest angular difference with wrap at 180° (HWP style)."""
+    """Smallest angular difference with wrap at 180deg (HWP style)."""
     d = (a - b) % period
     if d > period / 2:
         d = period - d
@@ -448,10 +448,10 @@ def _build_spectra_compare_fig(
 # ----------------------------
 # Page setup
 # ----------------------------
-st.set_page_config(page_title="Compare", page_icon="🧩", layout="wide")
+st.set_page_config(page_title="Compare", page_icon="Compare", layout="wide")
 init_session_state()
 sidebar_folder_picker()
-st.title("🧩 Compare")
+st.title("Compare")
 
 folder = st.session_state.user_folder
 if not folder:
@@ -461,6 +461,9 @@ files = list_root_csvs(folder)
 if not files:
     st.warning("No CSV files found in the root of the selected folder.")
     st.stop()
+
+def _log_cmp(msg: str) -> None:
+    log(f"[Compare] {msg}")
 
 # defaults
 st.session_state.setdefault("cmp_mode", "2 files (KK + KKp)")
@@ -539,7 +542,7 @@ with right:
                     st.session_state[f"cmp_{k}"] = v
 
                 needed = ["KK", "KKp", "KpK", "KpKp"] if want4 else ["KK", "KKp"]
-                log("Compare auto-match: " + (", ".join([f"{k}<-{v}" for k, v in found.items()]) or "no matches"))
+                _log_cmp("Compare auto-match: " + (", ".join([f"{k}<-{v}" for k, v in found.items()]) or "no matches"))
                 _autofill_notice(found, needed)
 
         # file pickers
@@ -554,7 +557,7 @@ with right:
                     f"{k} file",
                     options=files,
                     key=state_key,
-                    format_func=_short_fn,  # ✅ short display
+                    format_func=_short_fn,  # OK short display
                 )
 
     # ---- Plot controls tab (only widgets here)
@@ -599,7 +602,7 @@ try:
         cubes[k] = load_pl(folder, sel[k], log_scale=log_scale)
 except Exception as e:
     st.error(f"Load failed: {e}")
-    log(f"ERROR compare load: {e}")
+    _log_cmp(f"ERROR compare load: {e}")
     st.stop()
 
 
@@ -744,7 +747,7 @@ with trace_slot:
         if st.session_state.get("cmp_trace_gate_req") is None:
             st.session_state["cmp_trace_gate_req"] = st.session_state["cmp_trace_gate_in"]
 
-        # user can type any value → will snap to nearest available gate
+        # user can type any value -> will snap to nearest available gate
         st.number_input(
             "Gate request (V) (auto-snap to nearest)",
             key="cmp_trace_gate_req",
@@ -932,7 +935,7 @@ with vp_slot:
         with c2:
             st.number_input("VP ROI E2 (eV)", key="cmp_vp_e2", format="%.6g")
 
-        st.caption("VP formula: (A − B) / (A + B)")
+        st.caption("VP formula: (A - B) / (A + B)")
 
 
 # ----------------------------
@@ -1038,7 +1041,7 @@ with left:
                     cubes_lin[k] = load_pl(folder, sel[k], log_scale=False)
             except Exception as e:
                 st.error(f"VP load (linear) failed: {e}")
-                log(f"ERROR VP load linear: {e}")
+                _log_cmp(f"ERROR VP load linear: {e}")
                 cubes_lin = None
         else:
             cubes_lin = cubes
@@ -1101,7 +1104,7 @@ with left:
                     g, vp_g = _vp_curve_vs_gate(A.energy, A.gate, ZA, ZB, roi=roi)
                     curve_fig = _build_vp_curve_fig(
                         g, vp_g,
-                        title=f"VP {label} (ROI {min(roi):.4g}–{max(roi):.4g} eV)"
+                        title=f"VP {label} (ROI {min(roi):.4g}-{max(roi):.4g} eV)"
                     )
                     _st_pyplot(curve_fig)
 
@@ -1155,7 +1158,7 @@ if st.button("Save all panels to processed data", key="cmp_save_all_btn"):
         out_path = _unique_path(out_dir, base, ".png")
 
         save_fig_png(fig, out_path)
-        # ✅ NEW: save heatmap .dat (NOT curves)
+        # OK NEW: save heatmap .dat (NOT curves)
         save_heatmap_dat(
             out_path.with_suffix(".dat"),
             c.energy,
@@ -1254,17 +1257,18 @@ if st.button("Save all panels to processed data", key="cmp_save_all_btn"):
 
                 if vp_mode in ("Curve (vs gate)", "Both"):
                     g, vp_g = _vp_curve_vs_gate(A.energy, A.gate, ZA, ZB, roi=roi)
-                    fig2 = _build_vp_curve_fig(g, vp_g, title=f"VP {label} (ROI {min(roi):.4g}–{max(roi):.4g} eV)")
+                    fig2 = _build_vp_curve_fig(g, vp_g, title=f"VP {label} (ROI {min(roi):.4g}-{max(roi):.4g} eV)")
 
                     base = f"VPcurve_{Akey}_vs_{Bkey}__{a_stem}__{b_stem}_{scale_tag}"
                     curve_png = _unique_path(out_dir, base, ".png")
                     save_fig_png(fig2, curve_png)
-                    # ❌ no .dat for curves (per your request)
+                    # NO no .dat for curves (per your request)
 
 
             _save_vp_pair("KK_KKp", "KK", "KKp")
             if want4:
                 _save_vp_pair("KpK_KpKp", "KpK", "KpKp")
 
-    log(f"Compare saved -> {out_dir}")
+    _log_cmp(f"Compare saved -> {out_dir}")
     st.success(f"Saved into: {out_dir}")
+
