@@ -130,6 +130,26 @@ def _nat_key(s: str):
     """Natural sort so ..._2.csv < ..._10.csv."""
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
 
+def _normalize_label_text(text: str) -> str:
+    """Normalize common mojibake sequences in UI/export labels."""
+    if not text:
+        return text
+    replacements = {
+        "â€™": "'",
+        "â€œ": '"',
+        "â€\x9d": '"',
+        "â€“": "-",
+        "â€”": "-",
+        "Â·": "-",
+        "Â²": "2",
+        "Â³": "3",
+        "Ã—": "x",
+    }
+    out = str(text)
+    for bad, good in replacements.items():
+        out = out.replace(bad, good)
+    return out
+
 def _gate_tag_from_name(name: str) -> str:
     """Return a gate tag like '0.9TG-BG=10' or 'TG+BG=0' from $...$ parts; else stem."""
     parts = re.findall(r"\$(.*?)\$", name)
@@ -1498,7 +1518,9 @@ def process_ref_avg(
             pad_flat_edges=dE_pad_flat_edges,
         )
         suffix += ("_dE" if derivative == 1 else "_d2E")
-        cbar_lbl = "d(DR/R)/dE" if derivative == 1 else "d²(DR/R)/dE²"
+        cbar_lbl = "d(DR/R)/dE" if derivative == 1 else "d2(DR/R)/dE2"
+    cbar_lbl = _normalize_label_text(cbar_lbl)
+    title0 = _normalize_label_text(title0)
     save_base = f"{stem0}{suffix}"
     if center_zero is None:
         center_zero = True
@@ -1987,3 +2009,5 @@ def avg_process_mcd(
         "folder": str(Path(user_folder)/processed_subfolder),
         "moved": moved
     }
+
+
