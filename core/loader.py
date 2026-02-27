@@ -1,11 +1,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from pathlib import Path
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 
 from core import processing_run as P
+
+try:
+    import streamlit as st
+except Exception:  # pragma: no cover - fallback for non-Streamlit usage
+    st = None
+
+
+def _cache_data(**kwargs):
+    """Use Streamlit cache when available; otherwise return a no-op decorator."""
+
+    def _decorator(func):
+        if st is None:
+            return func
+        return st.cache_data(**kwargs)(func)
+
+    return _decorator
 
 
 @dataclass
@@ -32,22 +49,51 @@ def _validate_cube_arrays(energy: np.ndarray, gate: np.ndarray, Z: np.ndarray, *
             f"{context}: Z shape {z.shape} does not match gate ({g.size}) x energy ({e.size})."
         )
 
-def peek_y_axis_options(user_folder: str, file_name: str):
-    # Preferred: use the implementation that owns _load_canonical (processing_run)
-    if hasattr(P, "peek_y_axis_options"):
-        return P.peek_y_axis_options(user_folder, file_name)
 
-    # Fallback: derive from _load_canonical if it exists there
-    d = P._load_canonical(user_folder, file_name, y_axis="auto")  # type: ignore[attr-defined]
-    opts = d.get("available_axes", ["Vbg", "Vtg"])
-    default = d.get("default_axis", opts[0] if opts else "Vtg")
+def _csv_signature(user_folder: str, file_name: str) -> Tuple[int, int]:
+    """Return cache key pieces from the root CSV mtime and size."""
+    folder = Path(user_folder)
+    if not folder.exists() or not folder.is_dir():
+        raise FileNotFoundError(f"Folder does not exist: {user_folder}")
+
+    csv_path = folder / Path(file_name).name
+    if not csv_path.exists() or not csv_path.is_file():
+        raise FileNotFoundError(f"CSV not found in folder root: {csv_path}")
+
+    stt = csv_path.stat()
+    return int(stt.st_mtime_ns), int(stt.st_size)
+
+
+@_cache_data(show_spinner=False)
+def _peek_y_axis_options_cached(
+    user_folder: str, file_name: str, csv_sig: Tuple[int, int]
+) -> Tuple[tuple[str, ...], str]:
+    del csv_sig  # only used to invalidate cache when data changes
+
+    # Preferred: use implementation that owns _load_canonical
+    if hasattr(P, "peek_y_axis_options"):
+        opts, default = P.peek_y_axis_options(user_folder, file_name)
+    else:
+        d = P._load_canonical(user_folder, file_name, y_axis="auto")  # type: ignore[attr-defined]
+        opts = d.get("available_axes", ["Vbg", "Vtg"])
+        default = d.get("default_axis", opts[0] if opts else "Vtg")
+
     if default not in opts and opts:
         default = opts[0]
-    return opts, default
+    return tuple(str(o) for o in opts), str(default)
 
 
-def load_pl(user_folder: str, file_name: str, *, log_scale: bool = False) -> DataCube:
-    res = P.process_pl(
+def peek_y_axis_options(user_folder: str, file_name: str) -> Tuple[list[str], str]:
+    csv_sig = _csv_signature(user_folder, file_name)
+    opts, default = _peek_y_axis_options_cached(user_folder, file_name, csv_sig)
+    return list(opts), default
+
+
+@_cache_data(show_spinner=False)
+def _load_pl_cached(user_folder: str, file_name: str, log_scale: bool, csv_sig: Tuple[int, int]) -> dict:
+    del csv_sig  # only used to invalidate cache when data changes
+
+    return P.process_pl(
         user_folder=user_folder,
         file=file_name,
         plot_interactive=False,
@@ -57,11 +103,17 @@ def load_pl(user_folder: str, file_name: str, *, log_scale: bool = False) -> Dat
         pl_scales=("log" if log_scale else "linear",),
         open_both_interactive=False,
     )
+
+
+def load_pl(user_folder: str, file_name: str, *, log_scale: bool = False) -> DataCube:
+    csv_sig = _csv_signature(user_folder, file_name)
+    res = _load_pl_cached(user_folder, file_name, bool(log_scale), csv_sig)
+
     _validate_cube_arrays(res["energy"], res["gate_axis"], res["Z"], context="PL load")
     return DataCube(
-        energy=res["energy"],
-        gate=res["gate_axis"],
-        Z=res["Z"],
+        energy=np.asarray(res["energy"], dtype=float).copy(),
+        gate=np.asarray(res["gate_axis"], dtype=float).copy(),
+        Z=np.asarray(res["Z"], dtype=float).copy(),
         gate_label=res.get("gate_label", "Gate (V)"),
         title=res.get("title", file_name),
         cbar_label="PL (a.u.)",
@@ -85,10 +137,8 @@ def build_external_baseline(user_folder: str, files: Sequence[str], *, which: st
         "first": "first",
         "1st": "first",
         "start": "first",
-
         "last": "last",
         "end": "last",
-
         "all": "all",
         "avg": "all",
         "mean": "all",
@@ -114,21 +164,21 @@ def load_drr_avg(
     files: Sequence[str],
     *,
     bg_mode: str,
-    y_axis: str = "auto",  
+    y_axis: str = "auto",
     external_vector: Optional[np.ndarray] = None,
     derivative: Optional[int] = None,
     dE_window_pts: int = 20,
     dE_polyorder: int = 2,
     dE_oversample: float = 1.0,
     dE_interp_kind: str = "cubic",
-    dE_origin_like: bool = False,        
-    dE_pad_flat_edges: bool = True,      
+    dE_origin_like: bool = False,
+    dE_pad_flat_edges: bool = True,
 ) -> DataCube:
     res = P.process_ref_avg(
         user_folder=user_folder,
         files=list(files),
         bg_mode=bg_mode,
-        y_axis=y_axis,  
+        y_axis=y_axis,
         external_vector=external_vector,
         use_global_background=False,
         plot_interactive=False,
@@ -147,12 +197,11 @@ def load_drr_avg(
 
     _validate_cube_arrays(res["energy"], res["gate_axis"], res["Z_out"], context="DRR load")
 
-    # use Z_out (DR/R or derivative)
-    cbar = "DR/R" if derivative is None else ("d(DR/R)/dE" if derivative == 1 else "d²(DR/R)/dE²")
+    cbar = "DR/R" if derivative is None else ("d(DR/R)/dE" if derivative == 1 else "d2(DR/R)/dE2")
     return DataCube(
-        energy=res["energy"],
-        gate=res["gate_axis"],
-        Z=res["Z_out"],
+        energy=np.asarray(res["energy"], dtype=float).copy(),
+        gate=np.asarray(res["gate_axis"], dtype=float).copy(),
+        Z=np.asarray(res["Z_out"], dtype=float).copy(),
         gate_label=res.get("gate_label", "Gate (V)"),
         title=res.get("title", "DR/R"),
         cbar_label=cbar,
