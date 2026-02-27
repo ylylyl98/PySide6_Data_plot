@@ -10,6 +10,11 @@ import streamlit as st
 from ui.state import init_session_state
 from ui.sidebar import sidebar_folder_picker
 from ui.logger import log
+from ui.page_helpers import (
+    ensure_state as _ensure,
+    ensure_state_choice as _ensure_choice,
+    ensure_processed_dir,
+)
 from ui.widgets import st_pyplot, btn, btn_click, dl_btn, rerun
 from ui.plotting import HeatmapConfig, build_heatmap_fig, build_spectrum_fig, save_fig_png
 
@@ -17,8 +22,6 @@ from core.file_ops import list_root_csvs, archive_all, restore_all
 from core.loader import load_drr_avg, build_external_baseline, peek_y_axis_options
 from core.processing_run import save_as_dat
 
-
-import numpy as np
 import matplotlib.ticker as mticker
 
 def _fmt_sci0(x: float) -> str:
@@ -60,19 +63,6 @@ def _format_drr_colorbar(fig, *, is_deriv: bool):
 
         # kill any offset text if mpl tries to add it
         cax.xaxis.get_offset_text().set_visible(False)
-
-# ----------------------------
-# Session-state helpers (avoid KeyError + avoid widget/value conflicts)
-# ----------------------------
-def _ensure(key: str, default):
-    if key not in st.session_state:
-        st.session_state[key] = default
-
-
-def _ensure_choice(key: str, options: list[str], default: str):
-    if key not in st.session_state or st.session_state[key] not in options:
-        st.session_state[key] = default
-
 
 # ----------------------------
 # Safe callbacks for multiselect state
@@ -881,8 +871,7 @@ with right:
 
     export_base = f"{safe_stem}_{suffix}{deriv_tag}{sg_tag}"
 
-    out_dir = Path(folder) / st.session_state.processed_name
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = ensure_processed_dir(folder, st.session_state.processed_name)
 
     # ----------------------------
     # PRIMARY ACTION (first)

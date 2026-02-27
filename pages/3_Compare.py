@@ -11,6 +11,12 @@ import matplotlib.ticker as mticker
 from ui.state import init_session_state
 from ui.sidebar import sidebar_folder_picker
 from ui.logger import log
+from ui.page_helpers import (
+    ensure_state as _ensure_state,
+    ensure_state_choice as _ensure_state_choice,
+    ensure_state_defaults,
+    ensure_processed_dir,
+)
 from ui.plotting import HeatmapConfig, build_heatmap_fig, save_fig_png
 from core.file_ops import list_root_csvs
 from core.loader import load_pl
@@ -161,15 +167,6 @@ def _short_fn(fn: str, max_len: int = 58) -> str:
     head = 26
     tail = max_len - head - 1
     return s[:head] + "..." + s[-tail:]
-
-
-def _ensure_state_choice(key: str, options: list[str], default: str):
-    """If session_state[key] not valid anymore, reset to default."""
-    if key not in st.session_state:
-        st.session_state[key] = default
-        return
-    if st.session_state[key] not in options:
-        st.session_state[key] = default
 
 
 def _autofill_notice(found: dict[str, str], needed_keys: list[str]):
@@ -466,30 +463,27 @@ def _log_cmp(msg: str) -> None:
     log(f"[Compare] {msg}")
 
 # defaults
-st.session_state.setdefault("cmp_mode", "2 files (KK + KKp)")
-st.session_state.setdefault("cmp_pl_scale", "linear")
-st.session_state.setdefault("cmp_clip_outliers", True)
-st.session_state.setdefault("cmp_cmap", "viridis")
-
-# auto-match defaults (your typical 4 angles)
-st.session_state.setdefault("cmp_tol_deg", 0.5)
-st.session_state.setdefault("cmp_in_k_deg", 14.1)
-st.session_state.setdefault("cmp_in_kp_deg", 60.0)
-st.session_state.setdefault("cmp_out_k_deg", 95.0)
-st.session_state.setdefault("cmp_out_kp_deg", 5.0)
-
-# VP defaults
-st.session_state.setdefault("cmp_vp_mode", "Off")  # Off / Heatmap / Curve / Both
-# Spectra compare defaults
-st.session_state.setdefault("cmp_trace_enable", True)
-st.session_state.setdefault("cmp_trace_gate_in", None)
-st.session_state.setdefault("cmp_trace_gate_req", None)  # user-typed gate request (will snap)
-
-st.session_state.setdefault("cmp_trace_apply_vp_bg", False)
-
-st.session_state.setdefault("cmp_vp_bg_method", "Per-energy low percentile (recommended)")
-st.session_state.setdefault("cmp_vp_bg_p", 1.0)
-st.session_state.setdefault("cmp_vp_clip0", True)
+ensure_state_defaults(
+    {
+        "cmp_mode": "2 files (KK + KKp)",
+        "cmp_pl_scale": "linear",
+        "cmp_clip_outliers": True,
+        "cmp_cmap": "viridis",
+        "cmp_tol_deg": 0.5,
+        "cmp_in_k_deg": 14.1,
+        "cmp_in_kp_deg": 60.0,
+        "cmp_out_k_deg": 95.0,
+        "cmp_out_kp_deg": 5.0,
+        "cmp_vp_mode": "Off",
+        "cmp_trace_enable": True,
+        "cmp_trace_gate_in": None,
+        "cmp_trace_gate_req": None,
+        "cmp_trace_apply_vp_bg": False,
+        "cmp_vp_bg_method": "Per-energy low percentile (recommended)",
+        "cmp_vp_bg_p": 1.0,
+        "cmp_vp_clip0": True,
+    }
+)
 
 # layout
 left, right = st.columns([3.4, 1.6], gap="large")
@@ -640,8 +634,8 @@ def _auto_limits_from_cubes():
     return v0, v1, emin, emax, gmin, gmax
 
 
-st.session_state.setdefault("_cmp_limits_src", None)
-st.session_state.setdefault("cmp_limits_dirty", False)
+_ensure_state("_cmp_limits_src", None)
+_ensure_state("cmp_limits_dirty", False)
 
 src_id = (folder, tuple((k, sel[k]) for k in keys), log_scale)
 if st.session_state["_cmp_limits_src"] != src_id:
@@ -769,12 +763,12 @@ with trace_slot:
 # ----------------------------
 # VP heatmap limits (auto-seed then editable)
 # ----------------------------
-st.session_state.setdefault("_cmp_vp_limits_src", None)
-st.session_state.setdefault("cmp_vp_limits_dirty", False)
+_ensure_state("_cmp_vp_limits_src", None)
+_ensure_state("cmp_vp_limits_dirty", False)
 
 # ensure ROI keys exist BEFORE computing limits
-st.session_state.setdefault("cmp_vp_e1", float(xlim[0]))
-st.session_state.setdefault("cmp_vp_e2", float(xlim[1]))
+_ensure_state("cmp_vp_e1", float(xlim[0]))
+_ensure_state("cmp_vp_e2", float(xlim[1]))
 
 def _vp_mark_dirty():
     st.session_state["cmp_vp_limits_dirty"] = True
@@ -926,8 +920,8 @@ with vp_slot:
         st.checkbox("Clip negative after subtraction to 0", key="cmp_vp_clip0")
 
         # energy ROI for VP curve integration (default to current xlim)
-        st.session_state.setdefault("cmp_vp_e1", float(xlim[0]))
-        st.session_state.setdefault("cmp_vp_e2", float(xlim[1]))
+        _ensure_state("cmp_vp_e1", float(xlim[0]))
+        _ensure_state("cmp_vp_e2", float(xlim[1]))
 
         c1, c2 = st.columns(2, gap="small")
         with c1:
@@ -1127,8 +1121,7 @@ st.divider()
 # Save
 # ----------------------------
 if st.button("Save all panels to processed data", key="cmp_save_all_btn"):
-    out_dir = Path(folder) / st.session_state.processed_name
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = ensure_processed_dir(folder, st.session_state.processed_name)
 
     scale_tag = st.session_state.get("cmp_pl_scale", "linear")
 

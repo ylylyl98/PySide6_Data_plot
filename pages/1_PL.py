@@ -10,25 +10,17 @@ import streamlit as st
 from ui.state import init_session_state
 from ui.sidebar import sidebar_folder_picker
 from ui.logger import log
+from ui.page_helpers import (
+    ensure_state as _ensure,
+    ensure_state_choice as _ensure_choice,
+    ensure_processed_dir,
+)
 from ui.widgets import st_pyplot, btn, btn_click, dl_btn, rerun
 from ui.plotting import HeatmapConfig, build_heatmap_fig, build_spectrum_fig, save_fig_png
 
 from core.file_ops import list_root_csvs, archive_all, restore_all
 from core.loader import load_pl
 from core.processing_run import save_as_dat
-
-
-# ----------------------------
-# Session-state helpers
-# ----------------------------
-def _ensure(key: str, default):
-    if key not in st.session_state:
-        st.session_state[key] = default
-
-
-def _ensure_choice(key: str, options: list[str], default: str):
-    if key not in st.session_state or st.session_state[key] not in options:
-        st.session_state[key] = default
 
 
 # ----------------------------
@@ -428,8 +420,7 @@ with right:
         # -----------------------------
         # Export
         # -----------------------------
-        out_dir = Path(folder) / processed_name
-        out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = ensure_processed_dir(folder, processed_name)
         safe_stem = Path(file_name).stem
 
         # 1) Button FIRST (so everything else appears underneath)
