@@ -1,4 +1,5 @@
 import streamlit as st
+from pathlib import Path
 from ui.logger import log
 from ui.local_dialogs import pick_directory_dialog
 from core.file_ops import list_root_csvs
@@ -33,9 +34,15 @@ def sidebar_folder_picker() -> None:
         # Lightweight status panel
         folder = st.session_state.get("user_folder", "")
         if folder:
-            files = list_root_csvs(folder)
+            p = Path(folder)
             st.caption(f"Folder: {folder}")
-            st.caption(f"Root CSVs: {len(files)}")
+            if not p.exists():
+                st.warning("Selected folder does not exist.")
+            elif not p.is_dir():
+                st.warning("Selected path is not a folder.")
+            else:
+                files = list_root_csvs(folder)
+                st.caption(f"Root CSVs: {len(files)}")
             st.caption(f"Archive: {st.session_state.get('archive_name', '')}")
             st.caption(f"Processed: {st.session_state.get('processed_name', '')}")
 
