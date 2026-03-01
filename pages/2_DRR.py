@@ -3,9 +3,11 @@ import hashlib
 import re
 import shutil
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import streamlit as st
+from scipy.signal import find_peaks, peak_widths, savgol_filter
 
 from ui.state import init_session_state
 from ui.sidebar import sidebar_folder_picker
@@ -23,6 +25,20 @@ from core.loader import load_drr_avg, build_external_baseline, peek_y_axis_optio
 from core.processing_run import save_as_dat
 
 import matplotlib.ticker as mticker
+
+try:
+    import plotly.graph_objects as go
+    _HAS_PLOTLY = True
+except Exception:
+    go = None
+    _HAS_PLOTLY = False
+
+try:
+    from streamlit_plotly_events import plotly_events
+    _HAS_PLOTLY_EVENTS = True
+except Exception:
+    plotly_events = None
+    _HAS_PLOTLY_EVENTS = False
 
 def _fmt_sci0(x: float) -> str:
     """0-decimal scientific like -7e4 (not -7e+04)."""
@@ -71,6 +87,189 @@ def _set_list_state(key: str, values):
     st.session_state[key] = list(values)
 
 
+def _nearest_index(vals: np.ndarray, target: float) -> int:
+    vals = np.asarray(vals, float).ravel()
+    if vals.size == 0:
+        return 0
+    return int(np.argmin(np.abs(vals - float(target))))
+
+
+def _cursor_payload_from_xy(E: np.ndarray, G: np.ndarray, Z: np.ndarray, x: float, y: float):
+    E = np.asarray(E, float).ravel()
+    G = np.asarray(G, float).ravel()
+    Z = np.asarray(Z, float)
+    if E.size == 0 or G.size == 0 or Z.size == 0:
+        return None
+    ix = _nearest_index(E, x)
+    iy = _nearest_index(G, y)
+    return {
+        "x": float(E[ix]),
+        "y": float(G[iy]),
+        "z": float(Z[iy, ix]) if np.isfinite(Z[iy, ix]) else float("nan"),
+        "ix": int(ix),
+        "iy": int(iy),
+    }
+
+
+def _plotly_heatmap_colors(cmap_name: str):
+    cmap = str(cmap_name or "RdBu_r")
+    if cmap == "RdBu_r":
+        return "RdBu", True
+    cmap_map = {
+        "coolwarm": "RdBu",
+        "seismic": "RdBu",
+        "Spectral": "Spectral",
+        "viridis": "Viridis",
+        "plasma": "Plasma",
+        "inferno": "Inferno",
+        "magma": "Magma",
+        "cividis": "Cividis",
+        "turbo": "Turbo",
+    }
+    return cmap_map.get(cmap, "RdBu"), False
+
+
+def _build_plotly_drr_heatmap(
+    E: np.ndarray,
+    G: np.ndarray,
+    Z: np.ndarray,
+    *,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    cbar_label: str,
+    xlim: tuple[float, float],
+    ylim: tuple[float, float],
+    vmin: float,
+    vmax: float,
+    cmap_name: str,
+    marker_point: Optional[dict],
+):
+    if not _HAS_PLOTLY or go is None:
+        return None
+
+    colorscale, reverse_scale = _plotly_heatmap_colors(cmap_name)
+    pfig = go.Figure(
+        data=[
+            go.Heatmap(
+                z=np.asarray(Z, float),
+                x=np.asarray(E, float).ravel(),
+                y=np.asarray(G, float).ravel(),
+                colorscale=colorscale,
+                reversescale=bool(reverse_scale),
+                zmin=float(vmin),
+                zmax=float(vmax),
+                colorbar={"title": cbar_label},
+                hovertemplate="x=%{x:.6g} eV<br>y=%{y:.6g} V<br>z=%{z:.6g}<extra></extra>",
+            )
+        ]
+    )
+
+    if marker_point is not None:
+        pfig.add_trace(
+            go.Scatter(
+                x=[marker_point["x"]],
+                y=[marker_point["y"]],
+                mode="markers",
+                marker={"size": 10, "color": "white", "line": {"color": "black", "width": 1}},
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+        pfig.add_hline(y=float(marker_point["y"]), line_dash="dot", line_color="white", line_width=1)
+        pfig.add_vline(x=float(marker_point["x"]), line_dash="dot", line_color="white", line_width=1)
+
+    pfig.update_layout(
+        title=title,
+        margin={"l": 10, "r": 10, "t": 50, "b": 10},
+        xaxis={"title": xlabel, "range": [float(xlim[0]), float(xlim[1])]},
+        yaxis={"title": ylabel, "range": [float(ylim[0]), float(ylim[1])]},
+        hovermode="closest",
+        clickmode="event+select",
+    )
+    return pfig
+
+
+def _pick_features_for_spectrum(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    kind: str,
+    xmin: float,
+    xmax: float,
+    smoothing: str,
+    sg_window: int,
+    sg_poly: int,
+    prominence: float,
+    distance_mode: str,
+    distance_value: float,
+    top_n: int,
+):
+    x = np.asarray(x, float).ravel()
+    y = np.asarray(y, float).ravel()
+    mask = np.isfinite(x) & np.isfinite(y)
+    mask &= (x >= float(min(xmin, xmax))) & (x <= float(max(xmin, xmax)))
+    xw = x[mask]
+    yw = y[mask]
+    if xw.size < 3:
+        return x, y, []
+
+    y_used = np.array(yw, copy=True)
+    if smoothing == "Savitzky-Golay":
+        win = int(max(3, sg_window))
+        if win % 2 == 0:
+            win += 1
+        if win >= xw.size:
+            win = xw.size if (xw.size % 2 == 1) else (xw.size - 1)
+        poly = int(max(1, sg_poly))
+        if win > poly and win >= 3:
+            y_used = savgol_filter(yw, window_length=win, polyorder=poly, mode="interp")
+
+    sig = y_used if kind == "Find peaks" else -y_used
+
+    distance_pts = None
+    if float(distance_value) > 0:
+        if distance_mode == "eV":
+            dx = np.nanmedian(np.abs(np.diff(xw)))
+            if np.isfinite(dx) and dx > 0:
+                distance_pts = max(1, int(round(float(distance_value) / float(dx))))
+        else:
+            distance_pts = max(1, int(round(float(distance_value))))
+
+    kwargs = {}
+    if float(prominence) > 0:
+        kwargs["prominence"] = float(prominence)
+    if distance_pts is not None:
+        kwargs["distance"] = int(distance_pts)
+
+    idx, props = find_peaks(sig, **kwargs)
+    if idx.size == 0:
+        return xw, y_used, []
+
+    widths = peak_widths(sig, idx, rel_height=0.5)[0]
+    dx_local = np.gradient(xw) if xw.size > 1 else np.array([np.nan])
+    rows = []
+    for k, i in enumerate(idx):
+        prom = float(props.get("prominences", np.full(idx.size, np.nan))[k]) if "prominences" in props else float("nan")
+        dxe = float(dx_local[int(i)]) if np.isfinite(dx_local[int(i)]) else float("nan")
+        width_ev = float(widths[k] * abs(dxe)) if np.isfinite(dxe) else float("nan")
+        rows.append(
+            {
+                "idx": int(i),
+                "energy_eV": float(xw[i]),
+                "amplitude": float(yw[i]),
+                "prominence": prom,
+                "width_eV": width_ev,
+            }
+        )
+
+    rows.sort(key=lambda r: (np.nan_to_num(r["prominence"], nan=-np.inf), abs(r["amplitude"])), reverse=True)
+    if int(top_n) > 0:
+        rows = rows[: int(top_n)]
+    rows.sort(key=lambda r: r["energy_eV"])
+    return xw, y_used, rows
+
+
 def _select_all_and_request_build(sel_key: str, matches: list[str], which: str):
     """
     SAFE: callback may modify widget key.
@@ -83,50 +282,43 @@ def _select_all_and_request_build(sel_key: str, matches: list[str], which: str):
 # ----------------------------
 # Grouping helper
 # ----------------------------
-# Supports:
-#   ..._001              or ...$_001
-#   ..._rep03_001        or ...$_rep03$_001
-#   ..._rep03            (optional)
-#
-# Grouping rule:
-#   - If name ends with _repXX_YYY, we group by "<prefix>_YYY" and use run=XX
-#     so rep01/02/03 become "runs" of the same group.
-#   - Else if name ends with _YYY, we group by "<prefix>" and use run=YYY (old behavior).
+# Preferred grouping:
+#   - If name ends with "_rep<digits>_<digits>", group by the condition stem
+#     before that suffix and sort by (rep, sub).
+# Fallback:
+#   - Keep old behavior for names without the rep+sub suffix.
 
-REP_RUN_SUFFIX_RE  = re.compile(r"(?:\$_|_)rep(?P<rep>\d{1,3})(?:\$_|_)(?P<seq>\d{3,})$", re.IGNORECASE)
+REP_SUB_SUFFIX_RE = re.compile(r"_rep(?P<rep>\d+)_(?P<sub>\d+)$", re.IGNORECASE)
 REP_ONLY_SUFFIX_RE = re.compile(r"(?:\$_|_)rep(?P<rep>\d{1,3})$", re.IGNORECASE)
-RUN_SUFFIX_RE      = re.compile(r"(?:\$_|_)(?P<run>\d{3,})$")
+RUN_SUFFIX_RE = re.compile(r"(?:\$_|_)(?P<run>\d{3,})$")
 
 
-def split_group_and_run(filename: str):
+def split_group_and_sort_key(filename: str):
     """
-    Returns (group_key, run_index_int_or_None).
+    Returns (group_key, sort_key_tuple).
 
     Examples:
-      AAA_rep03_001 -> (AAA_001, 3)   # group across rep01/02/03, sorted by rep#
-      AAA_002       -> (AAA, 2)       # old behavior
+      AAA_rep03_001 -> (AAA, (0, 3, 1))
+      AAA_002       -> (AAA, (1, 2, 0))
     """
     stem = Path(filename).stem
 
-    m = REP_RUN_SUFFIX_RE.search(stem)
+    m = REP_SUB_SUFFIX_RE.search(stem)
     if m:
-        prefix = stem[: m.start()]
-        rep_i = int(m.group("rep"))
-        seq = m.group("seq")
-        group_key = f"{prefix}_{seq}"     # keep the _001/_002 as the "shot" id
-        return group_key, rep_i
+        condition_key = re.sub(r"_rep\d+_\d+$", "", stem, flags=re.IGNORECASE)
+        return condition_key, (0, int(m.group("rep")), int(m.group("sub")))
 
     m = REP_ONLY_SUFFIX_RE.search(stem)
     if m:
         prefix = stem[: m.start()]
-        return prefix, int(m.group("rep"))
+        return prefix, (1, int(m.group("rep")), 0)
 
     m = RUN_SUFFIX_RE.search(stem)
     if m:
         prefix = stem[: m.start()]
-        return prefix, int(m.group("run"))
+        return prefix, (1, int(m.group("run")), 0)
 
-    return stem, None
+    return stem, (2, 0, 0)
 
 
 
@@ -274,15 +466,15 @@ if mode == "DR/R External" and baseline_used:
 else:
     candidate_files = list(files)
 
-groups = {}  # group_key -> list[(run, file)]
+groups = {}  # group_key -> list[(sort_key, file)]
 for f in candidate_files:
-    gk, run = split_group_and_run(f)
-    groups.setdefault(gk, []).append((run, f))
+    gk, sort_key = split_group_and_sort_key(f)
+    groups.setdefault(gk, []).append((sort_key, f))
 
-# sort within groups by run index
+# sort within groups by parsed (rep, sub) tuple when present
 groups_sorted = {}
 for gk, items in groups.items():
-    items.sort(key=lambda t: (t[0] is None, t[0] if t[0] is not None else 10**9))
+    items.sort(key=lambda t: t[0])
     groups_sorted[gk] = [f for _, f in items]
 
 if not groups_sorted:
@@ -358,7 +550,7 @@ with colA:
             st.session_state["drr_use_n_runs"] = 1
 
     use_n = st.number_input(
-        "Average first N runs in this group (sorted by _###)",
+        "Average first N runs in this group (sorted by rep/sub when present)",
         min_value=1,
         max_value=max_runs,
         step=1,
@@ -815,12 +1007,79 @@ _format_drr_colorbar(fig, is_deriv=is_deriv)
 
 
 with left:
-    st_pyplot(fig)
+    _ensure("_drr_cursor_src", None)
+    _ensure("drr_cursor_locked", False)
+    _ensure("drr_cursor_locked_point", None)
+    _ensure("drr_cursor_hover_point", None)
+
+    cursor_src = (folder, tuple(sel_files), mode, derivative, y_axis_choice, len(E), len(G))
+    if st.session_state["_drr_cursor_src"] != cursor_src:
+        st.session_state["_drr_cursor_src"] = cursor_src
+        st.session_state["drr_cursor_locked"] = False
+        st.session_state["drr_cursor_locked_point"] = None
+        st.session_state["drr_cursor_hover_point"] = None
+
+    cursor_marker = (
+        st.session_state.get("drr_cursor_locked_point")
+        if st.session_state.get("drr_cursor_locked", False)
+        else st.session_state.get("drr_cursor_hover_point")
+    )
+    pfig = _build_plotly_drr_heatmap(
+        cube.energy,
+        cube.gate,
+        Z_plot,
+        title=cube.title,
+        xlabel="Photon Energy (eV)",
+        ylabel=cube.gate_label,
+        cbar_label=cube.cbar_label,
+        xlim=xlim,
+        ylim=ylim,
+        vmin=vmin,
+        vmax=vmax,
+        cmap_name=st.session_state.get("drr_cmap", "RdBu_r"),
+        marker_point=cursor_marker,
+    )
+
+    if _HAS_PLOTLY and _HAS_PLOTLY_EVENTS and pfig is not None:
+        pts = plotly_events(
+            pfig,
+            click_event=True,
+            hover_event=True,
+            select_event=False,
+            key="drr_heatmap_plotly_events",
+            override_height=620,
+        )
+        if pts:
+            p = pts[-1]
+            x_ev = p.get("x", None)
+            y_v = p.get("y", None)
+            if x_ev is not None and y_v is not None:
+                payload = _cursor_payload_from_xy(E, G, Z_plot, float(x_ev), float(y_v))
+                if payload is not None:
+                    st.session_state["drr_cursor_hover_point"] = payload
+                    etype = str(p.get("event_type") or p.get("type") or p.get("event") or "").lower()
+                    if "click" in etype:
+                        st.session_state["drr_cursor_locked"] = True
+                        st.session_state["drr_cursor_locked_point"] = payload
+    elif _HAS_PLOTLY and pfig is not None:
+        st.info("Install `streamlit-plotly-events` for hover/click capture. Showing Plotly heatmap without event capture.")
+        st.plotly_chart(pfig, use_container_width=True, theme=None)
+    else:
+        st.info("Plotly is not installed. Showing static heatmap; install `plotly` + `streamlit-plotly-events` for interactive cursor readout.")
+        st_pyplot(fig)
 
 with t_cursor:
     gate_vals = np.asarray(cube.gate, float).ravel()
     if gate_vals.size:
-        default_gate = float(gate_vals[len(gate_vals) // 2])
+        if st.session_state.get("drr_cursor_locked", False) and st.session_state.get("drr_cursor_locked_point") is not None:
+            active_cursor = st.session_state["drr_cursor_locked_point"]
+        else:
+            active_cursor = st.session_state.get("drr_cursor_hover_point")
+
+        if active_cursor is not None:
+            st.session_state["drr_cursor_gate_slider"] = float(active_cursor["y"])
+
+        default_gate = float(st.session_state.get("drr_cursor_gate_slider", gate_vals[len(gate_vals) // 2]))
         gsel = st.slider(
             "Cursor gate",
             float(gate_vals.min()),
@@ -830,7 +1089,139 @@ with t_cursor:
         )
         idx = int(np.argmin(np.abs(gate_vals - gsel)))
         Zrow = np.asarray(cube.Z, float)[idx, :]
+
+        st.markdown("#### Cursor readout")
+        c1, c2, c3 = st.columns([1.1, 1.0, 1.2], gap="small")
+        with c1:
+            if st.session_state.get("drr_cursor_locked", False):
+                st.success("Cursor locked")
+            else:
+                st.caption("Cursor unlocked")
+        with c2:
+            if st.button("Unlock cursor", key="drr_unlock_cursor_btn"):
+                st.session_state["drr_cursor_locked"] = False
+                st.session_state["drr_cursor_locked_point"] = None
+                rerun()
+        with c3:
+            if st.button("Lock current hover", key="drr_lock_hover_btn"):
+                hp = st.session_state.get("drr_cursor_hover_point")
+                if hp is not None:
+                    st.session_state["drr_cursor_locked"] = True
+                    st.session_state["drr_cursor_locked_point"] = hp
+                    rerun()
+
+        readout_point = (
+            st.session_state.get("drr_cursor_locked_point")
+            if st.session_state.get("drr_cursor_locked", False)
+            else st.session_state.get("drr_cursor_hover_point")
+        )
+        if readout_point is not None:
+            st.code(
+                f"x = {float(readout_point['x']):.6g} eV\n"
+                f"y = {float(readout_point['y']):.6g} V\n"
+                f"z = {float(readout_point['z']):.6g}",
+                language="text",
+            )
+        else:
+            st.caption("Hover the heatmap to view x/y/z. Click to lock the point.")
+
         spec = build_spectrum_fig(cube.energy, Zrow, title=f"Spectrum @ {gate_vals[idx]:g} V", ylabel=cube.cbar_label)
+        ax_spec = spec.axes[0] if getattr(spec, "axes", None) else None
+
+        _ensure("_drr_peak_src", None)
+        _ensure_choice("drr_peak_mode", ["Find dips", "Find peaks"], "Find dips")
+        _ensure_choice("drr_peak_smooth_mode", ["None", "Savitzky-Golay"], "None")
+        _ensure("drr_peak_prominence", 0.0)
+        _ensure_choice("drr_peak_dist_mode", ["points", "eV"], "points")
+        _ensure("drr_peak_dist_value", 0.0)
+        _ensure("drr_peak_top_n", 5)
+        _ensure("drr_peak_sg_window", 11)
+        _ensure("drr_peak_sg_poly", 2)
+
+        peak_src = (tuple(sel_files), mode, derivative, float(E.min()) if E.size else None, float(E.max()) if E.size else None)
+        if st.session_state["_drr_peak_src"] != peak_src:
+            st.session_state["_drr_peak_src"] = peak_src
+            st.session_state["drr_peak_xmin"] = float(np.nanmin(E))
+            st.session_state["drr_peak_xmax"] = float(np.nanmax(E))
+
+        with st.expander("Peak/Dip Finder", expanded=False):
+            rr0 = st.columns([1.2, 1.2, 1.0], gap="small")
+            with rr0[0]:
+                st.selectbox("Mode", options=["Find dips", "Find peaks"], key="drr_peak_mode")
+            with rr0[1]:
+                st.selectbox("Smoothing", options=["None", "Savitzky-Golay"], key="drr_peak_smooth_mode")
+            with rr0[2]:
+                st.number_input("Top N", min_value=1, max_value=100, step=1, key="drr_peak_top_n")
+
+            rr1 = st.columns(2, gap="small")
+            with rr1[0]:
+                st.number_input("Energy min (eV)", key="drr_peak_xmin", format="%.6g")
+            with rr1[1]:
+                st.number_input("Energy max (eV)", key="drr_peak_xmax", format="%.6g")
+
+            rr2 = st.columns([1.2, 1.2, 1.2], gap="small")
+            with rr2[0]:
+                st.number_input("Prominence", min_value=0.0, step=0.01, key="drr_peak_prominence", format="%.6g")
+            with rr2[1]:
+                st.selectbox("Min distance unit", options=["points", "eV"], key="drr_peak_dist_mode")
+            with rr2[2]:
+                st.number_input("Min distance", min_value=0.0, step=1.0, key="drr_peak_dist_value", format="%.6g")
+
+            if st.session_state.get("drr_peak_smooth_mode") == "Savitzky-Golay":
+                rr3 = st.columns(2, gap="small")
+                with rr3[0]:
+                    st.number_input("SG window", min_value=3, step=2, key="drr_peak_sg_window")
+                with rr3[1]:
+                    st.number_input("SG polyorder", min_value=1, max_value=6, step=1, key="drr_peak_sg_poly")
+
+            xs, y_used, rows = _pick_features_for_spectrum(
+                cube.energy,
+                Zrow,
+                kind=st.session_state.get("drr_peak_mode", "Find dips"),
+                xmin=float(st.session_state.get("drr_peak_xmin", float(np.nanmin(E)))),
+                xmax=float(st.session_state.get("drr_peak_xmax", float(np.nanmax(E)))),
+                smoothing=st.session_state.get("drr_peak_smooth_mode", "None"),
+                sg_window=int(st.session_state.get("drr_peak_sg_window", 11)),
+                sg_poly=int(st.session_state.get("drr_peak_sg_poly", 2)),
+                prominence=float(st.session_state.get("drr_peak_prominence", 0.0)),
+                distance_mode=st.session_state.get("drr_peak_dist_mode", "points"),
+                distance_value=float(st.session_state.get("drr_peak_dist_value", 0.0)),
+                top_n=int(st.session_state.get("drr_peak_top_n", 5)),
+            )
+
+            if ax_spec is not None and st.session_state.get("drr_peak_smooth_mode") == "Savitzky-Golay":
+                ax_spec.plot(xs, y_used, linestyle="--", linewidth=1.1, alpha=0.9, label="Smoothed")
+
+            if ax_spec is not None and rows:
+                for r in rows:
+                    ax_spec.axvline(float(r["energy_eV"]), color="tab:red", linestyle="--", linewidth=0.9, alpha=0.8)
+                    ax_spec.plot(float(r["energy_eV"]), float(r["amplitude"]), marker="o", color="tab:red", markersize=4)
+                ax_spec.legend(loc="best", fontsize=8)
+
+            if rows:
+                table_rows = [
+                    {
+                        "energy (eV)": float(r["energy_eV"]),
+                        "amplitude": float(r["amplitude"]),
+                        "prominence": float(r["prominence"]),
+                        "width (eV)": float(r["width_eV"]),
+                    }
+                    for r in rows
+                ]
+                st.dataframe(table_rows, use_container_width=True, hide_index=True)
+                csv_text = "energy_eV,amplitude,prominence,width_eV\n" + "\n".join(
+                    f"{r['energy_eV']:.9g},{r['amplitude']:.9g},{r['prominence']:.9g},{r['width_eV']:.9g}" for r in rows
+                )
+                st.download_button(
+                    "Download peaks/dips CSV",
+                    data=csv_text.encode("utf-8"),
+                    file_name=f"{Path(sel_files[0]).stem}_gate{gate_vals[idx]:.6g}_features.csv",
+                    mime="text/csv",
+                    key="drr_peak_csv_download",
+                )
+            else:
+                st.caption("No features found with current settings.")
+
         st_pyplot(spec)
 
 with right:
