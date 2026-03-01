@@ -4,8 +4,8 @@ Streamlit multipage UI for loading measurement CSV files, plotting heatmaps/spec
 
 ## Installation
 ```bash
-git clone https://github.com/ylylyl98/streamlit-data-plot-app.git
-cd streamlit-data-plot-app
+git clone https://github.com/ylylyl98/PySide6_Data_plot.git
+cd PySide6_Data_plot
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
