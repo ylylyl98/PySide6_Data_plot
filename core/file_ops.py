@@ -75,3 +75,49 @@ def restore_all(user_folder: str, archive_name: str) -> int:
         except OSError:
             pass
     return n
+
+
+def archive_selected(user_folder: str, file_names: List[str], archive_name: str) -> int:
+    """Move selected root CSV files into `<user_folder>/<archive_name>`."""
+    p = Path(user_folder)
+    if not p.exists() or not p.is_dir():
+        return 0
+    dst_root = p / archive_name
+    try:
+        dst_root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return 0
+
+    n = 0
+    seen = set()
+    for name in file_names:
+        try:
+            nm = str(name).strip()
+        except Exception:
+            continue
+        if not nm or nm in seen:
+            continue
+        seen.add(nm)
+        src = p / nm
+        if (not src.exists()) or (not src.is_file()):
+            continue
+        # Keep behavior conservative: move CSV-like names only.
+        if src.suffix.lower() != ".csv":
+            continue
+        dst = dst_root / src.name
+        if dst.exists():
+            stem = dst.stem
+            suf = dst.suffix
+            k = 1
+            while True:
+                cand = dst_root / f"{stem}_{k:02d}{suf}"
+                if not cand.exists():
+                    dst = cand
+                    break
+                k += 1
+        try:
+            src.replace(dst)
+            n += 1
+        except OSError:
+            pass
+    return n

@@ -1,28 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
 import numpy as np
 
 from core import processing_run as P
-
-try:
-    import streamlit as st
-except Exception:  # pragma: no cover - fallback for non-Streamlit usage
-    st = None
-
-
-def _cache_data(**kwargs):
-    """Use Streamlit cache when available; otherwise return a no-op decorator."""
-
-    def _decorator(func):
-        if st is None:
-            return func
-        return st.cache_data(**kwargs)(func)
-
-    return _decorator
 
 
 @dataclass
@@ -64,11 +49,11 @@ def _csv_signature(user_folder: str, file_name: str) -> Tuple[int, int]:
     return int(stt.st_mtime_ns), int(stt.st_size)
 
 
-@_cache_data(show_spinner=False)
+@lru_cache(maxsize=256)
 def _peek_y_axis_options_cached(
     user_folder: str, file_name: str, csv_sig: Tuple[int, int]
 ) -> Tuple[tuple[str, ...], str]:
-    del csv_sig  # only used to invalidate cache when data changes
+    del csv_sig
 
     # Preferred: use implementation that owns _load_canonical
     if hasattr(P, "peek_y_axis_options"):
@@ -89,9 +74,9 @@ def peek_y_axis_options(user_folder: str, file_name: str) -> Tuple[list[str], st
     return list(opts), default
 
 
-@_cache_data(show_spinner=False)
+@lru_cache(maxsize=512)
 def _load_pl_cached(user_folder: str, file_name: str, log_scale: bool, csv_sig: Tuple[int, int]) -> dict:
-    del csv_sig  # only used to invalidate cache when data changes
+    del csv_sig
 
     return P.process_pl(
         user_folder=user_folder,

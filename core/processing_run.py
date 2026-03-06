@@ -1047,7 +1047,10 @@ def _load_canonical(user_folder: str, origin_name: str, *, y_axis: str = "auto")
         v = np.asarray(v, float)
         if v.size == 0:
             return True
-        vmin, vmax = np.nanmin(v), np.nanmax(v)
+        finite = v[np.isfinite(v)]
+        if finite.size == 0:
+            return True
+        vmin, vmax = np.min(finite), np.max(finite)
         span = vmax - vmin
         return (span <= atol) or (span <= rtol * max(1.0, abs(vmin), abs(vmax)))
 
@@ -1493,12 +1496,73 @@ def process_ref_avg(
     dmode = mode_map[bg_mode]
     stack = [ _drr_from_Z(Z0, dmode, I0_ext) ]
     stack_raw = [ Z0 ]
+
+    def _same_axis(a: np.ndarray, b: np.ndarray) -> bool:
+        return a.shape == b.shape and np.allclose(a, b, rtol=1e-6, atol=1e-9, equal_nan=True)
+
+    def _interp_z_to_ref(
+        z_src: np.ndarray,
+        e_src: np.ndarray,
+        g_src: np.ndarray,
+        e_ref: np.ndarray,
+        g_ref: np.ndarray,
+    ) -> np.ndarray:
+        z = np.asarray(z_src, float)
+        e0 = np.asarray(e_src, float).ravel()
+        g0 = np.asarray(g_src, float).ravel()
+        er = np.asarray(e_ref, float).ravel()
+        gr = np.asarray(g_ref, float).ravel()
+        if z.shape != (g0.size, e0.size):
+            raise ValueError(f"Unexpected Z shape {z.shape}; expected ({g0.size}, {e0.size}).")
+        # np.interp requires ascending x; sort source axes if needed.
+        if e0.size >= 2 and np.any(np.diff(e0) < 0):
+            e_ord = np.argsort(e0)
+            e0 = e0[e_ord]
+            z = z[:, e_ord]
+        if g0.size >= 2 and np.any(np.diff(g0) < 0):
+            g_ord = np.argsort(g0)
+            g0 = g0[g_ord]
+            z = z[g_ord, :]
+        z_e = z
+        if not _same_axis(e0, er):
+            if e0.size < 2:
+                raise ValueError("Cannot interpolate energy axis with fewer than 2 points.")
+            z_e = np.vstack([np.interp(er, e0, row, left=np.nan, right=np.nan) for row in z])
+        z_ge = z_e
+        if not _same_axis(g0, gr):
+            if g0.size < 2:
+                raise ValueError("Cannot interpolate gate axis with fewer than 2 points.")
+            z_ge = np.column_stack(
+                [np.interp(gr, g0, z_e[:, j], left=np.nan, right=np.nan) for j in range(z_e.shape[1])]
+            )
+        return np.asarray(z_ge, float)
+
     for f in files[1:]:
         d = _load_canonical(user_folder, f, y_axis=y_axis)
-        if not (np.allclose(d["energy"], energy0) and np.allclose(d["gate_axis"], gate0)):
-            raise ValueError(f"Grid mismatch in {f}")
-        stack.append(_drr_from_Z(d["Z"], dmode, I0_ext))
-        stack_raw.append(d["Z"])
+        e_i = np.asarray(d["energy"], float)
+        g_i = np.asarray(d["gate_axis"], float)
+        z_i = np.asarray(d["Z"], float)
+        e_match = _same_axis(e_i, energy0)
+        g_match = _same_axis(g_i, gate0)
+        if not (e_match and g_match):
+            parts = []
+            if not e_match:
+                if e_i.shape != energy0.shape:
+                    parts.append(f"energy shape {e_i.shape} vs {energy0.shape}")
+                else:
+                    e_max = float(np.nanmax(np.abs(e_i - energy0)))
+                    parts.append(f"energy max|d|={e_max:.3e}")
+            if not g_match:
+                if g_i.shape != gate0.shape:
+                    parts.append(f"gate shape {g_i.shape} vs {gate0.shape}")
+                else:
+                    g_max = float(np.nanmax(np.abs(g_i - gate0)))
+                    parts.append(f"gate max|d|={g_max:.3e}")
+            detail = "; ".join(parts) if parts else "axis mismatch"
+            print(f"[DRR][warn] Grid mismatch in {f} ({detail}); interpolating to reference grid.")
+            z_i = _interp_z_to_ref(z_i, e_i, g_i, energy0, gate0)
+        stack.append(_drr_from_Z(z_i, dmode, I0_ext))
+        stack_raw.append(z_i)
     Z_avg = np.nanmean(np.stack(stack, axis=0), axis=0)
     R_avg = np.nanmean(np.stack(stack_raw, axis=0), axis=0)
     Z_out = Z_avg

@@ -1,6 +1,6 @@
-# Streamlit Data Plot App (Multipage)
+# PySide6 Data Plot App
 
-Streamlit multipage UI for loading measurement CSV files, plotting heatmaps/spectra, and exporting PNG/DAT outputs.
+Desktop data plotting app built with PySide6. It loads measurement CSV files, renders PL/DRR/Compare views with Matplotlib, and exports CSV/PNG outputs.
 
 ## Installation
 ```bash
@@ -12,14 +12,17 @@ pip install -r requirements.txt
 ```
 
 ## Run
-Use either:
 ```bash
-streamlit run app.py
+python run_qt.py
 ```
-or double-click `Data_Plot_App.bat` from the repo root.
+
+## Architecture
+- `core/`: UI-agnostic data loading, processing, plotting primitives, and export.
+- `ui_qt/`: PySide6 desktop UI (`QMainWindow`, controls, Matplotlib embed, log/progress).
+- `run_qt.py`: PySide6 entrypoint.
 
 ## Expected Folder Structure
-When you choose a user folder in the sidebar, CSV files must be in the folder root (not subfolders):
+When you choose a data folder, CSV files must be in the folder root (not subfolders):
 
 ```text
 <user-folder>/
@@ -31,11 +34,12 @@ When you choose a user folder in the sidebar, CSV files must be in the folder ro
 ```
 
 ## Usage Notes
-- `PL` page: one-file-at-a-time processing with export workflow for linear/log outputs.
-- `DRR` page:
-  - `Self` mode uses per-file first/last frame baselines.
-  - `External` mode uses selected baseline CSV files from the same folder.
-- `Compare` page: side-by-side panels for KK/KKp (or KK/KKp/KpK/KpKp) with optional VP views.
+- `PL`: one-file plotting workflow for heatmap + spectrum.
+- `DRR`:
+  - `Self (last/first frame)` baseline modes.
+  - `External` baseline mode from selected baseline files.
+- `Compare`: 2-4 selected files rendered in a compare grid.
+- `Save PNG` exports with fixed size (`1600x1200 @ 200 DPI`) independent of window size.
 
 ## Smoke Check (No Test Framework Required)
 Run:
@@ -43,10 +47,10 @@ Run:
 python scripts/smoke_check.py
 ```
 
-This performs lightweight import/path checks for core modules and app entry files.
+This performs lightweight import/path checks for the Qt app and core modules.
 
 ## Troubleshooting
 - `No CSV files found`: confirm files are directly in the selected folder root and have `.csv` extension.
-- `Folder does not exist` or `Selected path is not a folder`: re-pick the folder using sidebar `Browse...`.
-- `Compute failed` in DRR: verify baseline mode and selected baseline files are compatible with the selected run files.
+- `Folder does not exist` or `Selected path is not a folder`: re-pick the folder in the folder panel.
+- `Compute failed` in DRR: verify baseline mode and selected baseline files match selected run files.
 - Blank/invalid plots: confirm CSV columns are numeric and contain finite energy/gate/intensity values.

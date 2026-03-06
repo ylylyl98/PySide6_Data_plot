@@ -19,21 +19,22 @@ def _assert_exists(path: Path) -> None:
 
 def main() -> int:
     required_paths = [
-        REPO_ROOT / "app.py",
+        REPO_ROOT / "run_qt.py",
         REPO_ROOT / "core",
-        REPO_ROOT / "ui",
-        REPO_ROOT / "pages",
+        REPO_ROOT / "ui_qt",
     ]
     for p in required_paths:
         _assert_exists(p)
 
     modules = [
         "core.file_ops",
+        "core.data_io",
         "core.loader",
+        "core.processing",
+        "core.plotting",
+        "core.export",
         "core.processing_run",
-        "ui.state",
-        "ui.sidebar",
-        "ui.plotting",
+        "ui_qt.main_window",
     ]
     for name in modules:
         importlib.import_module(name)
