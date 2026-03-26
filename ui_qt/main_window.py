@@ -271,7 +271,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.tabs, 1)
         return box
 
-    def _build_common_range_grid(self, prefix: str) -> tuple[QGridLayout, Dict[str, QDoubleSpinBox], QCheckBox, QCheckBox, QComboBox]:
+    def _build_common_range_grid(
+        self, prefix: str
+    ) -> tuple[QGridLayout, Dict[str, QDoubleSpinBox], QCheckBox, QCheckBox, QComboBox, Dict[str, QCheckBox]]:
         grid = QGridLayout()
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(6)
@@ -293,6 +295,14 @@ class MainWindow(QMainWindow):
             "ymax": spin(),
             "gate": spin(),
         }
+        fix_checks = {
+            "vmin": QCheckBox("F"),
+            "vmax": QCheckBox("F"),
+            "xmin": QCheckBox("F"),
+            "xmax": QCheckBox("F"),
+            "ymin": QCheckBox("F"),
+            "ymax": QCheckBox("F"),
+        }
         spins["vmin"].setToolTip("Lower color scale bound")
         spins["vmax"].setToolTip("Upper color scale bound")
         spins["xmin"].setToolTip("Left energy axis bound")
@@ -300,6 +310,12 @@ class MainWindow(QMainWindow):
         spins["ymin"].setToolTip("Lower gate axis bound")
         spins["ymax"].setToolTip("Upper gate axis bound")
         spins["gate"].setToolTip("Gate value for spectrum extraction")
+        fix_checks["vmin"].setToolTip("Fix vmin when loading/updating files")
+        fix_checks["vmax"].setToolTip("Fix vmax when loading/updating files")
+        fix_checks["xmin"].setToolTip("Fix xmin when loading/updating files")
+        fix_checks["xmax"].setToolTip("Fix xmax when loading/updating files")
+        fix_checks["ymin"].setToolTip("Fix ymin when loading/updating files")
+        fix_checks["ymax"].setToolTip("Fix ymax when loading/updating files")
 
         def add_pair(row: int, col: int, text: str, widget: QWidget) -> None:
             label = QLabel(text)
@@ -309,12 +325,22 @@ class MainWindow(QMainWindow):
             grid.addWidget(label, row, base)
             grid.addWidget(widget, row, base + 1)
 
-        add_pair(0, 0, "vmin", spins["vmin"])
-        add_pair(0, 1, "vmax", spins["vmax"])
-        add_pair(1, 0, "xmin", spins["xmin"])
-        add_pair(1, 1, "xmax", spins["xmax"])
-        add_pair(2, 0, "ymin", spins["ymin"])
-        add_pair(2, 1, "ymax", spins["ymax"])
+        def spin_with_fix(k: str) -> QWidget:
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(4)
+            h.addWidget(spins[k])
+            h.addWidget(fix_checks[k])
+            h.addStretch(1)
+            return row
+
+        add_pair(0, 0, "vmin", spin_with_fix("vmin"))
+        add_pair(0, 1, "vmax", spin_with_fix("vmax"))
+        add_pair(1, 0, "xmin", spin_with_fix("xmin"))
+        add_pair(1, 1, "xmax", spin_with_fix("xmax"))
+        add_pair(2, 0, "ymin", spin_with_fix("ymin"))
+        add_pair(2, 1, "ymax", spin_with_fix("ymax"))
         add_pair(3, 0, "gate", spins["gate"])
 
         log_chk = QCheckBox("Log Scale")
@@ -340,7 +366,8 @@ class MainWindow(QMainWindow):
         setattr(self, f"{prefix}_log_chk", log_chk)
         setattr(self, f"{prefix}_clip_chk", clip_chk)
         setattr(self, f"{prefix}_cmap", cmap)
-        return grid, spins, log_chk, clip_chk, cmap
+        setattr(self, f"{prefix}_fix_checks", fix_checks)
+        return grid, spins, log_chk, clip_chk, cmap, fix_checks
 
     def _build_pl_tab(self) -> QWidget:
         tab = QWidget()
@@ -356,7 +383,7 @@ class MainWindow(QMainWindow):
         params = QGroupBox("")
         params_layout = QVBoxLayout(params)
         cfg = QFormLayout()
-        grid, _, _, _, cmap = self._build_common_range_grid("pl")
+        grid, _, _, _, cmap, _ = self._build_common_range_grid("pl")
         cmap.setCurrentText("turbo")
         cfg.addRow("Colormap", cmap)
         params_layout.addLayout(cfg)
@@ -501,7 +528,7 @@ class MainWindow(QMainWindow):
         self.drr_derivative_combo.addItems(["None", "dE", "d2E"])
         self.drr_derivative_combo.setToolTip("Apply derivative transform to DRR")
         self._style_combo_popup(self.drr_derivative_combo)
-        _grid, spins, log_chk, clip_chk, cmap = self._build_common_range_grid("drr")
+        _grid, spins, log_chk, clip_chk, cmap, fix_checks = self._build_common_range_grid("drr")
 
         for s in spins.values():
             s.setFixedWidth(UI_METRICS["spin_w"])
@@ -533,7 +560,14 @@ class MainWindow(QMainWindow):
         self.drr_sg_poly_spin.setFixedWidth(UI_METRICS["spin_w"])
         self.drr_sg_poly_spin.setFixedHeight(UI_METRICS["input_h"])
 
-        def pair_auto_row(a: QDoubleSpinBox, b: QDoubleSpinBox, auto_btn: QToolButton, auto_text: str) -> QWidget:
+        def pair_auto_row(
+            a: QDoubleSpinBox,
+            b: QDoubleSpinBox,
+            fa: QCheckBox,
+            fb: QCheckBox,
+            auto_btn: QToolButton,
+            auto_text: str,
+        ) -> QWidget:
             auto_btn.setText(auto_text)
             auto_btn.setAutoRaise(True)
             auto_btn.setFixedWidth(UI_METRICS["tool_w"])
@@ -543,7 +577,9 @@ class MainWindow(QMainWindow):
             h.setContentsMargins(0, 0, 0, 0)
             h.setSpacing(4)
             h.addWidget(a)
+            h.addWidget(fa)
             h.addWidget(b)
+            h.addWidget(fb)
             h.addWidget(auto_btn)
             h.addStretch(1)
             return row
@@ -586,9 +622,18 @@ class MainWindow(QMainWindow):
         baseline_cmap_h.addWidget(cmap)
         basic_form.addRow("DRR Baseline", baseline_cmap_row)
         basic_form.addRow("Derivative / SG", deriv_row)
-        basic_form.addRow("vmin / vmax", pair_auto_row(spins["vmin"], spins["vmax"], self.drr_auto_v_btn, "Auto V"))
-        basic_form.addRow("xmin / xmax", pair_auto_row(spins["xmin"], spins["xmax"], self.drr_auto_x_btn, "Auto X"))
-        basic_form.addRow("ymin / ymax", pair_auto_row(spins["ymin"], spins["ymax"], self.drr_auto_y_btn, "Auto Y"))
+        basic_form.addRow(
+            "vmin / vmax",
+            pair_auto_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.drr_auto_v_btn, "Auto V"),
+        )
+        basic_form.addRow(
+            "xmin / xmax",
+            pair_auto_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.drr_auto_x_btn, "Auto X"),
+        )
+        basic_form.addRow(
+            "ymin / ymax",
+            pair_auto_row(spins["ymin"], spins["ymax"], fix_checks["ymin"], fix_checks["ymax"], self.drr_auto_y_btn, "Auto Y"),
+        )
         basic_form.addRow("Cursor Gate", spins["gate"])
         flags = QWidget()
         flags_h = QHBoxLayout(flags)
@@ -746,7 +791,7 @@ class MainWindow(QMainWindow):
         params = QGroupBox("")
         params_layout = QVBoxLayout(params)
         cfg = QFormLayout()
-        grid, _, _, _, cmap = self._build_common_range_grid("cmp")
+        grid, _, _, _, cmap, _ = self._build_common_range_grid("cmp")
         cmap.setCurrentText("turbo")
         cfg.addRow("Colormap", cmap)
         params_layout.addLayout(cfg)
@@ -1429,6 +1474,16 @@ class MainWindow(QMainWindow):
     def _mode_clip(self, mode: str) -> bool:
         return bool(self.pl_clip_chk.isChecked()) if mode == "PL" else bool(self.drr_clip_chk.isChecked()) if mode == "DRR" else bool(self.cmp_clip_chk.isChecked())
 
+    def _mode_fix_value(self, mode: str, key: str) -> bool:
+        if mode == "PL":
+            checks = self.pl_fix_checks
+        elif mode == "DRR":
+            checks = self.drr_fix_checks
+        else:
+            checks = self.cmp_fix_checks
+        chk = checks.get(key)
+        return bool(chk.isChecked()) if chk is not None else False
+
     def _apply_auto_limits_for_loaded(self) -> None:
         if not self.loaded:
             return
@@ -1444,12 +1499,18 @@ class MainWindow(QMainWindow):
 
         limits = compute_auto_limits(cube, log_scale=self._mode_log(mode))
         spins = self._mode_spins(mode)
-        spins["vmin"].setValue(limits.vmin)
-        spins["vmax"].setValue(limits.vmax)
-        spins["xmin"].setValue(limits.xmin)
-        spins["xmax"].setValue(limits.xmax)
-        spins["ymin"].setValue(limits.ymin)
-        spins["ymax"].setValue(limits.ymax)
+        if not self._mode_fix_value(mode, "vmin"):
+            spins["vmin"].setValue(limits.vmin)
+        if not self._mode_fix_value(mode, "vmax"):
+            spins["vmax"].setValue(limits.vmax)
+        if not self._mode_fix_value(mode, "xmin"):
+            spins["xmin"].setValue(limits.xmin)
+        if not self._mode_fix_value(mode, "xmax"):
+            spins["xmax"].setValue(limits.xmax)
+        if not self._mode_fix_value(mode, "ymin"):
+            spins["ymin"].setValue(limits.ymin)
+        if not self._mode_fix_value(mode, "ymax"):
+            spins["ymax"].setValue(limits.ymax)
         spins["gate"].setValue(float(np.nanmedian(cube.gate)))
 
     def _make_params(self, mode: str, cube: DataCube) -> HeatmapParams:
