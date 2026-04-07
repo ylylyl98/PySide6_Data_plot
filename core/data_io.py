@@ -22,18 +22,43 @@ DEFAULT_PROCESSED = "Processed Data"
 
 @dataclass(frozen=True)
 class CompareSelection:
-    kk: str
-    kkp: str
+    kk: str | None = None
+    kkp: str | None = None
     kpk: str | None = None
     kpkp: str | None = None
+    visible_order: tuple[str, ...] = ()
 
     def as_pairs(self) -> Dict[str, str]:
-        pairs: Dict[str, str] = {"KK": self.kk, "KKp": self.kkp}
+        raw: Dict[str, str] = {}
+        if self.kk:
+            raw["KK"] = self.kk
+        if self.kkp:
+            raw["KKp"] = self.kkp
         if self.kpk:
-            pairs["KpK"] = self.kpk
+            raw["KpK"] = self.kpk
         if self.kpkp:
-            pairs["KpKp"] = self.kpkp
+            raw["KpKp"] = self.kpkp
+        order = self.visible_order if self.visible_order else ("KK", "KKp", "KpK", "KpKp")
+        pairs: Dict[str, str] = {}
+        for key in order:
+            if key in raw:
+                pairs[key] = raw[key]
         return pairs
+
+    @classmethod
+    def from_mapping(
+        cls,
+        mapping: Dict[str, str],
+        *,
+        visible_order: Sequence[str] | None = None,
+    ) -> "CompareSelection":
+        return cls(
+            kk=mapping.get("KK"),
+            kkp=mapping.get("KKp"),
+            kpk=mapping.get("KpK"),
+            kpkp=mapping.get("KpKp"),
+            visible_order=tuple(visible_order or ()),
+        )
 
 
 def processed_dir(folder: str, processed_name: str = DEFAULT_PROCESSED) -> Path:
@@ -58,8 +83,8 @@ def move_selected_to_archive(folder: str, file_names: Sequence[str], archive_nam
     return archive_selected(folder, list(file_names), archive_name)
 
 
-def load_pl_cube(folder: str, file_name: str, *, log_scale: bool = False) -> DataCube:
-    return load_pl(folder, file_name, log_scale=log_scale)
+def load_pl_cube(folder: str, file_name: str, *, log_scale: bool = False, y_axis: str = "auto") -> DataCube:
+    return load_pl(folder, file_name, log_scale=log_scale, y_axis=y_axis)
 
 
 def load_drr_self_cube(
@@ -105,8 +130,9 @@ def load_compare_cubes(
     selection: CompareSelection,
     *,
     log_scale: bool = False,
+    y_axis: str = "auto",
 ) -> Dict[str, DataCube]:
-    return {name: load_pl(folder, fn, log_scale=log_scale) for name, fn in selection.as_pairs().items()}
+    return {name: load_pl(folder, fn, log_scale=log_scale, y_axis=y_axis) for name, fn in selection.as_pairs().items()}
 
 
 def get_y_axis_options(folder: str, file_name: str) -> tuple[list[str], str]:

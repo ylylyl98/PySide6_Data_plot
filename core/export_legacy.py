@@ -15,7 +15,8 @@ from matplotlib.font_manager import FontProperties
 from matplotlib.ticker import FixedFormatter, FixedLocator, FuncFormatter, NullFormatter, NullLocator
 
 from core.loader import DataCube
-from core.plotting import HeatmapParams
+from core.plotting import COMPARE_PANEL_ORDER, HeatmapParams, plot_compare_panel
+from core.processing import nearest_gate_spectrum
 from core.processing_run import save_as_dat
 
 
@@ -379,13 +380,16 @@ def export_compare_panels(
     params: HeatmapParams,
     scale_tag: str,
     clip_outliers: bool,
+    gate_value: float | None = None,
     processed_name: str = DEFAULT_PROCESSED,
 ) -> list[Path]:
     out_dir = ensure_processed_dir(folder, processed_name)
     written: list[Path] = []
-    for key, cube in cubes.items():
+    ordered_keys = [key for key in COMPARE_PANEL_ORDER if key in cubes]
+    for key in ordered_keys:
+        cube = cubes[key]
         panel_params = HeatmapParams(
-            title=f"{key}: {cube.title}",
+            title=cube.title,
             xlabel=params.xlabel,
             ylabel=cube.gate_label,
             cbar_label=cube.cbar_label,
@@ -423,4 +427,84 @@ def export_compare_panels(
             ],
         )
         written.extend([png_path, dat_path])
+
+    if ordered_keys:
+        grid_key = "_".join(ordered_keys)
+        fig = plt.figure(figsize=(10.0, 8.0), dpi=EXPORT_DPI, facecolor="white")
+        if len(ordered_keys) <= 2:
+            gs = fig.add_gridspec(
+                nrows=2,
+                ncols=len(ordered_keys) + 1,
+                width_ratios=([1.0] * len(ordered_keys)) + [0.05],
+                height_ratios=[1.0, 0.85],
+                wspace=0.14,
+                hspace=0.32,
+            )
+            heat_axes = [fig.add_subplot(gs[0, idx]) for idx in range(len(ordered_keys))]
+            line_ax = fig.add_subplot(gs[1, :len(ordered_keys)], sharex=heat_axes[0])
+            cax = fig.add_subplot(gs[0, len(ordered_keys)])
+        else:
+            gs = fig.add_gridspec(
+                nrows=3,
+                ncols=3,
+                width_ratios=[1.0, 1.0, 0.05],
+                height_ratios=[1.0, 1.0, 0.85],
+                wspace=0.14,
+                hspace=0.32,
+            )
+            heat_axes = [
+                fig.add_subplot(gs[0, 0]),
+                fig.add_subplot(gs[0, 1]),
+                fig.add_subplot(gs[1, 0]),
+                fig.add_subplot(gs[1, 1]),
+            ]
+            line_ax = fig.add_subplot(gs[2, :2], sharex=heat_axes[0])
+            cax = fig.add_subplot(gs[0:2, 2])
+
+        images = []
+        linecut_cols = []
+        x_ref = None
+        for ax, key in zip(heat_axes, ordered_keys):
+            cube = cubes[key]
+            panel_params = HeatmapParams(
+                title=cube.title,
+                xlabel=params.xlabel,
+                ylabel=cube.gate_label,
+                cbar_label=cube.cbar_label,
+                vmin=params.vmin,
+                vmax=params.vmax,
+                xlim=params.xlim,
+                ylim=params.ylim,
+                cmap=params.cmap,
+                log_scale=params.log_scale,
+                center_zero=False,
+                clip_outliers=clip_outliers,
+            )
+            images.append(plot_compare_panel(ax, key, cube, panel_params))
+            gate_used, y = nearest_gate_spectrum(cube, float(gate_value if gate_value is not None else np.nanmedian(cube.gate)))
+            x = np.asarray(cube.energy, float).ravel()
+            x_ref = x if x_ref is None else x_ref
+            line_ax.plot(x, np.asarray(y, float), linewidth=1.3, label=key)
+            linecut_cols.append((key, np.asarray(y, float), float(gate_used)))
+        if images:
+            fig.colorbar(images[0], cax=cax, label=params.cbar_label)
+        line_ax.set_title(
+            "Compare Spectra @ "
+            + ", ".join(f"{key}={gate_used:.6g} V" for key, _y, gate_used in linecut_cols),
+            fontsize=10,
+        )
+        line_ax.set_xlabel(params.xlabel)
+        line_ax.set_ylabel("PL (a.u.)")
+        line_ax.grid(alpha=0.25)
+        line_ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
+        combined_png = _unique_path(out_dir, f"{grid_key}_CompareGrid_{scale_tag}", ".png")
+        fig.savefig(combined_png, dpi=fig.dpi, facecolor=fig.get_facecolor(), edgecolor="none", bbox_inches="tight", pad_inches=0.01)
+        plt.close(fig)
+        written.append(combined_png)
+        if x_ref is not None and linecut_cols:
+            dat_arr = np.column_stack([x_ref] + [col for _key, col, _gate in linecut_cols])
+            header = "\t".join(["PhotonEnergy_eV"] + [key for key, _col, _gate in linecut_cols])
+            linecut_dat = combined_png.with_name(f"{grid_key}_CompareLinecut_{scale_tag}.dat")
+            np.savetxt(linecut_dat, dat_arr, fmt="%.10g", delimiter="\t", header=header, comments="# ")
+            written.append(linecut_dat)
     return written

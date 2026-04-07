@@ -11,6 +11,9 @@ from core.loader import DataCube
 from core.processing import nearest_gate_spectrum
 
 
+COMPARE_PANEL_ORDER = ("KK", "KKp", "KpK", "KpKp")
+
+
 @dataclass
 class HeatmapParams:
     title: str
@@ -112,7 +115,7 @@ def plot_drr(ax: Axes, cube: DataCube, params: HeatmapParams):
 
 def plot_compare_panel(ax: Axes, label: str, cube: DataCube, params: HeatmapParams):
     panel = HeatmapParams(
-        title=f"{label}: {params.title}",
+        title=cube.title,
         xlabel=params.xlabel,
         ylabel=params.ylabel,
         cbar_label=params.cbar_label,
@@ -125,7 +128,21 @@ def plot_compare_panel(ax: Axes, label: str, cube: DataCube, params: HeatmapPara
         center_zero=params.center_zero,
         clip_outliers=params.clip_outliers,
     )
-    return plot_heatmap(ax, cube, panel)
+    im = plot_heatmap(ax, cube, panel)
+    ax.text(
+        0.98,
+        0.98,
+        label,
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=10,
+        fontweight="bold",
+        color="#111",
+        bbox=dict(boxstyle="round,pad=0.22", facecolor="white", edgecolor="none", alpha=0.78),
+        zorder=40,
+    )
+    return im
 
 
 def plot_spectrum(ax: Axes, cube: DataCube, gate_value: float, *, ylabel: str):
@@ -157,7 +174,7 @@ def plot_vp(ax: Axes, energy: np.ndarray, gate: np.ndarray, vp_z: np.ndarray):
 
 
 def render_compare_grid(fig, cubes: Dict[str, DataCube], params: HeatmapParams):
-    keys = list(cubes.keys())
+    keys = [key for key in COMPARE_PANEL_ORDER if key in cubes]
     if len(keys) <= 2:
         axes = fig.subplots(1, len(keys))
         axes = np.atleast_1d(axes)

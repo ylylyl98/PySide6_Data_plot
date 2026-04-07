@@ -1,0 +1,120 @@
+from __future__ import annotations
+
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
+
+from core import data_io
+import core.loader as loader
+import core.processing_run as processing_run
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "y_axis"
+
+
+class CanonicalYAxisResolutionTests(unittest.TestCase):
+    def test_auto_ratio_from_structured_metadata(self) -> None:
+        d = processing_run._load_canonical(str(FIXTURES), "sample$0.9TG+BG$.csv", y_axis="auto")
+        expected = np.array([8.8, 8.9, 9.0])
+        self.assertTrue(np.allclose(d["gate_axis"], expected))
+        self.assertEqual(d["gate_label"], "0.9TG-BG (V)")
+
+    def test_auto_ratio_from_stem_fallback(self) -> None:
+        d = processing_run._load_canonical(str(FIXTURES), "sample_0.9TG+BG_scan.csv", y_axis="auto")
+        expected = np.array([8.8, 8.9, 9.0])
+        self.assertTrue(np.allclose(d["gate_axis"], expected))
+        self.assertEqual(d["gate_label"], "0.9TG-BG (V)")
+
+    def test_metadata_has_priority_over_stem_fallback(self) -> None:
+        d = processing_run._load_canonical(str(FIXTURES), "device$bgonly$_0.9TG+BG_scan.csv", y_axis="auto")
+        self.assertTrue(np.allclose(d["gate_axis"], np.array([0.0, 1.0, 2.0])))
+        self.assertEqual(d["gate_label"], "BG (V)")
+
+    def test_auto_tgonly_from_stem(self) -> None:
+        d = processing_run._load_canonical(str(FIXTURES), "deviceA_tgonly_5K.csv", y_axis="auto")
+        self.assertTrue(np.allclose(d["gate_axis"], np.array([10.0, 11.0, 12.0])))
+        self.assertEqual(d["gate_label"], "TG (V)")
+
+    def test_auto_bgonly_from_stem(self) -> None:
+        d = processing_run._load_canonical(str(FIXTURES), "run3_bgonly_repeat.csv", y_axis="auto")
+        self.assertTrue(np.allclose(d["gate_axis"], np.array([0.0, 1.0, 2.0])))
+        self.assertEqual(d["gate_label"], "BG (V)")
+
+    def test_auto_legacy_fallback_when_no_match(self) -> None:
+        d = processing_run._load_canonical(str(FIXTURES), "plain_scan.csv", y_axis="auto")
+        self.assertTrue(np.allclose(d["gate_axis"], np.array([10.0, 11.0, 12.0])))
+        self.assertEqual(d["gate_label"], "Top gate (V)")
+
+    def test_manual_tg(self) -> None:
+        d = processing_run._load_canonical(str(FIXTURES), "plain_scan.csv", y_axis="tg")
+        self.assertTrue(np.allclose(d["gate_axis"], np.array([10.0, 11.0, 12.0])))
+        self.assertEqual(d["gate_label"], "TG (V)")
+
+    def test_manual_bg(self) -> None:
+        d = processing_run._load_canonical(str(FIXTURES), "plain_scan.csv", y_axis="bg")
+        self.assertTrue(np.allclose(d["gate_axis"], np.array([0.0, 1.0, 2.0])))
+        self.assertEqual(d["gate_label"], "BG (V)")
+
+    def test_manual_bias(self) -> None:
+        d = processing_run._load_canonical(str(FIXTURES), "plain_scan.csv", y_axis="bias")
+        self.assertTrue(np.allclose(d["gate_axis"], np.array([0.2, 0.3, 0.4])))
+        self.assertEqual(d["gate_label"], "Bias (V)")
+
+    def test_manual_linear_combination(self) -> None:
+        d = processing_run._load_canonical(str(FIXTURES), "plain_scan.csv", y_axis="linear:0.9,-1,0")
+        expected = np.array([8.8, 8.9, 9.0])
+        self.assertTrue(np.allclose(d["gate_axis"], expected))
+        self.assertEqual(d["gate_label"], "0.9TG-BG (V)")
+
+    def test_manual_bias_missing_column_raises(self) -> None:
+        with self.assertRaisesRegex(ValueError, "no bias column exists"):
+            processing_run._load_canonical(str(FIXTURES), "plain_no_bias.csv", y_axis="bias")
+
+
+class SharedPipelinePropagationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        for fn in (loader._peek_y_axis_options_cached, loader._load_pl_cached):
+            clear = getattr(fn, "cache_clear", None)
+            if callable(clear):
+                clear()
+
+    def test_pl_loader_uses_shared_y_axis_override(self) -> None:
+        with patch.object(loader.P, "process_pl") as mock_process:
+            mock_process.return_value = {
+                "energy": np.array([1.0, 2.0]),
+                "gate_axis": np.array([0.0, 1.0]),
+                "Z": np.array([[1.0, 2.0], [3.0, 4.0]]),
+                "gate_label": "TG (V)",
+                "title": "Title",
+            }
+            loader.load_pl(str(Path(__file__).resolve().parent / "fixtures"), "sample.csv", y_axis="tg")
+            self.assertEqual(mock_process.call_args.kwargs["y_axis"], "tg")
+
+    def test_drr_loader_uses_shared_y_axis_override(self) -> None:
+        with patch.object(loader.P, "process_ref_avg") as mock_process:
+            mock_process.return_value = {
+                "energy": np.array([1.0, 2.0]),
+                "gate_axis": np.array([0.0, 1.0]),
+                "Z_out": np.array([[1.0, 2.0], [3.0, 4.0]]),
+                "gate_label": "BG (V)",
+                "title": "DRR",
+            }
+            loader.load_drr_avg("folder", ["a.csv"], bg_mode="self_last", y_axis="bg")
+        self.assertEqual(mock_process.call_args.kwargs["y_axis"], "bg")
+
+    def test_compare_loader_propagates_y_axis_to_each_cube(self) -> None:
+        selection = data_io.CompareSelection(kk="a.csv", kkp="b.csv")
+        with patch("core.data_io.load_pl") as mock_load_pl:
+            mock_load_pl.side_effect = [
+                loader.DataCube(np.array([1.0]), np.array([0.0]), np.array([[1.0]]), "TG (V)", "A", "PL"),
+                loader.DataCube(np.array([1.0]), np.array([0.0]), np.array([[1.0]]), "TG (V)", "B", "PL"),
+            ]
+            data_io.load_compare_cubes("folder", selection, y_axis="tg")
+        calls = mock_load_pl.call_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(call.kwargs["y_axis"] == "tg" for call in calls))
+
+
+if __name__ == "__main__":
+    unittest.main()

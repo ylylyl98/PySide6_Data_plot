@@ -109,6 +109,340 @@ def _extract_tg_bg_ratio(tag: str) -> Optional[float]:
     m = re.match(r"\s*([0-9]*\.?[0-9]+)\s*TG\s*([+-])\s*BG", tag, flags=re.I)
     return float(m.group(1)) if m else None
 
+
+def _format_coeff(value: float) -> str:
+    if not np.isfinite(value):
+        raise ValueError("Coefficient must be finite.")
+    rounded = round(float(value), 12)
+    if abs(rounded - round(rounded)) < 1e-12:
+        return str(int(round(rounded)))
+    return format(rounded, ".12g")
+
+
+def _format_ratio_label(ratio: float) -> str:
+    if not np.isfinite(ratio):
+        raise ValueError("Ratio must be finite.")
+    if abs(float(ratio) - 1.0) < 1e-12:
+        return ""
+    return _format_coeff(float(ratio))
+
+
+def _build_ratio_tg_minus_bg_label(ratio: float) -> str:
+    prefix = _format_ratio_label(ratio)
+    return f"{prefix}TG-BG (V)" if prefix else "TG-BG (V)"
+
+
+def _build_linear_combo_label(a: float, b: float, c: float = 0.0) -> str:
+    if not all(np.isfinite(v) for v in (a, b, c)):
+        raise ValueError("Linear-combination coefficients must be finite.")
+
+    if abs(a) < 1e-12 and abs(b) < 1e-12:
+        return f"y = {_format_coeff(c)} (V)"
+
+    if abs(c) < 1e-12:
+        if abs(a - 1.0) < 1e-12 and abs(b) < 1e-12:
+            return "TG (V)"
+        if abs(b - 1.0) < 1e-12 and abs(a) < 1e-12:
+            return "BG (V)"
+        if abs(b + 1.0) < 1e-12 and abs(a) > 1e-12:
+            return _build_ratio_tg_minus_bg_label(a)
+        if abs(a - 1.0) < 1e-12 and abs(b - 1.0) < 1e-12:
+            return "TG+BG (V)"
+
+    terms: list[str] = []
+    for coeff, symbol in ((a, "TG"), (b, "BG")):
+        if abs(coeff) < 1e-12:
+            continue
+        sign = "-" if coeff < 0 else "+"
+        mag = abs(float(coeff))
+        if abs(mag - 1.0) < 1e-12:
+            piece = symbol
+        else:
+            piece = f"{_format_coeff(mag)}*{symbol}"
+        if not terms:
+            terms.append(piece if sign == "+" else f"-{piece}")
+        else:
+            terms.append(f"{sign}{piece}")
+    if abs(c) >= 1e-12:
+        c_sign = "-" if c < 0 else "+"
+        c_piece = _format_coeff(abs(float(c)))
+        if not terms:
+            terms.append(c_piece if c_sign == "+" else f"-{c_piece}")
+        else:
+            terms.append(f"{c_sign}{c_piece}")
+    return f"y = {''.join(terms)} (V)"
+
+
+def _parse_axis_request(y_axis) -> Tuple[str, Optional[Tuple[float, float, float]]]:
+    if y_axis is None:
+        return "auto", None
+    if isinstance(y_axis, (tuple, list)) and len(y_axis) == 3:
+        a, b, c = (float(y_axis[0]), float(y_axis[1]), float(y_axis[2]))
+        if not all(np.isfinite(v) for v in (a, b, c)):
+            raise ValueError("Linear-combination coefficients must be finite.")
+        return "linear", (a, b, c)
+
+    text = str(y_axis).strip()
+    lowered = text.lower()
+    aliases = {
+        "auto": "auto",
+        "default": "auto",
+        "vtg": "tg",
+        "tg": "tg",
+        "vbg": "bg",
+        "bg": "bg",
+        "vbias": "bias",
+        "bias": "bias",
+        "tg+bg": "legacy_tg_plus_bg",
+        "tg-bg": "legacy_tg_minus_bg",
+    }
+    if lowered in aliases:
+        return aliases[lowered], None
+    if lowered.startswith("linear:"):
+        parts = [p.strip() for p in text.split(":", 1)[1].split(",")]
+        if len(parts) not in (2, 3):
+            raise ValueError("Linear y-axis must be encoded as 'linear:a,b' or 'linear:a,b,c'.")
+        coeffs = [float(p) for p in parts]
+        if len(coeffs) == 2:
+            coeffs.append(0.0)
+        if not all(np.isfinite(v) for v in coeffs):
+            raise ValueError("Linear-combination coefficients must be finite.")
+        return "linear", (coeffs[0], coeffs[1], coeffs[2])
+    return text, None
+
+
+def _extract_gate_tokens(name: str) -> list[str]:
+    return [seg.strip() for seg in re.findall(r"\$(.*?)\$", name) if str(seg).strip()]
+
+
+def _match_gate_mode_token(text: str) -> Optional[Dict[str, float | str]]:
+    token = str(text or "").strip()
+    if not token:
+        return None
+
+    m = re.match(r"^\s*(?:(\d+(?:\.\d+)?)\s*)?TG\s*\+\s*BG\s*$", token, flags=re.I)
+    if m:
+        ratio = float(m.group(1)) if m.group(1) is not None else 1.0
+        return {"mode": "ratio_tg_plus_bg", "ratio": ratio}
+
+    if re.match(r"^\s*TGONLY\s*$", token, flags=re.I):
+        return {"mode": "tgonly", "ratio": 1.0}
+
+    if re.match(r"^\s*BGONLY\s*$", token, flags=re.I):
+        return {"mode": "bgonly", "ratio": 1.0}
+
+    return None
+
+
+def _find_gate_mode_in_segments(parts: Sequence[str]) -> Optional[Dict[str, float | str]]:
+    for part in parts:
+        match = _match_gate_mode_token(part)
+        if match is not None:
+            return match
+    return None
+
+
+def _find_gate_mode_in_stem(stem: str) -> Optional[Dict[str, float | str]]:
+    bounded = f" {stem or ''} "
+    patterns = (
+        (re.compile(r"(?i)(?<![A-Za-z0-9])((?:\d+(?:\.\d+)?)?\s*TG\s*\+\s*BG)(?![A-Za-z0-9])"), "ratio"),
+        (re.compile(r"(?i)(?<![A-Za-z0-9])TGONLY(?![A-Za-z0-9])"), "tgonly"),
+        (re.compile(r"(?i)(?<![A-Za-z0-9])BGONLY(?![A-Za-z0-9])"), "bgonly"),
+    )
+    for rx, kind in patterns:
+        m = rx.search(bounded)
+        if not m:
+            continue
+        if kind == "ratio":
+            return _match_gate_mode_token(m.group(1))
+        if kind == "tgonly":
+            return {"mode": "tgonly", "ratio": 1.0}
+        return {"mode": "bgonly", "ratio": 1.0}
+    return None
+
+
+def _legacy_gate_resolution(
+    *,
+    vbg: np.ndarray,
+    vtg: np.ndarray,
+    vbias: Optional[np.ndarray],
+    parts: Sequence[str],
+) -> Dict[str, object]:
+    def _is_constant(v, atol=1e-12, rtol=1e-9):
+        v = np.asarray(v, float)
+        if v.size == 0:
+            return True
+        finite = v[np.isfinite(v)]
+        if finite.size == 0:
+            return True
+        vmin, vmax = np.min(finite), np.max(finite)
+        span = vmax - vmin
+        return (span <= atol) or (span <= rtol * max(1.0, abs(vmin), abs(vmax)))
+
+    def _is_varying(v) -> bool:
+        if v is None:
+            return False
+        v = np.asarray(v, float)
+        if v.size == 0:
+            return False
+        return not _is_constant(v)
+
+    axes = {
+        "Vbg": np.asarray(vbg, float),
+        "Vtg": np.asarray(vtg, float),
+    }
+    if vbias is not None:
+        axes["Vbias"] = np.asarray(vbias, float)
+
+    available_axes = ["Vbg", "Vtg"]
+    if _is_varying(axes.get("Vbias")):
+        available_axes.append("Vbias")
+
+    bg_const = _is_constant(vbg)
+    tg_const = _is_constant(vtg)
+    vbias_var = _is_varying(axes.get("Vbias"))
+
+    default_axis = None
+    default_label = None
+
+    if vbias_var and bg_const and tg_const:
+        default_axis = "Vbias"
+        default_label = "Bias (V)"
+    elif (not bg_const) and tg_const:
+        default_axis = "Vbg"
+        default_label = "Back gate (V)"
+    elif (not tg_const) and bg_const:
+        default_axis = "Vtg"
+        default_label = "Top gate (V)"
+    else:
+        gate_tag = next((p for p in parts if ("TG" in p or "BG" in p)), "")
+        ratio = _extract_tg_bg_ratio(gate_tag) or 1.0
+        if "TG+BG" in gate_tag:
+            axes["TG+BG"] = ratio * axes["Vtg"] - axes["Vbg"]
+            available_axes.append("TG+BG")
+            default_axis = "TG+BG"
+            default_label = f"{ratio}Tg-Bg (V)"
+        elif "TG-BG" in gate_tag:
+            axes["TG-BG"] = ratio * axes["Vtg"] + axes["Vbg"]
+            available_axes.append("TG-BG")
+            default_axis = "TG-BG"
+            default_label = f"{ratio}Tg+Bg (V)"
+        else:
+            default_axis = "Vtg"
+            default_label = "Top gate (V)"
+
+    return {
+        "axes": axes,
+        "available_axes": available_axes,
+        "default_axis": default_axis,
+        "default_label": default_label,
+    }
+
+
+def _resolve_axis_choice(
+    *,
+    y_axis,
+    vbg: np.ndarray,
+    vtg: np.ndarray,
+    vbias: Optional[np.ndarray],
+    parts: Sequence[str],
+    stem: str,
+) -> Dict[str, object]:
+    legacy = _legacy_gate_resolution(vbg=vbg, vtg=vtg, vbias=vbias, parts=parts)
+    axes = dict(legacy["axes"])
+    available_axes = list(legacy["available_axes"])
+    default_axis = str(legacy["default_axis"])
+    default_label = legacy["default_label"]
+
+    request_mode, linear_coeffs = _parse_axis_request(y_axis)
+
+    if request_mode == "auto":
+        auto_match = _find_gate_mode_in_segments(parts) or _find_gate_mode_in_stem(stem)
+        if auto_match is not None:
+            mode = str(auto_match["mode"])
+            if mode == "ratio_tg_plus_bg":
+                ratio = float(auto_match.get("ratio", 1.0))
+                gate_axis = ratio * np.asarray(vtg, float) - np.asarray(vbg, float)
+                gate_label = _build_ratio_tg_minus_bg_label(ratio)
+                if "TG+BG" not in available_axes:
+                    available_axes.append("TG+BG")
+                return {
+                    "gate_axis": gate_axis,
+                    "gate_label": gate_label,
+                    "available_axes": available_axes,
+                    "default_axis": "TG+BG",
+                }
+            if mode == "tgonly":
+                return {
+                    "gate_axis": np.asarray(vtg, float),
+                    "gate_label": "TG (V)",
+                    "available_axes": available_axes,
+                    "default_axis": "Vtg",
+                }
+            if mode == "bgonly":
+                return {
+                    "gate_axis": np.asarray(vbg, float),
+                    "gate_label": "BG (V)",
+                    "available_axes": available_axes,
+                    "default_axis": "Vbg",
+                }
+        request_mode = default_axis
+
+    if request_mode == "tg":
+        return {
+            "gate_axis": np.asarray(vtg, float),
+            "gate_label": "TG (V)",
+            "available_axes": available_axes,
+            "default_axis": "tg",
+        }
+    if request_mode == "bg":
+        return {
+            "gate_axis": np.asarray(vbg, float),
+            "gate_label": "BG (V)",
+            "available_axes": available_axes,
+            "default_axis": "bg",
+        }
+    if request_mode == "bias":
+        if vbias is None:
+            raise ValueError("Bias y-axis requested but no bias column exists in the loaded file.")
+        return {
+            "gate_axis": np.asarray(vbias, float),
+            "gate_label": "Bias (V)",
+            "available_axes": available_axes,
+            "default_axis": "bias",
+        }
+    if request_mode == "linear":
+        if linear_coeffs is None:
+            raise ValueError("Linear y-axis requested without coefficients.")
+        a, b, c = linear_coeffs
+        return {
+            "gate_axis": a * np.asarray(vtg, float) + b * np.asarray(vbg, float) + c,
+            "gate_label": _build_linear_combo_label(a, b, c),
+            "available_axes": available_axes,
+            "default_axis": "linear",
+        }
+
+    chosen = str(request_mode)
+    if chosen not in axes:
+        raise ValueError(f"Requested y_axis='{chosen}' not available. Have: {sorted(axes.keys())}")
+
+    gate_axis = np.asarray(axes[chosen], float)
+    if chosen == "Vbg":
+        gate_label = "Back gate (V)"
+    elif chosen == "Vtg":
+        gate_label = "Top gate (V)"
+    elif chosen == "Vbias":
+        gate_label = "Bias (V)"
+    else:
+        gate_label = default_label or chosen
+
+    return {
+        "gate_axis": gate_axis,
+        "gate_label": gate_label,
+        "available_axes": available_axes,
+        "default_axis": default_axis,
+    }
+
 def _require_csv_in_root(user_folder: Path, origin_name: str) -> Path:
     """Load ONLY from the root folder; do not search subfolders."""
     fname = Path(origin_name).name
@@ -1040,96 +1374,18 @@ def _load_canonical(user_folder: str, origin_name: str, *, y_axis: str = "auto")
             energy = energy[::-1]
             Z_gateE = Z_gateE[:, ::-1]
 
-    # --------------------------
-    # Decide Y axis (same logic as your original)
-    # --------------------------
-    def _is_constant(v, atol=1e-12, rtol=1e-9):
-        v = np.asarray(v, float)
-        if v.size == 0:
-            return True
-        finite = v[np.isfinite(v)]
-        if finite.size == 0:
-            return True
-        vmin, vmax = np.min(finite), np.max(finite)
-        span = vmax - vmin
-        return (span <= atol) or (span <= rtol * max(1.0, abs(vmin), abs(vmax)))
-
-    def _is_varying(v) -> bool:
-        if v is None:
-            return False
-        v = np.asarray(v, float)
-        if v.size == 0:
-            return False
-        return not _is_constant(v)
-
-    # build axis candidates
-    axes = {
-        "Vbg": np.asarray(vbg, float),
-        "Vtg": np.asarray(vtg, float),
-    }
-    if vbias is not None:
-        axes["Vbias"] = np.asarray(vbias, float)
-
-    # only offer Vbias if it actually varies
-    available_axes = ["Vbg", "Vtg"]
-    if _is_varying(axes.get("Vbias")):
-        available_axes.append("Vbias")
-
-    # ---- AUTO default axis ----
-    bg_const = _is_constant(vbg)
-    tg_const = _is_constant(vtg)
-    vbias_var = _is_varying(axes.get("Vbias"))
-
-    default_axis = None
-    default_label = None
-
-    if vbias_var and bg_const and tg_const:
-        # NEW: bias varies but gates are constant -> use Vbias by default
-        default_axis = "Vbias"
-        default_label = "Bias (V)"
-    elif (not bg_const) and tg_const:
-        default_axis = "Vbg"
-        default_label = "Back gate (V)"
-    elif (not tg_const) and bg_const:
-        default_axis = "Vtg"
-        default_label = "Top gate (V)"
-    else:
-        # fallback to your existing tag-based combined axis logic
-        gate_tag = next((p for p in parts if ("TG" in p or "BG" in p)), "")
-        ratio = _extract_tg_bg_ratio(gate_tag) or 1.0
-        if "TG+BG" in gate_tag:
-            axes["TG+BG"] = ratio * axes["Vtg"] - axes["Vbg"]
-            available_axes.append("TG+BG")
-            default_axis = "TG+BG"
-            default_label = f"{ratio}Tg-Bg (V)"
-        elif "TG-BG" in gate_tag:
-            axes["TG-BG"] = ratio * axes["Vtg"] + axes["Vbg"]
-            available_axes.append("TG-BG")
-            default_axis = "TG-BG"
-            default_label = f"{ratio}Tg+Bg (V)"
-        else:
-            default_axis = "Vtg"
-            default_label = "Top gate (V)"
-
-    # ---- choose axis with override ----
-    # IMPORTANT: add y_axis parameter to _load_canonical signature, default "auto"
-    # def _load_canonical(..., y_axis: str = "auto") -> Dict:
-
-    chosen = default_axis if (y_axis is None or str(y_axis).lower() == "auto") else str(y_axis)
-
-    if chosen not in axes:
-        raise ValueError(f"Requested y_axis='{chosen}' not available. Have: {sorted(axes.keys())}")
-
-    gate_axis = np.asarray(axes[chosen], float)
-
-    if chosen == "Vbg":
-        gate_label = "Back gate (V)"
-    elif chosen == "Vtg":
-        gate_label = "Top gate (V)"
-    elif chosen == "Vbias":
-        gate_label = "Bias (V)"
-    else:
-        gate_label = default_label or chosen
+    resolved = _resolve_axis_choice(
+        y_axis=y_axis,
+        vbg=vbg,
+        vtg=vtg,
+        vbias=vbias,
+        parts=parts,
+        stem=stem,
+    )
+    gate_axis = np.asarray(resolved["gate_axis"], float)
+    gate_label = str(resolved["gate_label"])
+    available_axes = list(resolved["available_axes"])
+    default_axis = str(resolved["default_axis"])
 
     # canonicalize gate increasing
     if gate_axis[0] > gate_axis[-1]:
@@ -1157,6 +1413,7 @@ def process_pl(
     user_folder: str,
     file: str,
     *,
+    y_axis: str = "auto",
     processed_subfolder: str = "Processed Data",
     plot_interactive: bool = False,
     clim=None, xlim=None, ylim=None,
@@ -1170,7 +1427,7 @@ def process_pl(
     linear_first: bool = True,
     interactive_window_px: tuple[int,int] = (1000, 720)
 ) -> dict:
-    d = _load_canonical(user_folder, file)
+    d = _load_canonical(user_folder, file, y_axis=y_axis)
     energy, gate, Z = d["energy"], d["gate_axis"], d["Z"]
     gate_label, title, stem = d["gate_label"], d["title_name"], d["stem"]
     p_user = Path(user_folder)

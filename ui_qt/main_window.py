@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import traceback
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,7 +56,7 @@ from core.export_legacy import (
     export_pl_pngs_and_dat,
 )
 from core.loader import DataCube
-from core.plotting import HeatmapParams, plot_drr, plot_pl, render_compare_grid
+from core.plotting import COMPARE_PANEL_ORDER, HeatmapParams, plot_compare_panel, plot_drr, plot_pl, render_compare_grid
 from core.processing import (
     apply_sg_derivative_energy,
     clamp_sg_window,
@@ -94,6 +95,7 @@ class LoadedState:
     drr_derivative_label: str = "None"
     drr_baseline_text: str = "Self (last frame)"
     drr_baseline_which: str = "last"
+    y_axis_spec: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -106,6 +108,8 @@ class LoadOptions:
     drr_baseline_text: str
     drr_baseline_which: str
     compare_log_scale: bool
+    y_axis_spec: str = "auto"
+    compare_sources: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -118,6 +122,7 @@ class ExportOptions:
     drr_derivative_label: str = "None"
     compare_scale_tag: str = "linear"
     compare_clip: bool = True
+    compare_gate: float = 0.0
     auto_move_sources: bool = False
 
 
@@ -167,8 +172,12 @@ class MainWindow(QMainWindow):
         self._drr_spectrum_ax = None
         self._pl_heatmap_ax = None
         self._pl_spectrum_ax = None
+        self._cmp_heatmap_axes: dict[str, Any] = {}
+        self._cmp_gate_lines: dict[str, Any] = {}
+        self._cmp_linecut_ax = None
         self._pl_last_plot_cube: DataCube | None = None
         self._gate_line = None
+        self._pl_gate_line = None
         self._gate_motion_cid: int | None = None
         self._gate_click_cid: int | None = None
         self._suspend_drr_autoplot = False
@@ -249,7 +258,7 @@ class MainWindow(QMainWindow):
         steps_label.setWordWrap(False)
         layout.addWidget(steps_label)
 
-        folder_box = QGroupBox("Data Source")
+        folder_box = QGroupBox("")
         folder_grid = QGridLayout(folder_box)
         self.folder_edit = QLineEdit()
         self.folder_edit.setReadOnly(True)
@@ -260,7 +269,7 @@ class MainWindow(QMainWindow):
         folder_grid.addWidget(self.browse_btn, 1, 0)
         folder_grid.addWidget(self.open_file_btn, 1, 1)
         folder_grid.addWidget(self.refresh_btn, 1, 2)
-        layout.addWidget(folder_box)
+        layout.addWidget(self._make_expander("Data Source", folder_box, expanded=True))
 
         self.tabs = QTabWidget()
         # Keep DRR tab non-scrollable: do not wrap this panel or parameters in QScrollArea.
@@ -369,6 +378,59 @@ class MainWindow(QMainWindow):
         setattr(self, f"{prefix}_fix_checks", fix_checks)
         return grid, spins, log_chk, clip_chk, cmap, fix_checks
 
+    def _build_y_axis_controls(self, prefix: str) -> QWidget:
+        host = QWidget()
+        layout = QVBoxLayout(host)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        combo = QComboBox()
+        combo.addItems(["Auto / Default", "TG", "BG", "Bias", "Advanced..."])
+        combo.setToolTip("Choose how the plot y-axis is derived from gate variables.")
+        self._style_combo_popup(combo)
+
+        advanced = QGroupBox("Advanced Linear Combination")
+        advanced_form = QFormLayout(advanced)
+        advanced_form.setContentsMargins(6, 6, 6, 6)
+        advanced_form.setHorizontalSpacing(6)
+        advanced_form.setVerticalSpacing(4)
+
+        def coeff_spin(default_value: float) -> QDoubleSpinBox:
+            spin = QDoubleSpinBox()
+            spin.setDecimals(6)
+            spin.setRange(-1e6, 1e6)
+            spin.setSingleStep(0.1)
+            spin.setValue(default_value)
+            spin.setFixedWidth(100)
+            return spin
+
+        a_spin = coeff_spin(1.0)
+        b_spin = coeff_spin(-1.0)
+        c_spin = coeff_spin(0.0)
+        equation = QLabel("")
+        label_preview = QLabel("")
+        equation.setWordWrap(True)
+        label_preview.setWordWrap(True)
+
+        advanced_form.addRow("a (TG)", a_spin)
+        advanced_form.addRow("b (BG)", b_spin)
+        advanced_form.addRow("c", c_spin)
+        advanced_form.addRow("Equation", equation)
+        advanced_form.addRow("Label", label_preview)
+        advanced.setVisible(False)
+
+        layout.addWidget(combo)
+        layout.addWidget(advanced)
+
+        setattr(self, f"{prefix}_yaxis_combo", combo)
+        setattr(self, f"{prefix}_yaxis_advanced_box", advanced)
+        setattr(self, f"{prefix}_yaxis_a_spin", a_spin)
+        setattr(self, f"{prefix}_yaxis_b_spin", b_spin)
+        setattr(self, f"{prefix}_yaxis_c_spin", c_spin)
+        setattr(self, f"{prefix}_yaxis_equation_lbl", equation)
+        setattr(self, f"{prefix}_yaxis_label_lbl", label_preview)
+        return host
+
     def _build_pl_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -383,11 +445,74 @@ class MainWindow(QMainWindow):
         params = QGroupBox("")
         params_layout = QVBoxLayout(params)
         cfg = QFormLayout()
-        grid, _, _, _, cmap, _ = self._build_common_range_grid("pl")
+        grid, spins, _, _, cmap, fix_checks = self._build_common_range_grid("pl")
         cmap.setCurrentText("turbo")
+        self.pl_yaxis_controls = self._build_y_axis_controls("pl")
+        cfg.addRow("Y-axis Source", self.pl_yaxis_controls)
         cfg.addRow("Colormap", cmap)
         params_layout.addLayout(cfg)
-        params_layout.addLayout(grid)
+        for s in spins.values():
+            s.setFixedWidth(UI_METRICS["spin_w"])
+            s.setFixedHeight(UI_METRICS["input_h"])
+
+        def pair_auto_row(
+            a: QDoubleSpinBox,
+            b: QDoubleSpinBox,
+            fa: QCheckBox,
+            fb: QCheckBox,
+            auto_btn: QToolButton,
+            auto_text: str,
+        ) -> QWidget:
+            auto_btn.setText(auto_text)
+            auto_btn.setAutoRaise(True)
+            auto_btn.setFixedWidth(UI_METRICS["tool_w"])
+            auto_btn.setFixedHeight(UI_METRICS["tool_h"])
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(4)
+            h.addWidget(a)
+            h.addWidget(fa)
+            h.addWidget(b)
+            h.addWidget(fb)
+            h.addWidget(auto_btn)
+            h.addStretch(1)
+            return row
+
+        self.pl_auto_v_btn = QToolButton()
+        self.pl_auto_x_btn = QToolButton()
+        self.pl_auto_y_btn = QToolButton()
+
+        basic = QGroupBox("Basic")
+        basic_form = QFormLayout(basic)
+        basic_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
+        basic_form.setHorizontalSpacing(4)
+        basic_form.setVerticalSpacing(UI_METRICS["row_spacing"])
+        basic_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        basic_form.addRow(
+            "vmin / vmax",
+            pair_auto_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.pl_auto_v_btn, "Auto V"),
+        )
+        basic_form.addRow(
+            "xmin / xmax",
+            pair_auto_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.pl_auto_x_btn, "Auto X"),
+        )
+        basic_form.addRow(
+            "ymin / ymax",
+            pair_auto_row(spins["ymin"], spins["ymax"], fix_checks["ymin"], fix_checks["ymax"], self.pl_auto_y_btn, "Auto Y"),
+        )
+        basic_form.addRow("Cursor Gate", spins["gate"])
+        flags = QWidget()
+        flags_h = QHBoxLayout(flags)
+        flags_h.setContentsMargins(0, 0, 0, 0)
+        flags_h.setSpacing(10)
+        flags_h.addWidget(self.pl_log_chk)
+        flags_h.addWidget(self.pl_clip_chk)
+        flags_h.addStretch(1)
+        basic_form.addRow("Scale / Clip", flags)
+        self._set_form_label_width(basic_form, UI_METRICS["label_col_width"])
+
+        params_layout.addWidget(basic)
 
         analysis = QGroupBox("")
         analysis_form = QFormLayout(analysis)
@@ -537,6 +662,7 @@ class MainWindow(QMainWindow):
         self.drr_baseline_combo.setMaximumWidth(210)
         self.drr_baseline_combo.setFixedHeight(UI_METRICS["input_h"])
         self.drr_baseline_combo.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.drr_yaxis_controls = self._build_y_axis_controls("drr")
         cmap.setMinimumWidth(110)
         cmap.setMaximumWidth(145)
         cmap.setFixedHeight(UI_METRICS["input_h"])
@@ -621,6 +747,7 @@ class MainWindow(QMainWindow):
         baseline_cmap_h.addWidget(QLabel("Colormap"))
         baseline_cmap_h.addWidget(cmap)
         basic_form.addRow("DRR Baseline", baseline_cmap_row)
+        basic_form.addRow("Y-axis Source", self.drr_yaxis_controls)
         basic_form.addRow("Derivative / SG", deriv_row)
         basic_form.addRow(
             "vmin / vmax",
@@ -745,6 +872,85 @@ class MainWindow(QMainWindow):
             "QListView { selection-background-color: #2d6cdf; selection-color: #ffffff; }"
         )
 
+    def _format_axis_coeff(self, value: float) -> str:
+        if not np.isfinite(value):
+            raise ValueError("Coefficient must be finite.")
+        rounded = round(float(value), 12)
+        if abs(rounded - round(rounded)) < 1e-12:
+            return str(int(round(rounded)))
+        return format(rounded, ".12g")
+
+    def _manual_y_axis_label(self, a: float, b: float, c: float) -> str:
+        if not all(np.isfinite(v) for v in (a, b, c)):
+            raise ValueError("Coefficients must be finite.")
+        if abs(c) < 1e-12:
+            if abs(a - 1.0) < 1e-12 and abs(b) < 1e-12:
+                return "TG (V)"
+            if abs(b - 1.0) < 1e-12 and abs(a) < 1e-12:
+                return "BG (V)"
+            if abs(b + 1.0) < 1e-12 and abs(a - 1.0) < 1e-12:
+                return "TG-BG (V)"
+            if abs(b + 1.0) < 1e-12:
+                ratio = self._format_axis_coeff(a)
+                return f"{ratio}TG-BG (V)" if ratio != "1" else "TG-BG (V)"
+        terms: list[str] = []
+        for coeff, symbol in ((a, "TG"), (b, "BG")):
+            if abs(coeff) < 1e-12:
+                continue
+            sign = "-" if coeff < 0 else "+"
+            mag = abs(float(coeff))
+            piece = symbol if abs(mag - 1.0) < 1e-12 else f"{self._format_axis_coeff(mag)}*{symbol}"
+            if not terms:
+                terms.append(piece if sign == "+" else f"-{piece}")
+            else:
+                terms.append(f"{sign}{piece}")
+        if abs(c) >= 1e-12:
+            c_piece = self._format_axis_coeff(abs(float(c)))
+            sign = "-" if c < 0 else "+"
+            if not terms:
+                terms.append(c_piece if sign == "+" else f"-{c_piece}")
+            else:
+                terms.append(f"{sign}{c_piece}")
+        return f"y = {''.join(terms)} (V)"
+
+    def _update_y_axis_controls(self, prefix: str) -> None:
+        combo: QComboBox = getattr(self, f"{prefix}_yaxis_combo")
+        advanced_box: QGroupBox = getattr(self, f"{prefix}_yaxis_advanced_box")
+        a_spin: QDoubleSpinBox = getattr(self, f"{prefix}_yaxis_a_spin")
+        b_spin: QDoubleSpinBox = getattr(self, f"{prefix}_yaxis_b_spin")
+        c_spin: QDoubleSpinBox = getattr(self, f"{prefix}_yaxis_c_spin")
+        equation_lbl: QLabel = getattr(self, f"{prefix}_yaxis_equation_lbl")
+        label_lbl: QLabel = getattr(self, f"{prefix}_yaxis_label_lbl")
+        advanced_on = combo.currentText() == "Advanced..."
+        advanced_box.setVisible(advanced_on)
+        a = float(a_spin.value())
+        b = float(b_spin.value())
+        c = float(c_spin.value())
+        equation_lbl.setText(
+            f"y = {self._format_axis_coeff(a)}*TG + {self._format_axis_coeff(b)}*BG + {self._format_axis_coeff(c)}"
+        )
+        label_lbl.setText(self._manual_y_axis_label(a, b, c))
+
+    def _selected_y_axis_spec(self, prefix: str) -> str:
+        combo: QComboBox = getattr(self, f"{prefix}_yaxis_combo")
+        text = combo.currentText()
+        if text == "Auto / Default":
+            return "auto"
+        if text == "TG":
+            return "tg"
+        if text == "BG":
+            return "bg"
+        if text == "Bias":
+            return "bias"
+        if text == "Advanced...":
+            a = float(getattr(self, f"{prefix}_yaxis_a_spin").value())
+            b = float(getattr(self, f"{prefix}_yaxis_b_spin").value())
+            c = float(getattr(self, f"{prefix}_yaxis_c_spin").value())
+            if not all(np.isfinite(v) for v in (a, b, c)):
+                raise ValueError("Manual linear-combination coefficients must be finite.")
+            return f"linear:{self._format_axis_coeff(a)},{self._format_axis_coeff(b)},{self._format_axis_coeff(c)}"
+        raise ValueError(f"Unknown y-axis selection: {text}")
+
     def _make_expander(self, title: str, content: QWidget, *, expanded: bool = True) -> QWidget:
         box = QWidget()
         v = QVBoxLayout(box)
@@ -786,19 +992,309 @@ class MainWindow(QMainWindow):
         self.cmp_files = QListWidget()
         self.cmp_files.setSelectionMode(QAbstractItemView.ExtendedSelection)
         files_layout.addWidget(self.cmp_files)
-        layout.addWidget(self._make_expander("Compare Files (2-4)", files, expanded=True))
+        layout.addWidget(self._make_expander("Available Compare Files", files, expanded=True))
 
         params = QGroupBox("")
         params_layout = QVBoxLayout(params)
+
+        assignment = QGroupBox("")
+        assignment_layout = QVBoxLayout(assignment)
+        assignment_layout.setContentsMargins(6, 8, 6, 6)
+        assignment_layout.setSpacing(6)
+        assignment_form = QFormLayout()
+        assignment_form.setContentsMargins(0, 0, 0, 0)
+        assignment_form.setHorizontalSpacing(6)
+        assignment_form.setVerticalSpacing(4)
+        self.cmp_assign_mode_combo = QComboBox()
+        self.cmp_assign_mode_combo.addItems(["Auto by angle", "Manual mapping"])
+        self._style_combo_popup(self.cmp_assign_mode_combo)
+        self.cmp_in_k_angle_spin = QDoubleSpinBox()
+        self.cmp_in_k_angle_spin.setDecimals(3)
+        self.cmp_in_k_angle_spin.setRange(-360.0, 360.0)
+        self.cmp_out_k_angle_spin = QDoubleSpinBox()
+        self.cmp_out_k_angle_spin.setDecimals(3)
+        self.cmp_out_k_angle_spin.setRange(-360.0, 360.0)
+        self.cmp_auto_assign_btn = QPushButton("Auto Detect")
+        angle_row = QWidget()
+        angle_h = QHBoxLayout(angle_row)
+        angle_h.setContentsMargins(0, 0, 0, 0)
+        angle_h.setSpacing(6)
+        angle_h.addWidget(QLabel("In K"))
+        angle_h.addWidget(self.cmp_in_k_angle_spin)
+        angle_h.addWidget(QLabel("Out K"))
+        angle_h.addWidget(self.cmp_out_k_angle_spin)
+        angle_h.addWidget(self.cmp_auto_assign_btn)
+        angle_h.addStretch(1)
+        assignment_form.addRow("Mode", self.cmp_assign_mode_combo)
+        assignment_form.addRow("Angle Rule", angle_row)
+        assignment_layout.addLayout(assignment_form)
+        self.cmp_channel_combos: dict[str, QComboBox] = {}
+        channels_box = QWidget()
+        channels_grid = QGridLayout(channels_box)
+        channels_grid.setContentsMargins(0, 0, 0, 0)
+        channels_grid.setHorizontalSpacing(8)
+        channels_grid.setVerticalSpacing(4)
+        for idx, key in enumerate(COMPARE_PANEL_ORDER):
+            combo = QComboBox()
+            combo.setEditable(False)
+            self._style_combo_popup(combo)
+            self.cmp_channel_combos[key] = combo
+            row = idx // 2
+            col = idx % 2
+            label = QLabel(key)
+            label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            channels_grid.addWidget(label, row, col * 2)
+            channels_grid.addWidget(combo, row, col * 2 + 1)
+        assignment_layout.addWidget(channels_box)
+        self.cmp_assignment_summary = QPlainTextEdit()
+        self.cmp_assignment_summary.setReadOnly(True)
+        self.cmp_assignment_summary.setMaximumHeight(88)
+        summary_form = QFormLayout()
+        summary_form.setContentsMargins(0, 0, 0, 0)
+        summary_form.setHorizontalSpacing(6)
+        summary_form.setVerticalSpacing(4)
+        summary_form.addRow("Summary", self.cmp_assignment_summary)
+        assignment_layout.addLayout(summary_form)
+        params_layout.addWidget(self._make_expander("Assignment", assignment, expanded=False))
+
+        display = QGroupBox("")
+        display_form = QFormLayout(display)
+        self.cmp_display_preset_combo = QComboBox()
+        self.cmp_display_preset_combo.addItems(["KK + KKp", "KpK + KpKp", "All four", "Custom"])
+        self._style_combo_popup(self.cmp_display_preset_combo)
+        display_form.addRow("Preset", self.cmp_display_preset_combo)
+        checks_row = QWidget()
+        checks_h = QHBoxLayout(checks_row)
+        checks_h.setContentsMargins(0, 0, 0, 0)
+        checks_h.setSpacing(10)
+        self.cmp_show_checks: dict[str, QCheckBox] = {}
+        for key in COMPARE_PANEL_ORDER:
+            chk = QCheckBox(key)
+            self.cmp_show_checks[key] = chk
+            checks_h.addWidget(chk)
+        checks_h.addStretch(1)
+        display_form.addRow("Channels", checks_row)
+        params_layout.addWidget(self._make_expander("Display", display, expanded=False))
+
         cfg = QFormLayout()
-        grid, _, _, _, cmap, _ = self._build_common_range_grid("cmp")
+        grid, spins, _, _, cmap, fix_checks = self._build_common_range_grid("cmp")
         cmap.setCurrentText("turbo")
+        self.cmp_yaxis_controls = self._build_y_axis_controls("cmp")
+        cfg.addRow("Y-axis Source", self.cmp_yaxis_controls)
         cfg.addRow("Colormap", cmap)
         params_layout.addLayout(cfg)
-        params_layout.addLayout(grid)
+        for s in spins.values():
+            s.setFixedWidth(UI_METRICS["spin_w"])
+            s.setFixedHeight(UI_METRICS["input_h"])
+
+        def pair_auto_row(
+            a: QDoubleSpinBox,
+            b: QDoubleSpinBox,
+            fa: QCheckBox,
+            fb: QCheckBox,
+            auto_btn: QToolButton,
+            auto_text: str,
+        ) -> QWidget:
+            auto_btn.setText(auto_text)
+            auto_btn.setAutoRaise(True)
+            auto_btn.setFixedWidth(UI_METRICS["tool_w"])
+            auto_btn.setFixedHeight(UI_METRICS["tool_h"])
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(4)
+            h.addWidget(a)
+            h.addWidget(fa)
+            h.addWidget(b)
+            h.addWidget(fb)
+            h.addWidget(auto_btn)
+            h.addStretch(1)
+            return row
+
+        self.cmp_auto_v_btn = QToolButton()
+        self.cmp_auto_x_btn = QToolButton()
+        self.cmp_auto_y_btn = QToolButton()
+        basic = QGroupBox("")
+        basic_form = QFormLayout(basic)
+        basic_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
+        basic_form.setHorizontalSpacing(4)
+        basic_form.setVerticalSpacing(UI_METRICS["row_spacing"])
+        basic_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        basic_form.addRow(
+            "vmin / vmax",
+            pair_auto_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.cmp_auto_v_btn, "Auto V"),
+        )
+        basic_form.addRow(
+            "xmin / xmax",
+            pair_auto_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.cmp_auto_x_btn, "Auto X"),
+        )
+        basic_form.addRow(
+            "ymin / ymax",
+            pair_auto_row(spins["ymin"], spins["ymax"], fix_checks["ymin"], fix_checks["ymax"], self.cmp_auto_y_btn, "Auto Y"),
+        )
+        basic_form.addRow("Cursor Gate", spins["gate"])
+        flags = QWidget()
+        flags_h = QHBoxLayout(flags)
+        flags_h.setContentsMargins(0, 0, 0, 0)
+        flags_h.setSpacing(10)
+        flags_h.addWidget(self.cmp_log_chk)
+        flags_h.addWidget(self.cmp_clip_chk)
+        flags_h.addStretch(1)
+        basic_form.addRow("Scale / Clip", flags)
+        self._set_form_label_width(basic_form, UI_METRICS["label_col_width"])
+        params_layout.addWidget(self._make_expander("Plot", basic, expanded=True))
         layout.addWidget(self._make_expander("Parameters", params, expanded=True))
         layout.addStretch(1)
         return tab
+
+    def _cmp_assign_candidate_files(self) -> list[str]:
+        chosen = self._selected(self.cmp_files)
+        return chosen if chosen else list(self.available_files)
+
+    def _cmp_set_channel_combo_items(self) -> None:
+        files = [""] + list(self.available_files)
+        for combo in self.cmp_channel_combos.values():
+            current = combo.currentText()
+            old = combo.blockSignals(True)
+            try:
+                combo.clear()
+                combo.addItems(files)
+                if current in files:
+                    combo.setCurrentText(current)
+            finally:
+                combo.blockSignals(old)
+
+    @staticmethod
+    def _cmp_angle_distance(a: float, b: float) -> float:
+        return abs(((float(a) - float(b) + 180.0) % 360.0) - 180.0)
+
+    def _cmp_parse_in_out_angles(self, file_name: str) -> tuple[float | None, float | None]:
+        text = str(Path(file_name).stem)
+        patterns = (
+            r"in[^0-9\-+]*([\-+]?\d+(?:\.\d+)?)\s*degree.*out[^0-9\-+]*([\-+]?\d+(?:\.\d+)?)\s*degree",
+            r"out[^0-9\-+]*([\-+]?\d+(?:\.\d+)?)\s*degree.*in[^0-9\-+]*([\-+]?\d+(?:\.\d+)?)\s*degree",
+        )
+        for idx, pattern in enumerate(patterns):
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            if idx == 0:
+                return float(match.group(1)), float(match.group(2))
+            return float(match.group(2)), float(match.group(1))
+        return None, None
+
+    def _cmp_classify_channel(self, file_name: str) -> str | None:
+        in_angle, out_angle = self._cmp_parse_in_out_angles(file_name)
+        if in_angle is None or out_angle is None:
+            return None
+        in_k = float(self.cmp_in_k_angle_spin.value())
+        out_k = float(self.cmp_out_k_angle_spin.value())
+        in_is_k = self._cmp_angle_distance(in_angle, in_k) <= 45.0
+        out_is_k = self._cmp_angle_distance(out_angle, out_k) <= 45.0
+        if in_is_k and out_is_k:
+            return "KK"
+        if in_is_k and (not out_is_k):
+            return "KKp"
+        if (not in_is_k) and out_is_k:
+            return "KpK"
+        return "KpKp"
+
+    def _cmp_current_mapping(self) -> dict[str, str]:
+        mapping: dict[str, str] = {}
+        used: set[str] = set()
+        for key in COMPARE_PANEL_ORDER:
+            name = self.cmp_channel_combos[key].currentText().strip()
+            if not name or name in used:
+                continue
+            mapping[key] = name
+            used.add(name)
+        return mapping
+
+    def _cmp_visible_channels(self, mapping: dict[str, str] | None = None) -> list[str]:
+        mapping = mapping or self._cmp_current_mapping()
+        preset = self.cmp_display_preset_combo.currentText()
+        if preset == "KK + KKp":
+            order = ["KK", "KKp"]
+        elif preset == "KpK + KpKp":
+            order = ["KpK", "KpKp"]
+        elif preset == "All four":
+            order = list(COMPARE_PANEL_ORDER)
+        else:
+            order = [key for key in COMPARE_PANEL_ORDER if self.cmp_show_checks[key].isChecked()]
+        return [key for key in order if key in mapping]
+
+    def _cmp_apply_display_preset(self) -> None:
+        preset = self.cmp_display_preset_combo.currentText()
+        enabled = preset == "Custom"
+        desired = {
+            "KK + KKp": {"KK", "KKp"},
+            "KpK + KpKp": {"KpK", "KpKp"},
+            "All four": set(COMPARE_PANEL_ORDER),
+            "Custom": None,
+        }[preset]
+        for key, chk in self.cmp_show_checks.items():
+            chk.setEnabled(enabled)
+            if desired is not None:
+                old = chk.blockSignals(True)
+                try:
+                    chk.setChecked(key in desired)
+                finally:
+                    chk.blockSignals(old)
+
+    def _cmp_update_assignment_summary(self) -> None:
+        mapping = self._cmp_current_mapping()
+        visible = self._cmp_visible_channels(mapping)
+        lines: list[str] = []
+        for key in COMPARE_PANEL_ORDER:
+            source = mapping.get(key, "missing")
+            lines.append(f"{key} -> {source}")
+        if visible:
+            lines.append("Visible -> " + ", ".join(visible))
+        else:
+            lines.append("Visible -> none")
+        self.cmp_assignment_summary.setPlainText("\n".join(lines))
+
+    def _cmp_update_assignment_mode(self) -> None:
+        auto_mode = self.cmp_assign_mode_combo.currentText() == "Auto by angle"
+        self.cmp_in_k_angle_spin.setEnabled(auto_mode)
+        self.cmp_out_k_angle_spin.setEnabled(auto_mode)
+        self.cmp_auto_assign_btn.setEnabled(auto_mode)
+
+    def _cmp_selection_from_ui(self) -> data_io.CompareSelection:
+        mapping = self._cmp_current_mapping()
+        visible = self._cmp_visible_channels(mapping)
+        if len(visible) < 1:
+            raise ValueError("Assign at least one compare channel.")
+        if len(visible) < 2:
+            raise ValueError("Select at least two visible compare channels.")
+        return data_io.CompareSelection.from_mapping(
+            mapping,
+            visible_order=visible,
+        )
+
+    def _cmp_auto_assign_channels(self) -> None:
+        candidates = self._cmp_assign_candidate_files()
+        found: dict[str, str] = {}
+        duplicates: dict[str, list[str]] = {}
+        for file_name in candidates:
+            key = self._cmp_classify_channel(file_name)
+            if key is None:
+                continue
+            if key in found:
+                duplicates.setdefault(key, [found[key]]).append(file_name)
+                continue
+            found[key] = file_name
+        for key, combo in self.cmp_channel_combos.items():
+            old = combo.blockSignals(True)
+            try:
+                combo.setCurrentText(found.get(key, ""))
+            finally:
+                combo.blockSignals(old)
+        self._cmp_update_assignment_summary()
+        if duplicates:
+            dup_text = "; ".join(f"{k}: {', '.join(v)}" for k, v in duplicates.items())
+            self._append_log(f"Compare auto-detect found duplicate matches -> {dup_text}")
+        self._on_cmp_plot_param_changed()
 
     def _build_tools_tab(self) -> QWidget:
         tab = QWidget()
@@ -890,6 +1386,50 @@ class MainWindow(QMainWindow):
         self.save_action.triggered.connect(self._toolbar_save)
         self.move_now_btn.clicked.connect(self._manual_move_sources)
         self.tabs.currentChanged.connect(lambda _i: self._update_action_states())
+        for prefix in ("pl", "drr", "cmp"):
+            combo: QComboBox = getattr(self, f"{prefix}_yaxis_combo")
+            combo.currentTextChanged.connect(lambda _text, p=prefix: self._update_y_axis_controls(p))
+            for key in ("a", "b", "c"):
+                spin: QDoubleSpinBox = getattr(self, f"{prefix}_yaxis_{key}_spin")
+                spin.valueChanged.connect(lambda _value, p=prefix: self._update_y_axis_controls(p))
+        self.pl_auto_v_btn.clicked.connect(self._auto_pl_vrange)
+        self.pl_auto_x_btn.clicked.connect(self._auto_pl_xrange)
+        self.pl_auto_y_btn.clicked.connect(self._auto_pl_yrange)
+        self.pl_yaxis_combo.currentTextChanged.connect(self._on_pl_plot_param_changed)
+        self.pl_yaxis_a_spin.valueChanged.connect(self._on_pl_plot_param_changed)
+        self.pl_yaxis_b_spin.valueChanged.connect(self._on_pl_plot_param_changed)
+        self.pl_yaxis_c_spin.valueChanged.connect(self._on_pl_plot_param_changed)
+        for key in ("vmin", "vmax", "xmin", "xmax", "ymin", "ymax"):
+            self.pl_spins[key].valueChanged.connect(self._on_pl_plot_param_changed)
+        self.pl_spins["gate"].valueChanged.connect(self._on_pl_gate_changed)
+        self.pl_cmap.currentTextChanged.connect(self._on_pl_plot_param_changed)
+        self.pl_log_chk.toggled.connect(self._on_pl_plot_param_changed)
+        self.pl_clip_chk.toggled.connect(self._on_pl_plot_param_changed)
+        self.cmp_assign_mode_combo.currentTextChanged.connect(self._on_cmp_assignment_mode_changed)
+        self.cmp_in_k_angle_spin.valueChanged.connect(self._on_cmp_assignment_inputs_changed)
+        self.cmp_out_k_angle_spin.valueChanged.connect(self._on_cmp_assignment_inputs_changed)
+        self.cmp_auto_assign_btn.clicked.connect(self._cmp_auto_assign_channels)
+        self.cmp_display_preset_combo.currentTextChanged.connect(self._on_cmp_display_preset_changed)
+        for combo in self.cmp_channel_combos.values():
+            combo.currentTextChanged.connect(self._on_cmp_plot_param_changed)
+        for chk in self.cmp_show_checks.values():
+            chk.toggled.connect(self._on_cmp_plot_param_changed)
+        self.cmp_yaxis_combo.currentTextChanged.connect(self._on_cmp_plot_param_changed)
+        self.cmp_yaxis_a_spin.valueChanged.connect(self._on_cmp_plot_param_changed)
+        self.cmp_yaxis_b_spin.valueChanged.connect(self._on_cmp_plot_param_changed)
+        self.cmp_yaxis_c_spin.valueChanged.connect(self._on_cmp_plot_param_changed)
+        for key in ("vmin", "vmax", "xmin", "xmax", "ymin", "ymax", "gate"):
+            self.cmp_spins[key].valueChanged.connect(self._on_cmp_plot_param_changed)
+        self.cmp_cmap.currentTextChanged.connect(self._on_cmp_plot_param_changed)
+        self.cmp_log_chk.toggled.connect(self._on_cmp_plot_param_changed)
+        self.cmp_clip_chk.toggled.connect(self._on_cmp_plot_param_changed)
+        self.cmp_auto_v_btn.clicked.connect(self._auto_cmp_vrange)
+        self.cmp_auto_x_btn.clicked.connect(self._auto_cmp_xrange)
+        self.cmp_auto_y_btn.clicked.connect(self._auto_cmp_yrange)
+        self.drr_yaxis_combo.currentTextChanged.connect(self._on_drr_plot_param_changed)
+        self.drr_yaxis_a_spin.valueChanged.connect(self._on_drr_plot_param_changed)
+        self.drr_yaxis_b_spin.valueChanged.connect(self._on_drr_plot_param_changed)
+        self.drr_yaxis_c_spin.valueChanged.connect(self._on_drr_plot_param_changed)
         self.drr_baseline_combo.currentTextChanged.connect(self._on_drr_plot_param_changed)
         self.drr_derivative_combo.currentTextChanged.connect(self._on_drr_derivative_changed)
         self.drr_sg_window_spin.valueChanged.connect(self._on_drr_derivative_changed)
@@ -925,6 +1465,12 @@ class MainWindow(QMainWindow):
         self.clear_log_btn.clicked.connect(self._clear_log)
         self._gate_motion_cid = self.canvas.mpl_connect("motion_notify_event", self._on_canvas_motion)
         self._gate_click_cid = self.canvas.mpl_connect("button_press_event", self._on_canvas_click)
+        for prefix in ("pl", "drr", "cmp"):
+            self._update_y_axis_controls(prefix)
+        self._cmp_apply_display_preset()
+        self._cmp_update_assignment_mode()
+        self._cmp_set_channel_combo_items()
+        self._cmp_update_assignment_summary()
 
     def _toggle_log(self) -> None:
         self.log_dock.setVisible(not self.log_dock.isVisible())
@@ -1001,6 +1547,34 @@ class MainWindow(QMainWindow):
         if self.loaded and self.loaded.mode == "DRR" and not self._suspend_drr_autoplot:
             self._plot_mode("DRR")
 
+    def _on_pl_plot_param_changed(self) -> None:
+        if self.loaded and self.loaded.mode == "PL":
+            self._plot_mode("PL")
+
+    def _on_cmp_assignment_mode_changed(self) -> None:
+        self._cmp_update_assignment_mode()
+        if self.cmp_assign_mode_combo.currentText() == "Auto by angle":
+            self._cmp_auto_assign_channels()
+        else:
+            self._cmp_update_assignment_summary()
+            self._on_cmp_plot_param_changed()
+
+    def _on_cmp_assignment_inputs_changed(self) -> None:
+        if self.cmp_assign_mode_combo.currentText() == "Auto by angle":
+            self._cmp_auto_assign_channels()
+        else:
+            self._cmp_update_assignment_summary()
+
+    def _on_cmp_display_preset_changed(self) -> None:
+        self._cmp_apply_display_preset()
+        self._cmp_update_assignment_summary()
+        self._on_cmp_plot_param_changed()
+
+    def _on_cmp_plot_param_changed(self) -> None:
+        self._cmp_update_assignment_summary()
+        if self.loaded and self.loaded.mode == "Compare":
+            self._plot_mode("Compare")
+
     def _show_error(self, message: str) -> None:
         first = message.splitlines()[0] if message else "Unknown error"
         self._append_log(f"ERROR: {first}")
@@ -1042,9 +1616,11 @@ class MainWindow(QMainWindow):
         self.available_files = data_io.list_csv_files(self.current_folder)
         self.pl_files.addItems(self.available_files)
         self.cmp_files.addItems(self.available_files)
+        self._cmp_set_channel_combo_items()
         self.drr_selected_files = [f for f in self.drr_selected_files if f in self.available_files]
         self.drr_baseline_files_manual = [f for f in self.drr_baseline_files_manual if f in self.available_files]
         self.drr_baseline_files_found = [f for f in self.drr_baseline_files_found if f in self.available_files]
+        self._cmp_update_assignment_summary()
         self._update_drr_selection_labels()
         self._status(f"Loaded file list: {len(self.available_files)}")
 
@@ -1231,10 +1807,18 @@ class MainWindow(QMainWindow):
         self.load_action.setEnabled(active_mode is not None)
         self.plot_action.setEnabled(active_mode is not None and loaded_mode == active_mode)
         self.save_action.setEnabled(active_mode is not None and plotted_mode == active_mode)
+        pl_loaded = loaded_mode == "PL"
         drr_loaded = loaded_mode == "DRR"
+        cmp_loaded = loaded_mode == "Compare"
+        self.pl_auto_v_btn.setEnabled(pl_loaded)
+        self.pl_auto_x_btn.setEnabled(pl_loaded)
+        self.pl_auto_y_btn.setEnabled(pl_loaded)
         self.drr_auto_v_btn.setEnabled(drr_loaded)
         self.drr_auto_x_btn.setEnabled(drr_loaded)
         self.drr_auto_y_btn.setEnabled(drr_loaded)
+        self.cmp_auto_v_btn.setEnabled(cmp_loaded)
+        self.cmp_auto_x_btn.setEnabled(cmp_loaded)
+        self.cmp_auto_y_btn.setEnabled(cmp_loaded)
 
     def _reset_params(self, mode: str) -> None:
         if self.loaded and self.loaded.mode == mode:
@@ -1276,6 +1860,72 @@ class MainWindow(QMainWindow):
         self._status(f"State: Auto vmin/vmax (ROI) = {vmin:.4g}, {vmax:.4g}")
         self._plot_mode("DRR")
 
+    def _auto_pl_vrange(self) -> None:
+        if not self.loaded or self.loaded.mode != "PL" or self.loaded.cube is None:
+            return
+        cube = self.loaded.cube
+        x = np.asarray(cube.energy, float).ravel()
+        y = np.asarray(cube.gate, float).ravel()
+        z = np.asarray(cube.Z, float)
+        x0, x1 = sorted((float(self.pl_spins["xmin"].value()), float(self.pl_spins["xmax"].value())))
+        y0, y1 = sorted((float(self.pl_spins["ymin"].value()), float(self.pl_spins["ymax"].value())))
+        x_mask = (x >= x0) & (x <= x1)
+        y_mask = (y >= y0) & (y <= y1)
+        z_roi = z[np.ix_(y_mask, x_mask)] if np.any(y_mask) and np.any(x_mask) else z
+        finite = z_roi[np.isfinite(z_roi)]
+        if finite.size == 0:
+            self._status("State: Auto vmin/vmax skipped (no finite values in selected x/y range).")
+            return
+        if self._mode_log("PL"):
+            pos = z_roi[np.isfinite(z_roi) & (z_roi > 0)]
+            if pos.size:
+                vmin, vmax = np.nanpercentile(pos, [0.01, 99.99])
+                vmin = float(max(vmin, 1e-12))
+                vmax = float(max(vmax, vmin * 1.01))
+            else:
+                vmin, vmax = float(np.nanmin(finite)), float(np.nanmax(finite))
+        else:
+            vmin, vmax = np.nanpercentile(finite, [0.01, 99.99])
+            vmin, vmax = float(vmin), float(vmax)
+        self.pl_spins["vmin"].setValue(vmin)
+        self.pl_spins["vmax"].setValue(vmax)
+        self._status(f"State: Auto vmin/vmax (ROI) = {vmin:.4g}, {vmax:.4g}")
+        self._plot_mode("PL")
+
+    def _auto_cmp_vrange(self) -> None:
+        if not self.loaded or self.loaded.mode != "Compare" or not self.loaded.compare_cubes:
+            return
+        x0, x1 = sorted((float(self.cmp_spins["xmin"].value()), float(self.cmp_spins["xmax"].value())))
+        y0, y1 = sorted((float(self.cmp_spins["ymin"].value()), float(self.cmp_spins["ymax"].value())))
+        vals: list[np.ndarray] = []
+        for cube in self.loaded.compare_cubes.values():
+            x = np.asarray(cube.energy, float).ravel()
+            y = np.asarray(cube.gate, float).ravel()
+            z = np.asarray(cube.Z, float)
+            x_mask = (x >= x0) & (x <= x1)
+            y_mask = (y >= y0) & (y <= y1)
+            z_roi = z[np.ix_(y_mask, x_mask)] if np.any(y_mask) and np.any(x_mask) else z
+            finite = z_roi[np.isfinite(z_roi)]
+            if finite.size:
+                vals.append(finite)
+        if not vals:
+            return
+        finite = np.concatenate(vals)
+        if self._mode_log("Compare"):
+            pos = finite[finite > 0]
+            if pos.size:
+                vmin, vmax = np.nanpercentile(pos, [0.01, 99.99])
+                vmin = float(max(vmin, 1e-12))
+                vmax = float(max(vmax, vmin * 1.01))
+            else:
+                vmin, vmax = float(np.nanmin(finite)), float(np.nanmax(finite))
+        else:
+            vmin, vmax = np.nanpercentile(finite, [0.01, 99.99])
+            vmin, vmax = float(vmin), float(vmax)
+        self.cmp_spins["vmin"].setValue(vmin)
+        self.cmp_spins["vmax"].setValue(vmax)
+        self._plot_mode("Compare")
+
     def _auto_drr_xrange(self) -> None:
         if not self.loaded or self.loaded.mode != "DRR":
             return
@@ -1285,6 +1935,23 @@ class MainWindow(QMainWindow):
         self._status("State: Auto xmin/xmax set from energy axis.")
         self._plot_mode("DRR")
 
+    def _auto_pl_xrange(self) -> None:
+        if not self.loaded or self.loaded.mode != "PL" or self.loaded.cube is None:
+            return
+        self.pl_spins["xmin"].setValue(float(np.nanmin(self.loaded.cube.energy)))
+        self.pl_spins["xmax"].setValue(float(np.nanmax(self.loaded.cube.energy)))
+        self._status("State: Auto xmin/xmax set from energy axis.")
+        self._plot_mode("PL")
+
+    def _auto_cmp_xrange(self) -> None:
+        if not self.loaded or self.loaded.mode != "Compare" or not self.loaded.compare_cubes:
+            return
+        mins = [float(np.nanmin(c.energy)) for c in self.loaded.compare_cubes.values()]
+        maxs = [float(np.nanmax(c.energy)) for c in self.loaded.compare_cubes.values()]
+        self.cmp_spins["xmin"].setValue(min(mins))
+        self.cmp_spins["xmax"].setValue(max(maxs))
+        self._plot_mode("Compare")
+
     def _auto_drr_yrange(self) -> None:
         if not self.loaded or self.loaded.mode != "DRR":
             return
@@ -1293,6 +1960,23 @@ class MainWindow(QMainWindow):
         self.drr_spins["ymax"].setValue(float(np.nanmax(cube.gate)))
         self._status("State: Auto ymin/ymax set from gate axis.")
         self._plot_mode("DRR")
+
+    def _auto_pl_yrange(self) -> None:
+        if not self.loaded or self.loaded.mode != "PL" or self.loaded.cube is None:
+            return
+        self.pl_spins["ymin"].setValue(float(np.nanmin(self.loaded.cube.gate)))
+        self.pl_spins["ymax"].setValue(float(np.nanmax(self.loaded.cube.gate)))
+        self._status("State: Auto ymin/ymax set from gate axis.")
+        self._plot_mode("PL")
+
+    def _auto_cmp_yrange(self) -> None:
+        if not self.loaded or self.loaded.mode != "Compare" or not self.loaded.compare_cubes:
+            return
+        mins = [float(np.nanmin(c.gate)) for c in self.loaded.compare_cubes.values()]
+        maxs = [float(np.nanmax(c.gate)) for c in self.loaded.compare_cubes.values()]
+        self.cmp_spins["ymin"].setValue(min(mins))
+        self.cmp_spins["ymax"].setValue(max(maxs))
+        self._plot_mode("Compare")
 
     def _drr_derivative_value(self) -> int | None:
         text = self.drr_derivative_combo.currentText()
@@ -1343,6 +2027,7 @@ class MainWindow(QMainWindow):
             cmp_log = False
             drr_baseline = "Self (last frame)"
             drr_baseline_which = "last"
+            y_axis_spec = self._selected_y_axis_spec("pl")
         elif mode == "DRR":
             selected = list(self.drr_selected_files)
             baselines = list(self.drr_baseline_files_manual)
@@ -1355,13 +2040,19 @@ class MainWindow(QMainWindow):
                 "Average all baseline files": "all",
             }
             drr_baseline_which = which_map.get(self.drr_baseline_combine_combo.currentText(), "last")
+            y_axis_spec = self._selected_y_axis_spec("drr")
         else:
-            selected = self._selected(self.cmp_files)
+            selection = self._cmp_selection_from_ui()
+            selected = list(selection.as_pairs().values())
+            compare_sources = selection.as_pairs()
             baselines = []
             pl_log = False
             cmp_log = bool(self.cmp_log_chk.isChecked())
             drr_baseline = "Self (last frame)"
             drr_baseline_which = "last"
+            y_axis_spec = self._selected_y_axis_spec("cmp")
+        if mode != "Compare":
+            compare_sources = {}
 
         options = LoadOptions(
             mode=mode,
@@ -1372,6 +2063,8 @@ class MainWindow(QMainWindow):
             drr_baseline_text=drr_baseline,
             drr_baseline_which=drr_baseline_which,
             compare_log_scale=cmp_log,
+            y_axis_spec=y_axis_spec,
+            compare_sources=compare_sources,
         )
 
         self._set_stage("Loading...")
@@ -1389,13 +2082,16 @@ class MainWindow(QMainWindow):
         log.emit(f"Loading {mode} ...")
 
         if mode == "PL":
-            cube = data_io.load_pl_cube(folder, options.selected_files[0], log_scale=options.pl_log_scale)
+            cube = data_io.load_pl_cube(
+                folder, options.selected_files[0], log_scale=options.pl_log_scale, y_axis=options.y_axis_spec
+            )
             return LoadedState(
                 mode="PL",
                 folder=folder,
                 primary_file=options.selected_files[0],
                 selected_files=options.selected_files,
                 cube=cube,
+                y_axis_spec=options.y_axis_spec,
             )
 
         if mode == "DRR":
@@ -1408,6 +2104,7 @@ class MainWindow(QMainWindow):
                     options.selected_files,
                     options.baseline_files,
                     baseline_which=options.drr_baseline_which,
+                    y_axis=options.y_axis_spec,
                     derivative=None,
                 )
                 drr_mode_label = "DR/R External"
@@ -1416,6 +2113,7 @@ class MainWindow(QMainWindow):
                     folder,
                     options.selected_files,
                     use_first_frame=(baseline == "Self (first frame)"),
+                    y_axis=options.y_axis_spec,
                     derivative=None,
                 )
                 drr_mode_label = "DR/R Self"
@@ -1431,20 +2129,18 @@ class MainWindow(QMainWindow):
                 drr_derivative_label="None",
                 drr_baseline_text=baseline,
                 drr_baseline_which=options.drr_baseline_which,
+                y_axis_spec=options.y_axis_spec,
             )
 
-        if len(options.selected_files) < 2:
-            raise ValueError("Compare mode needs at least 2 files.")
-        kpk = options.selected_files[2] if len(options.selected_files) > 2 else None
-        kpkp = options.selected_files[3] if len(options.selected_files) > 3 else None
-        selection = data_io.CompareSelection(kk=options.selected_files[0], kkp=options.selected_files[1], kpk=kpk, kpkp=kpkp)
-        cubes = data_io.load_compare_cubes(folder, selection, log_scale=options.compare_log_scale)
+        selection = data_io.CompareSelection.from_mapping(options.compare_sources)
+        cubes = data_io.load_compare_cubes(folder, selection, log_scale=options.compare_log_scale, y_axis=options.y_axis_spec)
         return LoadedState(
             mode="Compare",
             folder=folder,
-            selected_files=options.selected_files,
+            selected_files=list(selection.as_pairs().values()),
             compare_cubes=cubes,
             compare_sources=selection.as_pairs(),
+            y_axis_spec=options.y_axis_spec,
         )
 
     def _on_loaded(self, loaded: LoadedState) -> None:
@@ -1483,6 +2179,70 @@ class MainWindow(QMainWindow):
             checks = self.cmp_fix_checks
         chk = checks.get(key)
         return bool(chk.isChecked()) if chk is not None else False
+
+    def _mode_y_axis_prefix(self, mode: str) -> str:
+        return "pl" if mode == "PL" else "drr" if mode == "DRR" else "cmp"
+
+    def _current_y_axis_spec_for_mode(self, mode: str) -> str:
+        return self._selected_y_axis_spec(self._mode_y_axis_prefix(mode))
+
+    def _ensure_loaded_matches_ui_params(self, mode: str) -> bool:
+        if not self.loaded or self.loaded.mode != mode:
+            return False
+        current_spec = self._current_y_axis_spec_for_mode(mode)
+        if mode == "DRR" and current_spec == getattr(self.loaded, "y_axis_spec", "auto"):
+            return self._ensure_loaded_matches_drr_params()
+        if mode == "Compare":
+            selection = self._cmp_selection_from_ui()
+            desired_sources = selection.as_pairs()
+            if (
+                current_spec == getattr(self.loaded, "y_axis_spec", "auto")
+                and desired_sources == (self.loaded.compare_sources or {})
+            ):
+                return False
+        elif current_spec == getattr(self.loaded, "y_axis_spec", "auto"):
+            return False
+
+        if mode == "PL":
+            if not self.loaded.primary_file:
+                raise ValueError("No PL file loaded.")
+            cube = data_io.load_pl_cube(
+                self.current_folder,
+                self.loaded.primary_file,
+                log_scale=bool(self.pl_log_chk.isChecked()),
+                y_axis=current_spec,
+            )
+            self.loaded = LoadedState(
+                mode="PL",
+                folder=self.current_folder,
+                primary_file=self.loaded.primary_file,
+                selected_files=list(self.loaded.selected_files),
+                cube=cube,
+                y_axis_spec=current_spec,
+            )
+        elif mode == "Compare":
+            selection = self._cmp_selection_from_ui()
+            cubes = data_io.load_compare_cubes(
+                self.current_folder,
+                selection,
+                log_scale=bool(self.cmp_log_chk.isChecked()),
+                y_axis=current_spec,
+            )
+            self.loaded = LoadedState(
+                mode="Compare",
+                folder=self.current_folder,
+                selected_files=list(selection.as_pairs().values()),
+                compare_cubes=cubes,
+                compare_sources=selection.as_pairs(),
+                y_axis_spec=current_spec,
+            )
+        else:
+            return self._ensure_loaded_matches_drr_params()
+
+        self._last_plot_cube = None
+        self._last_plot_params_key = None
+        self._apply_auto_limits_for_loaded()
+        return True
 
     def _apply_auto_limits_for_loaded(self) -> None:
         if not self.loaded:
@@ -1548,6 +2308,18 @@ class MainWindow(QMainWindow):
             pad = max(1e-12, (ymax - ymin) * 0.08)
         ax.set_ylim(ymin - pad, ymax + pad)
 
+    def _safe_spectrum_xlim(self, x: np.ndarray, xlim: tuple[float, float]) -> tuple[float, float]:
+        x = np.asarray(x, float).ravel()
+        lo, hi = float(xlim[0]), float(xlim[1])
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            lo = float(np.nanmin(x))
+            hi = float(np.nanmax(x))
+        if lo == hi:
+            pad = max(1e-9, abs(lo) * 1e-6, (float(np.nanmax(x)) - float(np.nanmin(x))) * 1e-3)
+            lo -= pad
+            hi += pad
+        return (lo, hi)
+
     def _plot_spectrum_with_roi(
         self,
         ax,
@@ -1579,6 +2351,22 @@ class MainWindow(QMainWindow):
 
     def _set_drr_gate_spin_value(self, gate_value: float) -> None:
         spin = self.drr_spins["gate"]
+        old = spin.blockSignals(True)
+        try:
+            spin.setValue(float(gate_value))
+        finally:
+            spin.blockSignals(old)
+
+    def _set_pl_gate_spin_value(self, gate_value: float) -> None:
+        spin = self.pl_spins["gate"]
+        old = spin.blockSignals(True)
+        try:
+            spin.setValue(float(gate_value))
+        finally:
+            spin.blockSignals(old)
+
+    def _set_cmp_gate_spin_value(self, gate_value: float) -> None:
+        spin = self.cmp_spins["gate"]
         old = spin.blockSignals(True)
         try:
             spin.setValue(float(gate_value))
@@ -1931,6 +2719,48 @@ class MainWindow(QMainWindow):
         self._update_pl_analysis_text(gate_used, x, np.asarray(y, float))
         self.canvas.draw_idle()
 
+    def _ensure_pl_gate_line(self, cube: DataCube, gate_value: float) -> None:
+        if self._pl_heatmap_ax is None:
+            return
+        gate = np.asarray(cube.gate, float).ravel()
+        gate_clamped = float(np.clip(gate_value, float(np.nanmin(gate)), float(np.nanmax(gate))))
+        if self._pl_gate_line is None or getattr(self._pl_gate_line, "axes", None) is not self._pl_heatmap_ax:
+            self._pl_gate_line = self._pl_heatmap_ax.axhline(
+                y=gate_clamped,
+                lw=1.2,
+                alpha=0.9,
+                color="#222",
+                linestyle="--",
+                zorder=20,
+            )
+        else:
+            self._pl_gate_line.set_ydata([gate_clamped, gate_clamped])
+            self._pl_gate_line.set_linestyle("--")
+
+    def _update_pl_spectrum_and_gate_line(self, cube: DataCube) -> None:
+        if self._pl_spectrum_ax is None:
+            return
+        gate_value = float(self.pl_spins["gate"].value())
+        gate_used, y = nearest_gate_spectrum(cube, gate_value)
+        x = np.asarray(cube.energy, float).ravel()
+        self._pl_spectrum_ax.clear()
+        self._pl_spectrum_ax.plot(x, np.asarray(y, float), linewidth=1.3)
+        self._pl_spectrum_ax.set_title(f"Spectrum @ {gate_used:.6g} V")
+        self._pl_spectrum_ax.set_xlabel("Photon Energy (eV)")
+        self._pl_spectrum_ax.set_ylabel(cube.cbar_label)
+        self._pl_spectrum_ax.grid(alpha=0.25)
+        xlim = self._safe_spectrum_xlim(
+            x,
+            (float(self.pl_spins["xmin"].value()), float(self.pl_spins["xmax"].value())),
+        )
+        self._pl_spectrum_ax.set_xlim(xlim)
+        self._auto_scale_spectrum_y(self._pl_spectrum_ax, x, y, xlim)
+        self._set_pl_gate_spin_value(gate_used)
+        self._ensure_pl_gate_line(cube, gate_used)
+        self._draw_pl_analysis_overlays(gate_used, x, np.asarray(y, float))
+        self._update_pl_analysis_text(gate_used, x, np.asarray(y, float))
+        self.canvas.draw_idle()
+
     def _on_pl_find_peaks(self) -> None:
         if self.last_plotted_mode != "PL" or self._pl_last_plot_cube is None:
             return
@@ -2031,7 +2861,44 @@ class MainWindow(QMainWindow):
 
     def _on_pl_analysis_view_changed(self) -> None:
         if self.last_plotted_mode == "PL" and self._pl_last_plot_cube is not None:
-            self._update_pl_spectrum_with_analysis(self._pl_last_plot_cube)
+            self._update_pl_spectrum_and_gate_line(self._pl_last_plot_cube)
+
+    def _on_pl_gate_changed(self) -> None:
+        if self.last_plotted_mode == "PL" and self._pl_last_plot_cube is not None:
+            self._update_pl_spectrum_and_gate_line(self._pl_last_plot_cube)
+
+    def _plot_compare_linecut(
+        self,
+        ax: Any,
+        cubes: Dict[str, DataCube],
+        *,
+        gate_value: float,
+        xlim: tuple[float, float],
+    ) -> float:
+        gate_used_values: list[float] = []
+        for key in [label for label in COMPARE_PANEL_ORDER if label in cubes]:
+            cube = cubes[key]
+            gate_used, y = nearest_gate_spectrum(cube, gate_value)
+            x = np.asarray(cube.energy, float).ravel()
+            ax.plot(x, np.asarray(y, float), linewidth=1.3, label=key)
+            gate_used_values.append(float(gate_used))
+        gate_used = float(np.median(gate_used_values)) if gate_used_values else float(gate_value)
+        ax.set_title(f"Compare Spectra @ {gate_used:.6g} V")
+        ax.set_xlabel("Photon Energy (eV)")
+        ax.set_ylabel("PL (a.u.)")
+        ax.grid(alpha=0.25)
+        safe_xlim = self._safe_spectrum_xlim(np.asarray(next(iter(cubes.values())).energy, float), xlim)
+        ax.set_xlim(safe_xlim)
+        finite_lines = [np.asarray(line.get_ydata(), float) for line in ax.lines if len(line.get_ydata())]
+        if finite_lines:
+            y_all = np.concatenate([line[np.isfinite(line)] for line in finite_lines if np.any(np.isfinite(line))])
+            if y_all.size:
+                ymin = float(np.nanmin(y_all))
+                ymax = float(np.nanmax(y_all))
+                pad = max(1e-12, (ymax - ymin) * 0.08) if ymax != ymin else max(1e-12, abs(ymin) * 0.05, 1.0)
+                ax.set_ylim(ymin - pad, ymax + pad)
+        ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
+        return gate_used
 
     def _update_pl_analysis_text(self, gate_used: float, x: np.ndarray, y: np.ndarray) -> None:
         lines: list[str] = []
@@ -2133,7 +3000,7 @@ class MainWindow(QMainWindow):
                 self._show_error("Load data for this tab before plotting.")
                 return
 
-            self._ensure_loaded_matches_drr_params()
+            self._ensure_loaded_matches_ui_params(mode)
             plot_key = self._current_plot_params_key(mode)
             gate_only_update = mode == "DRR" and self._is_drr_gate_only_change(plot_key)
             if gate_only_update and self._last_plot_cube is not None:
@@ -2146,6 +3013,9 @@ class MainWindow(QMainWindow):
                 return
 
             self.figure.clear()
+            self._cmp_heatmap_axes = {}
+            self._cmp_gate_lines = {}
+            self._cmp_linecut_ax = None
             if mode == "PL" and self.loaded.cube is not None:
                 plot_cube = self.loaded.cube
                 params = self._make_params(mode, plot_cube)
@@ -2162,18 +3032,18 @@ class MainWindow(QMainWindow):
                 ax2 = self.figure.add_subplot(gs[1, 0], sharex=ax1)
                 im = plot_pl(ax1, plot_cube, params)
                 self.figure.colorbar(im, cax=cax, label=params.cbar_label)
-                gate_val = float(self._mode_spins(mode)["gate"].value())
-                self._plot_spectrum_with_roi(ax2, plot_cube, gate_val, ylabel=params.cbar_label, xlim=params.xlim)
                 self._pl_heatmap_ax = ax1
                 self._pl_spectrum_ax = ax2
                 self._pl_last_plot_cube = plot_cube
+                self._pl_gate_line = None
                 self._pl_heatmap_peak_artist = None
                 self._pl_heatmap_fit_artist = None
-                self._update_pl_spectrum_with_analysis(plot_cube)
+                self._update_pl_spectrum_and_gate_line(plot_cube)
             elif mode == "DRR" and self.loaded.cube is not None:
                 self._pl_heatmap_ax = None
                 self._pl_spectrum_ax = None
                 self._pl_last_plot_cube = None
+                self._pl_gate_line = None
                 plot_cube = self._drr_cube_for_display()
                 self.loaded.drr_derivative_label = self.drr_derivative_combo.currentText()
                 params = self._make_params(mode, plot_cube)
@@ -2204,11 +3074,61 @@ class MainWindow(QMainWindow):
                 self._pl_heatmap_ax = None
                 self._pl_spectrum_ax = None
                 self._pl_last_plot_cube = None
-                first = next(iter(self.loaded.compare_cubes.values()))
+                cubes = {
+                    key: self.loaded.compare_cubes[key]
+                    for key in COMPARE_PANEL_ORDER
+                    if key in self.loaded.compare_cubes
+                }
+                if len(cubes) < 2:
+                    raise ValueError("Compare mode needs at least two visible channels.")
+                first = next(iter(cubes.values()))
                 params = self._make_params(mode, first)
-                images = render_compare_grid(self.figure, self.loaded.compare_cubes, params)
+                n = len(cubes)
+                if n <= 2:
+                    gs = self.figure.add_gridspec(
+                        nrows=2,
+                        ncols=n + 1,
+                        width_ratios=([1.0] * n) + [0.035],
+                        height_ratios=[1.0, 0.95],
+                        wspace=0.12,
+                        hspace=0.30,
+                    )
+                    heat_axes = [self.figure.add_subplot(gs[0, idx]) for idx in range(n)]
+                    line_ax = self.figure.add_subplot(gs[1, :n], sharex=heat_axes[0])
+                    cax = self.figure.add_subplot(gs[0, n])
+                else:
+                    gs = self.figure.add_gridspec(
+                        nrows=3,
+                        ncols=3,
+                        width_ratios=[1.0, 1.0, 0.035],
+                        height_ratios=[1.0, 1.0, 0.95],
+                        wspace=0.12,
+                        hspace=0.30,
+                    )
+                    heat_axes = [
+                        self.figure.add_subplot(gs[0, 0]),
+                        self.figure.add_subplot(gs[0, 1]),
+                        self.figure.add_subplot(gs[1, 0]),
+                        self.figure.add_subplot(gs[1, 1]),
+                    ]
+                    line_ax = self.figure.add_subplot(gs[2, :2], sharex=heat_axes[0])
+                    cax = self.figure.add_subplot(gs[0:2, 2])
+                images = []
+                for ax, key in zip(heat_axes, cubes.keys()):
+                    im = plot_compare_panel(ax, key, cubes[key], params)
+                    images.append(im)
+                    self._cmp_heatmap_axes[key] = ax
                 if images:
-                    self.figure.colorbar(images[0], ax=self.figure.axes, label=params.cbar_label, shrink=0.82)
+                    self.figure.colorbar(images[0], cax=cax, label=params.cbar_label)
+                gate_used = self._plot_compare_linecut(
+                    line_ax,
+                    cubes,
+                    gate_value=float(self.cmp_spins["gate"].value()),
+                    xlim=(float(self.cmp_spins["xmin"].value()), float(self.cmp_spins["xmax"].value())),
+                )
+                self._cmp_linecut_ax = line_ax
+                self._set_cmp_gate_spin_value(gate_used)
+                self._ensure_cmp_gate_lines(cubes, gate_used)
             else:
                 raise ValueError("No loaded data to plot.")
 
@@ -2247,6 +3167,7 @@ class MainWindow(QMainWindow):
             "baseline_which": self.drr_baseline_combine_combo.currentText(),
             "baseline_files": tuple(self.drr_baseline_files_manual),
             "selected_files": tuple(self.drr_selected_files),
+            "y_axis_spec": self._selected_y_axis_spec("drr"),
             "derivative": self.drr_derivative_combo.currentText(),
             "sg_window": int(self.drr_sg_window_spin.value()),
             "sg_poly": int(self.drr_sg_poly_spin.value()),
@@ -2264,12 +3185,29 @@ class MainWindow(QMainWindow):
         }
 
     def _current_plot_params_key(self, mode: str) -> tuple[Any, ...]:
+        if mode == "Compare":
+            return (
+                mode,
+                tuple(self._cmp_current_mapping().items()),
+                tuple(self._cmp_visible_channels()),
+                self._current_y_axis_spec_for_mode(mode),
+                self.cmp_cmap.currentText(),
+                float(self.cmp_spins["vmin"].value()),
+                float(self.cmp_spins["vmax"].value()),
+                float(self.cmp_spins["xmin"].value()),
+                float(self.cmp_spins["xmax"].value()),
+                float(self.cmp_spins["ymin"].value()),
+                float(self.cmp_spins["ymax"].value()),
+                float(self.cmp_spins["gate"].value()),
+                bool(self.cmp_log_chk.isChecked()),
+                bool(self.cmp_clip_chk.isChecked()),
+            )
         if mode != "DRR":
-            return (mode, int(self.tabs.currentIndex()), self.last_plotted_mode)
+            return (mode, int(self.tabs.currentIndex()), self.last_plotted_mode, self._current_y_axis_spec_for_mode(mode))
         p = self._read_drr_params()
         return (
             "DRR", p["baseline_mode"], p["baseline_which"], p["baseline_files"], p["selected_files"],
-            p["derivative"], p["sg_window"], p["sg_poly"], p["cmap"], p["vmin"], p["vmax"],
+            p["y_axis_spec"], p["derivative"], p["sg_window"], p["sg_poly"], p["cmap"], p["vmin"], p["vmax"],
             p["xmin"], p["xmax"], p["ymin"], p["ymax"], p["gate"], p["log"], p["clip"], p["center_zero"],
         )
 
@@ -2278,20 +3216,21 @@ class MainWindow(QMainWindow):
             return False
         if len(new_key) != len(self._last_plot_params_key):
             return False
-        gate_idx = 15
+        gate_idx = 16
         return (
             new_key[:gate_idx] == self._last_plot_params_key[:gate_idx]
             and new_key[gate_idx + 1 :] == self._last_plot_params_key[gate_idx + 1 :]
             and new_key[gate_idx] != self._last_plot_params_key[gate_idx]
         )
 
-    def _ensure_loaded_matches_drr_params(self) -> None:
+    def _ensure_loaded_matches_drr_params(self) -> bool:
         if not self.loaded or self.loaded.mode != "DRR":
-            return
+            return False
         p = self._read_drr_params()
         selected = list(p["selected_files"])
         baselines = list(p["baseline_files"])
         baseline_text = p["baseline_mode"]
+        y_axis_spec = str(p["y_axis_spec"])
         which_map = {
             "Last frame of each baseline file": "last",
             "First frame of each baseline file": "first",
@@ -2303,6 +3242,7 @@ class MainWindow(QMainWindow):
             or baseline_text != self.loaded.drr_baseline_text
             or baseline_which != self.loaded.drr_baseline_which
             or baselines != list(self.loaded.baseline_files)
+            or y_axis_spec != getattr(self.loaded, "y_axis_spec", "auto")
         )
         if needs_reload:
             if baseline_text == "External":
@@ -2313,6 +3253,7 @@ class MainWindow(QMainWindow):
                     selected,
                     baselines,
                     baseline_which=baseline_which,
+                    y_axis=y_axis_spec,
                     derivative=None,
                 )
                 mode_label = "DR/R External"
@@ -2321,6 +3262,7 @@ class MainWindow(QMainWindow):
                     self.current_folder,
                     selected,
                     use_first_frame=(baseline_text == "Self (first frame)"),
+                    y_axis=y_axis_spec,
                     derivative=None,
                 )
                 mode_label = "DR/R Self"
@@ -2335,9 +3277,13 @@ class MainWindow(QMainWindow):
                 drr_derivative_label=self.drr_derivative_combo.currentText(),
                 drr_baseline_text=baseline_text,
                 drr_baseline_which=baseline_which,
+                y_axis_spec=y_axis_spec,
             )
             self._last_plot_cube = None
             self._last_plot_params_key = None
+            self._apply_auto_limits_for_loaded()
+            return True
+        return False
 
     def _ensure_gate_line(self, cube: DataCube, gate_value: float) -> None:
         if self._drr_heatmap_ax is None:
@@ -2369,7 +3315,10 @@ class MainWindow(QMainWindow):
         self._drr_spectrum_ax.set_xlabel("Photon Energy (eV)")
         self._drr_spectrum_ax.set_ylabel(cube.cbar_label)
         self._drr_spectrum_ax.grid(alpha=0.25)
-        xlim = (float(self.drr_spins["xmin"].value()), float(self.drr_spins["xmax"].value()))
+        xlim = self._safe_spectrum_xlim(
+            x,
+            (float(self.drr_spins["xmin"].value()), float(self.drr_spins["xmax"].value())),
+        )
         self._drr_spectrum_ax.set_xlim(xlim)
         self._auto_scale_spectrum_y(self._drr_spectrum_ax, x, y, xlim)
         self._set_drr_gate_spin_value(gate_used)
@@ -2378,12 +3327,56 @@ class MainWindow(QMainWindow):
         self._update_drr_analysis_text(gate_used, x, np.asarray(y, float))
         self.canvas.draw_idle()
 
+    def _ensure_cmp_gate_lines(self, cubes: Dict[str, DataCube], gate_value: float) -> None:
+        active_keys = set(cubes.keys())
+        for key in list(self._cmp_gate_lines.keys()):
+            if key in active_keys and key in self._cmp_heatmap_axes:
+                continue
+            line = self._cmp_gate_lines.pop(key, None)
+            if line is not None:
+                try:
+                    line.remove()
+                except Exception:
+                    pass
+        for key, cube in cubes.items():
+            ax = self._cmp_heatmap_axes.get(key)
+            if ax is None:
+                continue
+            gate = np.asarray(cube.gate, float).ravel()
+            gate_clamped = float(np.clip(gate_value, float(np.nanmin(gate)), float(np.nanmax(gate))))
+            line = self._cmp_gate_lines.get(key)
+            if line is None or getattr(line, "axes", None) is not ax:
+                self._cmp_gate_lines[key] = ax.axhline(
+                    y=gate_clamped,
+                    lw=1.2,
+                    alpha=0.95,
+                    color="#222",
+                    linestyle="--",
+                    zorder=50,
+                )
+            else:
+                line.set_ydata([gate_clamped, gate_clamped])
+                line.set_linestyle("--")
+
     def _on_canvas_motion(self, event: Any) -> None:
-        if self._drr_heatmap_ax is None or self.last_plotted_mode != "DRR":
+        if self.last_plotted_mode == "DRR":
+            heatmap_ax = self._drr_heatmap_ax
+            cube = self._last_plot_cube
+        elif self.last_plotted_mode == "PL":
+            heatmap_ax = self._pl_heatmap_ax
+            cube = self._pl_last_plot_cube
+        elif self.last_plotted_mode == "Compare":
+            heatmap_ax = event.inaxes if event.inaxes in set(self._cmp_heatmap_axes.values()) else None
+            cube = None
+            for key, ax in self._cmp_heatmap_axes.items():
+                if ax is heatmap_ax and self.loaded and self.loaded.compare_cubes:
+                    cube = self.loaded.compare_cubes.get(key)
+                    break
+        else:
             return
-        if event.inaxes is not self._drr_heatmap_ax or event.ydata is None or self._last_plot_cube is None:
+        if heatmap_ax is None or cube is None or event.inaxes is not heatmap_ax or event.ydata is None:
             return
-        ygrid = np.asarray(self._last_plot_cube.gate, float).ravel()
+        ygrid = np.asarray(cube.gate, float).ravel()
         y = float(np.clip(float(event.ydata), float(np.nanmin(ygrid)), float(np.nanmax(ygrid))))
         self.statusBar().showMessage(f"Hover gate: {y:.3f} V")
 
@@ -2414,15 +3407,46 @@ class MainWindow(QMainWindow):
             if self._remove_peak_from_pl_heatmap_click(float(event.xdata), float(event.ydata)):
                 return
 
-        if self._drr_heatmap_ax is None or self.last_plotted_mode != "DRR":
+        if self.last_plotted_mode == "DRR":
+            if self._drr_heatmap_ax is None or self._last_plot_cube is None:
+                return
+            if event.inaxes is not self._drr_heatmap_ax or event.ydata is None:
+                return
+            ygrid = np.asarray(self._last_plot_cube.gate, float).ravel()
+            idx = int(np.argmin(np.abs(ygrid - float(event.ydata))))
+            gate = float(ygrid[idx])
+            self.drr_spins["gate"].setValue(gate)
+            self._update_drr_spectrum_and_gate_line(self._last_plot_cube)
             return
-        if event.inaxes is not self._drr_heatmap_ax or event.ydata is None or self._last_plot_cube is None:
+
+        if self.last_plotted_mode == "Compare":
+            if not self.loaded or not self.loaded.compare_cubes or event.ydata is None:
+                return
+            clicked_key = None
+            for key, ax in self._cmp_heatmap_axes.items():
+                if event.inaxes is ax:
+                    clicked_key = key
+                    break
+            if clicked_key is None:
+                return
+            cube = self.loaded.compare_cubes.get(clicked_key)
+            if cube is None:
+                return
+            ygrid = np.asarray(cube.gate, float).ravel()
+            idx = int(np.argmin(np.abs(ygrid - float(event.ydata))))
+            self._set_cmp_gate_spin_value(float(ygrid[idx]))
+            self._plot_mode("Compare")
             return
-        ygrid = np.asarray(self._last_plot_cube.gate, float).ravel()
+
+        if self.last_plotted_mode != "PL" or self._pl_heatmap_ax is None or self._pl_last_plot_cube is None:
+            return
+        if event.inaxes is not self._pl_heatmap_ax or event.ydata is None:
+            return
+        ygrid = np.asarray(self._pl_last_plot_cube.gate, float).ravel()
         idx = int(np.argmin(np.abs(ygrid - float(event.ydata))))
         gate = float(ygrid[idx])
-        self.drr_spins["gate"].setValue(gate)
-        self._update_drr_spectrum_and_gate_line(self._last_plot_cube)
+        self.pl_spins["gate"].setValue(gate)
+        self._update_pl_spectrum_and_gate_line(self._pl_last_plot_cube)
 
     def _start_export(self, mode: str) -> None:
         if not self.loaded or self.loaded.mode != mode:
@@ -2469,6 +3493,7 @@ class MainWindow(QMainWindow):
                 params=params,
                 compare_scale_tag=("log" if self.cmp_log_chk.isChecked() else "linear"),
                 compare_clip=bool(self.cmp_clip_chk.isChecked()),
+                compare_gate=float(self.cmp_spins["gate"].value()),
                 auto_move_sources=bool(self.auto_move_after_export_chk.isChecked()),
             )
 
@@ -2485,8 +3510,8 @@ class MainWindow(QMainWindow):
         out_folder: str | None = None
         files_to_move: list[str] = []
         if mode == "PL" and loaded.primary_file and options.params_linear is not None and options.params_log is not None:
-            linear_cube = data_io.load_pl_cube(folder, loaded.primary_file, log_scale=False)
-            log_cube = data_io.load_pl_cube(folder, loaded.primary_file, log_scale=True)
+            linear_cube = data_io.load_pl_cube(folder, loaded.primary_file, log_scale=False, y_axis=loaded.y_axis_spec)
+            log_cube = data_io.load_pl_cube(folder, loaded.primary_file, log_scale=True, y_axis=loaded.y_axis_spec)
             paths = export_pl_pngs_and_dat(
                 folder,
                 loaded.primary_file,
@@ -2520,6 +3545,7 @@ class MainWindow(QMainWindow):
                 params=options.params,
                 scale_tag=options.compare_scale_tag,
                 clip_outliers=options.compare_clip,
+                gate_value=options.compare_gate,
             )
             log.emit(f"Exported {len(paths)} compare files.")
             out_folder = str(Path(paths[0]).parent) if paths else str(Path(folder))

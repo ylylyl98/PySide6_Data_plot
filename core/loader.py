@@ -75,12 +75,15 @@ def peek_y_axis_options(user_folder: str, file_name: str) -> Tuple[list[str], st
 
 
 @lru_cache(maxsize=512)
-def _load_pl_cached(user_folder: str, file_name: str, log_scale: bool, csv_sig: Tuple[int, int]) -> dict:
+def _load_pl_cached(
+    user_folder: str, file_name: str, log_scale: bool, y_axis: str, csv_sig: Tuple[int, int]
+) -> dict:
     del csv_sig
 
     return P.process_pl(
         user_folder=user_folder,
         file=file_name,
+        y_axis=y_axis,
         plot_interactive=False,
         save_png=False,
         save_dat_file=False,
@@ -90,9 +93,9 @@ def _load_pl_cached(user_folder: str, file_name: str, log_scale: bool, csv_sig: 
     )
 
 
-def load_pl(user_folder: str, file_name: str, *, log_scale: bool = False) -> DataCube:
+def load_pl(user_folder: str, file_name: str, *, log_scale: bool = False, y_axis: str = "auto") -> DataCube:
     csv_sig = _csv_signature(user_folder, file_name)
-    res = _load_pl_cached(user_folder, file_name, bool(log_scale), csv_sig)
+    res = _load_pl_cached(user_folder, file_name, bool(log_scale), str(y_axis), csv_sig)
 
     _validate_cube_arrays(res["energy"], res["gate_axis"], res["Z"], context="PL load")
     return DataCube(
