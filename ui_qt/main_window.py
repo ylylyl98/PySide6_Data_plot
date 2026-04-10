@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QDialog,
     QDialogButtonBox,
+    QProgressBar,
     QSpinBox,
     QStyle,
     QSizePolicy,
@@ -243,7 +244,14 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(splitter)
 
-        self.setStatusBar(QStatusBar())
+        sb = QStatusBar()
+        self._status_progress = QProgressBar()
+        self._status_progress.setRange(0, 0)  # indeterminate spinner
+        self._status_progress.setMaximumWidth(120)
+        self._status_progress.setVisible(False)
+        self._status_progress.setToolTip("Loading data in background…")
+        sb.addPermanentWidget(self._status_progress)
+        self.setStatusBar(sb)
         self.statusBar().showMessage("Ready")
         self._build_log_dock()
         self._build_menu_and_toolbar()
@@ -254,17 +262,33 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(box)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(UI_METRICS["row_spacing"])
-        steps_label = QLabel("1) Select -> 2) Load -> 3) Plot -> 4) Export")
-        steps_label.setWordWrap(False)
+
+        # Workflow step banner
+        steps_label = QLabel("Select  ›  Load  ›  Plot  ›  Export")
+        steps_label.setAlignment(Qt.AlignCenter)
+        steps_label.setStyleSheet(
+            "QLabel { background: #deeaf8; color: #1a4a88; border-radius: 5px; "
+            "padding: 5px 10px; font-size: 11px; font-weight: 600; "
+            "border: 1px solid #bcd0ec; letter-spacing: 0.3px; }"
+        )
         layout.addWidget(steps_label)
 
+        # Data source section
         folder_box = QGroupBox("")
         folder_grid = QGridLayout(folder_box)
+        folder_grid.setContentsMargins(6, 4, 6, 6)
+        folder_grid.setHorizontalSpacing(6)
+        folder_grid.setVerticalSpacing(6)
         self.folder_edit = QLineEdit()
         self.folder_edit.setReadOnly(True)
+        self.folder_edit.setPlaceholderText("No folder selected — click Browse or Open File")
+        self.folder_edit.setToolTip("Current working folder for data files")
         self.browse_btn = QPushButton("Browse Folder")
+        self.browse_btn.setToolTip("Select a folder containing CSV data files")
         self.open_file_btn = QPushButton("Open File")
+        self.open_file_btn.setToolTip("Open a single CSV file and set its folder as the working directory")
         self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.setToolTip("Re-scan the current folder for new or changed CSV files")
         folder_grid.addWidget(self.folder_edit, 0, 0, 1, 3)
         folder_grid.addWidget(self.browse_btn, 1, 0)
         folder_grid.addWidget(self.open_file_btn, 1, 1)
@@ -434,56 +458,50 @@ class MainWindow(QMainWindow):
     def _build_pl_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
 
-        files = QGroupBox("")
+        files = QGroupBox("File")
         files_layout = QVBoxLayout(files)
+        files_layout.setContentsMargins(6, 6, 6, 6)
         self.pl_files = QListWidget()
         self.pl_files.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.pl_files.setMinimumHeight(60)
+        self.pl_files.setMaximumHeight(120)
+        self.pl_files.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.pl_files.setToolTip("Select a PL measurement file to load")
         files_layout.addWidget(self.pl_files)
         layout.addWidget(self._make_expander("Measurement File", files, expanded=True))
 
-        params = QGroupBox("")
+        params = QGroupBox("Plot Options")
         params_layout = QVBoxLayout(params)
+        params_layout.setContentsMargins(6, 6, 6, 4)
+        params_layout.setSpacing(4)
         cfg = QFormLayout()
-        grid, spins, _, _, cmap, fix_checks = self._build_common_range_grid("pl")
+        cfg.setHorizontalSpacing(6)
+        cfg.setVerticalSpacing(4)
+        _grid, spins, _, _, cmap, fix_checks = self._build_common_range_grid("pl")
         cmap.setCurrentText("turbo")
         self.pl_yaxis_controls = self._build_y_axis_controls("pl")
-        cfg.addRow("Y-axis Source", self.pl_yaxis_controls)
-        cfg.addRow("Colormap", cmap)
+        _pl_yc_row = QWidget()
+        _pl_yc_h = QHBoxLayout(_pl_yc_row)
+        _pl_yc_h.setContentsMargins(0, 0, 0, 0)
+        _pl_yc_h.setSpacing(6)
+        _pl_yc_h.addWidget(self.pl_yaxis_combo, 1)
+        _pl_yc_h.addWidget(QLabel("Cmap"))
+        _pl_yc_h.addWidget(cmap)
+        cfg.addRow("Y-axis / Cmap", _pl_yc_row)
+        cfg.addRow("", self.pl_yaxis_advanced_box)
         params_layout.addLayout(cfg)
         for s in spins.values():
             s.setFixedWidth(UI_METRICS["spin_w"])
             s.setFixedHeight(UI_METRICS["input_h"])
 
-        def pair_auto_row(
-            a: QDoubleSpinBox,
-            b: QDoubleSpinBox,
-            fa: QCheckBox,
-            fb: QCheckBox,
-            auto_btn: QToolButton,
-            auto_text: str,
-        ) -> QWidget:
-            auto_btn.setText(auto_text)
-            auto_btn.setAutoRaise(True)
-            auto_btn.setFixedWidth(UI_METRICS["tool_w"])
-            auto_btn.setFixedHeight(UI_METRICS["tool_h"])
-            row = QWidget()
-            h = QHBoxLayout(row)
-            h.setContentsMargins(0, 0, 0, 0)
-            h.setSpacing(4)
-            h.addWidget(a)
-            h.addWidget(fa)
-            h.addWidget(b)
-            h.addWidget(fb)
-            h.addWidget(auto_btn)
-            h.addStretch(1)
-            return row
-
         self.pl_auto_v_btn = QToolButton()
         self.pl_auto_x_btn = QToolButton()
         self.pl_auto_y_btn = QToolButton()
 
-        basic = QGroupBox("Basic")
+        basic = QGroupBox("Axis Ranges")
         basic_form = QFormLayout(basic)
         basic_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
         basic_form.setHorizontalSpacing(4)
@@ -491,15 +509,15 @@ class MainWindow(QMainWindow):
         basic_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         basic_form.addRow(
             "vmin / vmax",
-            pair_auto_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.pl_auto_v_btn, "Auto V"),
+            self._make_axis_range_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.pl_auto_v_btn, "Auto V"),
         )
         basic_form.addRow(
             "xmin / xmax",
-            pair_auto_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.pl_auto_x_btn, "Auto X"),
+            self._make_axis_range_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.pl_auto_x_btn, "Auto X"),
         )
         basic_form.addRow(
             "ymin / ymax",
-            pair_auto_row(spins["ymin"], spins["ymax"], fix_checks["ymin"], fix_checks["ymax"], self.pl_auto_y_btn, "Auto Y"),
+            self._make_axis_range_row(spins["ymin"], spins["ymax"], fix_checks["ymin"], fix_checks["ymax"], self.pl_auto_y_btn, "Auto Y"),
         )
         basic_form.addRow("Cursor Gate", spins["gate"])
         flags = QWidget()
@@ -514,11 +532,11 @@ class MainWindow(QMainWindow):
 
         params_layout.addWidget(basic)
 
-        analysis = QGroupBox("")
+        analysis = QGroupBox("Spectrum Analysis Controls")
         analysis_form = QFormLayout(analysis)
         analysis_form.setContentsMargins(6, 6, 6, 6)
         analysis_form.setHorizontalSpacing(6)
-        analysis_form.setVerticalSpacing(6)
+        analysis_form.setVerticalSpacing(4)
         self.pl_peak_find_btn = QPushButton("Find Peaks")
         self.pl_peak_show_chk = QCheckBox("Show Peaks")
         self.pl_peak_show_chk.setChecked(True)
@@ -574,23 +592,26 @@ class MainWindow(QMainWindow):
         row3h.addStretch(1)
         analysis_form.addRow("", row3)
         self.pl_fit_status = QLabel("")
+        self.pl_fit_status.setStyleSheet("QLabel { color: #2a6090; font-size: 10px; }")
         analysis_form.addRow("", self.pl_fit_status)
         self.pl_analysis_text = QPlainTextEdit()
         self.pl_analysis_text.setReadOnly(True)
-        self.pl_analysis_text.setMaximumHeight(86)
-        self.pl_analysis_text.setPlaceholderText("Detected/Fit points will appear here.")
+        self.pl_analysis_text.setMinimumHeight(60)
+        self.pl_analysis_text.setMaximumHeight(100)
+        self.pl_analysis_text.setPlaceholderText("Peak/fit results will appear here after detection.")
         analysis_form.addRow("", self.pl_analysis_text)
-        analysis_section = self._make_expander("Spectrum Analysis", analysis, expanded=False)
         layout.addWidget(self._make_expander("Parameters", params, expanded=True))
-        layout.addWidget(analysis_section)
+        layout.addWidget(self._make_expander("Spectrum Analysis", analysis, expanded=False))
         layout.addStretch(1)
         return tab
 
     def _build_drr_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
 
-        files = QGroupBox("")
+        files = QGroupBox("Files")
         files_layout = QVBoxLayout(files)
         files_layout.setContentsMargins(6, 6, 6, 6)
         files_layout.setSpacing(6)
@@ -640,9 +661,9 @@ class MainWindow(QMainWindow):
         files_layout.addWidget(self.drr_baseline_combine_combo)
         layout.addWidget(self._make_expander("Measurement + Baseline Files", files, expanded=True))
 
-        params = QGroupBox("")
+        params = QGroupBox("Plot Options")
         params_layout = QVBoxLayout(params)
-        params_layout.setContentsMargins(8, 8, 8, 8)
+        params_layout.setContentsMargins(6, 6, 6, 4)
         params_layout.setSpacing(6)
 
         self.drr_baseline_combo = QComboBox()
@@ -686,30 +707,6 @@ class MainWindow(QMainWindow):
         self.drr_sg_poly_spin.setFixedWidth(UI_METRICS["spin_w"])
         self.drr_sg_poly_spin.setFixedHeight(UI_METRICS["input_h"])
 
-        def pair_auto_row(
-            a: QDoubleSpinBox,
-            b: QDoubleSpinBox,
-            fa: QCheckBox,
-            fb: QCheckBox,
-            auto_btn: QToolButton,
-            auto_text: str,
-        ) -> QWidget:
-            auto_btn.setText(auto_text)
-            auto_btn.setAutoRaise(True)
-            auto_btn.setFixedWidth(UI_METRICS["tool_w"])
-            auto_btn.setFixedHeight(UI_METRICS["tool_h"])
-            row = QWidget()
-            h = QHBoxLayout(row)
-            h.setContentsMargins(0, 0, 0, 0)
-            h.setSpacing(4)
-            h.addWidget(a)
-            h.addWidget(fa)
-            h.addWidget(b)
-            h.addWidget(fb)
-            h.addWidget(auto_btn)
-            h.addStretch(1)
-            return row
-
         deriv_row = QWidget()
         deriv_h = QHBoxLayout(deriv_row)
         deriv_h.setContentsMargins(0, 0, 0, 0)
@@ -728,7 +725,7 @@ class MainWindow(QMainWindow):
         self.drr_center_zero_chk.setToolTip("When enabled, DRR colormap is centered at zero.")
         self.drr_center_zero_chk.setChecked(False)
 
-        basic = QGroupBox("Basic")
+        basic = QGroupBox("Axis Ranges")
         basic_form = QFormLayout(basic)
         basic_form.setContentsMargins(
             4,
@@ -747,19 +744,20 @@ class MainWindow(QMainWindow):
         baseline_cmap_h.addWidget(QLabel("Colormap"))
         baseline_cmap_h.addWidget(cmap)
         basic_form.addRow("DRR Baseline", baseline_cmap_row)
-        basic_form.addRow("Y-axis Source", self.drr_yaxis_controls)
+        basic_form.addRow("Y-axis", self.drr_yaxis_combo)
+        basic_form.addRow("", self.drr_yaxis_advanced_box)
         basic_form.addRow("Derivative / SG", deriv_row)
         basic_form.addRow(
             "vmin / vmax",
-            pair_auto_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.drr_auto_v_btn, "Auto V"),
+            self._make_axis_range_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.drr_auto_v_btn, "Auto V"),
         )
         basic_form.addRow(
             "xmin / xmax",
-            pair_auto_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.drr_auto_x_btn, "Auto X"),
+            self._make_axis_range_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.drr_auto_x_btn, "Auto X"),
         )
         basic_form.addRow(
             "ymin / ymax",
-            pair_auto_row(spins["ymin"], spins["ymax"], fix_checks["ymin"], fix_checks["ymax"], self.drr_auto_y_btn, "Auto Y"),
+            self._make_axis_range_row(spins["ymin"], spins["ymax"], fix_checks["ymin"], fix_checks["ymax"], self.drr_auto_y_btn, "Auto Y"),
         )
         basic_form.addRow("Cursor Gate", spins["gate"])
         flags = QWidget()
@@ -777,7 +775,7 @@ class MainWindow(QMainWindow):
         analysis_form = QFormLayout(analysis_box)
         analysis_form.setContentsMargins(6, 6, 6, 6)
         analysis_form.setHorizontalSpacing(6)
-        analysis_form.setVerticalSpacing(6)
+        analysis_form.setVerticalSpacing(4)
 
         self.drr_peak_show_chk = QCheckBox("Show Peaks")
         self.drr_peak_show_chk.setChecked(True)
@@ -847,13 +845,14 @@ class MainWindow(QMainWindow):
         analysis_form.addRow("", self.drr_fit_status)
         self.drr_analysis_text = QPlainTextEdit()
         self.drr_analysis_text.setReadOnly(True)
-        self.drr_analysis_text.setMaximumHeight(86)
-        self.drr_analysis_text.setPlaceholderText("Detected/Fit points will appear here.")
+        self.drr_analysis_text.setMinimumHeight(60)
+        self.drr_analysis_text.setMaximumHeight(100)
+        self.drr_analysis_text.setPlaceholderText("Peak/fit results will appear here after detection.")
         analysis_form.addRow("", self.drr_analysis_text)
-        analysis_section = self._make_expander("Spectrum Analysis", analysis_box, expanded=False)
+        self.drr_fit_status.setStyleSheet("QLabel { color: #2a6090; font-size: 10px; }")
         params_layout.addWidget(basic)
         layout.addWidget(self._make_expander("Parameters", params, expanded=True))
-        layout.addWidget(analysis_section)
+        layout.addWidget(self._make_expander("Spectrum Analysis", analysis_box, expanded=False))
         layout.addStretch(1)
         return tab
 
@@ -864,6 +863,33 @@ class MainWindow(QMainWindow):
                 lbl = item.widget()
                 lbl.setFixedWidth(width)
                 lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+    def _make_axis_range_row(
+        self,
+        a: QDoubleSpinBox,
+        b: QDoubleSpinBox,
+        fa: QCheckBox,
+        fb: QCheckBox,
+        auto_btn: QToolButton,
+        auto_text: str,
+    ) -> QWidget:
+        """Build a min/max spin pair with Fix checkboxes and an Auto button."""
+        auto_btn.setText(auto_text)
+        auto_btn.setAutoRaise(True)
+        auto_btn.setFixedWidth(UI_METRICS["tool_w"])
+        auto_btn.setFixedHeight(UI_METRICS["tool_h"])
+        auto_btn.setToolTip(f"Set {auto_text.replace('Auto ', '')} bounds automatically from loaded data")
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(4)
+        h.addWidget(a)
+        h.addWidget(fa)
+        h.addWidget(b)
+        h.addWidget(fb)
+        h.addWidget(auto_btn)
+        h.addStretch(1)
+        return row
 
     def _style_combo_popup(self, combo: QComboBox) -> None:
         view = combo.view()
@@ -954,21 +980,26 @@ class MainWindow(QMainWindow):
     def _make_expander(self, title: str, content: QWidget, *, expanded: bool = True) -> QWidget:
         box = QWidget()
         v = QVBoxLayout(box)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(2)
+        v.setContentsMargins(0, 2, 0, 2)
+        v.setSpacing(3)
         head = QToolButton()
         head.setCheckable(True)
         head.setChecked(bool(expanded))
         head.setAutoRaise(True)
         head.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        head.setStyleSheet("QToolButton { border: none; padding: 0px 4px; }")
+        head.setStyleSheet(
+            "QToolButton { border: none; padding: 2px 4px; font-weight: 600; "
+            "color: #2a3a50; font-size: 11px; text-align: left; }"
+            "QToolButton:hover { color: #1a5090; }"
+        )
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
-        line.setFrameShadow(QFrame.Sunken)
+        line.setFrameShadow(QFrame.Plain)
+        line.setStyleSheet("QFrame { color: #ccd6e2; }")
         row = QWidget()
         row_h = QHBoxLayout(row)
         row_h.setContentsMargins(0, 0, 0, 0)
-        row_h.setSpacing(4)
+        row_h.setSpacing(6)
         row_h.addWidget(head)
         row_h.addWidget(line, 1)
         v.addWidget(row)
@@ -976,7 +1007,8 @@ class MainWindow(QMainWindow):
         v.addWidget(content)
 
         def _update(on: bool) -> None:
-            head.setText(f"{'[-]' if on else '[+]'} {title}")
+            arrow = "▼" if on else "▶"
+            head.setText(f"{arrow}  {title}")
             content.setVisible(bool(on))
 
         _update(bool(expanded))
@@ -986,18 +1018,25 @@ class MainWindow(QMainWindow):
     def _build_compare_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
 
-        files = QGroupBox("")
+        files = QGroupBox("File")
         files_layout = QVBoxLayout(files)
+        files_layout.setContentsMargins(6, 6, 6, 6)
         self.cmp_files = QListWidget()
         self.cmp_files.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.cmp_files.setMinimumHeight(70)
+        self.cmp_files.setToolTip("Select files to compare (multi-select with Ctrl/Shift)")
         files_layout.addWidget(self.cmp_files)
         layout.addWidget(self._make_expander("Available Compare Files", files, expanded=True))
 
-        params = QGroupBox("")
+        params = QGroupBox("Plot Options")
         params_layout = QVBoxLayout(params)
+        params_layout.setContentsMargins(6, 6, 6, 4)
+        params_layout.setSpacing(4)
 
-        assignment = QGroupBox("")
+        assignment = QGroupBox("Channel Assignment")
         assignment_layout = QVBoxLayout(assignment)
         assignment_layout.setContentsMargins(6, 8, 6, 6)
         assignment_layout.setSpacing(6)
@@ -1057,7 +1096,7 @@ class MainWindow(QMainWindow):
         assignment_layout.addLayout(summary_form)
         params_layout.addWidget(self._make_expander("Assignment", assignment, expanded=False))
 
-        display = QGroupBox("")
+        display = QGroupBox("Display Preset")
         display_form = QFormLayout(display)
         self.cmp_display_preset_combo = QComboBox()
         self.cmp_display_preset_combo.addItems(["KK + KKp", "KpK + KpKp", "All four", "Custom"])
@@ -1077,44 +1116,29 @@ class MainWindow(QMainWindow):
         params_layout.addWidget(self._make_expander("Display", display, expanded=False))
 
         cfg = QFormLayout()
-        grid, spins, _, _, cmap, fix_checks = self._build_common_range_grid("cmp")
+        cfg.setHorizontalSpacing(6)
+        cfg.setVerticalSpacing(4)
+        _grid, spins, _, _, cmap, fix_checks = self._build_common_range_grid("cmp")
         cmap.setCurrentText("turbo")
         self.cmp_yaxis_controls = self._build_y_axis_controls("cmp")
-        cfg.addRow("Y-axis Source", self.cmp_yaxis_controls)
-        cfg.addRow("Colormap", cmap)
+        _cmp_yc_row = QWidget()
+        _cmp_yc_h = QHBoxLayout(_cmp_yc_row)
+        _cmp_yc_h.setContentsMargins(0, 0, 0, 0)
+        _cmp_yc_h.setSpacing(6)
+        _cmp_yc_h.addWidget(self.cmp_yaxis_combo, 1)
+        _cmp_yc_h.addWidget(QLabel("Cmap"))
+        _cmp_yc_h.addWidget(cmap)
+        cfg.addRow("Y-axis / Cmap", _cmp_yc_row)
+        cfg.addRow("", self.cmp_yaxis_advanced_box)
         params_layout.addLayout(cfg)
         for s in spins.values():
             s.setFixedWidth(UI_METRICS["spin_w"])
             s.setFixedHeight(UI_METRICS["input_h"])
 
-        def pair_auto_row(
-            a: QDoubleSpinBox,
-            b: QDoubleSpinBox,
-            fa: QCheckBox,
-            fb: QCheckBox,
-            auto_btn: QToolButton,
-            auto_text: str,
-        ) -> QWidget:
-            auto_btn.setText(auto_text)
-            auto_btn.setAutoRaise(True)
-            auto_btn.setFixedWidth(UI_METRICS["tool_w"])
-            auto_btn.setFixedHeight(UI_METRICS["tool_h"])
-            row = QWidget()
-            h = QHBoxLayout(row)
-            h.setContentsMargins(0, 0, 0, 0)
-            h.setSpacing(4)
-            h.addWidget(a)
-            h.addWidget(fa)
-            h.addWidget(b)
-            h.addWidget(fb)
-            h.addWidget(auto_btn)
-            h.addStretch(1)
-            return row
-
         self.cmp_auto_v_btn = QToolButton()
         self.cmp_auto_x_btn = QToolButton()
         self.cmp_auto_y_btn = QToolButton()
-        basic = QGroupBox("")
+        basic = QGroupBox("Axis Ranges")
         basic_form = QFormLayout(basic)
         basic_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
         basic_form.setHorizontalSpacing(4)
@@ -1122,15 +1146,15 @@ class MainWindow(QMainWindow):
         basic_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         basic_form.addRow(
             "vmin / vmax",
-            pair_auto_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.cmp_auto_v_btn, "Auto V"),
+            self._make_axis_range_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.cmp_auto_v_btn, "Auto V"),
         )
         basic_form.addRow(
             "xmin / xmax",
-            pair_auto_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.cmp_auto_x_btn, "Auto X"),
+            self._make_axis_range_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.cmp_auto_x_btn, "Auto X"),
         )
         basic_form.addRow(
             "ymin / ymax",
-            pair_auto_row(spins["ymin"], spins["ymax"], fix_checks["ymin"], fix_checks["ymax"], self.cmp_auto_y_btn, "Auto Y"),
+            self._make_axis_range_row(spins["ymin"], spins["ymax"], fix_checks["ymin"], fix_checks["ymax"], self.cmp_auto_y_btn, "Auto Y"),
         )
         basic_form.addRow("Cursor Gate", spins["gate"])
         flags = QWidget()
@@ -1299,13 +1323,41 @@ class MainWindow(QMainWindow):
     def _build_tools_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        box = QGroupBox("")
-        b = QVBoxLayout(box)
-        self.show_log_btn = QPushButton("Show/Hide Log")
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(10)
+
+        log_box = QGroupBox("Log Panel")
+        log_layout = QVBoxLayout(log_box)
+        log_layout.setContentsMargins(8, 8, 8, 8)
+        log_layout.setSpacing(6)
+        hint = QLabel("The log panel records all load, plot, and export events.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("QLabel { color: #5a6a7a; font-size: 10px; }")
+        log_layout.addWidget(hint)
+        log_btn_row = QHBoxLayout()
+        log_btn_row.setSpacing(8)
+        self.show_log_btn = QPushButton("Show / Hide Log Panel")
+        self.show_log_btn.setToolTip("Toggle the bottom log dock panel")
         self.clear_log_btn = QPushButton("Clear Log")
-        b.addWidget(self.show_log_btn)
-        b.addWidget(self.clear_log_btn)
-        layout.addWidget(self._make_expander("Tools", box, expanded=True))
+        self.clear_log_btn.setToolTip("Clear all messages from the log")
+        log_btn_row.addWidget(self.show_log_btn)
+        log_btn_row.addWidget(self.clear_log_btn)
+        log_layout.addLayout(log_btn_row)
+        layout.addWidget(log_box)
+
+        file_box = QGroupBox("File Management")
+        file_layout = QVBoxLayout(file_box)
+        file_layout.setContentsMargins(8, 8, 8, 8)
+        file_layout.setSpacing(6)
+        file_hint = QLabel(
+            "After export, source CSV files can be moved to an archive folder "
+            "('Initial data after processing') to keep the workspace clean."
+        )
+        file_hint.setWordWrap(True)
+        file_hint.setStyleSheet("QLabel { color: #5a6a7a; font-size: 10px; }")
+        file_layout.addWidget(file_hint)
+        layout.addWidget(file_box)
+
         layout.addStretch(1)
         return tab
 
@@ -1374,6 +1426,7 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.load_action)
         toolbar.addAction(self.plot_action)
         toolbar.addAction(self.save_action)
+        toolbar.addSeparator()
         toolbar.addWidget(self.move_now_btn)
         toolbar.addWidget(self.auto_move_after_export_chk)
 
@@ -1518,6 +1571,7 @@ class MainWindow(QMainWindow):
 
     def _set_stage(self, stage: str) -> None:
         self._status(f"State: {stage}")
+        self._status_progress.setVisible(stage == "Loading...")
 
     def _active_mode(self) -> str | None:
         text = self.tabs.tabText(self.tabs.currentIndex())
