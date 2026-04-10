@@ -3,58 +3,68 @@ setlocal
 cd /d "%~dp0"
 
 set "PYEXE=.venv\Scripts\python.exe"
-set "GIT_PULL_OK=0"
+set "GIT_UPDATE_STATUS=Git update skipped."
+set "GIT_TERMINAL_PROMPT=0"
+set "GCM_INTERACTIVE=Never"
+set "GIT_ASKPASS=echo"
 
 git rev-parse --is-inside-work-tree >nul 2>nul
-if errorlevel 1 goto after_git_pull
+if errorlevel 1 (
+    set "GIT_UPDATE_STATUS=Not a git working tree. Skipping git pull."
+    goto after_git_pull
+)
 
 git diff --no-ext-diff --quiet --exit-code >nul 2>nul
 if errorlevel 1 (
-    echo Git working tree has local unstaged changes. Skipping git pull.
+    set "GIT_UPDATE_STATUS=Git working tree has local unstaged changes. Skipping git pull."
     goto after_git_pull
 )
 
 git diff --cached --no-ext-diff --quiet --exit-code >nul 2>nul
 if errorlevel 1 (
-    echo Git working tree has staged changes. Skipping git pull.
+    set "GIT_UPDATE_STATUS=Git working tree has staged changes. Skipping git pull."
     goto after_git_pull
 )
 
 for /f %%I in ('git ls-files --others --exclude-standard 2^>nul') do (
-    echo Git working tree has untracked files. Skipping git pull.
+    set "GIT_UPDATE_STATUS=Git working tree has untracked files. Skipping git pull."
     goto after_git_pull
 )
 
 git rev-parse --abbrev-ref --symbolic-full-name @{u} >nul 2>nul
 if errorlevel 1 (
-    echo No upstream branch is configured. Skipping git pull.
+    set "GIT_UPDATE_STATUS=No upstream branch is configured. Skipping git pull."
     goto after_git_pull
 )
 
 echo Checking for remote updates...
 git fetch --quiet
 if errorlevel 1 (
-    echo Git fetch failed. Launching without pulling updates.
+    set "GIT_UPDATE_STATUS=Git fetch failed or needs authentication. Launching without pulling updates."
     goto after_git_pull
 )
 
 for /f %%I in ('git rev-list --count HEAD..@{u} 2^>nul') do set "BEHIND_COUNT=%%I"
-if not defined BEHIND_COUNT goto after_git_pull
-if "%BEHIND_COUNT%"=="0" goto after_git_pull
+if not defined BEHIND_COUNT (
+    set "GIT_UPDATE_STATUS=Could not determine remote status. Launching without pulling updates."
+    goto after_git_pull
+)
+if "%BEHIND_COUNT%"=="0" (
+    set "GIT_UPDATE_STATUS=Git is already up to date."
+    goto after_git_pull
+)
 
 echo Pulling latest changes from git...
 git pull --ff-only
 if errorlevel 1 (
-    echo Git pull failed. Launching without applying remote updates.
+    set "GIT_UPDATE_STATUS=Git pull failed. Launching without applying remote updates."
     goto after_git_pull
 )
 
-set "GIT_PULL_OK=1"
+set "GIT_UPDATE_STATUS=Git pull completed successfully."
 
 :after_git_pull
-if "%GIT_PULL_OK%"=="1" (
-    echo Git pull completed successfully.
-)
+echo %GIT_UPDATE_STATUS%
 
 py -3.13 --version >nul 2>nul
 if errorlevel 1 (
