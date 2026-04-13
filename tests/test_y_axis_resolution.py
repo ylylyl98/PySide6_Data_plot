@@ -20,11 +20,23 @@ class CanonicalYAxisResolutionTests(unittest.TestCase):
         self.assertTrue(np.allclose(d["gate_axis"], expected))
         self.assertEqual(d["gate_label"], "0.9TG-BG (V)")
 
+    def test_auto_bg_coefficient_from_structured_metadata(self) -> None:
+        d = processing_run._load_canonical(str(FIXTURES), "sample$TG+1.1BG=0$.csv", y_axis="auto")
+        expected = np.array([9.8, 9.9, 10.0])
+        self.assertTrue(np.allclose(d["gate_axis"], expected))
+        self.assertEqual(d["gate_label"], "TG-1.1BG (V)")
+
     def test_auto_ratio_from_stem_fallback(self) -> None:
         d = processing_run._load_canonical(str(FIXTURES), "sample_0.9TG+BG_scan.csv", y_axis="auto")
         expected = np.array([8.8, 8.9, 9.0])
         self.assertTrue(np.allclose(d["gate_axis"], expected))
         self.assertEqual(d["gate_label"], "0.9TG-BG (V)")
+
+    def test_auto_bg_coefficient_from_stem_fallback(self) -> None:
+        d = processing_run._load_canonical(str(FIXTURES), "sample_TG+1.1BG=0_scan.csv", y_axis="auto")
+        expected = np.array([9.8, 9.9, 10.0])
+        self.assertTrue(np.allclose(d["gate_axis"], expected))
+        self.assertEqual(d["gate_label"], "TG-1.1BG (V)")
 
     def test_metadata_has_priority_over_stem_fallback(self) -> None:
         d = processing_run._load_canonical(str(FIXTURES), "device$bgonly$_0.9TG+BG_scan.csv", y_axis="auto")

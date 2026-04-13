@@ -127,9 +127,19 @@ def _format_ratio_label(ratio: float) -> str:
     return _format_coeff(float(ratio))
 
 
+def _build_tg_minus_bg_label(tg_coeff: float = 1.0, bg_coeff: float = 1.0) -> str:
+    if not np.isfinite(tg_coeff) or not np.isfinite(bg_coeff):
+        raise ValueError("TG/BG coefficients must be finite.")
+
+    tg_prefix = _format_ratio_label(float(tg_coeff))
+    bg_prefix = _format_ratio_label(float(bg_coeff))
+    tg_text = f"{tg_prefix}TG" if tg_prefix else "TG"
+    bg_text = f"{bg_prefix}BG" if bg_prefix else "BG"
+    return f"{tg_text}-{bg_text} (V)"
+
+
 def _build_ratio_tg_minus_bg_label(ratio: float) -> str:
-    prefix = _format_ratio_label(ratio)
-    return f"{prefix}TG-BG (V)" if prefix else "TG-BG (V)"
+    return _build_tg_minus_bg_label(float(ratio), 1.0)
 
 
 def _build_linear_combo_label(a: float, b: float, c: float = 0.0) -> str:
@@ -220,10 +230,15 @@ def _match_gate_mode_token(text: str) -> Optional[Dict[str, float | str]]:
     if not token:
         return None
 
-    m = re.match(r"^\s*(?:(\d+(?:\.\d+)?)\s*)?TG\s*\+\s*BG\s*$", token, flags=re.I)
+    m = re.match(
+        r"^\s*(?:(?P<tg>\d+(?:\.\d+)?)\s*)?TG\s*\+\s*(?:(?P<bg>\d+(?:\.\d+)?)\s*)?BG(?:\s*=\s*0(?:\.0+)?)?\s*$",
+        token,
+        flags=re.I,
+    )
     if m:
-        ratio = float(m.group(1)) if m.group(1) is not None else 1.0
-        return {"mode": "ratio_tg_plus_bg", "ratio": ratio}
+        tg_coeff = float(m.group("tg")) if m.group("tg") is not None else 1.0
+        bg_coeff = float(m.group("bg")) if m.group("bg") is not None else 1.0
+        return {"mode": "tg_minus_bg", "tg_coeff": tg_coeff, "bg_coeff": bg_coeff}
 
     if re.match(r"^\s*TGONLY\s*$", token, flags=re.I):
         return {"mode": "tgonly", "ratio": 1.0}
@@ -245,7 +260,12 @@ def _find_gate_mode_in_segments(parts: Sequence[str]) -> Optional[Dict[str, floa
 def _find_gate_mode_in_stem(stem: str) -> Optional[Dict[str, float | str]]:
     bounded = f" {stem or ''} "
     patterns = (
-        (re.compile(r"(?i)(?<![A-Za-z0-9])((?:\d+(?:\.\d+)?)?\s*TG\s*\+\s*BG)(?![A-Za-z0-9])"), "ratio"),
+        (
+            re.compile(
+                r"(?i)(?<![A-Za-z0-9])((?:(?:\d+(?:\.\d+)?)\s*)?TG\s*\+\s*(?:(?:\d+(?:\.\d+)?)\s*)?BG(?:\s*=\s*0(?:\.0+)?)?)(?![A-Za-z0-9])"
+            ),
+            "tg_minus_bg",
+        ),
         (re.compile(r"(?i)(?<![A-Za-z0-9])TGONLY(?![A-Za-z0-9])"), "tgonly"),
         (re.compile(r"(?i)(?<![A-Za-z0-9])BGONLY(?![A-Za-z0-9])"), "bgonly"),
     )
@@ -253,7 +273,7 @@ def _find_gate_mode_in_stem(stem: str) -> Optional[Dict[str, float | str]]:
         m = rx.search(bounded)
         if not m:
             continue
-        if kind == "ratio":
+        if kind == "tg_minus_bg":
             return _match_gate_mode_token(m.group(1))
         if kind == "tgonly":
             return {"mode": "tgonly", "ratio": 1.0}
@@ -360,10 +380,11 @@ def _resolve_axis_choice(
         auto_match = _find_gate_mode_in_segments(parts) or _find_gate_mode_in_stem(stem)
         if auto_match is not None:
             mode = str(auto_match["mode"])
-            if mode == "ratio_tg_plus_bg":
-                ratio = float(auto_match.get("ratio", 1.0))
-                gate_axis = ratio * np.asarray(vtg, float) - np.asarray(vbg, float)
-                gate_label = _build_ratio_tg_minus_bg_label(ratio)
+            if mode == "tg_minus_bg":
+                tg_coeff = float(auto_match.get("tg_coeff", 1.0))
+                bg_coeff = float(auto_match.get("bg_coeff", 1.0))
+                gate_axis = tg_coeff * np.asarray(vtg, float) - bg_coeff * np.asarray(vbg, float)
+                gate_label = _build_tg_minus_bg_label(tg_coeff, bg_coeff)
                 if "TG+BG" not in available_axes:
                     available_axes.append("TG+BG")
                 return {
