@@ -10,8 +10,8 @@ from typing import Any, Callable, Dict, List
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtCore import QMimeData, QObject, QRunnable, Qt, QThreadPool, Signal
+from PySide6.QtGui import QAction, QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -67,18 +67,18 @@ from core.processing import (
 )
 
 UI_METRICS = {
-    "left_max_width": 520,
-    "main_margin": 10,
-    "group_margin": 8,
-    "row_spacing": 6,
-    "label_col_width": 82,
-    "input_h": 29,
+    "left_max_width": 500,
+    "main_margin": 12,
+    "group_margin": 10,
+    "row_spacing": 8,
+    "label_col_width": 86,
+    "input_h": 30,
     "spin_w": 88,
-    "short_combo_w": 150,
+    "short_combo_w": 145,
     "deriv_combo_w": 90,
-    "long_combo_min_w": 210,
-    "tool_h": 26,
-    "tool_w": 60,
+    "long_combo_min_w": 200,
+    "tool_h": 28,
+    "tool_w": 62,
 }
 
 
@@ -198,13 +198,17 @@ class MainWindow(QMainWindow):
         self._drr_fit_centers: np.ndarray | None = None
         self._drr_heatmap_peak_artist = None
         self._drr_heatmap_fit_artist = None
+        self._folder_placeholder_text = ""
+        self._load_in_progress = False
 
         self._build_ui()
+        self._folder_placeholder_text = self.folder_edit.placeholderText()
         self.apply_ui_metrics()
         self._wire_actions()
         self._apply_initial_geometry()
         self._set_stage("No data")
         self._update_action_states()
+        self.setAcceptDrops(True)
 
     def _apply_initial_geometry(self) -> None:
         screen = QApplication.primaryScreen()
@@ -219,6 +223,155 @@ class MainWindow(QMainWindow):
             available.x() + (available.width() - width) // 2,
             available.y() + (available.height() - height) // 2,
         )
+
+    def _drop_has_csv(self, mime: QMimeData) -> bool:
+        if not mime.hasUrls():
+            return False
+        for url in mime.urls():
+            if not url.isLocalFile():
+                continue
+            path = Path(url.toLocalFile())
+            if path.is_dir() or path.suffix.lower() == ".csv":
+                return True
+        return False
+
+    def _set_drop_highlight(self, on: bool) -> None:
+        if on:
+            self.folder_edit.setStyleSheet("border: 1px solid #2F80ED; background-color: #EAF3FF;")
+            if not self.current_folder:
+                self.folder_edit.setPlaceholderText("Drop to set folder")
+            return
+        self.folder_edit.setStyleSheet("")
+        self.folder_edit.setPlaceholderText(self._folder_placeholder_text)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        source = event.source()
+        if isinstance(source, QWidget) and (source is self or self.isAncestorOf(source)):
+            event.ignore()
+            return
+        if self._drop_has_csv(event.mimeData()):
+            self._set_drop_highlight(True)
+            event.acceptProposedAction()
+            return
+        self._set_drop_highlight(False)
+        if event.mimeData().hasUrls():
+            self._status("Drop ignored: only .csv files or folders are supported")
+        event.ignore()
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:
+        source = event.source()
+        if isinstance(source, QWidget) and (source is self or self.isAncestorOf(source)):
+            event.ignore()
+            return
+        if self._drop_has_csv(event.mimeData()):
+            self._set_drop_highlight(True)
+            event.acceptProposedAction()
+            return
+        self._set_drop_highlight(False)
+        event.ignore()
+
+    def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:
+        self._set_drop_highlight(False)
+        event.accept()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        self._set_drop_highlight(False)
+        source = event.source()
+        if isinstance(source, QWidget) and (source is self or self.isAncestorOf(source)):
+            event.ignore()
+            return
+        if not self._drop_has_csv(event.mimeData()):
+            self._status("Drop ignored: only .csv files or folders are supported")
+            event.ignore()
+            return
+        paths: list[Path] = []
+        for url in event.mimeData().urls():
+            if not url.isLocalFile():
+                continue
+            raw = url.toLocalFile()
+            if raw:
+                paths.append(Path(raw))
+        if self._handle_dropped_files(paths):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def _handle_dropped_files(self, paths: List[Path]) -> bool:
+        self._set_drop_highlight(False)
+        if self._load_in_progress:
+            self._status("Drop ignored: a load is already in progress")
+            return False
+        valid_paths = [path for path in paths if path.exists()]
+        if not valid_paths:
+            self._status("Drop ignored: no valid local files were found")
+            return False
+
+        folders = [path for path in valid_paths if path.is_dir()]
+        files = [path for path in valid_paths if path.is_file()]
+        csv_files = [path for path in files if path.suffix.lower() == ".csv"]
+        ignored_count = len(files) - len(csv_files)
+
+        if folders and csv_files:
+            self._status("Drop ignored: drop either one folder or CSV files from one folder")
+            return False
+        if len(folders) > 1:
+            self._status("Drop ignored: only one folder can be dropped at a time")
+            return False
+        if folders:
+            folder = str(folders[0])
+            self.current_folder = folder
+            self.folder_edit.setText(folder)
+            self._refresh_file_lists()
+            self._status(f"Folder set: {folders[0].name} — {len(self.available_files)} CSV files found")
+            return True
+
+        if not csv_files:
+            if ignored_count > 0:
+                self._status("Drop ignored: only .csv files are supported")
+            else:
+                self._status("Drop ignored: no supported files detected")
+            return False
+
+        parent_folders = list(dict.fromkeys(str(path.parent) for path in csv_files))
+        if len(parent_folders) != 1:
+            self._status("Drop ignored: all files must be from the same folder")
+            return False
+
+        self.current_folder = parent_folders[0]
+        self.folder_edit.setText(self.current_folder)
+        self._refresh_file_lists()
+
+        dropped_names = list(dict.fromkeys(path.name for path in csv_files))
+        selected_names = [name for name in dropped_names if name in self.available_files]
+        if not selected_names:
+            self._status("Drop ignored: dropped CSV files were not found in the selected folder")
+            return False
+
+        self.pl_files.clearSelection()
+        pl_matches = self.pl_files.findItems(selected_names[0], Qt.MatchExactly)
+        if pl_matches:
+            pl_matches[0].setSelected(True)
+
+        self.cmp_files.clearSelection()
+        for name in selected_names:
+            for match in self.cmp_files.findItems(name, Qt.MatchExactly):
+                match.setSelected(True)
+
+        self.drr_selected_files = list(selected_names)
+        self._update_drr_selection_labels()
+
+        if len(selected_names) == 1:
+            extra = " Ignored 1 non-CSV file." if ignored_count == 1 else f" Ignored {ignored_count} non-CSV files." if ignored_count else ""
+            self._status(f"Dropped: {selected_names[0]} — select a tab and press Load.{extra}")
+            return True
+
+        extra = ""
+        if ignored_count == 1:
+            extra = " Ignored 1 non-CSV file."
+        elif ignored_count > 1:
+            extra = f" Ignored {ignored_count} non-CSV files."
+        self._status(f"Dropped: {len(selected_names)} files from {Path(self.current_folder).name} — select a tab and press Load.{extra}")
+        return True
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -260,25 +413,25 @@ class MainWindow(QMainWindow):
         box = QWidget()
         box.setMaximumWidth(UI_METRICS["left_max_width"])
         layout = QVBoxLayout(box)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(UI_METRICS["row_spacing"])
 
         # Workflow step banner
         steps_label = QLabel("Select  ›  Load  ›  Plot  ›  Export")
         steps_label.setAlignment(Qt.AlignCenter)
         steps_label.setStyleSheet(
-            "QLabel { background: #deeaf8; color: #1a4a88; border-radius: 5px; "
-            "padding: 5px 10px; font-size: 11px; font-weight: 600; "
-            "border: 1px solid #bcd0ec; letter-spacing: 0.3px; }"
+            "QLabel { background: #f5f5f7; color: #6e6e73; border-radius: 6px; "
+            "padding: 5px 10px; font-size: 11px; font-weight: 400; "
+            "border: 1px solid #e5e5ea; letter-spacing: 0.2px; }"
         )
         layout.addWidget(steps_label)
 
         # Data source section
         folder_box = QGroupBox("")
         folder_grid = QGridLayout(folder_box)
-        folder_grid.setContentsMargins(6, 4, 6, 6)
-        folder_grid.setHorizontalSpacing(6)
-        folder_grid.setVerticalSpacing(6)
+        folder_grid.setContentsMargins(8, 6, 8, 8)
+        folder_grid.setHorizontalSpacing(8)
+        folder_grid.setVerticalSpacing(8)
         self.folder_edit = QLineEdit()
         self.folder_edit.setReadOnly(True)
         self.folder_edit.setPlaceholderText("No folder selected — click Browse or Open File")
@@ -458,8 +611,8 @@ class MainWindow(QMainWindow):
     def _build_pl_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
         files = QGroupBox("File")
         files_layout = QVBoxLayout(files)
@@ -490,7 +643,7 @@ class MainWindow(QMainWindow):
         _pl_yc_h.addWidget(self.pl_yaxis_combo, 1)
         _pl_yc_h.addWidget(QLabel("Cmap"))
         _pl_yc_h.addWidget(cmap)
-        cfg.addRow("Y-axis / Cmap", _pl_yc_row)
+        cfg.addRow("Y-axis", _pl_yc_row)
         cfg.addRow("", self.pl_yaxis_advanced_box)
         params_layout.addLayout(cfg)
         for s in spins.values():
@@ -592,7 +745,7 @@ class MainWindow(QMainWindow):
         row3h.addStretch(1)
         analysis_form.addRow("", row3)
         self.pl_fit_status = QLabel("")
-        self.pl_fit_status.setStyleSheet("QLabel { color: #2a6090; font-size: 10px; }")
+        self.pl_fit_status.setStyleSheet("QLabel { color: #0071e3; font-size: 10px; }")
         analysis_form.addRow("", self.pl_fit_status)
         self.pl_analysis_text = QPlainTextEdit()
         self.pl_analysis_text.setReadOnly(True)
@@ -608,8 +761,8 @@ class MainWindow(QMainWindow):
     def _build_drr_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
         files = QGroupBox("Files")
         files_layout = QVBoxLayout(files)
@@ -725,6 +878,30 @@ class MainWindow(QMainWindow):
         self.drr_center_zero_chk.setToolTip("When enabled, DRR colormap is centered at zero.")
         self.drr_center_zero_chk.setChecked(False)
 
+        # Config rows outside Axis Ranges — mirrors PL tab structure
+        cfg = QFormLayout()
+        cfg.setHorizontalSpacing(6)
+        cfg.setVerticalSpacing(UI_METRICS["row_spacing"])
+        cfg.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        baseline_cmap_row = QWidget()
+        baseline_cmap_h = QHBoxLayout(baseline_cmap_row)
+        baseline_cmap_h.setContentsMargins(0, 0, 0, 0)
+        baseline_cmap_h.setSpacing(6)
+        baseline_cmap_h.addWidget(self.drr_baseline_combo, 1)
+        baseline_cmap_h.addWidget(QLabel("Cmap"))
+        baseline_cmap_h.addWidget(cmap)
+        _drr_yc_row = QWidget()
+        _drr_yc_h = QHBoxLayout(_drr_yc_row)
+        _drr_yc_h.setContentsMargins(0, 0, 0, 0)
+        _drr_yc_h.setSpacing(6)
+        _drr_yc_h.addWidget(self.drr_yaxis_combo, 1)
+        cfg.addRow("DRR Baseline", baseline_cmap_row)
+        cfg.addRow("Y-axis", _drr_yc_row)
+        cfg.addRow("", self.drr_yaxis_advanced_box)
+        cfg.addRow("Derivative / SG", deriv_row)
+        self._set_form_label_width(cfg, UI_METRICS["label_col_width"])
+        params_layout.addLayout(cfg)
+
         basic = QGroupBox("Axis Ranges")
         basic_form = QFormLayout(basic)
         basic_form.setContentsMargins(
@@ -736,17 +913,6 @@ class MainWindow(QMainWindow):
         basic_form.setHorizontalSpacing(4)
         basic_form.setVerticalSpacing(UI_METRICS["row_spacing"])
         basic_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        baseline_cmap_row = QWidget()
-        baseline_cmap_h = QHBoxLayout(baseline_cmap_row)
-        baseline_cmap_h.setContentsMargins(0, 0, 0, 0)
-        baseline_cmap_h.setSpacing(6)
-        baseline_cmap_h.addWidget(self.drr_baseline_combo, 1)
-        baseline_cmap_h.addWidget(QLabel("Colormap"))
-        baseline_cmap_h.addWidget(cmap)
-        basic_form.addRow("DRR Baseline", baseline_cmap_row)
-        basic_form.addRow("Y-axis", self.drr_yaxis_combo)
-        basic_form.addRow("", self.drr_yaxis_advanced_box)
-        basic_form.addRow("Derivative / SG", deriv_row)
         basic_form.addRow(
             "vmin / vmax",
             self._make_axis_range_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.drr_auto_v_btn, "Auto V"),
@@ -849,7 +1015,7 @@ class MainWindow(QMainWindow):
         self.drr_analysis_text.setMaximumHeight(100)
         self.drr_analysis_text.setPlaceholderText("Peak/fit results will appear here after detection.")
         analysis_form.addRow("", self.drr_analysis_text)
-        self.drr_fit_status.setStyleSheet("QLabel { color: #2a6090; font-size: 10px; }")
+        self.drr_fit_status.setStyleSheet("QLabel { color: #0071e3; font-size: 10px; }")
         params_layout.addWidget(basic)
         layout.addWidget(self._make_expander("Parameters", params, expanded=True))
         layout.addWidget(self._make_expander("Spectrum Analysis", analysis_box, expanded=False))
@@ -894,8 +1060,8 @@ class MainWindow(QMainWindow):
     def _style_combo_popup(self, combo: QComboBox) -> None:
         view = combo.view()
         view.setStyleSheet(
-            "QListView::item:selected { background-color: #2d6cdf; color: #ffffff; }"
-            "QListView { selection-background-color: #2d6cdf; selection-color: #ffffff; }"
+            "QListView::item:selected { background-color: #0071e3; color: #ffffff; }"
+            "QListView { selection-background-color: #0071e3; selection-color: #ffffff; }"
         )
 
     def _format_axis_coeff(self, value: float) -> str:
@@ -980,22 +1146,22 @@ class MainWindow(QMainWindow):
     def _make_expander(self, title: str, content: QWidget, *, expanded: bool = True) -> QWidget:
         box = QWidget()
         v = QVBoxLayout(box)
-        v.setContentsMargins(0, 2, 0, 2)
-        v.setSpacing(3)
+        v.setContentsMargins(0, 3, 0, 4)
+        v.setSpacing(4)
         head = QToolButton()
         head.setCheckable(True)
         head.setChecked(bool(expanded))
         head.setAutoRaise(True)
         head.setToolButtonStyle(Qt.ToolButtonTextOnly)
         head.setStyleSheet(
-            "QToolButton { border: none; padding: 2px 4px; font-weight: 600; "
-            "color: #2a3a50; font-size: 11px; text-align: left; }"
-            "QToolButton:hover { color: #1a5090; }"
+            "QToolButton { border: none; background: transparent; padding: 2px 4px; font-weight: 600; "
+            "color: #1d1d1f; font-size: 11px; text-align: left; }"
+            "QToolButton:hover { color: #0071e3; background: transparent; }"
         )
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
         line.setFrameShadow(QFrame.Plain)
-        line.setStyleSheet("QFrame { color: #ccd6e2; }")
+        line.setStyleSheet("QFrame { color: #e5e5ea; }")
         row = QWidget()
         row_h = QHBoxLayout(row)
         row_h.setContentsMargins(0, 0, 0, 0)
@@ -1018,8 +1184,8 @@ class MainWindow(QMainWindow):
     def _build_compare_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
         files = QGroupBox("File")
         files_layout = QVBoxLayout(files)
@@ -1332,7 +1498,7 @@ class MainWindow(QMainWindow):
         log_layout.setSpacing(6)
         hint = QLabel("The log panel records all load, plot, and export events.")
         hint.setWordWrap(True)
-        hint.setStyleSheet("QLabel { color: #5a6a7a; font-size: 10px; }")
+        hint.setStyleSheet("QLabel { color: #6e6e73; font-size: 10px; }")
         log_layout.addWidget(hint)
         log_btn_row = QHBoxLayout()
         log_btn_row.setSpacing(8)
@@ -1354,7 +1520,7 @@ class MainWindow(QMainWindow):
             "('Initial data after processing') to keep the workspace clean."
         )
         file_hint.setWordWrap(True)
-        file_hint.setStyleSheet("QLabel { color: #5a6a7a; font-size: 10px; }")
+        file_hint.setStyleSheet("QLabel { color: #6e6e73; font-size: 10px; }")
         file_layout.addWidget(file_hint)
         layout.addWidget(file_box)
 
@@ -2070,6 +2236,9 @@ class MainWindow(QMainWindow):
         return cube
 
     def _start_load(self, mode: str) -> None:
+        if self._load_in_progress:
+            self._status("State: Load already in progress.")
+            return
         if not self.current_folder:
             self._show_error("Choose a folder first.")
             return
@@ -2122,10 +2291,12 @@ class MainWindow(QMainWindow):
         )
 
         self._set_stage("Loading...")
+        self._load_in_progress = True
         worker = Worker(self._load_task, options)
         worker.signals.log.connect(self._append_log)
         worker.signals.result.connect(self._on_loaded)
         worker.signals.error.connect(self._show_error)
+        worker.signals.finished.connect(self._on_load_finished)
         self.thread_pool.start(worker)
 
     def _load_task(self, options: LoadOptions, *, progress: Signal, log: Signal) -> LoadedState:
@@ -2207,6 +2378,10 @@ class MainWindow(QMainWindow):
         self._update_action_states()
         self._status(f"Loaded {loaded.mode}.")
         self._plot_mode(loaded.mode, auto=True)
+
+    def _on_load_finished(self) -> None:
+        self._load_in_progress = False
+        self._status_progress.setVisible(False)
 
     def _mode_spins(self, mode: str) -> Dict[str, QDoubleSpinBox]:
         if mode == "PL":
