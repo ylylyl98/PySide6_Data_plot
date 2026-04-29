@@ -3,6 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 set "PYEXE=.venv\Scripts\python.exe"
+set "PYWEXE=.venv\Scripts\pythonw.exe"
 set "GIT_UPDATE_STATUS=Git update skipped."
 set "GIT_TERMINAL_PROMPT=0"
 set "GCM_INTERACTIVE=Never"
@@ -116,7 +117,29 @@ if errorlevel 1 (
     )
 )
 
-"%PYEXE%" run_qt.py
+"%PYEXE%" -c "import run_qt" >nul 2>nul
+if errorlevel 1 (
+    echo ERROR: App import check failed. Details:
+    "%PYEXE%" -c "import run_qt"
+    pause
+    exit /b 1
+)
+
+if /i "%DPTK_DEBUG_CONSOLE%"=="1" (
+    "%PYEXE%" run_qt.py
+    if errorlevel 1 (
+        echo ERROR: Failed to launch run_qt.py.
+        pause
+        exit /b 1
+    )
+    exit /b 0
+)
+
+if exist "%PYWEXE%" (
+    start "DPTK Desktop" "%PYWEXE%" "%~dp0run_qt.py"
+) else (
+    start "DPTK Desktop" "%PYEXE%" "%~dp0run_qt.py"
+)
 if errorlevel 1 (
     echo ERROR: Failed to launch run_qt.py.
     pause

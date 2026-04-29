@@ -1903,6 +1903,8 @@ class MainWindow(QMainWindow):
     ) -> List[str]:
         dlg = QDialog(self)
         dlg.setWindowTitle(title)
+        if not self.windowIcon().isNull():
+            dlg.setWindowIcon(self.windowIcon())
         dlg.resize(760, 500)
         v = QVBoxLayout(dlg)
         top_row = QHBoxLayout()

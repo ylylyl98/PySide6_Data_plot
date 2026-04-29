@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="DPTK Desktop app icon">
+  <defs>
+    <linearGradient id="base" x1="32" y1="22" x2="224" y2="234" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#172033"/>
+      <stop offset="0.55" stop-color="#0d1425"/>
+      <stop offset="1" stop-color="#101827"/>
+    </linearGradient>
+    <linearGradient id="map" x1="42" y1="182" x2="214" y2="182" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="0.35" stop-color="#2563eb"/>
+      <stop offset="0.68" stop-color="#f59e0b"/>
+      <stop offset="1" stop-color="#ef4444"/>
+    </linearGradient>
+    <linearGradient id="curve" x1="42" y1="118" x2="214" y2="118" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#a7f3d0"/>
+      <stop offset="0.5" stop-color="#38bdf8"/>
+      <stop offset="1" stop-color="#fef3c7"/>
+    </linearGradient>
+  </defs>
+  <rect x="18" y="18" width="220" height="220" rx="42" fill="url(#base)"/>
+  <rect x="34" y="36" width="188" height="184" rx="24" fill="#0b1020" opacity="0.72"/>
+  <g stroke="#5eead4" stroke-opacity="0.24" stroke-width="2">
+    <path d="M52 58v144M88 58v144M124 58v144M160 58v144M196 58v144"/>
+    <path d="M48 76h160M48 112h160M48 148h160M48 184h160"/>
+  </g>
+  <rect x="48" y="172" width="160" height="34" rx="10" fill="url(#map)" opacity="0.92"/>
+  <path d="M50 142 C70 136 75 96 92 96 C110 96 111 158 131 158 C153 158 157 70 178 70 C194 70 199 120 210 116"
+        fill="none" stroke="#ecfeff" stroke-opacity="0.34" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M50 142 C70 136 75 96 92 96 C110 96 111 158 131 158 C153 158 157 70 178 70 C194 70 199 120 210 116"
+        fill="none" stroke="url(#curve)" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="178" cy="70" r="8" fill="#fef08a"/>
+</svg>
