@@ -38,6 +38,24 @@ class CanonicalYAxisResolutionTests(unittest.TestCase):
         self.assertTrue(np.allclose(d["gate_axis"], expected))
         self.assertEqual(d["gate_label"], "TG-1.1BG (V)")
 
+    def test_auto_minus_gate_condition_from_stem_uses_complementary_plus_axis(self) -> None:
+        d = processing_run._load_canonical(str(FIXTURES), "sample_TG-BG=0_scan.csv", y_axis="auto")
+        expected = np.array([10.0, 12.0, 14.0])
+        self.assertTrue(np.allclose(d["gate_axis"], expected))
+        self.assertEqual(d["gate_label"], "TG+BG (V)")
+
+    def test_auto_minus_bg_coefficient_from_stem_uses_complementary_plus_axis(self) -> None:
+        d = processing_run._load_canonical(str(FIXTURES), "sample_TG-1.1BG=0_scan.csv", y_axis="auto")
+        expected = np.array([10.0, 12.1, 14.2])
+        self.assertTrue(np.allclose(d["gate_axis"], expected))
+        self.assertEqual(d["gate_label"], "TG+1.1BG (V)")
+
+    def test_auto_minus_tg_coefficient_from_stem_uses_complementary_plus_axis(self) -> None:
+        d = processing_run._load_canonical(str(FIXTURES), "sample_0.9TG-BG=0_scan.csv", y_axis="auto")
+        expected = np.array([9.0, 10.9, 12.8])
+        self.assertTrue(np.allclose(d["gate_axis"], expected))
+        self.assertEqual(d["gate_label"], "0.9TG+BG (V)")
+
     def test_metadata_has_priority_over_stem_fallback(self) -> None:
         d = processing_run._load_canonical(str(FIXTURES), "device$bgonly$_0.9TG+BG_scan.csv", y_axis="auto")
         self.assertTrue(np.allclose(d["gate_axis"], np.array([0.0, 1.0, 2.0])))

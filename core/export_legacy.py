@@ -15,8 +15,8 @@ from matplotlib.font_manager import FontProperties
 from matplotlib.ticker import FixedFormatter, FixedLocator, FuncFormatter, NullFormatter, NullLocator
 
 from core.loader import DataCube
-from core.plotting import COMPARE_PANEL_ORDER, HeatmapParams, plot_compare_panel
-from core.processing import nearest_gate_spectrum
+from core.plotting import COMPARE_PANEL_ORDER, HeatmapParams
+from core.processing import background_correct_cube, parse_compare_gate_condition, valley_polarization_cube
 from core.processing_run import save_as_dat
 
 
@@ -46,6 +46,101 @@ def safe_stem(file_name: str, max_len: int = 140) -> str:
     head = 90
     tail = max_len - head - 2
     return stem[:head] + "__" + stem[-tail:]
+
+
+def compare_scale_short(scale_tag: str) -> str:
+    return "Log" if str(scale_tag).strip().lower().startswith("log") else "Lin"
+
+
+def format_background_tag(background: float) -> str:
+    value = float(background)
+    if abs(value) < 1e-12:
+        return "Bkg0"
+    if abs(value - round(value)) < 1e-9:
+        text = str(int(round(value)))
+    else:
+        text = f"{value:.6g}"
+    text = text.replace("-", "m").replace("+", "").replace(".", "p")
+    return f"Bkg{text}"
+
+
+def corrected_compare_export_base(channel: str, source_file: str, scale_tag: str) -> str:
+    return f"{channel}_{safe_stem(source_file)}_C_{compare_scale_short(scale_tag)}"
+
+
+def compare_source_title(source_file: str) -> str:
+    return safe_stem(source_file, max_len=180)
+
+
+def _tokenize_export_stem(file_name: str) -> list[str]:
+    return [token for token in safe_stem(file_name, max_len=220).split("_") if token]
+
+
+def _first_matching_token(file_name: str, pattern: str) -> str:
+    for token in _tokenize_export_stem(file_name):
+        match = re.match(pattern, token, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _extract_power_uw(file_name: str) -> str:
+    match = re.search(r"(\d+(?:[pP\.]\d+)?)\s*uW", safe_stem(file_name, max_len=220), flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return match.group(1).replace("P", "p")
+
+
+def _compact_shared_vp_source_stem(kk_source: str, kkp_source: str) -> str:
+    kk_tokens = _tokenize_export_stem(kk_source)
+    kkp_tokens = set(_tokenize_export_stem(kkp_source))
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in kk_tokens:
+        keep = None
+        if token in kkp_tokens and not re.match(r"Rot\s*2", token, flags=re.IGNORECASE):
+            keep = token
+        else:
+            nm_match = re.match(r"(\d+(?:p\d+|\.\d+)?nm)", token, flags=re.IGNORECASE)
+            if nm_match:
+                keep = nm_match.group(1)
+        if keep and keep not in seen:
+            out.append(keep)
+            seen.add(keep)
+    if not out:
+        out = ["KK-KKp"]
+    return safe_stem("_".join(out), max_len=130)
+
+
+def _compact_vp_title_stem(source_files: Dict[str, str]) -> str:
+    kk_source = source_files.get("KK", "KK")
+    kkp_source = source_files.get("KKp", "KKp")
+    sample = _first_matching_token(kk_source, r"([A-Za-z]+\d+)")
+    temp = _first_matching_token(kk_source, r"(\d+(?:p\d+|\.\d+)?K[A-Za-z]*)")
+    wavelength = _first_matching_token(kk_source, r"(\d+(?:p\d+|\.\d+)?nm)")
+    kk_power = _extract_power_uw(kk_source)
+    kkp_power = _extract_power_uw(kkp_source)
+    rot1 = _first_matching_token(kk_source, r"(Rot1[^_]+)")
+    gate = parse_compare_gate_condition(kk_source) or parse_compare_gate_condition(kkp_source)
+
+    tokens = [token for token in (sample, temp, wavelength) if token]
+    if kk_power or kkp_power:
+        tokens.append(f"P{kk_power or '?'}-{kkp_power or '?'}uW")
+    if rot1:
+        tokens.append(rot1)
+    if gate:
+        tokens.append(gate)
+    return safe_stem("_".join(tokens) if tokens else _compact_shared_vp_source_stem(kk_source, kkp_source), max_len=130)
+
+
+def vp_compare_title(source_files: Dict[str, str], background: float, scale_tag: str) -> str:
+    shared = _compact_vp_title_stem(source_files)
+    return f"VP_{shared}_{format_background_tag(background)}_{compare_scale_short(scale_tag)}"
+
+
+def vp_compare_export_base(source_files: Dict[str, str], background: float, scale_tag: str) -> str:
+    shared = _compact_vp_title_stem(source_files)
+    return f"VP_{shared}_{format_background_tag(background)}_C_{compare_scale_short(scale_tag)}"
 
 
 def _unique_path(out_dir: Path, base: str, ext: str = ".png") -> Path:
@@ -381,13 +476,17 @@ def export_compare_panels(
     scale_tag: str,
     clip_outliers: bool,
     gate_value: float | None = None,
+    correction_background: float = 0.0,
+    export_vp: bool = True,
     processed_name: str = DEFAULT_PROCESSED,
 ) -> list[Path]:
+    del gate_value
     out_dir = ensure_processed_dir(folder, processed_name)
     written: list[Path] = []
     ordered_keys = [key for key in COMPARE_PANEL_ORDER if key in cubes]
     for key in ordered_keys:
-        cube = cubes[key]
+        title = compare_source_title(source_files.get(key, key))
+        cube = background_correct_cube(cubes[key], correction_background, title=title)
         panel_params = HeatmapParams(
             title=cube.title,
             xlabel=params.xlabel,
@@ -402,7 +501,7 @@ def export_compare_panels(
             center_zero=False,
             clip_outliers=clip_outliers,
         )
-        base = f"{key}_{safe_stem(source_files[key])}_Compare_{scale_tag}"
+        base = corrected_compare_export_base(key, source_files[key], scale_tag)
         png_path = _unique_path(out_dir, base, ".png")
         _save_heatmap_png(png_path, cube, panel_params, drr=False)
         z_out = np.asarray(cube.Z, float)
@@ -417,7 +516,9 @@ def export_compare_panels(
                 f"panel={key}",
                 f"source_csv={source_files[key]}",
                 f"title={cube.title}",
-                f"scale={scale_tag}",
+                f"scale={compare_scale_short(scale_tag)}",
+                f"corrected=True",
+                f"background_constant={correction_background}",
                 f"log_scale={params.log_scale}",
                 f"clip_outliers={clip_outliers}",
                 f"vmin={params.vmin}",
@@ -428,83 +529,47 @@ def export_compare_panels(
         )
         written.extend([png_path, dat_path])
 
-    if ordered_keys:
-        grid_key = "_".join(ordered_keys)
-        fig = plt.figure(figsize=(10.0, 8.0), dpi=EXPORT_DPI, facecolor="white")
-        if len(ordered_keys) <= 2:
-            gs = fig.add_gridspec(
-                nrows=2,
-                ncols=len(ordered_keys) + 1,
-                width_ratios=([1.0] * len(ordered_keys)) + [0.05],
-                height_ratios=[1.0, 0.85],
-                wspace=0.14,
-                hspace=0.32,
-            )
-            heat_axes = [fig.add_subplot(gs[0, idx]) for idx in range(len(ordered_keys))]
-            line_ax = fig.add_subplot(gs[1, :len(ordered_keys)], sharex=heat_axes[0])
-            cax = fig.add_subplot(gs[0, len(ordered_keys)])
-        else:
-            gs = fig.add_gridspec(
-                nrows=3,
-                ncols=3,
-                width_ratios=[1.0, 1.0, 0.05],
-                height_ratios=[1.0, 1.0, 0.85],
-                wspace=0.14,
-                hspace=0.32,
-            )
-            heat_axes = [
-                fig.add_subplot(gs[0, 0]),
-                fig.add_subplot(gs[0, 1]),
-                fig.add_subplot(gs[1, 0]),
-                fig.add_subplot(gs[1, 1]),
-            ]
-            line_ax = fig.add_subplot(gs[2, :2], sharex=heat_axes[0])
-            cax = fig.add_subplot(gs[0:2, 2])
-
-        images = []
-        linecut_cols = []
-        x_ref = None
-        for ax, key in zip(heat_axes, ordered_keys):
-            cube = cubes[key]
-            panel_params = HeatmapParams(
-                title=cube.title,
-                xlabel=params.xlabel,
-                ylabel=cube.gate_label,
-                cbar_label=cube.cbar_label,
-                vmin=params.vmin,
-                vmax=params.vmax,
-                xlim=params.xlim,
-                ylim=params.ylim,
-                cmap=params.cmap,
-                log_scale=params.log_scale,
-                center_zero=False,
-                clip_outliers=clip_outliers,
-            )
-            images.append(plot_compare_panel(ax, key, cube, panel_params))
-            gate_used, y = nearest_gate_spectrum(cube, float(gate_value if gate_value is not None else np.nanmedian(cube.gate)))
-            x = np.asarray(cube.energy, float).ravel()
-            x_ref = x if x_ref is None else x_ref
-            line_ax.plot(x, np.asarray(y, float), linewidth=1.3, label=key)
-            linecut_cols.append((key, np.asarray(y, float), float(gate_used)))
-        if images:
-            fig.colorbar(images[0], cax=cax, label=params.cbar_label)
-        line_ax.set_title(
-            "Compare Spectra @ "
-            + ", ".join(f"{key}={gate_used:.6g} V" for key, _y, gate_used in linecut_cols),
-            fontsize=10,
+    if export_vp and "KK" in cubes and "KKp" in cubes:
+        vp_cube = valley_polarization_cube(
+            cubes["KK"],
+            cubes["KKp"],
+            background=correction_background,
+            title=vp_compare_title(source_files, correction_background, scale_tag),
         )
-        line_ax.set_xlabel(params.xlabel)
-        line_ax.set_ylabel("PL (a.u.)")
-        line_ax.grid(alpha=0.25)
-        line_ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
-        combined_png = _unique_path(out_dir, f"{grid_key}_CompareGrid_{scale_tag}", ".png")
-        fig.savefig(combined_png, dpi=fig.dpi, facecolor=fig.get_facecolor(), edgecolor="none", bbox_inches="tight", pad_inches=0.01)
-        plt.close(fig)
-        written.append(combined_png)
-        if x_ref is not None and linecut_cols:
-            dat_arr = np.column_stack([x_ref] + [col for _key, col, _gate in linecut_cols])
-            header = "\t".join(["PhotonEnergy_eV"] + [key for key, _col, _gate in linecut_cols])
-            linecut_dat = combined_png.with_name(f"{grid_key}_CompareLinecut_{scale_tag}.dat")
-            np.savetxt(linecut_dat, dat_arr, fmt="%.10g", delimiter="\t", header=header, comments="# ")
-            written.append(linecut_dat)
+        vp_params = HeatmapParams(
+            title=vp_cube.title,
+            xlabel=params.xlabel,
+            ylabel=vp_cube.gate_label,
+            cbar_label="VP",
+            vmin=-1.0,
+            vmax=1.0,
+            xlim=params.xlim,
+            ylim=params.ylim,
+            cmap="RdBu_r",
+            log_scale=False,
+            center_zero=True,
+            clip_outliers=False,
+        )
+        base = vp_compare_export_base(source_files, correction_background, scale_tag)
+        png_path = _unique_path(out_dir, base, ".png")
+        _save_heatmap_png(png_path, vp_cube, vp_params, drr=False)
+        dat_path = save_heatmap_dat_streamlit(
+            png_path.with_suffix(".dat"),
+            vp_cube.energy,
+            vp_cube.gate,
+            np.asarray(vp_cube.Z, float),
+            header_lines=[
+                "panel=VP",
+                f"title={vp_cube.title}",
+                f"source_KK={source_files.get('KK', '')}",
+                f"source_KKp={source_files.get('KKp', '')}",
+                "formula=(KK_corr-KKp_corr)/(KK_corr+KKp_corr)",
+                f"background_constant={correction_background}",
+                "vmin=-1.0",
+                "vmax=1.0",
+                f"xlim={params.xlim}",
+                f"ylim={params.ylim}",
+            ],
+        )
+        written.extend([png_path, dat_path])
     return written

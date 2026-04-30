@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import traceback
-import re
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,7 +9,8 @@ from typing import Any, Callable, Dict, List
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
-from PySide6.QtCore import QMimeData, QObject, QRunnable, Qt, QThreadPool, Signal
+from matplotlib.ticker import PercentFormatter
+from PySide6.QtCore import QFileSystemWatcher, QMimeData, QObject, QRunnable, QSettings, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -52,18 +52,27 @@ from scipy.signal import find_peaks
 from core import data_io
 from core.export_legacy import (
     build_drr_export_base,
+    compare_source_title,
     export_compare_panels,
     export_drr_png_and_dat,
     export_pl_pngs_and_dat,
+    vp_compare_export_base,
+    vp_compare_title,
 )
 from core.loader import DataCube
-from core.plotting import COMPARE_PANEL_ORDER, HeatmapParams, plot_compare_panel, plot_drr, plot_pl, render_compare_grid
+from core.plotting import COMPARE_PANEL_ORDER, HeatmapParams, plot_compare_panel, plot_drr, plot_heatmap, plot_pl
 from core.processing import (
     apply_sg_derivative_energy,
+    background_correct_cube,
     clamp_sg_window,
+    classify_compare_channel,
+    coherent_compare_auto_assignment,
     compute_auto_limits,
+    estimate_constant_background,
     group_measurement_files,
     nearest_gate_spectrum,
+    parse_compare_in_out_angles,
+    valley_polarization_cube,
 )
 
 UI_METRICS = {
@@ -124,6 +133,8 @@ class ExportOptions:
     compare_scale_tag: str = "linear"
     compare_clip: bool = True
     compare_gate: float = 0.0
+    compare_background: float = 0.0
+    compare_export_vp: bool = True
     auto_move_sources: bool = False
 
 
@@ -154,12 +165,28 @@ class Worker(QRunnable):
 
 
 class MainWindow(QMainWindow):
+    SETTINGS_ORG = "DPTK"
+    SETTINGS_APP = "PySide6_Data_Plot"
+    SETTINGS_LAST_DATA_FOLDER = "data/last_folder"
+    SETTINGS_LAST_PARENT_FOLDER = "data/last_parent_folder"
+    SETTINGS_RECENT_FOLDERS = "data/recent_folders"
+    MAX_RECENT_FOLDERS = 8
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DPTK Desktop (PySide6)")
         self.setMinimumSize(1100, 700)
         self.thread_pool = QThreadPool.globalInstance()
+        self.settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
         self.current_folder = ""
+        self._watched_folder = ""
+        self.folder_watcher = QFileSystemWatcher(self)
+        self.folder_refresh_timer = QTimer(self)
+        self.folder_refresh_timer.setSingleShot(True)
+        self.folder_refresh_timer.setInterval(800)
+        self.folder_watcher.directoryChanged.connect(self._on_watched_folder_changed)
+        self.folder_refresh_timer.timeout.connect(self._refresh_watched_folder)
+        self.recent_folders: List[str] = self._load_recent_folders()
         self.available_files: List[str] = []
         self.drr_selected_files: List[str] = []
         self.drr_baseline_files_manual: List[str] = []
@@ -176,6 +203,7 @@ class MainWindow(QMainWindow):
         self._cmp_heatmap_axes: dict[str, Any] = {}
         self._cmp_gate_lines: dict[str, Any] = {}
         self._cmp_linecut_ax = None
+        self._cmp_active_cubes: dict[str, DataCube] = {}
         self._pl_last_plot_cube: DataCube | None = None
         self._gate_line = None
         self._pl_gate_line = None
@@ -205,10 +233,154 @@ class MainWindow(QMainWindow):
         self._folder_placeholder_text = self.folder_edit.placeholderText()
         self.apply_ui_metrics()
         self._wire_actions()
+        self._cmp_update_background_mode()
         self._apply_initial_geometry()
         self._set_stage("No data")
         self._update_action_states()
+        self._restore_last_folder()
         self.setAcceptDrops(True)
+
+    def _load_recent_folders(self) -> List[str]:
+        raw = self.settings.value(self.SETTINGS_RECENT_FOLDERS, [])
+        if raw is None:
+            values: list[object] = []
+        elif isinstance(raw, str):
+            values = [raw]
+        else:
+            values = list(raw)
+        out: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            folder = str(value)
+            path = Path(folder)
+            key = str(path).lower()
+            if key in seen or not path.exists() or not path.is_dir():
+                continue
+            out.append(str(path))
+            seen.add(key)
+            if len(out) >= self.MAX_RECENT_FOLDERS:
+                break
+        return out
+
+    def _settings_folder_value(self, key: str) -> str:
+        value = self.settings.value(key, "")
+        return str(value) if value is not None else ""
+
+    def _remember_data_folder(self, folder: str) -> None:
+        path = Path(folder)
+        if not path.exists() or not path.is_dir():
+            return
+        folder_text = str(path)
+        parent_text = str(path.parent)
+        self.settings.setValue(self.SETTINGS_LAST_DATA_FOLDER, folder_text)
+        self.settings.setValue(self.SETTINGS_LAST_PARENT_FOLDER, parent_text)
+        recent: list[str] = [folder_text]
+        seen = {folder_text.lower()}
+        for existing in self.recent_folders:
+            if existing.lower() in seen:
+                continue
+            if Path(existing).exists() and Path(existing).is_dir():
+                recent.append(existing)
+                seen.add(existing.lower())
+            if len(recent) >= self.MAX_RECENT_FOLDERS:
+                break
+        self.recent_folders = recent
+        self.settings.setValue(self.SETTINGS_RECENT_FOLDERS, self.recent_folders)
+        self._populate_recent_folder_combo()
+
+    def _browse_start_folder(self) -> str:
+        candidates: list[str] = []
+        if self.current_folder:
+            candidates.append(str(Path(self.current_folder).parent))
+        candidates.extend(
+            [
+                self._settings_folder_value(self.SETTINGS_LAST_PARENT_FOLDER),
+                self.current_folder,
+                self._settings_folder_value(self.SETTINGS_LAST_DATA_FOLDER),
+                str(Path.home()),
+            ]
+        )
+        for candidate in candidates:
+            if candidate and Path(candidate).exists() and Path(candidate).is_dir():
+                return candidate
+        return str(Path.home())
+
+    def _populate_recent_folder_combo(self) -> None:
+        if not hasattr(self, "recent_folder_combo"):
+            return
+        old = self.recent_folder_combo.blockSignals(True)
+        try:
+            self.recent_folder_combo.clear()
+            self.recent_folder_combo.addItem("Recent folders", "")
+            current_idx = 0
+            for folder in self.recent_folders:
+                path = Path(folder)
+                label = path.name or folder
+                if path.parent.name:
+                    label = f"{label}  ({path.parent.name})"
+                self.recent_folder_combo.addItem(label, folder)
+                idx = self.recent_folder_combo.count() - 1
+                self.recent_folder_combo.setItemData(idx, folder, Qt.ToolTipRole)
+                if self.current_folder and folder.lower() == self.current_folder.lower():
+                    current_idx = idx
+            self.recent_folder_combo.setCurrentIndex(current_idx)
+            self.recent_folder_combo.setEnabled(bool(self.recent_folders))
+        finally:
+            self.recent_folder_combo.blockSignals(old)
+
+    def _set_current_folder(self, folder: str, *, remember: bool = True, refresh: bool = True) -> bool:
+        path = Path(folder)
+        if not path.exists() or not path.is_dir():
+            self._show_error(f"Folder does not exist: {folder}")
+            return False
+        self.current_folder = str(path)
+        self.folder_edit.setText(self.current_folder)
+        self._watch_current_folder()
+        if remember:
+            self._remember_data_folder(self.current_folder)
+        else:
+            self._populate_recent_folder_combo()
+        if refresh:
+            self._refresh_file_lists()
+        return True
+
+    def _watch_current_folder(self) -> None:
+        watched = list(self.folder_watcher.directories())
+        if watched:
+            self.folder_watcher.removePaths(watched)
+        self._watched_folder = ""
+        if not self.current_folder:
+            return
+        path = Path(self.current_folder)
+        if not path.exists() or not path.is_dir():
+            return
+        if self.folder_watcher.addPath(str(path)):
+            self._watched_folder = str(path)
+
+    def _on_watched_folder_changed(self, folder: str) -> None:
+        if self.current_folder and str(Path(folder)) == str(Path(self.current_folder)):
+            self.folder_refresh_timer.start()
+
+    def _refresh_watched_folder(self) -> None:
+        if not self.current_folder:
+            return
+        path = Path(self.current_folder)
+        if not path.exists() or not path.is_dir():
+            self._status("Data source unavailable; choose a folder.")
+            self._watch_current_folder()
+            return
+        if self._load_in_progress:
+            self.folder_refresh_timer.start()
+            return
+        self._refresh_file_lists(auto=True)
+        if self.current_folder and self.current_folder not in self.folder_watcher.directories():
+            self._watch_current_folder()
+
+    def _restore_last_folder(self) -> None:
+        self._populate_recent_folder_combo()
+        folder = self._settings_folder_value(self.SETTINGS_LAST_DATA_FOLDER)
+        if folder and Path(folder).exists() and Path(folder).is_dir():
+            self._set_current_folder(folder, remember=False, refresh=True)
 
     def _apply_initial_geometry(self) -> None:
         screen = QApplication.primaryScreen()
@@ -319,9 +491,8 @@ class MainWindow(QMainWindow):
             return False
         if folders:
             folder = str(folders[0])
-            self.current_folder = folder
-            self.folder_edit.setText(folder)
-            self._refresh_file_lists()
+            if not self._set_current_folder(folder):
+                return False
             self._status(f"Folder set: {folders[0].name} — {len(self.available_files)} CSV files found")
             return True
 
@@ -337,9 +508,8 @@ class MainWindow(QMainWindow):
             self._status("Drop ignored: all files must be from the same folder")
             return False
 
-        self.current_folder = parent_folders[0]
-        self.folder_edit.setText(self.current_folder)
-        self._refresh_file_lists()
+        if not self._set_current_folder(parent_folders[0]):
+            return False
 
         dropped_names = list(dict.fromkeys(path.name for path in csv_files))
         selected_names = [name for name in dropped_names if name in self.available_files]
@@ -442,10 +612,15 @@ class MainWindow(QMainWindow):
         self.open_file_btn.setToolTip("Open a single CSV file and set its folder as the working directory")
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.setToolTip("Re-scan the current folder for new or changed CSV files")
+        self.recent_folder_combo = QComboBox()
+        self.recent_folder_combo.setToolTip("Switch to a recently used data folder")
+        self._style_combo_popup(self.recent_folder_combo)
         folder_grid.addWidget(self.folder_edit, 0, 0, 1, 3)
         folder_grid.addWidget(self.browse_btn, 1, 0)
         folder_grid.addWidget(self.open_file_btn, 1, 1)
         folder_grid.addWidget(self.refresh_btn, 1, 2)
+        folder_grid.addWidget(QLabel("Recent"), 2, 0)
+        folder_grid.addWidget(self.recent_folder_combo, 2, 1, 1, 2)
         layout.addWidget(self._make_expander("Data Source", folder_box, expanded=True))
 
         self.tabs = QTabWidget()
@@ -1281,6 +1456,42 @@ class MainWindow(QMainWindow):
         display_form.addRow("Channels", checks_row)
         params_layout.addWidget(self._make_expander("Display", display, expanded=False))
 
+        vp_box = QGroupBox("Valley Polarization")
+        vp_form = QFormLayout(vp_box)
+        vp_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
+        vp_form.setHorizontalSpacing(6)
+        vp_form.setVerticalSpacing(UI_METRICS["row_spacing"])
+        self.cmp_vp_background_spin = QDoubleSpinBox()
+        self.cmp_vp_background_spin.setDecimals(6)
+        self.cmp_vp_background_spin.setRange(-1.0e12, 1.0e12)
+        self.cmp_vp_background_spin.setSingleStep(100.0)
+        self.cmp_vp_background_spin.setFixedWidth(UI_METRICS["spin_w"] + 18)
+        self.cmp_vp_auto_background_chk = QCheckBox("Auto")
+        self.cmp_vp_auto_background_chk.setChecked(True)
+        self.cmp_vp_auto_background_chk.setToolTip("Estimate one constant background from KK and KKp.")
+        bkg_row = QWidget()
+        bkg_h = QHBoxLayout(bkg_row)
+        bkg_h.setContentsMargins(0, 0, 0, 0)
+        bkg_h.setSpacing(8)
+        bkg_h.addWidget(self.cmp_vp_background_spin)
+        bkg_h.addWidget(self.cmp_vp_auto_background_chk)
+        bkg_h.addStretch(1)
+        self.cmp_vp_filename_preview = QLineEdit()
+        self.cmp_vp_filename_preview.setReadOnly(True)
+        self.cmp_vp_filename_preview.setMinimumWidth(200)
+        self.cmp_kk_title_preview = QLineEdit()
+        self.cmp_kk_title_preview.setReadOnly(True)
+        self.cmp_kkp_title_preview = QLineEdit()
+        self.cmp_kkp_title_preview.setReadOnly(True)
+        self.cmp_vp_title_preview = QLineEdit()
+        self.cmp_vp_title_preview.setReadOnly(True)
+        vp_form.addRow("Background", bkg_row)
+        vp_form.addRow("VP filename", self.cmp_vp_filename_preview)
+        vp_form.addRow("KK title", self.cmp_kk_title_preview)
+        vp_form.addRow("KKp title", self.cmp_kkp_title_preview)
+        vp_form.addRow("VP title", self.cmp_vp_title_preview)
+        params_layout.addWidget(self._make_expander("VP", vp_box, expanded=False))
+
         cfg = QFormLayout()
         cfg.setHorizontalSpacing(6)
         cfg.setVerticalSpacing(4)
@@ -1359,35 +1570,131 @@ class MainWindow(QMainWindow):
         return abs(((float(a) - float(b) + 180.0) % 360.0) - 180.0)
 
     def _cmp_parse_in_out_angles(self, file_name: str) -> tuple[float | None, float | None]:
-        text = str(Path(file_name).stem)
-        patterns = (
-            r"in[^0-9\-+]*([\-+]?\d+(?:\.\d+)?)\s*degree.*out[^0-9\-+]*([\-+]?\d+(?:\.\d+)?)\s*degree",
-            r"out[^0-9\-+]*([\-+]?\d+(?:\.\d+)?)\s*degree.*in[^0-9\-+]*([\-+]?\d+(?:\.\d+)?)\s*degree",
+        return parse_compare_in_out_angles(file_name)
+
+    def _cmp_view_mode(self) -> str:
+        if hasattr(self, "cmp_view_vp_btn") and self.cmp_view_vp_btn.isChecked():
+            return "Valley Polarization"
+        return "Intensity Compare"
+
+    def _cmp_set_view_mode(self, mode: str) -> None:
+        vp_mode = mode == "Valley Polarization"
+        if hasattr(self, "cmp_view_intensity_btn"):
+            self.cmp_view_intensity_btn.setChecked(not vp_mode)
+        if hasattr(self, "cmp_view_vp_btn"):
+            self.cmp_view_vp_btn.setChecked(vp_mode)
+
+    def _cmp_is_vp_view(self) -> bool:
+        return self._cmp_view_mode() == "Valley Polarization"
+
+    def _cmp_background_auto_enabled(self) -> bool:
+        return bool(
+            hasattr(self, "cmp_vp_auto_background_chk")
+            and self.cmp_vp_auto_background_chk.isChecked()
         )
-        for idx, pattern in enumerate(patterns):
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if not match:
-                continue
-            if idx == 0:
-                return float(match.group(1)), float(match.group(2))
-            return float(match.group(2)), float(match.group(1))
-        return None, None
+
+    def _cmp_update_background_mode(self) -> None:
+        if hasattr(self, "cmp_vp_background_spin"):
+            self.cmp_vp_background_spin.setEnabled(not self._cmp_background_auto_enabled())
+
+    @staticmethod
+    def _cmp_background_source_cubes(cubes: Dict[str, DataCube]) -> Dict[str, DataCube]:
+        kk_pair = {key: cubes[key] for key in ("KK", "KKp") if key in cubes}
+        return kk_pair if kk_pair else dict(cubes)
+
+    def _cmp_set_background_spin_silent(self, value: float) -> None:
+        if not hasattr(self, "cmp_vp_background_spin"):
+            return
+        old = self.cmp_vp_background_spin.blockSignals(True)
+        try:
+            self.cmp_vp_background_spin.setValue(float(value))
+        finally:
+            self.cmp_vp_background_spin.blockSignals(old)
+
+    def _cmp_background_value(
+        self,
+        cubes: Dict[str, DataCube] | None = None,
+        *,
+        update_spin: bool = True,
+    ) -> float:
+        if not hasattr(self, "cmp_vp_background_spin"):
+            return 0.0
+        if self._cmp_background_auto_enabled() and cubes:
+            value = estimate_constant_background(
+                self._cmp_background_source_cubes(cubes),
+                percentile=1.0,
+            )
+            if update_spin:
+                self._cmp_set_background_spin_silent(value)
+            return value
+        return float(self.cmp_vp_background_spin.value())
+
+    def _cmp_scale_tag(self) -> str:
+        return "log" if bool(self.cmp_log_chk.isChecked()) else "linear"
+
+    def _cmp_source_mapping(self) -> dict[str, str]:
+        if self.loaded and self.loaded.mode == "Compare" and self.loaded.compare_sources:
+            return dict(self.loaded.compare_sources)
+        return self._cmp_current_mapping()
+
+    def _cmp_corrected_cubes(
+        self,
+        cubes: Dict[str, DataCube],
+        source_files: dict[str, str] | None = None,
+        background: float | None = None,
+    ) -> Dict[str, DataCube]:
+        if background is None:
+            background = self._cmp_background_value(cubes)
+        source_files = source_files or self._cmp_source_mapping()
+        corrected: dict[str, DataCube] = {}
+        for key, cube in cubes.items():
+            title = compare_source_title(source_files.get(key, cube.title))
+            corrected[key] = background_correct_cube(cube, background, title=title)
+        return corrected
+
+    def _cmp_vp_cube(
+        self,
+        cubes: Dict[str, DataCube],
+        source_files: dict[str, str] | None = None,
+        background: float | None = None,
+    ) -> DataCube:
+        if "KK" not in cubes or "KKp" not in cubes:
+            raise ValueError("VP needs assigned KK and KKp channels.")
+        if background is None:
+            background = self._cmp_background_value(cubes)
+        source_files = source_files or self._cmp_source_mapping()
+        return valley_polarization_cube(
+            cubes["KK"],
+            cubes["KKp"],
+            background=background,
+            title=vp_compare_title(source_files, background, self._cmp_scale_tag()),
+        )
+
+    def _cmp_update_title_previews(self) -> None:
+        if not hasattr(self, "cmp_vp_filename_preview"):
+            return
+        mapping = self._cmp_current_mapping()
+        loaded_cubes = self.loaded.compare_cubes if self.loaded and self.loaded.mode == "Compare" else None
+        background = self._cmp_background_value(loaded_cubes, update_spin=loaded_cubes is not None)
+        kk_title = compare_source_title(mapping["KK"]) if "KK" in mapping else "Assign KK"
+        kkp_title = compare_source_title(mapping["KKp"]) if "KKp" in mapping else "Assign KKp"
+        self.cmp_kk_title_preview.setText(kk_title)
+        self.cmp_kkp_title_preview.setText(kkp_title)
+        if "KK" in mapping and "KKp" in mapping:
+            base = vp_compare_export_base(mapping, background, self._cmp_scale_tag())
+            title = vp_compare_title(mapping, background, self._cmp_scale_tag())
+            self.cmp_vp_filename_preview.setText(f"{base}.png / .dat")
+            self.cmp_vp_title_preview.setText(title)
+        else:
+            self.cmp_vp_filename_preview.setText("Assign KK and KKp")
+            self.cmp_vp_title_preview.setText("Assign KK and KKp")
 
     def _cmp_classify_channel(self, file_name: str) -> str | None:
-        in_angle, out_angle = self._cmp_parse_in_out_angles(file_name)
-        if in_angle is None or out_angle is None:
-            return None
-        in_k = float(self.cmp_in_k_angle_spin.value())
-        out_k = float(self.cmp_out_k_angle_spin.value())
-        in_is_k = self._cmp_angle_distance(in_angle, in_k) <= 45.0
-        out_is_k = self._cmp_angle_distance(out_angle, out_k) <= 45.0
-        if in_is_k and out_is_k:
-            return "KK"
-        if in_is_k and (not out_is_k):
-            return "KKp"
-        if (not in_is_k) and out_is_k:
-            return "KpK"
-        return "KpKp"
+        return classify_compare_channel(
+            file_name,
+            in_k_angle=float(self.cmp_in_k_angle_spin.value()),
+            out_k_angle=float(self.cmp_out_k_angle_spin.value()),
+        )
 
     def _cmp_current_mapping(self) -> dict[str, str]:
         mapping: dict[str, str] = {}
@@ -1415,7 +1722,7 @@ class MainWindow(QMainWindow):
 
     def _cmp_apply_display_preset(self) -> None:
         preset = self.cmp_display_preset_combo.currentText()
-        enabled = preset == "Custom"
+        enabled = preset == "Custom" and not self._cmp_is_vp_view()
         desired = {
             "KK + KKp": {"KK", "KKp"},
             "KpK + KpKp": {"KpK", "KpKp"},
@@ -1438,11 +1745,17 @@ class MainWindow(QMainWindow):
         for key in COMPARE_PANEL_ORDER:
             source = mapping.get(key, "missing")
             lines.append(f"{key} -> {source}")
-        if visible:
+        if self._cmp_is_vp_view():
+            if "KK" in mapping and "KKp" in mapping:
+                lines.append("Visible -> VP from KK, KKp")
+            else:
+                lines.append("Visible -> VP needs KK and KKp")
+        elif visible:
             lines.append("Visible -> " + ", ".join(visible))
         else:
             lines.append("Visible -> none")
         self.cmp_assignment_summary.setPlainText("\n".join(lines))
+        self._cmp_update_title_previews()
 
     def _cmp_update_assignment_mode(self) -> None:
         auto_mode = self.cmp_assign_mode_combo.currentText() == "Auto by angle"
@@ -1450,8 +1763,27 @@ class MainWindow(QMainWindow):
         self.cmp_out_k_angle_spin.setEnabled(auto_mode)
         self.cmp_auto_assign_btn.setEnabled(auto_mode)
 
+    def _cmp_update_view_mode(self) -> None:
+        vp_mode = self._cmp_is_vp_view()
+        self.cmp_display_preset_combo.setEnabled(not vp_mode)
+        for chk in self.cmp_show_checks.values():
+            chk.setEnabled((not vp_mode) and self.cmp_display_preset_combo.currentText() == "Custom")
+        self._update_plot_view_bar_visibility()
+
+    def _update_plot_view_bar_visibility(self) -> None:
+        if hasattr(self, "cmp_plot_view_bar"):
+            self.cmp_plot_view_bar.setVisible(self._active_mode() == "Compare")
+
     def _cmp_selection_from_ui(self) -> data_io.CompareSelection:
         mapping = self._cmp_current_mapping()
+        if self._cmp_is_vp_view():
+            missing = [key for key in ("KK", "KKp") if key not in mapping]
+            if missing:
+                raise ValueError("VP needs assigned KK and KKp channels.")
+            return data_io.CompareSelection.from_mapping(
+                mapping,
+                visible_order=("KK", "KKp"),
+            )
         visible = self._cmp_visible_channels(mapping)
         if len(visible) < 1:
             raise ValueError("Assign at least one compare channel.")
@@ -1464,16 +1796,11 @@ class MainWindow(QMainWindow):
 
     def _cmp_auto_assign_channels(self) -> None:
         candidates = self._cmp_assign_candidate_files()
-        found: dict[str, str] = {}
-        duplicates: dict[str, list[str]] = {}
-        for file_name in candidates:
-            key = self._cmp_classify_channel(file_name)
-            if key is None:
-                continue
-            if key in found:
-                duplicates.setdefault(key, [found[key]]).append(file_name)
-                continue
-            found[key] = file_name
+        found, duplicates, gate_group, gate_groups = coherent_compare_auto_assignment(
+            candidates,
+            in_k_angle=float(self.cmp_in_k_angle_spin.value()),
+            out_k_angle=float(self.cmp_out_k_angle_spin.value()),
+        )
         for key, combo in self.cmp_channel_combos.items():
             old = combo.blockSignals(True)
             try:
@@ -1481,6 +1808,12 @@ class MainWindow(QMainWindow):
             finally:
                 combo.blockSignals(old)
         self._cmp_update_assignment_summary()
+        if gate_group and len(set(gate_groups)) > 1:
+            self._append_log(
+                "Compare auto-detect found multiple gate groups: "
+                + ", ".join(sorted(set(gate_groups)))
+                + f". Using {gate_group}."
+            )
         if duplicates:
             dup_text = "; ".join(f"{k}: {', '.join(v)}" for k, v in duplicates.items())
             self._append_log(f"Compare auto-detect found duplicate matches -> {dup_text}")
@@ -1551,10 +1884,36 @@ class MainWindow(QMainWindow):
         box = QWidget()
         layout = QVBoxLayout(box)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         self.figure = Figure(figsize=(9, 7), dpi=100)
         self.canvas = FigureCanvasQTAgg(self.figure)
         self.toolbar = NavigationToolbar2QT(self.canvas, box)
         layout.addWidget(self.toolbar)
+        self.cmp_plot_view_bar = QFrame()
+        self.cmp_plot_view_bar.setFrameShape(QFrame.NoFrame)
+        self.cmp_plot_view_bar.setVisible(False)
+        self.cmp_plot_view_bar.setStyleSheet(
+            "QFrame { background: #f7f7f9; border-top: 1px solid #ececf0; border-bottom: 1px solid #ececf0; }"
+            "QToolButton { border: 1px solid #d0d0d5; border-radius: 4px; padding: 3px 10px; "
+            "background: #ffffff; font-size: 11px; }"
+            "QToolButton:checked { background: #0078d4; color: white; border-color: #0078d4; }"
+        )
+        view_layout = QHBoxLayout(self.cmp_plot_view_bar)
+        view_layout.setContentsMargins(8, 4, 8, 4)
+        view_layout.setSpacing(0)
+        self.cmp_view_intensity_btn = QToolButton()
+        self.cmp_view_intensity_btn.setText("Intensity")
+        self.cmp_view_intensity_btn.setToolTip("Show corrected KK/KKp intensity maps and spectra")
+        self.cmp_view_intensity_btn.setCheckable(True)
+        self.cmp_view_intensity_btn.setChecked(True)
+        self.cmp_view_vp_btn = QToolButton()
+        self.cmp_view_vp_btn.setText("VP")
+        self.cmp_view_vp_btn.setToolTip("Show valley polarization map and linecut")
+        self.cmp_view_vp_btn.setCheckable(True)
+        view_layout.addWidget(self.cmp_view_intensity_btn)
+        view_layout.addWidget(self.cmp_view_vp_btn)
+        view_layout.addStretch(1)
+        layout.addWidget(self.cmp_plot_view_bar)
         layout.addWidget(self.canvas, 1)
         return box
 
@@ -1599,12 +1958,13 @@ class MainWindow(QMainWindow):
     def _wire_actions(self) -> None:
         self.browse_btn.clicked.connect(self._browse_folder)
         self.open_file_btn.clicked.connect(self._open_file)
-        self.refresh_btn.clicked.connect(self._refresh_file_lists)
+        self.refresh_btn.clicked.connect(lambda: self._refresh_file_lists())
+        self.recent_folder_combo.currentIndexChanged.connect(self._on_recent_folder_selected)
         self.load_action.triggered.connect(self._toolbar_load)
         self.plot_action.triggered.connect(self._toolbar_plot)
         self.save_action.triggered.connect(self._toolbar_save)
         self.move_now_btn.clicked.connect(self._manual_move_sources)
-        self.tabs.currentChanged.connect(lambda _i: self._update_action_states())
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         for prefix in ("pl", "drr", "cmp"):
             combo: QComboBox = getattr(self, f"{prefix}_yaxis_combo")
             combo.currentTextChanged.connect(lambda _text, p=prefix: self._update_y_axis_controls(p))
@@ -1628,6 +1988,10 @@ class MainWindow(QMainWindow):
         self.cmp_in_k_angle_spin.valueChanged.connect(self._on_cmp_assignment_inputs_changed)
         self.cmp_out_k_angle_spin.valueChanged.connect(self._on_cmp_assignment_inputs_changed)
         self.cmp_auto_assign_btn.clicked.connect(self._cmp_auto_assign_channels)
+        self.cmp_view_intensity_btn.clicked.connect(lambda: self._on_cmp_plot_view_button_clicked("Intensity Compare"))
+        self.cmp_view_vp_btn.clicked.connect(lambda: self._on_cmp_plot_view_button_clicked("Valley Polarization"))
+        self.cmp_vp_background_spin.valueChanged.connect(self._on_cmp_plot_param_changed)
+        self.cmp_vp_auto_background_chk.toggled.connect(self._on_cmp_background_mode_changed)
         self.cmp_display_preset_combo.currentTextChanged.connect(self._on_cmp_display_preset_changed)
         for combo in self.cmp_channel_combos.values():
             combo.currentTextChanged.connect(self._on_cmp_plot_param_changed)
@@ -1688,8 +2052,10 @@ class MainWindow(QMainWindow):
             self._update_y_axis_controls(prefix)
         self._cmp_apply_display_preset()
         self._cmp_update_assignment_mode()
+        self._cmp_update_view_mode()
         self._cmp_set_channel_combo_items()
         self._cmp_update_assignment_summary()
+        self._update_plot_view_bar_visibility()
 
     def _toggle_log(self) -> None:
         self.log_dock.setVisible(not self.log_dock.isVisible())
@@ -1790,6 +2156,25 @@ class MainWindow(QMainWindow):
         self._cmp_update_assignment_summary()
         self._on_cmp_plot_param_changed()
 
+    def _on_cmp_plot_view_button_clicked(self, mode: str) -> None:
+        self._cmp_set_view_mode(mode)
+        self._on_cmp_view_changed()
+
+    def _on_cmp_view_changed(self) -> None:
+        self._cmp_update_view_mode()
+        self._cmp_update_assignment_summary()
+        self._on_cmp_plot_param_changed()
+
+    def _on_cmp_background_mode_changed(self, _checked: bool) -> None:
+        self._cmp_update_background_mode()
+        if self.loaded and self.loaded.mode == "Compare" and self.loaded.compare_cubes:
+            self._cmp_background_value(self.loaded.compare_cubes)
+        self._on_cmp_plot_param_changed()
+
+    def _on_tab_changed(self, _index: int) -> None:
+        self._update_action_states()
+        self._update_plot_view_bar_visibility()
+
     def _on_cmp_plot_param_changed(self) -> None:
         self._cmp_update_assignment_summary()
         if self.loaded and self.loaded.mode == "Compare":
@@ -1801,24 +2186,32 @@ class MainWindow(QMainWindow):
         self._status(f"Error: {first}")
         QMessageBox.critical(self, "Error", message)
 
+    def _on_recent_folder_selected(self, index: int) -> None:
+        folder = self.recent_folder_combo.itemData(index)
+        if not folder:
+            return
+        folder_text = str(folder)
+        if self.current_folder and folder_text.lower() == self.current_folder.lower():
+            return
+        if self._set_current_folder(folder_text):
+            self._status(f"Folder set: {Path(folder_text).name} - {len(self.available_files)} CSV files found")
+
     def _browse_folder(self) -> None:
-        start = self.current_folder or str(Path.home())
+        start = self._browse_start_folder()
         folder = QFileDialog.getExistingDirectory(self, "Select Data Folder", start)
         if not folder:
             return
-        self.current_folder = folder
-        self.folder_edit.setText(folder)
-        self._refresh_file_lists()
+        if self._set_current_folder(folder):
+            self._status(f"Folder set: {Path(folder).name} - {len(self.available_files)} CSV files found")
 
     def _open_file(self) -> None:
-        start = self.current_folder or str(Path.home())
+        start = self.current_folder or self._browse_start_folder()
         file_path, _ = QFileDialog.getOpenFileName(self, "Open CSV File", start, "CSV (*.csv)")
         if not file_path:
             return
         path = Path(file_path)
-        self.current_folder = str(path.parent)
-        self.folder_edit.setText(self.current_folder)
-        self._refresh_file_lists()
+        if not self._set_current_folder(str(path.parent)):
+            return
         for lst in (self.pl_files, self.cmp_files):
             matches = lst.findItems(path.name, Qt.MatchExactly)
             if matches:
@@ -1828,21 +2221,47 @@ class MainWindow(QMainWindow):
         self._update_drr_selection_labels()
         self._status(f"Selected {path.name}")
 
-    def _refresh_file_lists(self) -> None:
+    def _restore_list_selection(self, widget: QListWidget, names: List[str]) -> None:
+        widget.clearSelection()
+        for name in names:
+            for match in widget.findItems(name, Qt.MatchExactly):
+                match.setSelected(True)
+
+    def _refresh_file_lists(self, *, auto: bool = False) -> None:
+        old_files = set(self.available_files)
+        pl_selected = self._selected(self.pl_files)
+        cmp_selected = self._selected(self.cmp_files)
         for lst in (self.pl_files, self.cmp_files):
             lst.clear()
         if not self.current_folder:
+            self.available_files = []
             return
         self.available_files = data_io.list_csv_files(self.current_folder)
         self.pl_files.addItems(self.available_files)
         self.cmp_files.addItems(self.available_files)
+        self._restore_list_selection(self.pl_files, [f for f in pl_selected if f in self.available_files])
+        self._restore_list_selection(self.cmp_files, [f for f in cmp_selected if f in self.available_files])
         self._cmp_set_channel_combo_items()
         self.drr_selected_files = [f for f in self.drr_selected_files if f in self.available_files]
         self.drr_baseline_files_manual = [f for f in self.drr_baseline_files_manual if f in self.available_files]
         self.drr_baseline_files_found = [f for f in self.drr_baseline_files_found if f in self.available_files]
-        self._cmp_update_assignment_summary()
+        if self.cmp_assign_mode_combo.currentText() == "Auto by angle":
+            self._cmp_auto_assign_channels()
+        else:
+            self._cmp_update_assignment_summary()
         self._update_drr_selection_labels()
-        self._status(f"Loaded file list: {len(self.available_files)}")
+        new_files = set(self.available_files)
+        added = len(new_files - old_files)
+        removed = len(old_files - new_files)
+        if auto and (added or removed):
+            parts = []
+            if added:
+                parts.append(f"{added} new")
+            if removed:
+                parts.append(f"{removed} removed")
+            self._status(f"Data source updated: {', '.join(parts)} ({len(self.available_files)} CSV files).")
+        elif not auto:
+            self._status(f"Loaded file list: {len(self.available_files)}")
 
     def _update_drr_selection_labels(self) -> None:
         def _brief(names: List[str]) -> str:
@@ -2120,7 +2539,8 @@ class MainWindow(QMainWindow):
         x0, x1 = sorted((float(self.cmp_spins["xmin"].value()), float(self.cmp_spins["xmax"].value())))
         y0, y1 = sorted((float(self.cmp_spins["ymin"].value()), float(self.cmp_spins["ymax"].value())))
         vals: list[np.ndarray] = []
-        for cube in self.loaded.compare_cubes.values():
+        background = self._cmp_background_value(self.loaded.compare_cubes)
+        for cube in self._cmp_corrected_cubes(self.loaded.compare_cubes, background=background).values():
             x = np.asarray(cube.energy, float).ravel()
             y = np.asarray(cube.gate, float).ravel()
             z = np.asarray(cube.Z, float)
@@ -2484,7 +2904,9 @@ class MainWindow(QMainWindow):
         elif mode == "DRR" and self.loaded.cube is not None:
             cube = self._drr_cube_for_display()
         elif mode == "Compare" and self.loaded.compare_cubes:
-            cube = next(iter(self.loaded.compare_cubes.values()))
+            background = self._cmp_background_value(self.loaded.compare_cubes)
+            corrected = self._cmp_corrected_cubes(self.loaded.compare_cubes, background=background)
+            cube = next(iter(corrected.values()))
         else:
             return
 
@@ -3116,7 +3538,7 @@ class MainWindow(QMainWindow):
         gate_used = float(np.median(gate_used_values)) if gate_used_values else float(gate_value)
         ax.set_title(f"Compare Spectra @ {gate_used:.6g} V")
         ax.set_xlabel("Photon Energy (eV)")
-        ax.set_ylabel("PL (a.u.)")
+        ax.set_ylabel("PL corr. (a.u.)")
         ax.grid(alpha=0.25)
         safe_xlim = self._safe_spectrum_xlim(np.asarray(next(iter(cubes.values())).energy, float), xlim)
         ax.set_xlim(safe_xlim)
@@ -3247,6 +3669,7 @@ class MainWindow(QMainWindow):
             self._cmp_heatmap_axes = {}
             self._cmp_gate_lines = {}
             self._cmp_linecut_ax = None
+            self._cmp_active_cubes = {}
             if mode == "PL" and self.loaded.cube is not None:
                 plot_cube = self.loaded.cube
                 params = self._make_params(mode, plot_cube)
@@ -3305,61 +3728,125 @@ class MainWindow(QMainWindow):
                 self._pl_heatmap_ax = None
                 self._pl_spectrum_ax = None
                 self._pl_last_plot_cube = None
-                cubes = {
+                raw_cubes = {
                     key: self.loaded.compare_cubes[key]
                     for key in COMPARE_PANEL_ORDER
                     if key in self.loaded.compare_cubes
                 }
-                if len(cubes) < 2:
+                if len(raw_cubes) < 2:
                     raise ValueError("Compare mode needs at least two visible channels.")
-                first = next(iter(cubes.values()))
+                first = next(iter(raw_cubes.values()))
                 params = self._make_params(mode, first)
-                n = len(cubes)
-                if n <= 2:
+                source_files = self._cmp_source_mapping()
+                background = self._cmp_background_value(raw_cubes)
+                self._cmp_update_title_previews()
+                if self._cmp_is_vp_view():
+                    vp_cube = self._cmp_vp_cube(raw_cubes, source_files, background=background)
+                    vp_params = HeatmapParams(
+                        title=vp_cube.title,
+                        xlabel=params.xlabel,
+                        ylabel=vp_cube.gate_label,
+                        cbar_label="VP",
+                        vmin=-1.0,
+                        vmax=1.0,
+                        xlim=params.xlim,
+                        ylim=params.ylim,
+                        cmap="RdBu_r",
+                        log_scale=False,
+                        center_zero=True,
+                        clip_outliers=False,
+                    )
                     gs = self.figure.add_gridspec(
                         nrows=2,
-                        ncols=n + 1,
-                        width_ratios=([1.0] * n) + [0.035],
+                        ncols=2,
+                        width_ratios=[1.0, 0.035],
                         height_ratios=[1.0, 0.95],
                         wspace=0.12,
                         hspace=0.30,
                     )
-                    heat_axes = [self.figure.add_subplot(gs[0, idx]) for idx in range(n)]
-                    line_ax = self.figure.add_subplot(gs[1, :n], sharex=heat_axes[0])
-                    cax = self.figure.add_subplot(gs[0, n])
-                else:
-                    gs = self.figure.add_gridspec(
-                        nrows=3,
-                        ncols=3,
-                        width_ratios=[1.0, 1.0, 0.035],
-                        height_ratios=[1.0, 1.0, 0.95],
-                        wspace=0.12,
-                        hspace=0.30,
+                    heat_ax = self.figure.add_subplot(gs[0, 0])
+                    cax = self.figure.add_subplot(gs[0, 1])
+                    line_ax = self.figure.add_subplot(gs[1, 0], sharex=heat_ax)
+                    im = plot_heatmap(heat_ax, vp_cube, vp_params)
+                    heat_ax.text(
+                        0.98,
+                        0.98,
+                        "VP",
+                        transform=heat_ax.transAxes,
+                        ha="right",
+                        va="top",
+                        fontsize=10,
+                        fontweight="bold",
+                        color="#111",
+                        bbox=dict(boxstyle="round,pad=0.22", facecolor="white", edgecolor="none", alpha=0.78),
+                        zorder=40,
                     )
-                    heat_axes = [
-                        self.figure.add_subplot(gs[0, 0]),
-                        self.figure.add_subplot(gs[0, 1]),
-                        self.figure.add_subplot(gs[1, 0]),
-                        self.figure.add_subplot(gs[1, 1]),
-                    ]
-                    line_ax = self.figure.add_subplot(gs[2, :2], sharex=heat_axes[0])
-                    cax = self.figure.add_subplot(gs[0:2, 2])
-                images = []
-                for ax, key in zip(heat_axes, cubes.keys()):
-                    im = plot_compare_panel(ax, key, cubes[key], params)
-                    images.append(im)
-                    self._cmp_heatmap_axes[key] = ax
-                if images:
-                    self.figure.colorbar(images[0], cax=cax, label=params.cbar_label)
-                gate_used = self._plot_compare_linecut(
-                    line_ax,
-                    cubes,
-                    gate_value=float(self.cmp_spins["gate"].value()),
-                    xlim=(float(self.cmp_spins["xmin"].value()), float(self.cmp_spins["xmax"].value())),
-                )
-                self._cmp_linecut_ax = line_ax
-                self._set_cmp_gate_spin_value(gate_used)
-                self._ensure_cmp_gate_lines(cubes, gate_used)
+                    self.figure.colorbar(im, cax=cax, label="VP")
+                    gate_used, y = nearest_gate_spectrum(vp_cube, float(self.cmp_spins["gate"].value()))
+                    x = np.asarray(vp_cube.energy, float).ravel()
+                    line_ax.plot(x, np.asarray(y, float), linewidth=1.3, color="#1f77b4", label="VP")
+                    line_ax.axhline(0.0, color="#333", linewidth=0.9, alpha=0.55)
+                    line_ax.set_title(f"VP Linecut @ {gate_used:.6g} V")
+                    line_ax.set_xlabel("Photon Energy (eV)")
+                    line_ax.set_ylabel("VP (%)")
+                    line_ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
+                    line_ax.set_ylim(-1.05, 1.05)
+                    line_ax.set_xlim(self._safe_spectrum_xlim(x, params.xlim))
+                    line_ax.grid(alpha=0.25)
+                    self._cmp_heatmap_axes["VP"] = heat_ax
+                    self._cmp_active_cubes = {"VP": vp_cube}
+                    self._cmp_linecut_ax = line_ax
+                    self._set_cmp_gate_spin_value(gate_used)
+                    self._ensure_cmp_gate_lines({"VP": vp_cube}, gate_used)
+                else:
+                    cubes = self._cmp_corrected_cubes(raw_cubes, source_files, background=background)
+                    n = len(cubes)
+                    if n <= 2:
+                        gs = self.figure.add_gridspec(
+                            nrows=2,
+                            ncols=n + 1,
+                            width_ratios=([1.0] * n) + [0.035],
+                            height_ratios=[1.0, 0.95],
+                            wspace=0.12,
+                            hspace=0.30,
+                        )
+                        heat_axes = [self.figure.add_subplot(gs[0, idx]) for idx in range(n)]
+                        line_ax = self.figure.add_subplot(gs[1, :n], sharex=heat_axes[0])
+                        cax = self.figure.add_subplot(gs[0, n])
+                    else:
+                        gs = self.figure.add_gridspec(
+                            nrows=3,
+                            ncols=3,
+                            width_ratios=[1.0, 1.0, 0.035],
+                            height_ratios=[1.0, 1.0, 0.95],
+                            wspace=0.12,
+                            hspace=0.30,
+                        )
+                        heat_axes = [
+                            self.figure.add_subplot(gs[0, 0]),
+                            self.figure.add_subplot(gs[0, 1]),
+                            self.figure.add_subplot(gs[1, 0]),
+                            self.figure.add_subplot(gs[1, 1]),
+                        ]
+                        line_ax = self.figure.add_subplot(gs[2, :2], sharex=heat_axes[0])
+                        cax = self.figure.add_subplot(gs[0:2, 2])
+                    images = []
+                    for ax, key in zip(heat_axes, cubes.keys()):
+                        im = plot_compare_panel(ax, key, cubes[key], params)
+                        images.append(im)
+                        self._cmp_heatmap_axes[key] = ax
+                    if images:
+                        self.figure.colorbar(images[0], cax=cax, label="PL corr. (a.u.)")
+                    gate_used = self._plot_compare_linecut(
+                        line_ax,
+                        cubes,
+                        gate_value=float(self.cmp_spins["gate"].value()),
+                        xlim=(float(self.cmp_spins["xmin"].value()), float(self.cmp_spins["xmax"].value())),
+                    )
+                    self._cmp_active_cubes = cubes
+                    self._cmp_linecut_ax = line_ax
+                    self._set_cmp_gate_spin_value(gate_used)
+                    self._ensure_cmp_gate_lines(cubes, gate_used)
             else:
                 raise ValueError("No loaded data to plot.")
 
@@ -3421,6 +3908,15 @@ class MainWindow(QMainWindow):
                 mode,
                 tuple(self._cmp_current_mapping().items()),
                 tuple(self._cmp_visible_channels()),
+                self._cmp_view_mode(),
+                bool(self._cmp_background_auto_enabled()),
+                float(
+                    self._cmp_background_value(
+                        self.loaded.compare_cubes
+                        if self.loaded and self.loaded.mode == "Compare" and self.loaded.compare_cubes
+                        else None
+                    )
+                ),
                 self._current_y_axis_spec_for_mode(mode),
                 self.cmp_cmap.currentText(),
                 float(self.cmp_spins["vmin"].value()),
@@ -3600,8 +4096,8 @@ class MainWindow(QMainWindow):
             heatmap_ax = event.inaxes if event.inaxes in set(self._cmp_heatmap_axes.values()) else None
             cube = None
             for key, ax in self._cmp_heatmap_axes.items():
-                if ax is heatmap_ax and self.loaded and self.loaded.compare_cubes:
-                    cube = self.loaded.compare_cubes.get(key)
+                if ax is heatmap_ax:
+                    cube = self._cmp_active_cubes.get(key)
                     break
         else:
             return
@@ -3651,7 +4147,7 @@ class MainWindow(QMainWindow):
             return
 
         if self.last_plotted_mode == "Compare":
-            if not self.loaded or not self.loaded.compare_cubes or event.ydata is None:
+            if not self._cmp_active_cubes or event.ydata is None:
                 return
             clicked_key = None
             for key, ax in self._cmp_heatmap_axes.items():
@@ -3660,7 +4156,7 @@ class MainWindow(QMainWindow):
                     break
             if clicked_key is None:
                 return
-            cube = self.loaded.compare_cubes.get(clicked_key)
+            cube = self._cmp_active_cubes.get(clicked_key)
             if cube is None:
                 return
             ygrid = np.asarray(cube.gate, float).ravel()
@@ -3719,12 +4215,19 @@ class MainWindow(QMainWindow):
                 auto_move_sources=bool(self.auto_move_after_export_chk.isChecked()),
             )
         else:
+            compare_background = self._cmp_background_value(
+                self.loaded.compare_cubes
+                if self.loaded and self.loaded.mode == "Compare" and self.loaded.compare_cubes
+                else None
+            )
             options = ExportOptions(
                 mode=mode,
                 params=params,
-                compare_scale_tag=("log" if self.cmp_log_chk.isChecked() else "linear"),
+                compare_scale_tag=self._cmp_scale_tag(),
                 compare_clip=bool(self.cmp_clip_chk.isChecked()),
                 compare_gate=float(self.cmp_spins["gate"].value()),
+                compare_background=compare_background,
+                compare_export_vp=True,
                 auto_move_sources=bool(self.auto_move_after_export_chk.isChecked()),
             )
 
@@ -3777,6 +4280,8 @@ class MainWindow(QMainWindow):
                 scale_tag=options.compare_scale_tag,
                 clip_outliers=options.compare_clip,
                 gate_value=options.compare_gate,
+                correction_background=options.compare_background,
+                export_vp=options.compare_export_vp,
             )
             log.emit(f"Exported {len(paths)} compare files.")
             out_folder = str(Path(paths[0]).parent) if paths else str(Path(folder))
