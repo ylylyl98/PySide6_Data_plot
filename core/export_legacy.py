@@ -116,6 +116,7 @@ def _compact_vp_title_stem(source_files: Dict[str, str]) -> str:
     kk_source = source_files.get("KK", "KK")
     kkp_source = source_files.get("KKp", "KKp")
     sample = _first_matching_token(kk_source, r"([A-Za-z]+\d+)")
+    scan = _first_matching_token(kk_source, r"(pX\d+[A-Za-z0-9]*)")
     temp = _first_matching_token(kk_source, r"(\d+(?:p\d+|\.\d+)?K[A-Za-z]*)")
     wavelength = _first_matching_token(kk_source, r"(\d+(?:p\d+|\.\d+)?nm)")
     kk_power = _extract_power_uw(kk_source)
@@ -123,7 +124,7 @@ def _compact_vp_title_stem(source_files: Dict[str, str]) -> str:
     rot1 = _first_matching_token(kk_source, r"(Rot1[^_]+)")
     gate = parse_compare_gate_condition(kk_source) or parse_compare_gate_condition(kkp_source)
 
-    tokens = [token for token in (sample, temp, wavelength) if token]
+    tokens = [token for token in (sample, scan, temp, wavelength) if token]
     if kk_power or kkp_power:
         tokens.append(f"P{kk_power or '?'}-{kkp_power or '?'}uW")
     if rot1:

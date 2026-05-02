@@ -89,6 +89,7 @@ class CompareExportTests(unittest.TestCase):
             "KKp": "YZ247_pX2_3.6KPL_730nm5.40uW_865nmc_2sx1_Rot1195p8deg_Rot2145deg_TG-BG=0.csv",
         }
         base = vp_compare_export_base(sources, 0.0, "linear")
+        self.assertIn("pX2", base)
         self.assertIn("Rot1195p8deg", base)
         self.assertIn("TG-BG=0", base)
         self.assertIn("P5.57-5.40uW", base)
