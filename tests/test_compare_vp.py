@@ -9,6 +9,7 @@ from core.loader import DataCube
 from core.plotting import HeatmapParams
 from core.processing import (
     background_correct_cube,
+    classify_compare_channel,
     coherent_compare_auto_assignment,
     estimate_constant_background,
     nearest_gate_spectrum,
@@ -51,6 +52,26 @@ class CompareAngleParserTests(unittest.TestCase):
         self.assertFalse(duplicates)
         self.assertEqual(found["KK"], files[2])
         self.assertEqual(found["KKp"], files[1])
+
+    def test_auto_assignment_uses_coherent_stage_pair_at_angle_boundary(self) -> None:
+        files = [
+            "YZ247_pX2_300g_3.6KPL_730nm17.83uW_855nmc_5sx1_Rot1195p8deg_Rot2140deg_Stage50_TG-BG=0.csv",
+            "YZ247_pX2_300g_3.6KPL_730nm370.87uW_855nmc_5sx1_Rot1195p8deg_Rot2140deg_Stage22_TG-BG=0.csv",
+            "YZ247_pX2_300g_3.6KPL_730nm373.39uW_855nmc_5sx1_Rot1195p8deg_Rot295deg_Stage22_TG-BG=0.csv",
+        ]
+        self.assertEqual(
+            classify_compare_channel(files[1], in_k_angle=195.0, out_k_angle=95.0),
+            "KKp",
+        )
+        found, duplicates, gate_group, _gate_groups = coherent_compare_auto_assignment(
+            files,
+            in_k_angle=195.0,
+            out_k_angle=95.0,
+        )
+        self.assertEqual(gate_group, "TG-BG=0")
+        self.assertEqual(found["KK"], files[2])
+        self.assertEqual(found["KKp"], files[1])
+        self.assertIn("KKp", duplicates)
 
 
 class CompareVpTests(unittest.TestCase):
@@ -142,11 +163,13 @@ class CompareExportTests(unittest.TestCase):
 
             kk_dat = next(Path(tmp, "Processed Data", name) for name in names if name.startswith("KK_") and name.endswith(".dat"))
             text = kk_dat.read_text()
-            self.assertIn(f"title={compare_source_title(sources['KK'])}", text)
-            self.assertIn("background_constant=1.0", text)
-            self.assertIn("\t4", text)
+            lines = text.splitlines()
+            self.assertFalse(any(line.startswith("#") for line in lines))
+            self.assertEqual(lines[0], "Photon energy\t0\t1")
+            self.assertEqual(lines[1], "1\t4\t2")
+            self.assertEqual(lines[2], "2\t8\t6")
             vp_dat = next(Path(tmp, "Processed Data", name) for name in names if name.startswith("VP_") and name.endswith(".dat"))
-            self.assertIn("title=VP_", vp_dat.read_text())
+            self.assertTrue(vp_dat.read_text().startswith("Photon energy\t0\t1\n"))
 
 
 if __name__ == "__main__":

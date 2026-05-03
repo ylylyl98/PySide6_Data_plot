@@ -4,7 +4,7 @@ import traceback
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Sequence
 
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
@@ -56,6 +56,8 @@ from core.export_legacy import (
     export_compare_panels,
     export_drr_png_and_dat,
     export_pl_pngs_and_dat,
+    export_power_series_png_and_dat,
+    export_power_vp_pngs_and_dat,
     vp_compare_export_base,
     vp_compare_title,
 )
@@ -70,7 +72,11 @@ from core.processing import (
     compute_auto_limits,
     estimate_constant_background,
     group_measurement_files,
+    power_group_title,
+    power_stage_paired_vp_cubes,
+    power_valley_polarization_cube,
     nearest_gate_spectrum,
+    parse_compare_gate_condition,
     parse_compare_in_out_angles,
     valley_polarization_cube,
 )
@@ -101,6 +107,9 @@ class LoadedState:
     cube: DataCube | None = None
     compare_cubes: Dict[str, DataCube] | None = None
     compare_sources: Dict[str, str] = field(default_factory=dict)
+    power_records: tuple[Any, ...] = ()
+    power_groups: Dict[str, tuple[Any, ...]] = field(default_factory=dict)
+    power_group_key: str = ""
     drr_mode_label: str = "DR/R Self"
     drr_derivative_label: str = "None"
     drr_baseline_text: str = "Self (last frame)"
@@ -120,6 +129,32 @@ class LoadOptions:
     compare_log_scale: bool
     y_axis_spec: str = "auto"
     compare_sources: Dict[str, str] = field(default_factory=dict)
+    power_group_key: str = ""
+
+
+def _vp_short_title(kk_title: str, kkp_title: str) -> str:
+    kk_words = kk_title.split()
+    kkp_words = kkp_title.split()
+    n_pre = 0
+    for a, b in zip(kk_words, kkp_words):
+        if a == b:
+            n_pre += 1
+        else:
+            break
+    kk_mid = kk_words[n_pre:]
+    kkp_mid = kkp_words[n_pre:]
+    n_suf = 0
+    for a, b in zip(reversed(kk_mid), reversed(kkp_mid)):
+        if a == b:
+            n_suf += 1
+        else:
+            break
+    prefix = " ".join(kk_words[:n_pre])
+    suffix = " ".join(kk_words[len(kk_words) - n_suf:]) if n_suf else ""
+    if prefix or suffix:
+        parts = ([prefix] if prefix else []) + ["KK/KKp"] + ([suffix] if suffix else [])
+        return "VP " + " ".join(parts)
+    return f"VP {kk_title} / {kkp_title}"
 
 
 @dataclass(frozen=True)
@@ -128,6 +163,7 @@ class ExportOptions:
     params: HeatmapParams
     params_linear: HeatmapParams | None = None
     params_log: HeatmapParams | None = None
+    params_intensity: HeatmapParams | None = None
     drr_cube: DataCube | None = None
     drr_derivative_label: str = "None"
     compare_scale_tag: str = "linear"
@@ -135,6 +171,18 @@ class ExportOptions:
     compare_gate: float = 0.0
     compare_background: float = 0.0
     compare_export_vp: bool = True
+    power_axis_log: bool = False
+    power_view: str = "Intensity"
+    power_background: float = 0.0
+    power_kk_group_key: str = ""
+    power_kkp_group_key: str = ""
+    power_kk_cube: DataCube | None = None
+    power_kkp_cube: DataCube | None = None
+    power_vp_cube: DataCube | None = None
+    power_kk_records: tuple[Any, ...] = ()
+    power_kkp_records: tuple[Any, ...] = ()
+    power_pairing_mode: str = "stage"
+    power_stage_pairs: tuple[Any, ...] = ()
     auto_move_sources: bool = False
 
 
@@ -204,6 +252,16 @@ class MainWindow(QMainWindow):
         self._cmp_gate_lines: dict[str, Any] = {}
         self._cmp_linecut_ax = None
         self._cmp_active_cubes: dict[str, DataCube] = {}
+        self._power_heatmap_ax = None
+        self._power_heatmap_axes: dict[str, Any] = {}
+        self._power_spectrum_ax = None
+        self._power_last_plot_cube: DataCube | None = None
+        self._power_gate_line = None
+        self._power_gate_lines: dict[str, Any] = {}
+        self._power_active_cubes: dict[str, DataCube] = {}
+        self._power_active_export_cube: DataCube | None = None
+        self._power_active_records: tuple[Any, ...] = ()
+        self._power_selected_row_index: int | None = None
         self._pl_last_plot_cube: DataCube | None = None
         self._gate_line = None
         self._pl_gate_line = None
@@ -527,8 +585,14 @@ class MainWindow(QMainWindow):
             for match in self.cmp_files.findItems(name, Qt.MatchExactly):
                 match.setSelected(True)
 
+        self.power_files.clearSelection()
+        for name in selected_names:
+            for match in self.power_files.findItems(name, Qt.MatchExactly):
+                match.setSelected(True)
+
         self.drr_selected_files = list(selected_names)
         self._update_drr_selection_labels()
+        self._power_refresh_groups()
 
         if len(selected_names) == 1:
             extra = " Ignored 1 non-CSV file." if ignored_count == 1 else f" Ignored {ignored_count} non-CSV files." if ignored_count else ""
@@ -628,6 +692,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_pl_tab(), "PL")
         self.tabs.addTab(self._build_drr_tab(), "DRR")
         self.tabs.addTab(self._build_compare_tab(), "Compare")
+        self.tabs.addTab(self._build_power_tab(), "Power Dependent")
         self.tabs.addTab(self._build_tools_tab(), "Log / Tools")
         layout.addWidget(self.tabs, 1)
         return box
@@ -1548,9 +1613,386 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         return tab
 
+    def _build_power_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        files = QGroupBox("Files")
+        files_layout = QVBoxLayout(files)
+        files_layout.setContentsMargins(6, 6, 6, 6)
+        self.power_files = QListWidget()
+        self.power_files.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.power_files.setMinimumHeight(85)
+        self.power_files.setToolTip("Select power-dependent PL files, or leave empty to scan all CSV files.")
+        files_layout.addWidget(self.power_files)
+
+        grouping = QGroupBox("Auto Groups")
+        grouping_form = QFormLayout(grouping)
+        grouping_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
+        grouping_form.setHorizontalSpacing(6)
+        grouping_form.setVerticalSpacing(UI_METRICS["row_spacing"])
+        self.power_group_combo = QComboBox()
+        self._style_combo_popup(self.power_group_combo)
+        self.power_group_combo.setToolTip("Detected groups differ only by power and Stage number.")
+        self.power_refresh_groups_btn = QPushButton("Auto Detect")
+        self.power_refresh_groups_btn.setToolTip("Rebuild groups from selected files, or all files when none are selected.")
+        group_row = QWidget()
+        group_h = QHBoxLayout(group_row)
+        group_h.setContentsMargins(0, 0, 0, 0)
+        group_h.setSpacing(6)
+        group_h.addWidget(self.power_group_combo, 1)
+        group_h.addWidget(self.power_refresh_groups_btn)
+        self.power_group_summary = QPlainTextEdit()
+        self.power_group_summary.setReadOnly(True)
+        self.power_group_summary.setMaximumHeight(88)
+        self.power_kk_group_combo = QComboBox()
+        self.power_kkp_group_combo = QComboBox()
+        self._style_combo_popup(self.power_kk_group_combo)
+        self._style_combo_popup(self.power_kkp_group_combo)
+        self.power_kk_group_combo.setToolTip("Power group to treat as KK in VP view.")
+        self.power_kkp_group_combo.setToolTip("Power group to treat as KKp in VP view.")
+        grouping_form.addRow("Group", group_row)
+        grouping_form.addRow("Summary", self.power_group_summary)
+        grouping_form.addRow("KK group", self.power_kk_group_combo)
+        grouping_form.addRow("KKp group", self.power_kkp_group_combo)
+        files_layout.addWidget(self._make_expander("Power Groups", grouping, expanded=True))
+        layout.addWidget(self._make_expander("Available Power Files", files, expanded=True))
+
+        params = QGroupBox("Plot Options")
+        params_layout = QVBoxLayout(params)
+        params_layout.setContentsMargins(6, 6, 6, 4)
+        params_layout.setSpacing(4)
+
+        cfg = QFormLayout()
+        cfg.setHorizontalSpacing(6)
+        cfg.setVerticalSpacing(4)
+        _grid, spins, _, _, cmap, fix_checks = self._build_common_range_grid("power")
+        cmap.setCurrentText("turbo")
+        self.power_axis_scale_combo = QComboBox()
+        self.power_axis_scale_combo.addItems(["Linear", "Log"])
+        self._style_combo_popup(self.power_axis_scale_combo)
+        self.power_axis_scale_combo.setToolTip("Set the power y-axis scale.")
+        self.power_pair_mode_combo = QComboBox()
+        self.power_pair_mode_combo.addItems(["Stage", "Power Interpolation"])
+        self._style_combo_popup(self.power_pair_mode_combo)
+        self.power_pair_mode_combo.setToolTip("Choose how KK and KKp spectra are paired for VP.")
+        scale_row = QWidget()
+        scale_h = QHBoxLayout(scale_row)
+        scale_h.setContentsMargins(0, 0, 0, 0)
+        scale_h.setSpacing(6)
+        scale_h.addWidget(self.power_axis_scale_combo)
+        scale_h.addWidget(QLabel("Cmap"))
+        scale_h.addWidget(cmap)
+        scale_h.addStretch(1)
+        pair_row = QWidget()
+        pair_h = QHBoxLayout(pair_row)
+        pair_h.setContentsMargins(0, 0, 0, 0)
+        pair_h.setSpacing(6)
+        pair_h.addWidget(self.power_pair_mode_combo)
+        pair_h.addStretch(1)
+        cfg.addRow("Power Axis / Cmap", scale_row)
+        cfg.addRow("VP Pair By", pair_row)
+        params_layout.addLayout(cfg)
+
+        background_box = QGroupBox("Background")
+        background_form = QFormLayout(background_box)
+        background_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
+        background_form.setHorizontalSpacing(6)
+        background_form.setVerticalSpacing(UI_METRICS["row_spacing"])
+        self.power_background_spin = QDoubleSpinBox()
+        self.power_background_spin.setDecimals(6)
+        self.power_background_spin.setRange(-1.0e12, 1.0e12)
+        self.power_background_spin.setSingleStep(100.0)
+        self.power_background_spin.setFixedWidth(UI_METRICS["spin_w"] + 18)
+        self.power_background_auto_chk = QCheckBox("Auto")
+        self.power_background_auto_chk.setChecked(True)
+        self.power_background_auto_chk.setToolTip("Estimate one constant background from low-percentile intensity.")
+        bkg_row = QWidget()
+        bkg_h = QHBoxLayout(bkg_row)
+        bkg_h.setContentsMargins(0, 0, 0, 0)
+        bkg_h.setSpacing(8)
+        bkg_h.addWidget(self.power_background_spin)
+        bkg_h.addWidget(self.power_background_auto_chk)
+        bkg_h.addStretch(1)
+        background_form.addRow("Constant", bkg_row)
+        params_layout.addWidget(self._make_expander("Background", background_box, expanded=True))
+
+        for s in spins.values():
+            s.setFixedWidth(UI_METRICS["spin_w"])
+            s.setFixedHeight(UI_METRICS["input_h"])
+
+        self.power_auto_v_btn = QToolButton()
+        self.power_auto_x_btn = QToolButton()
+        self.power_auto_y_btn = QToolButton()
+        basic = QGroupBox("Axis Ranges")
+        basic_form = QFormLayout(basic)
+        basic_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
+        basic_form.setHorizontalSpacing(4)
+        basic_form.setVerticalSpacing(UI_METRICS["row_spacing"])
+        basic_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        basic_form.addRow(
+            "vmin / vmax",
+            self._make_axis_range_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.power_auto_v_btn, "Auto V"),
+        )
+        basic_form.addRow(
+            "xmin / xmax",
+            self._make_axis_range_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.power_auto_x_btn, "Auto X"),
+        )
+        basic_form.addRow(
+            "pmin / pmax",
+            self._make_axis_range_row(spins["ymin"], spins["ymax"], fix_checks["ymin"], fix_checks["ymax"], self.power_auto_y_btn, "Auto Y"),
+        )
+        basic_form.addRow("Cursor Power", spins["gate"])
+        flags = QWidget()
+        flags_h = QHBoxLayout(flags)
+        flags_h.setContentsMargins(0, 0, 0, 0)
+        flags_h.setSpacing(10)
+        self.power_log_chk.setText("Color Log")
+        self.power_log_chk.setToolTip("Use logarithmic color normalization.")
+        flags_h.addWidget(self.power_log_chk)
+        flags_h.addWidget(self.power_clip_chk)
+        flags_h.addStretch(1)
+        basic_form.addRow("Color / Clip", flags)
+        self._set_form_label_width(basic_form, UI_METRICS["label_col_width"])
+        params_layout.addWidget(self._make_expander("Plot", basic, expanded=True))
+
+        layout.addWidget(self._make_expander("Parameters", params, expanded=True))
+        layout.addStretch(1)
+        return tab
+
     def _cmp_assign_candidate_files(self) -> list[str]:
         chosen = self._selected(self.cmp_files)
         return chosen if chosen else list(self.available_files)
+
+    def _power_candidate_files(self) -> list[str]:
+        chosen = self._selected(self.power_files)
+        return chosen if chosen else list(self.available_files)
+
+    def _power_axis_log(self) -> bool:
+        return hasattr(self, "power_axis_scale_combo") and self.power_axis_scale_combo.currentText() == "Log"
+
+    def _power_view(self) -> str:
+        if hasattr(self, "power_view_vp_btn") and self.power_view_vp_btn.isChecked():
+            return "VP"
+        return "Intensity"
+
+    def _power_set_view_mode(self, mode: str) -> None:
+        vp_mode = mode == "VP"
+        if hasattr(self, "power_view_intensity_btn"):
+            self.power_view_intensity_btn.setChecked(not vp_mode)
+        if hasattr(self, "power_view_vp_btn"):
+            self.power_view_vp_btn.setChecked(vp_mode)
+        self._power_update_view_mode()
+
+    def _power_update_view_mode(self) -> None:
+        vp_mode = self._power_view() == "VP"
+        if hasattr(self, "power_group_combo"):
+            self.power_group_combo.setEnabled(not vp_mode)
+        if hasattr(self, "power_pair_mode_combo"):
+            self.power_pair_mode_combo.setEnabled(vp_mode)
+        self._update_plot_view_bar_visibility()
+
+    def _power_pairing_mode(self) -> str:
+        if not hasattr(self, "power_pair_mode_combo"):
+            return "stage"
+        return "power" if self.power_pair_mode_combo.currentText() == "Power Interpolation" else "stage"
+
+    def _power_selected_group_key(self) -> str:
+        if not hasattr(self, "power_group_combo"):
+            return ""
+        data = self.power_group_combo.currentData()
+        return str(data) if data else str(self.power_group_combo.currentText()).strip()
+
+    def _power_role_group_key(self, role: str) -> str:
+        combo = self.power_kk_group_combo if role == "KK" else self.power_kkp_group_combo
+        data = combo.currentData()
+        return str(data) if data else str(combo.currentText()).strip()
+
+    def _power_current_groups(self) -> Dict[str, tuple[Any, ...]]:
+        return data_io.get_power_series_groups(self._power_candidate_files())
+
+    def _power_refresh_groups(self) -> None:
+        if not hasattr(self, "power_group_combo"):
+            return
+        old_key = self._power_selected_group_key()
+        old_kk = self._power_role_group_key("KK") if hasattr(self, "power_kk_group_combo") else ""
+        old_kkp = self._power_role_group_key("KKp") if hasattr(self, "power_kkp_group_combo") else ""
+        groups = self._power_current_groups()
+        old = self.power_group_combo.blockSignals(True)
+        old_role_blocks: list[tuple[QComboBox, bool]] = []
+        if hasattr(self, "power_kk_group_combo"):
+            old_role_blocks = [
+                (self.power_kk_group_combo, self.power_kk_group_combo.blockSignals(True)),
+                (self.power_kkp_group_combo, self.power_kkp_group_combo.blockSignals(True)),
+            ]
+        try:
+            self.power_group_combo.clear()
+            if hasattr(self, "power_kk_group_combo"):
+                self.power_kk_group_combo.clear()
+                self.power_kkp_group_combo.clear()
+            ordered_groups = sorted(groups.items(), key=lambda item: (-len(item[1]), item[0]))
+            for key, records in ordered_groups:
+                powers = [float(getattr(record, "power_uW", 0.0)) for record in records]
+                if powers:
+                    label = f"{power_group_title(key)}  ({len(records)} files, {min(powers):.4g}-{max(powers):.4g} uW)"
+                else:
+                    label = f"{power_group_title(key)}  ({len(records)} files)"
+                self.power_group_combo.addItem(label, key)
+                if hasattr(self, "power_kk_group_combo"):
+                    self.power_kk_group_combo.addItem(label, key)
+                    self.power_kkp_group_combo.addItem(label, key)
+            if old_key:
+                idx = self.power_group_combo.findData(old_key)
+                if idx >= 0:
+                    self.power_group_combo.setCurrentIndex(idx)
+            if hasattr(self, "power_kk_group_combo"):
+                keys = [key for key, _records in ordered_groups]
+                kk_idx = self.power_kk_group_combo.findData(old_kk)
+                if kk_idx < 0:
+                    kk_idx = 0 if keys else -1
+                kkp_idx = self.power_kkp_group_combo.findData(old_kkp)
+                if kkp_idx < 0:
+                    kkp_idx = 1 if len(keys) > 1 else (0 if keys else -1)
+                if kk_idx >= 0:
+                    self.power_kk_group_combo.setCurrentIndex(kk_idx)
+                if kkp_idx >= 0:
+                    self.power_kkp_group_combo.setCurrentIndex(kkp_idx)
+        finally:
+            self.power_group_combo.blockSignals(old)
+            for combo, blocked in old_role_blocks:
+                combo.blockSignals(blocked)
+        self._power_update_group_summary()
+        self._power_update_vp_availability()
+
+    def _power_update_group_summary(self) -> None:
+        if not hasattr(self, "power_group_summary"):
+            return
+        groups = self._power_current_groups()
+        key = self._power_selected_group_key()
+        records = groups.get(key, ())
+        if not records and groups:
+            key, records = next(iter(sorted(groups.items(), key=lambda item: (-len(item[1]), item[0]))))
+        if not records:
+            self.power_group_summary.setPlainText("No power groups found.")
+            return
+        lines = [f"{power_group_title(key)}", f"{len(records)} files sorted by power:"]
+        for record in records[:8]:
+            stage = getattr(record, "stage", None)
+            stage_text = "" if stage is None else f", Stage {stage:g}"
+            lines.append(f"{getattr(record, 'power_uW', 0.0):.6g} uW{stage_text} -> {getattr(record, 'file_name', '')}")
+        if len(records) > 8:
+            lines.append(f"+{len(records) - 8} more")
+        if hasattr(self, "power_kk_group_combo") and self._power_has_distinct_role_groups():
+            lines.append(f"KK -> {power_group_title(self._power_role_group_key('KK')) or 'none'}")
+            lines.append(f"KKp -> {power_group_title(self._power_role_group_key('KKp')) or 'none'}")
+        self.power_group_summary.setPlainText("\n".join(lines))
+
+    def _power_background_auto_enabled(self) -> bool:
+        return bool(hasattr(self, "power_background_auto_chk") and self.power_background_auto_chk.isChecked())
+
+    def _power_set_background_spin_silent(self, value: float) -> None:
+        if not hasattr(self, "power_background_spin"):
+            return
+        old = self.power_background_spin.blockSignals(True)
+        try:
+            self.power_background_spin.setValue(float(value))
+        finally:
+            self.power_background_spin.blockSignals(old)
+
+    def _power_background_value(self, cubes: Sequence[DataCube] | Dict[str, DataCube] | None = None) -> float:
+        if not hasattr(self, "power_background_spin"):
+            return 0.0
+        if self._power_background_auto_enabled() and cubes:
+            value = estimate_constant_background(cubes, percentile=1.0)
+            self._power_set_background_spin_silent(value)
+            return value
+        return float(self.power_background_spin.value())
+
+    def _power_load_group_result(self, group_key: str) -> data_io.PowerSeriesResult:
+        return data_io.load_power_series_cube(
+            self.current_folder,
+            self._power_candidate_files(),
+            group_key=group_key,
+            y_axis="auto",
+        )
+
+    def _power_corrected_cube(self, cube: DataCube, background: float | None = None) -> DataCube:
+        if background is None:
+            background = self._power_background_value([cube])
+        return background_correct_cube(cube, background, title=cube.title)
+
+    def _power_role_payload(self) -> tuple[data_io.PowerSeriesResult, data_io.PowerSeriesResult, str, str]:
+        kk_key = self._power_role_group_key("KK")
+        kkp_key = self._power_role_group_key("KKp")
+        if not kk_key or not kkp_key:
+            raise ValueError("Assign KK and KKp power groups.")
+        if kk_key == kkp_key:
+            raise ValueError("KK and KKp must use different power groups.")
+        kk_result = self._power_load_group_result(kk_key)
+        kkp_result = self._power_load_group_result(kkp_key)
+        return kk_result, kkp_result, kk_key, kkp_key
+
+    def _power_active_source_files_for_move(self) -> list[str]:
+        names: list[str] = []
+        if self._power_has_distinct_role_groups():
+            groups = self._power_current_groups()
+            for key in (self._power_role_group_key("KK"), self._power_role_group_key("KKp")):
+                for record in groups.get(key, ()):
+                    file_name = getattr(record, "file_name", "")
+                    if file_name:
+                        names.append(str(file_name))
+        if not names and self.loaded and self.loaded.mode == "Power Dependent":
+            names = list(self.loaded.selected_files)
+        return list(dict.fromkeys(names))
+
+    def _power_has_distinct_role_groups(self) -> bool:
+        kk_key = self._power_role_group_key("KK")
+        kkp_key = self._power_role_group_key("KKp")
+        return bool(kk_key and kkp_key and kk_key != kkp_key)
+
+    def _power_update_vp_availability(self) -> None:
+        has_distinct = self._power_has_distinct_role_groups()
+        if hasattr(self, "power_view_vp_btn"):
+            self.power_view_vp_btn.setEnabled(has_distinct)
+        if not has_distinct and self._power_view() == "VP":
+            self._power_set_view_mode("Intensity")
+
+    def _power_vp_payload(self) -> tuple[DataCube, DataCube, DataCube, tuple[Any, ...], tuple[Any, ...], str, str, float, str, tuple[Any, ...]]:
+        kk_result, kkp_result, kk_key, kkp_key = self._power_role_payload()
+        background = self._power_background_value([kk_result.cube, kkp_result.cube])
+        vp_title = _vp_short_title(power_group_title(kk_key), power_group_title(kkp_key))
+        pairing_mode = self._power_pairing_mode()
+        if pairing_mode == "stage":
+            kk_cube, kkp_cube, vp_cube, stage_pairs = power_stage_paired_vp_cubes(
+                kk_result.cube,
+                kk_result.records,
+                kkp_result.cube,
+                kkp_result.records,
+                background=background,
+                title=vp_title,
+            )
+        else:
+            kk_cube, kkp_cube, vp_cube = power_valley_polarization_cube(
+                kk_result.cube,
+                kkp_result.cube,
+                background=background,
+                title=vp_title,
+            )
+            stage_pairs = ()
+        return (
+            kk_cube,
+            kkp_cube,
+            vp_cube,
+            kk_result.records,
+            kkp_result.records,
+            kk_key,
+            kkp_key,
+            background,
+            pairing_mode,
+            tuple(stage_pairs),
+        )
 
     def _cmp_set_channel_combo_items(self) -> None:
         files = [""] + list(self.available_files)
@@ -1773,6 +2215,8 @@ class MainWindow(QMainWindow):
     def _update_plot_view_bar_visibility(self) -> None:
         if hasattr(self, "cmp_plot_view_bar"):
             self.cmp_plot_view_bar.setVisible(self._active_mode() == "Compare")
+        if hasattr(self, "power_plot_view_bar"):
+            self.power_plot_view_bar.setVisible(self._active_mode() == "Power Dependent")
 
     def _cmp_selection_from_ui(self) -> data_io.CompareSelection:
         mapping = self._cmp_current_mapping()
@@ -1796,10 +2240,12 @@ class MainWindow(QMainWindow):
 
     def _cmp_auto_assign_channels(self) -> None:
         candidates = self._cmp_assign_candidate_files()
+        in_k = float(self.cmp_in_k_angle_spin.value())
+        out_k = float(self.cmp_out_k_angle_spin.value())
         found, duplicates, gate_group, gate_groups = coherent_compare_auto_assignment(
             candidates,
-            in_k_angle=float(self.cmp_in_k_angle_spin.value()),
-            out_k_angle=float(self.cmp_out_k_angle_spin.value()),
+            in_k_angle=in_k,
+            out_k_angle=out_k,
         )
         for key, combo in self.cmp_channel_combos.items():
             old = combo.blockSignals(True)
@@ -1808,6 +2254,39 @@ class MainWindow(QMainWindow):
             finally:
                 combo.blockSignals(old)
         self._cmp_update_assignment_summary()
+        # --- diagnostic logging ---
+        classified_counts: dict[str, int] = {}
+        group_keys: dict[str, set[str]] = {}
+        for fname in candidates:
+            ch = classify_compare_channel(fname, in_k_angle=in_k, out_k_angle=out_k)
+            if ch:
+                classified_counts[ch] = classified_counts.get(ch, 0) + 1
+                gk = parse_compare_gate_condition(fname) or "__ungrouped__"
+                group_keys.setdefault(gk, set()).add(ch)
+        assigned = [k for k in ("KK", "KKp", "KpK", "KpKp") if k in found]
+        missing = [k for k in ("KK", "KKp", "KpK", "KpKp") if k not in found]
+        self._append_log(
+            f"Auto-assign (InK={in_k:.1f}°, OutK={out_k:.1f}°): "
+            + f"classified {classified_counts} across {len(group_keys)} group(s)"
+        )
+        for gk, keys in sorted(group_keys.items()):
+            marker = " <-- selected" if gk == (gate_group or "__ungrouped__") else ""
+            self._append_log(f"  group [{gk}]: keys={sorted(keys)}{marker}")
+        if assigned:
+            self._append_log(f"  assigned: {', '.join(assigned)}")
+        if missing:
+            reason_parts: list[str] = []
+            for mk in missing:
+                if mk not in classified_counts:
+                    reason_parts.append(f"{mk}=no file classified as {mk}")
+                else:
+                    in_selected = mk in group_keys.get(gate_group or "__ungrouped__", set())
+                    if not in_selected:
+                        reason_parts.append(f"{mk}=only in other gate group(s)")
+                    else:
+                        reason_parts.append(f"{mk}=duplicate (already assigned)")
+            self._append_log(f"  MISSING: {'; '.join(reason_parts)}")
+        # --- end diagnostic ---
         if gate_group and len(set(gate_groups)) > 1:
             self._append_log(
                 "Compare auto-detect found multiple gate groups: "
@@ -1914,6 +2393,26 @@ class MainWindow(QMainWindow):
         view_layout.addWidget(self.cmp_view_vp_btn)
         view_layout.addStretch(1)
         layout.addWidget(self.cmp_plot_view_bar)
+        self.power_plot_view_bar = QFrame()
+        self.power_plot_view_bar.setFrameShape(QFrame.NoFrame)
+        self.power_plot_view_bar.setVisible(False)
+        self.power_plot_view_bar.setStyleSheet(self.cmp_plot_view_bar.styleSheet())
+        power_view_layout = QHBoxLayout(self.power_plot_view_bar)
+        power_view_layout.setContentsMargins(8, 4, 8, 4)
+        power_view_layout.setSpacing(0)
+        self.power_view_intensity_btn = QToolButton()
+        self.power_view_intensity_btn.setText("Intensity")
+        self.power_view_intensity_btn.setToolTip("Show corrected power-dependent intensity map and spectrum")
+        self.power_view_intensity_btn.setCheckable(True)
+        self.power_view_intensity_btn.setChecked(True)
+        self.power_view_vp_btn = QToolButton()
+        self.power_view_vp_btn.setText("VP")
+        self.power_view_vp_btn.setToolTip("Show power-dependent valley polarization from assigned KK and KKp groups")
+        self.power_view_vp_btn.setCheckable(True)
+        power_view_layout.addWidget(self.power_view_intensity_btn)
+        power_view_layout.addWidget(self.power_view_vp_btn)
+        power_view_layout.addStretch(1)
+        layout.addWidget(self.power_plot_view_bar)
         layout.addWidget(self.canvas, 1)
         return box
 
@@ -2009,6 +2508,24 @@ class MainWindow(QMainWindow):
         self.cmp_auto_v_btn.clicked.connect(self._auto_cmp_vrange)
         self.cmp_auto_x_btn.clicked.connect(self._auto_cmp_xrange)
         self.cmp_auto_y_btn.clicked.connect(self._auto_cmp_yrange)
+        self.power_refresh_groups_btn.clicked.connect(self._power_refresh_groups)
+        self.power_group_combo.currentIndexChanged.connect(lambda _idx: self._on_power_plot_param_changed())
+        self.power_kk_group_combo.currentIndexChanged.connect(lambda _idx: self._on_power_plot_param_changed())
+        self.power_kkp_group_combo.currentIndexChanged.connect(lambda _idx: self._on_power_plot_param_changed())
+        self.power_view_intensity_btn.clicked.connect(lambda: self._on_power_plot_view_button_clicked("Intensity"))
+        self.power_view_vp_btn.clicked.connect(lambda: self._on_power_plot_view_button_clicked("VP"))
+        self.power_axis_scale_combo.currentTextChanged.connect(self._on_power_axis_scale_changed)
+        self.power_pair_mode_combo.currentTextChanged.connect(self._on_power_plot_param_changed)
+        self.power_background_spin.valueChanged.connect(self._on_power_plot_param_changed)
+        self.power_background_auto_chk.toggled.connect(self._on_power_background_mode_changed)
+        for key in ("vmin", "vmax", "xmin", "xmax", "ymin", "ymax", "gate"):
+            self.power_spins[key].valueChanged.connect(self._on_power_plot_param_changed)
+        self.power_cmap.currentTextChanged.connect(self._on_power_plot_param_changed)
+        self.power_log_chk.toggled.connect(self._on_power_plot_param_changed)
+        self.power_clip_chk.toggled.connect(self._on_power_plot_param_changed)
+        self.power_auto_v_btn.clicked.connect(self._auto_power_vrange)
+        self.power_auto_x_btn.clicked.connect(self._auto_power_xrange)
+        self.power_auto_y_btn.clicked.connect(self._auto_power_yrange)
         self.drr_yaxis_combo.currentTextChanged.connect(self._on_drr_plot_param_changed)
         self.drr_yaxis_a_spin.valueChanged.connect(self._on_drr_plot_param_changed)
         self.drr_yaxis_b_spin.valueChanged.connect(self._on_drr_plot_param_changed)
@@ -2055,6 +2572,10 @@ class MainWindow(QMainWindow):
         self._cmp_update_view_mode()
         self._cmp_set_channel_combo_items()
         self._cmp_update_assignment_summary()
+        self._power_refresh_groups()
+        self._power_update_view_mode()
+        if hasattr(self, "power_background_spin"):
+            self.power_background_spin.setEnabled(not self._power_background_auto_enabled())
         self._update_plot_view_bar_visibility()
 
     def _toggle_log(self) -> None:
@@ -2085,6 +2606,10 @@ class MainWindow(QMainWindow):
             names = self._selected(self.cmp_files)
             if (not names) and self.loaded and self.loaded.mode == "Compare":
                 names = list(self.loaded.compare_sources.values()) if self.loaded.compare_sources else list(self.loaded.selected_files)
+        elif mode == "Power Dependent":
+            names = self._selected(self.power_files)
+            if not names:
+                names = self._power_active_source_files_for_move()
         if not names:
             self._show_error("No source files selected to move.")
             return
@@ -2107,7 +2632,7 @@ class MainWindow(QMainWindow):
 
     def _active_mode(self) -> str | None:
         text = self.tabs.tabText(self.tabs.currentIndex())
-        return text if text in {"PL", "DRR", "Compare"} else None
+        return text if text in {"PL", "DRR", "Compare", "Power Dependent"} else None
 
     def _toolbar_load(self) -> None:
         mode = self._active_mode()
@@ -2137,6 +2662,19 @@ class MainWindow(QMainWindow):
         if self.loaded and self.loaded.mode == "PL":
             self._plot_mode("PL")
 
+    def _on_power_axis_scale_changed(self) -> None:
+        self._power_update_group_summary()
+        self._on_power_plot_param_changed()
+
+    def _on_power_background_mode_changed(self, _checked: bool) -> None:
+        self.power_background_spin.setEnabled(not self._power_background_auto_enabled())
+        self._on_power_plot_param_changed()
+
+    def _on_power_plot_param_changed(self) -> None:
+        self._power_update_group_summary()
+        if self.loaded and self.loaded.mode == "Power Dependent":
+            self._plot_mode("Power Dependent")
+
     def _on_cmp_assignment_mode_changed(self) -> None:
         self._cmp_update_assignment_mode()
         if self.cmp_assign_mode_combo.currentText() == "Auto by angle":
@@ -2159,6 +2697,11 @@ class MainWindow(QMainWindow):
     def _on_cmp_plot_view_button_clicked(self, mode: str) -> None:
         self._cmp_set_view_mode(mode)
         self._on_cmp_view_changed()
+
+    def _on_power_plot_view_button_clicked(self, mode: str) -> None:
+        self._power_selected_row_index = None
+        self._power_set_view_mode(mode)
+        self._on_power_plot_param_changed()
 
     def _on_cmp_view_changed(self) -> None:
         self._cmp_update_view_mode()
@@ -2212,13 +2755,14 @@ class MainWindow(QMainWindow):
         path = Path(file_path)
         if not self._set_current_folder(str(path.parent)):
             return
-        for lst in (self.pl_files, self.cmp_files):
+        for lst in (self.pl_files, self.cmp_files, self.power_files):
             matches = lst.findItems(path.name, Qt.MatchExactly)
             if matches:
                 lst.clearSelection()
                 matches[0].setSelected(True)
         self.drr_selected_files = [path.name]
         self._update_drr_selection_labels()
+        self._power_refresh_groups()
         self._status(f"Selected {path.name}")
 
     def _restore_list_selection(self, widget: QListWidget, names: List[str]) -> None:
@@ -2231,7 +2775,8 @@ class MainWindow(QMainWindow):
         old_files = set(self.available_files)
         pl_selected = self._selected(self.pl_files)
         cmp_selected = self._selected(self.cmp_files)
-        for lst in (self.pl_files, self.cmp_files):
+        power_selected = self._selected(self.power_files)
+        for lst in (self.pl_files, self.cmp_files, self.power_files):
             lst.clear()
         if not self.current_folder:
             self.available_files = []
@@ -2239,9 +2784,12 @@ class MainWindow(QMainWindow):
         self.available_files = data_io.list_csv_files(self.current_folder)
         self.pl_files.addItems(self.available_files)
         self.cmp_files.addItems(self.available_files)
+        self.power_files.addItems(self.available_files)
         self._restore_list_selection(self.pl_files, [f for f in pl_selected if f in self.available_files])
         self._restore_list_selection(self.cmp_files, [f for f in cmp_selected if f in self.available_files])
+        self._restore_list_selection(self.power_files, [f for f in power_selected if f in self.available_files])
         self._cmp_set_channel_combo_items()
+        self._power_refresh_groups()
         self.drr_selected_files = [f for f in self.drr_selected_files if f in self.available_files]
         self.drr_baseline_files_manual = [f for f in self.drr_baseline_files_manual if f in self.available_files]
         self.drr_baseline_files_found = [f for f in self.drr_baseline_files_found if f in self.available_files]
@@ -2451,6 +2999,7 @@ class MainWindow(QMainWindow):
         pl_loaded = loaded_mode == "PL"
         drr_loaded = loaded_mode == "DRR"
         cmp_loaded = loaded_mode == "Compare"
+        power_loaded = loaded_mode == "Power Dependent"
         self.pl_auto_v_btn.setEnabled(pl_loaded)
         self.pl_auto_x_btn.setEnabled(pl_loaded)
         self.pl_auto_y_btn.setEnabled(pl_loaded)
@@ -2460,6 +3009,9 @@ class MainWindow(QMainWindow):
         self.cmp_auto_v_btn.setEnabled(cmp_loaded)
         self.cmp_auto_x_btn.setEnabled(cmp_loaded)
         self.cmp_auto_y_btn.setEnabled(cmp_loaded)
+        self.power_auto_v_btn.setEnabled(power_loaded)
+        self.power_auto_x_btn.setEnabled(power_loaded)
+        self.power_auto_y_btn.setEnabled(power_loaded)
 
     def _reset_params(self, mode: str) -> None:
         if self.loaded and self.loaded.mode == mode:
@@ -2568,6 +3120,53 @@ class MainWindow(QMainWindow):
         self.cmp_spins["vmax"].setValue(vmax)
         self._plot_mode("Compare")
 
+    def _auto_power_vrange(self) -> None:
+        if not self.loaded or self.loaded.mode != "Power Dependent" or self.loaded.cube is None:
+            return
+        x0, x1 = sorted((float(self.power_spins["xmin"].value()), float(self.power_spins["xmax"].value())))
+        y0, y1 = sorted((float(self.power_spins["ymin"].value()), float(self.power_spins["ymax"].value())))
+
+        def _roi_finite(cube) -> np.ndarray:
+            x = np.asarray(cube.energy, float).ravel()
+            y = np.asarray(cube.gate, float).ravel()
+            z = np.asarray(cube.Z, float)
+            x_mask = (x >= x0) & (x <= x1)
+            y_mask = (y >= y0) & (y <= y1)
+            z_roi = z[np.ix_(y_mask, x_mask)] if np.any(y_mask) and np.any(x_mask) else z
+            return z_roi[np.isfinite(z_roi)]
+
+        if self._power_has_distinct_role_groups():
+            try:
+                kk_result, kkp_result, _kk_key, _kkp_key = self._power_role_payload()
+                bg = self._power_background_value([kk_result.cube, kkp_result.cube])
+                kk_c = self._power_corrected_cube(kk_result.cube, background=bg)
+                kkp_c = self._power_corrected_cube(kkp_result.cube, background=bg)
+                parts = [_roi_finite(kk_c), _roi_finite(kkp_c)]
+                vals_all = np.concatenate([p for p in parts if p.size > 0]) if any(p.size for p in parts) else np.array([])
+            except Exception:
+                vals_all = np.array([])
+        else:
+            vals_all = np.array([])
+
+        if vals_all.size == 0:
+            vals_all = _roi_finite(self.loaded.cube)
+        if vals_all.size == 0:
+            return
+
+        if self._mode_log("Power Dependent"):
+            pos = vals_all[vals_all > 0]
+            vals = pos if pos.size else vals_all
+        else:
+            vals = vals_all
+        vmin, vmax = np.nanpercentile(vals, [0.01, 99.99])
+        vmin, vmax = float(vmin), float(vmax)
+        if self._mode_log("Power Dependent"):
+            vmin = max(vmin, 1e-12)
+            vmax = max(vmax, vmin * 1.01)
+        self.power_spins["vmin"].setValue(vmin)
+        self.power_spins["vmax"].setValue(vmax)
+        self._plot_mode("Power Dependent")
+
     def _auto_drr_xrange(self) -> None:
         if not self.loaded or self.loaded.mode != "DRR":
             return
@@ -2594,6 +3193,13 @@ class MainWindow(QMainWindow):
         self.cmp_spins["xmax"].setValue(max(maxs))
         self._plot_mode("Compare")
 
+    def _auto_power_xrange(self) -> None:
+        if not self.loaded or self.loaded.mode != "Power Dependent" or self.loaded.cube is None:
+            return
+        self.power_spins["xmin"].setValue(float(np.nanmin(self.loaded.cube.energy)))
+        self.power_spins["xmax"].setValue(float(np.nanmax(self.loaded.cube.energy)))
+        self._plot_mode("Power Dependent")
+
     def _auto_drr_yrange(self) -> None:
         if not self.loaded or self.loaded.mode != "DRR":
             return
@@ -2619,6 +3225,18 @@ class MainWindow(QMainWindow):
         self.cmp_spins["ymin"].setValue(min(mins))
         self.cmp_spins["ymax"].setValue(max(maxs))
         self._plot_mode("Compare")
+
+    def _auto_power_yrange(self) -> None:
+        if not self.loaded or self.loaded.mode != "Power Dependent" or self.loaded.cube is None:
+            return
+        powers = np.asarray(self.loaded.cube.gate, float)
+        positive = powers[np.isfinite(powers) & (powers > 0)]
+        vals = positive if self._power_axis_log() and positive.size else powers[np.isfinite(powers)]
+        if vals.size == 0:
+            return
+        self.power_spins["ymin"].setValue(float(np.nanmin(vals)))
+        self.power_spins["ymax"].setValue(float(np.nanmax(vals)))
+        self._plot_mode("Power Dependent")
 
     def _drr_derivative_value(self) -> int | None:
         text = self.drr_derivative_combo.currentText()
@@ -2686,7 +3304,8 @@ class MainWindow(QMainWindow):
             }
             drr_baseline_which = which_map.get(self.drr_baseline_combine_combo.currentText(), "last")
             y_axis_spec = self._selected_y_axis_spec("drr")
-        else:
+            power_group_key = ""
+        elif mode == "Compare":
             selection = self._cmp_selection_from_ui()
             selected = list(selection.as_pairs().values())
             compare_sources = selection.as_pairs()
@@ -2696,6 +3315,19 @@ class MainWindow(QMainWindow):
             drr_baseline = "Self (last frame)"
             drr_baseline_which = "last"
             y_axis_spec = self._selected_y_axis_spec("cmp")
+            power_group_key = ""
+        else:
+            selected = self._power_candidate_files()
+            compare_sources = {}
+            baselines = []
+            pl_log = False
+            cmp_log = False
+            drr_baseline = "Self (last frame)"
+            drr_baseline_which = "last"
+            y_axis_spec = "auto"
+            power_group_key = self._power_selected_group_key()
+        if mode == "PL":
+            power_group_key = ""
         if mode != "Compare":
             compare_sources = {}
 
@@ -2710,6 +3342,7 @@ class MainWindow(QMainWindow):
             compare_log_scale=cmp_log,
             y_axis_spec=y_axis_spec,
             compare_sources=compare_sources,
+            power_group_key=power_group_key,
         )
 
         self._set_stage("Loading...")
@@ -2779,6 +3412,25 @@ class MainWindow(QMainWindow):
                 y_axis_spec=options.y_axis_spec,
             )
 
+        if mode == "Power Dependent":
+            result = data_io.load_power_series_cube(
+                folder,
+                options.selected_files,
+                group_key=options.power_group_key,
+                y_axis="auto",
+            )
+            return LoadedState(
+                mode="Power Dependent",
+                folder=folder,
+                primary_file=(result.records[0].file_name if result.records else None),
+                selected_files=[record.file_name for record in result.records],
+                cube=result.cube,
+                power_records=result.records,
+                power_groups=result.groups,
+                power_group_key=result.group_key,
+                y_axis_spec="auto",
+            )
+
         selection = data_io.CompareSelection.from_mapping(options.compare_sources)
         cubes = data_io.load_compare_cubes(folder, selection, log_scale=options.compare_log_scale, y_axis=options.y_axis_spec)
         return LoadedState(
@@ -2795,6 +3447,11 @@ class MainWindow(QMainWindow):
         self.last_plotted_mode = None
         self._last_plot_params_key = None
         self._last_plot_cube = None
+        if loaded.mode == "Power Dependent":
+            self._power_refresh_groups()
+            idx = self.power_group_combo.findData(loaded.power_group_key)
+            if idx >= 0:
+                self.power_group_combo.setCurrentIndex(idx)
         self._apply_auto_limits_for_loaded()
         self._set_stage("Loaded")
         self._update_action_states()
@@ -2810,22 +3467,26 @@ class MainWindow(QMainWindow):
             return self.pl_spins
         if mode == "DRR":
             return self.drr_spins
+        if mode == "Power Dependent":
+            return self.power_spins
         return self.cmp_spins
 
     def _mode_cmap(self, mode: str) -> QComboBox:
-        return self.pl_cmap if mode == "PL" else self.drr_cmap if mode == "DRR" else self.cmp_cmap
+        return self.pl_cmap if mode == "PL" else self.drr_cmap if mode == "DRR" else self.power_cmap if mode == "Power Dependent" else self.cmp_cmap
 
     def _mode_log(self, mode: str) -> bool:
-        return bool(self.pl_log_chk.isChecked()) if mode == "PL" else bool(self.drr_log_chk.isChecked()) if mode == "DRR" else bool(self.cmp_log_chk.isChecked())
+        return bool(self.pl_log_chk.isChecked()) if mode == "PL" else bool(self.drr_log_chk.isChecked()) if mode == "DRR" else bool(self.power_log_chk.isChecked()) if mode == "Power Dependent" else bool(self.cmp_log_chk.isChecked())
 
     def _mode_clip(self, mode: str) -> bool:
-        return bool(self.pl_clip_chk.isChecked()) if mode == "PL" else bool(self.drr_clip_chk.isChecked()) if mode == "DRR" else bool(self.cmp_clip_chk.isChecked())
+        return bool(self.pl_clip_chk.isChecked()) if mode == "PL" else bool(self.drr_clip_chk.isChecked()) if mode == "DRR" else bool(self.power_clip_chk.isChecked()) if mode == "Power Dependent" else bool(self.cmp_clip_chk.isChecked())
 
     def _mode_fix_value(self, mode: str, key: str) -> bool:
         if mode == "PL":
             checks = self.pl_fix_checks
         elif mode == "DRR":
             checks = self.drr_fix_checks
+        elif mode == "Power Dependent":
+            checks = self.power_fix_checks
         else:
             checks = self.cmp_fix_checks
         chk = checks.get(key)
@@ -2835,6 +3496,8 @@ class MainWindow(QMainWindow):
         return "pl" if mode == "PL" else "drr" if mode == "DRR" else "cmp"
 
     def _current_y_axis_spec_for_mode(self, mode: str) -> str:
+        if mode == "Power Dependent":
+            return "auto"
         return self._selected_y_axis_spec(self._mode_y_axis_prefix(mode))
 
     def _ensure_loaded_matches_ui_params(self, mode: str) -> bool:
@@ -2843,6 +3506,32 @@ class MainWindow(QMainWindow):
         current_spec = self._current_y_axis_spec_for_mode(mode)
         if mode == "DRR" and current_spec == getattr(self.loaded, "y_axis_spec", "auto"):
             return self._ensure_loaded_matches_drr_params()
+        if mode == "Power Dependent":
+            desired_key = self._power_selected_group_key()
+            desired_files = self._power_candidate_files()
+            if desired_key == self.loaded.power_group_key and list(self.loaded.selected_files):
+                return False
+            result = data_io.load_power_series_cube(
+                self.current_folder,
+                desired_files,
+                group_key=desired_key,
+                y_axis="auto",
+            )
+            self.loaded = LoadedState(
+                mode="Power Dependent",
+                folder=self.current_folder,
+                primary_file=(result.records[0].file_name if result.records else None),
+                selected_files=[record.file_name for record in result.records],
+                cube=result.cube,
+                power_records=result.records,
+                power_groups=result.groups,
+                power_group_key=result.group_key,
+                y_axis_spec="auto",
+            )
+            self._last_plot_cube = None
+            self._last_plot_params_key = None
+            self._apply_auto_limits_for_loaded()
+            return True
         if mode == "Compare":
             selection = self._cmp_selection_from_ui()
             desired_sources = selection.as_pairs()
@@ -2907,6 +3596,15 @@ class MainWindow(QMainWindow):
             background = self._cmp_background_value(self.loaded.compare_cubes)
             corrected = self._cmp_corrected_cubes(self.loaded.compare_cubes, background=background)
             cube = next(iter(corrected.values()))
+        elif mode == "Power Dependent" and self.loaded.cube is not None:
+            if self._power_view() == "VP":
+                try:
+                    _kk_cube, _kkp_cube, vp_cube, *_rest = self._power_vp_payload()
+                    cube = vp_cube
+                except Exception:
+                    cube = self._power_corrected_cube(self.loaded.cube)
+            else:
+                cube = self._power_corrected_cube(self.loaded.cube)
         else:
             return
 
@@ -2924,6 +3622,14 @@ class MainWindow(QMainWindow):
             spins["ymin"].setValue(limits.ymin)
         if not self._mode_fix_value(mode, "ymax"):
             spins["ymax"].setValue(limits.ymax)
+        if mode == "Power Dependent" and self._power_axis_log():
+            positive = np.asarray(cube.gate, float)
+            positive = positive[np.isfinite(positive) & (positive > 0)]
+            if positive.size:
+                if not self._mode_fix_value(mode, "ymin"):
+                    spins["ymin"].setValue(float(np.nanmin(positive)))
+                if not self._mode_fix_value(mode, "ymax"):
+                    spins["ymax"].setValue(float(np.nanmax(positive)))
         spins["gate"].setValue(float(np.nanmedian(cube.gate)))
 
     def _make_params(self, mode: str, cube: DataCube) -> HeatmapParams:
@@ -2939,6 +3645,7 @@ class MainWindow(QMainWindow):
             ylim=(float(spins["ymin"].value()), float(spins["ymax"].value())),
             cmap=self._mode_cmap(mode).currentText(),
             log_scale=self._mode_log(mode),
+            y_axis_log=(mode == "Power Dependent" and self._power_axis_log()),
             center_zero=(mode == "DRR" and bool(self.drr_center_zero_chk.isChecked())),
             clip_outliers=self._mode_clip(mode),
         )
@@ -3025,6 +3732,113 @@ class MainWindow(QMainWindow):
             spin.setValue(float(gate_value))
         finally:
             spin.blockSignals(old)
+
+    def _set_power_gate_spin_value(self, gate_value: float) -> None:
+        spin = self.power_spins["gate"]
+        old = spin.blockSignals(True)
+        try:
+            spin.setValue(float(gate_value))
+        finally:
+            spin.blockSignals(old)
+
+    def _display_power_cube(self, cube: DataCube) -> tuple[DataCube, np.ndarray, np.ndarray]:
+        true_power = np.asarray(cube.gate, float).ravel()
+        display_power = true_power.astype(float, copy=True)
+        if display_power.size > 1:
+            finite = display_power[np.isfinite(display_power)]
+            span = float(np.nanmax(finite) - np.nanmin(finite)) if finite.size else 1.0
+            scale = max(span, float(np.nanmax(np.abs(finite))) if finite.size else 1.0, 1.0)
+            eps = scale * 1e-6
+            for idx in range(1, display_power.size):
+                if not np.isfinite(display_power[idx]) or not np.isfinite(display_power[idx - 1]):
+                    continue
+                if display_power[idx] <= display_power[idx - 1]:
+                    display_power[idx] = display_power[idx - 1] + eps
+        display_cube = DataCube(
+            np.asarray(cube.energy, float).copy(),
+            display_power,
+            np.asarray(cube.Z, float).copy(),
+            cube.gate_label,
+            cube.title,
+            cube.cbar_label,
+        )
+        return display_cube, true_power, display_power
+
+    def _apply_power_tick_labels(self, ax, true_power: np.ndarray, display_power: np.ndarray) -> None:
+        if true_power.size == 0 or true_power.size > 14:
+            return
+        if np.allclose(true_power, display_power, rtol=1e-10, atol=1e-12):
+            return
+        ax.set_yticks(display_power)
+        ax.set_yticklabels([f"{float(value):.6g}" for value in true_power])
+
+    def _update_power_spectrum_and_line(self, cube: DataCube) -> None:
+        if self._power_spectrum_ax is None or self._power_heatmap_ax is None:
+            return
+        self._update_power_compare_spectrum_and_lines({"Power": cube})
+
+    def _update_power_compare_spectrum_and_lines(self, cubes: Dict[str, DataCube]) -> None:
+        if self._power_spectrum_ax is None or not cubes:
+            return
+        power_value = float(self.power_spins["gate"].value())
+        self._power_spectrum_ax.clear()
+        first_cube = next(iter(cubes.values()))
+        power_grid = np.asarray(first_cube.gate, float).ravel()
+        if self._power_selected_row_index is not None and 0 <= self._power_selected_row_index < power_grid.size:
+            idx = int(self._power_selected_row_index)
+        else:
+            idx = int(np.argmin(np.abs(power_grid - power_value)))
+        power_used = float(power_grid[idx])
+        x_ref = np.asarray(first_cube.energy, float).ravel()
+        for label, cube in cubes.items():
+            z = np.asarray(cube.Z, float)
+            y = z[idx, :] if idx < z.shape[0] else nearest_gate_spectrum(cube, power_used)[1]
+            x = np.asarray(cube.energy, float).ravel()
+            self._power_spectrum_ax.plot(x, np.asarray(y, float), linewidth=1.3, label=label)
+        if len(cubes) > 1:
+            self._power_spectrum_ax.legend(loc="best", fontsize=9)
+        self._power_spectrum_ax.set_title(f"Spectrum @ {power_used:.6g} uW")
+        self._power_spectrum_ax.set_xlabel("Photon Energy (eV)")
+        self._power_spectrum_ax.set_ylabel(first_cube.cbar_label)
+        self._power_spectrum_ax.grid(alpha=0.25)
+        xlim = self._safe_spectrum_xlim(
+            x_ref,
+            (float(self.power_spins["xmin"].value()), float(self.power_spins["xmax"].value())),
+        )
+        self._power_spectrum_ax.set_xlim(xlim)
+        ys = []
+        xs = []
+        for cube in cubes.values():
+            z = np.asarray(cube.Z, float)
+            y = z[idx, :] if idx < z.shape[0] else nearest_gate_spectrum(cube, power_used)[1]
+            ys.append(np.asarray(y, float))
+            xs.append(np.asarray(cube.energy, float))
+        if ys:
+            merged_y = np.concatenate([y[np.isfinite(y)] for y in ys if np.any(np.isfinite(y))])
+            if merged_y.size:
+                fake_x = np.linspace(xlim[0], xlim[1], merged_y.size)
+                self._auto_scale_spectrum_y(self._power_spectrum_ax, fake_x, merged_y, xlim)
+        self._set_power_gate_spin_value(power_used)
+        for key, ax in self._power_heatmap_axes.items():
+            cube = self._power_active_cubes.get(key)
+            if cube is None:
+                continue
+            display_cube, true_power, display_power = self._display_power_cube(cube)
+            idx = int(np.argmin(np.abs(true_power - power_used)))
+            y_line = float(display_power[idx]) if idx < display_power.size else power_used
+            line = self._power_gate_lines.get(key)
+            if line is None or getattr(line, "axes", None) is not ax:
+                self._power_gate_lines[key] = ax.axhline(
+                    y=y_line,
+                    lw=1.2,
+                    alpha=0.9,
+                    color="#222",
+                    linestyle="--",
+                    zorder=20,
+                )
+            else:
+                line.set_ydata([y_line, y_line])
+        self.canvas.draw_idle()
 
     def _current_drr_spectrum(self, cube: DataCube) -> tuple[float, np.ndarray, np.ndarray]:
         gate_value = float(self.drr_spins["gate"].value())
@@ -3670,6 +4484,15 @@ class MainWindow(QMainWindow):
             self._cmp_gate_lines = {}
             self._cmp_linecut_ax = None
             self._cmp_active_cubes = {}
+            self._power_heatmap_ax = None
+            self._power_heatmap_axes = {}
+            self._power_spectrum_ax = None
+            self._power_last_plot_cube = None
+            self._power_gate_line = None
+            self._power_gate_lines = {}
+            self._power_active_cubes = {}
+            self._power_active_export_cube = None
+            self._power_active_records = ()
             if mode == "PL" and self.loaded.cube is not None:
                 plot_cube = self.loaded.cube
                 params = self._make_params(mode, plot_cube)
@@ -3724,6 +4547,109 @@ class MainWindow(QMainWindow):
                 self._drr_heatmap_fit_artist = None
                 self._set_drr_gate_spin_value(gate_used)
                 self._update_drr_spectrum_and_gate_line(plot_cube)
+            elif mode == "Power Dependent" and self.loaded.cube is not None:
+                self._pl_heatmap_ax = None
+                self._pl_spectrum_ax = None
+                self._pl_last_plot_cube = None
+                self._pl_gate_line = None
+                if self._power_view() == "VP":
+                    _kk_cube, _kkp_cube, vp_cube, _kk_records, _kkp_records, _kk_key, _kkp_key, background, _pairing, _pairs = self._power_vp_payload()
+                    plot_cube = vp_cube
+                    params_base = self._make_params(mode, plot_cube)
+                    params = HeatmapParams(
+                        title=vp_cube.title,
+                        xlabel=params_base.xlabel,
+                        ylabel=vp_cube.gate_label,
+                        cbar_label="VP",
+                        vmin=-1.0,
+                        vmax=1.0,
+                        xlim=params_base.xlim,
+                        ylim=params_base.ylim,
+                        cmap="RdBu_r",
+                        log_scale=False,
+                        y_axis_log=params_base.y_axis_log,
+                        center_zero=True,
+                        clip_outliers=False,
+                    )
+                    self._power_set_background_spin_silent(background)
+                    display_cube, true_power, display_power = self._display_power_cube(plot_cube)
+                    gs = self.figure.add_gridspec(
+                        nrows=2,
+                        ncols=2,
+                        width_ratios=[1.0, 0.035],
+                        height_ratios=[1.0, 0.95],
+                        wspace=0.12,
+                        hspace=0.30,
+                    )
+                    ax1 = self.figure.add_subplot(gs[0, 0])
+                    cax = self.figure.add_subplot(gs[0, 1])
+                    ax2 = self.figure.add_subplot(gs[1, 0], sharex=ax1)
+                    im = plot_heatmap(ax1, display_cube, params)
+                    self._apply_power_tick_labels(ax1, true_power, display_power)
+                    self.figure.colorbar(im, cax=cax, label=params.cbar_label)
+                    self._power_heatmap_ax = ax1
+                    self._power_heatmap_axes = {"VP": ax1}
+                    self._power_spectrum_ax = ax2
+                    self._power_last_plot_cube = plot_cube
+                    self._power_active_cubes = {"VP": plot_cube}
+                    self._power_active_export_cube = plot_cube
+                    self._power_active_records = ()
+                    self._update_power_compare_spectrum_and_lines({"VP": plot_cube})
+                else:
+                    role_compare = self._power_has_distinct_role_groups()
+                    role_titles: dict[str, str] = {}
+                    if role_compare:
+                        kk_result, kkp_result, kk_key, kkp_key = self._power_role_payload()
+                        background = self._power_background_value([kk_result.cube, kkp_result.cube])
+                        cubes = {
+                            "KK": self._power_corrected_cube(kk_result.cube, background=background),
+                            "KKp": self._power_corrected_cube(kkp_result.cube, background=background),
+                        }
+                        plot_cube = cubes["KK"]
+                        role_titles = {"KK": power_group_title(kk_key), "KKp": power_group_title(kkp_key)}
+                    else:
+                        background = self._power_background_value([self.loaded.cube])
+                        plot_cube = self._power_corrected_cube(self.loaded.cube, background=background)
+                        cubes = {"Power": plot_cube}
+                    params = self._make_params(mode, plot_cube)
+                    if role_compare:
+                        kk_z = np.asarray(cubes["KK"].Z, float)
+                        kkp_z = np.asarray(cubes["KKp"].Z, float)
+                        combined_vmin = float(min(np.nanmin(kk_z), np.nanmin(kkp_z)))
+                        combined_vmax = float(max(np.nanmax(kk_z), np.nanmax(kkp_z)))
+                        new_vmin = params.vmin if self._mode_fix_value(mode, "vmin") else combined_vmin
+                        new_vmax = params.vmax if self._mode_fix_value(mode, "vmax") else combined_vmax
+                        params = HeatmapParams(**{**params.__dict__, "vmin": new_vmin, "vmax": new_vmax})
+                    self._power_set_background_spin_silent(background)
+                    n = len(cubes)
+                    gs = self.figure.add_gridspec(
+                        nrows=2,
+                        ncols=n + 1,
+                        width_ratios=([1.0] * n) + [0.035],
+                        height_ratios=[1.0, 0.95],
+                        wspace=0.12,
+                        hspace=0.30,
+                    )
+                    heat_axes = [self.figure.add_subplot(gs[0, idx]) for idx in range(n)]
+                    cax = self.figure.add_subplot(gs[0, n])
+                    ax2 = self.figure.add_subplot(gs[1, :n], sharex=heat_axes[0])
+                    images = []
+                    for ax, (key, cube) in zip(heat_axes, cubes.items()):
+                        display_cube, true_power, display_power = self._display_power_cube(cube)
+                        panel_params = HeatmapParams(**{**params.__dict__, "title": role_titles.get(key, key) if role_compare else cube.title})
+                        im = plot_heatmap(ax, display_cube, panel_params)
+                        self._apply_power_tick_labels(ax, true_power, display_power)
+                        images.append(im)
+                        self._power_heatmap_axes[key] = ax
+                    if images:
+                        self.figure.colorbar(images[0], cax=cax, label=params.cbar_label)
+                    self._power_heatmap_ax = heat_axes[0]
+                    self._power_spectrum_ax = ax2
+                    self._power_last_plot_cube = plot_cube
+                    self._power_active_cubes = cubes
+                    self._power_active_export_cube = plot_cube
+                    self._power_active_records = tuple(self.loaded.power_records)
+                    self._update_power_compare_spectrum_and_lines(cubes)
             elif mode == "Compare" and self.loaded.compare_cubes:
                 self._pl_heatmap_ax = None
                 self._pl_spectrum_ax = None
@@ -3903,6 +4829,30 @@ class MainWindow(QMainWindow):
         }
 
     def _current_plot_params_key(self, mode: str) -> tuple[Any, ...]:
+        if mode == "Power Dependent":
+            return (
+                mode,
+                self._power_selected_group_key(),
+                self._power_view(),
+                self._power_role_group_key("KK"),
+                self._power_role_group_key("KKp"),
+                self._power_pairing_mode(),
+                self.power_axis_scale_combo.currentText(),
+                bool(self._power_background_auto_enabled()),
+                float(self._power_background_value(
+                    [self.loaded.cube] if self.loaded and self.loaded.mode == "Power Dependent" and self.loaded.cube is not None else None
+                )),
+                self.power_cmap.currentText(),
+                float(self.power_spins["vmin"].value()),
+                float(self.power_spins["vmax"].value()),
+                float(self.power_spins["xmin"].value()),
+                float(self.power_spins["xmax"].value()),
+                float(self.power_spins["ymin"].value()),
+                float(self.power_spins["ymax"].value()),
+                float(self.power_spins["gate"].value()),
+                bool(self.power_log_chk.isChecked()),
+                bool(self.power_clip_chk.isChecked()),
+            )
         if mode == "Compare":
             return (
                 mode,
@@ -4099,13 +5049,29 @@ class MainWindow(QMainWindow):
                 if ax is heatmap_ax:
                     cube = self._cmp_active_cubes.get(key)
                     break
+        elif self.last_plotted_mode == "Power Dependent":
+            heatmap_ax = event.inaxes if event.inaxes in set(self._power_heatmap_axes.values()) else self._power_heatmap_ax
+            cube = None
+            for key, ax in self._power_heatmap_axes.items():
+                if ax is heatmap_ax:
+                    cube = self._power_active_cubes.get(key)
+                    break
+            if cube is None:
+                cube = self._power_last_plot_cube
         else:
             return
         if heatmap_ax is None or cube is None or event.inaxes is not heatmap_ax or event.ydata is None:
             return
         ygrid = np.asarray(cube.gate, float).ravel()
-        y = float(np.clip(float(event.ydata), float(np.nanmin(ygrid)), float(np.nanmax(ygrid))))
-        self.statusBar().showMessage(f"Hover gate: {y:.3f} V")
+        if self.last_plotted_mode == "Power Dependent":
+            _display_cube, true_power, display_power = self._display_power_cube(cube)
+            idx = int(np.argmin(np.abs(display_power - float(event.ydata))))
+            y = float(true_power[idx])
+        else:
+            y = float(np.clip(float(event.ydata), float(np.nanmin(ygrid)), float(np.nanmax(ygrid))))
+        unit = "uW" if self.last_plotted_mode == "Power Dependent" else "V"
+        label = "power" if self.last_plotted_mode == "Power Dependent" else "gate"
+        self.statusBar().showMessage(f"Hover {label}: {y:.3f} {unit}")
 
     def _on_canvas_click(self, event: Any) -> None:
         if event.button != 1:
@@ -4125,6 +5091,8 @@ class MainWindow(QMainWindow):
         if event.xdata is not None and self.last_plotted_mode == "PL" and event.inaxes is self._pl_spectrum_ax:
             if self._remove_nearest_pl_peak(float(event.xdata)):
                 return
+        if event.xdata is not None and self.last_plotted_mode == "Power Dependent" and event.inaxes is self._power_spectrum_ax:
+            return
         if (
             event.xdata is not None
             and event.ydata is not None
@@ -4165,6 +5133,27 @@ class MainWindow(QMainWindow):
             self._plot_mode("Compare")
             return
 
+        if self.last_plotted_mode == "Power Dependent":
+            if not self._power_active_cubes or event.ydata is None:
+                return
+            clicked_key = None
+            for key, ax in self._power_heatmap_axes.items():
+                if event.inaxes is ax:
+                    clicked_key = key
+                    break
+            if clicked_key is None:
+                return
+            cube = self._power_active_cubes.get(clicked_key)
+            if cube is None:
+                return
+            _display_cube, true_power, display_power = self._display_power_cube(cube)
+            idx = int(np.argmin(np.abs(display_power - float(event.ydata))))
+            power = float(true_power[idx])
+            self._power_selected_row_index = idx
+            self.power_spins["gate"].setValue(power)
+            self._update_power_compare_spectrum_and_lines(self._power_active_cubes)
+            return
+
         if self.last_plotted_mode != "PL" or self._pl_heatmap_ax is None or self._pl_last_plot_cube is None:
             return
         if event.inaxes is not self._pl_heatmap_ax or event.ydata is None:
@@ -4183,10 +5172,78 @@ class MainWindow(QMainWindow):
             self._show_error("Plot/Update before exporting.")
             return
 
-        if mode in {"PL", "DRR"} and self.loaded.cube is not None:
+        power_vp_payload = None
+        params_intensity: HeatmapParams | None = None
+        power_records = tuple(self.loaded.power_records) if self.loaded and self.loaded.mode == "Power Dependent" else ()
+        if mode in {"PL", "DRR", "Power Dependent"} and self.loaded.cube is not None:
             if mode == "DRR":
                 export_cube = self._drr_cube_for_display()
                 params = self._make_params(mode, export_cube)
+            elif mode == "Power Dependent":
+                if self._power_view() == "VP":
+                    power_vp_payload = self._power_vp_payload()
+                    _kk_cube, _kkp_cube, vp_cube, _kk_records, _kkp_records, _kk_key, _kkp_key, background, _pairing, _pairs = power_vp_payload
+                    params_intensity = self._make_params(mode, _kk_cube)
+                    _kk_z = np.asarray(_kk_cube.Z, float)
+                    _kkp_z = np.asarray(_kkp_cube.Z, float)
+                    _comb_vmin = float(min(np.nanmin(_kk_z), np.nanmin(_kkp_z)))
+                    _comb_vmax = float(max(np.nanmax(_kk_z), np.nanmax(_kkp_z)))
+                    params_intensity = HeatmapParams(**{**params_intensity.__dict__,
+                        "vmin": params_intensity.vmin if self._mode_fix_value(mode, "vmin") else _comb_vmin,
+                        "vmax": params_intensity.vmax if self._mode_fix_value(mode, "vmax") else _comb_vmax,
+                    })
+                    export_cube = vp_cube
+                    params_base = self._make_params(mode, vp_cube)
+                    params = HeatmapParams(
+                        title=vp_cube.title,
+                        xlabel=params_base.xlabel,
+                        ylabel=vp_cube.gate_label,
+                        cbar_label="VP",
+                        vmin=-1.0,
+                        vmax=1.0,
+                        xlim=params_base.xlim,
+                        ylim=params_base.ylim,
+                        cmap="RdBu_r",
+                        log_scale=False,
+                        y_axis_log=params_base.y_axis_log,
+                        center_zero=True,
+                        clip_outliers=False,
+                    )
+                    self._power_set_background_spin_silent(background)
+                else:
+                    if self._power_has_distinct_role_groups():
+                        kk_result, kkp_result, kk_key, kkp_key = self._power_role_payload()
+                        background = self._power_background_value([kk_result.cube, kkp_result.cube])
+                        kk_cube = self._power_corrected_cube(kk_result.cube, background=background)
+                        kkp_cube = self._power_corrected_cube(kkp_result.cube, background=background)
+                        export_cube = kk_cube
+                        params = self._make_params(mode, kk_cube)
+                        _kk_z = np.asarray(kk_cube.Z, float)
+                        _kkp_z = np.asarray(kkp_cube.Z, float)
+                        _comb_vmin = float(min(np.nanmin(_kk_z), np.nanmin(_kkp_z)))
+                        _comb_vmax = float(max(np.nanmax(_kk_z), np.nanmax(_kkp_z)))
+                        params = HeatmapParams(**{**params.__dict__,
+                            "vmin": params.vmin if self._mode_fix_value(mode, "vmin") else _comb_vmin,
+                            "vmax": params.vmax if self._mode_fix_value(mode, "vmax") else _comb_vmax,
+                        })
+                        power_vp_payload = (
+                            kk_cube,
+                            kkp_cube,
+                            None,
+                            kk_result.records,
+                            kkp_result.records,
+                            kk_key,
+                            kkp_key,
+                            background,
+                            "intensity",
+                            (),
+                        )
+                    else:
+                        background = self._power_background_value([self.loaded.cube])
+                        export_cube = self._power_corrected_cube(self.loaded.cube, background=background)
+                        params = self._make_params(mode, export_cube)
+                        power_records = tuple(self.loaded.power_records)
+                    self._power_set_background_spin_silent(background)
             else:
                 export_cube = self.loaded.cube
                 params = self._make_params(mode, export_cube)
@@ -4212,6 +5269,26 @@ class MainWindow(QMainWindow):
                 params=params,
                 drr_cube=export_cube,
                 drr_derivative_label=self.drr_derivative_combo.currentText(),
+                auto_move_sources=bool(self.auto_move_after_export_chk.isChecked()),
+            )
+        elif mode == "Power Dependent":
+            options = ExportOptions(
+                mode=mode,
+                params=params,
+                params_intensity=params_intensity,
+                drr_cube=export_cube,
+                power_view=("Intensity Compare" if power_vp_payload and power_vp_payload[8] == "intensity" else self._power_view()),
+                power_background=float(self.power_background_spin.value()),
+                power_axis_log=self._power_axis_log(),
+                power_kk_group_key=(power_vp_payload[5] if power_vp_payload else ""),
+                power_kkp_group_key=(power_vp_payload[6] if power_vp_payload else ""),
+                power_kk_cube=(power_vp_payload[0] if power_vp_payload else None),
+                power_kkp_cube=(power_vp_payload[1] if power_vp_payload else None),
+                power_vp_cube=(power_vp_payload[2] if power_vp_payload else None),
+                power_kk_records=(power_vp_payload[3] if power_vp_payload else ()),
+                power_kkp_records=(power_vp_payload[4] if power_vp_payload else ()),
+                power_pairing_mode=(power_vp_payload[8] if power_vp_payload else self._power_pairing_mode()),
+                power_stage_pairs=(power_vp_payload[9] if power_vp_payload else ()),
                 auto_move_sources=bool(self.auto_move_after_export_chk.isChecked()),
             )
         else:
@@ -4271,6 +5348,80 @@ class MainWindow(QMainWindow):
             log.emit(f"Exported DAT: {paths['dat'].name}")
             out_folder = str(paths["png"].parent)
             files_to_move = list(loaded.selected_files) + list(loaded.baseline_files)
+        elif mode == "Power Dependent" and options.drr_cube is not None:
+            if options.power_view == "VP":
+                if options.power_kk_cube is None or options.power_kkp_cube is None or options.power_vp_cube is None:
+                    raise ValueError("Power VP export requires KK, KKp, and VP cubes.")
+                paths = export_power_vp_pngs_and_dat(
+                    folder,
+                    kk_cube=options.power_kk_cube,
+                    kkp_cube=options.power_kkp_cube,
+                    vp_cube=options.power_vp_cube,
+                    params=options.params,
+                    params_intensity=options.params_intensity,
+                    kk_group_key=options.power_kk_group_key,
+                    kkp_group_key=options.power_kkp_group_key,
+                    kk_records=options.power_kk_records,
+                    kkp_records=options.power_kkp_records,
+                    y_axis_log=options.power_axis_log,
+                    background=options.power_background,
+                    pairing_mode=options.power_pairing_mode,
+                    stage_pairs=options.power_stage_pairs,
+                )
+                log.emit(f"Exported {len(paths)} power VP files.")
+                out_folder = str(next(iter(paths.values())).parent) if paths else str(Path(folder))
+                files_to_move = list(
+                    dict.fromkeys(
+                        [getattr(record, "file_name", "") for record in options.power_kk_records]
+                        + [getattr(record, "file_name", "") for record in options.power_kkp_records]
+                    )
+                )
+            elif options.power_view == "Intensity Compare":
+                if options.power_kk_cube is None or options.power_kkp_cube is None:
+                    raise ValueError("Power intensity compare export requires KK and KKp cubes.")
+                kk_params = HeatmapParams(**{**options.params.__dict__, "title": options.power_kk_cube.title, "cbar_label": options.power_kk_cube.cbar_label})
+                kkp_params = HeatmapParams(**{**options.params.__dict__, "title": options.power_kkp_cube.title, "cbar_label": options.power_kkp_cube.cbar_label})
+                kk_paths = export_power_series_png_and_dat(
+                    folder,
+                    cube=options.power_kk_cube,
+                    params=kk_params,
+                    records=options.power_kk_records,
+                    group_key=f"KK_{options.power_kk_group_key}",
+                    y_axis_log=options.power_axis_log,
+                    background=options.power_background,
+                )
+                kkp_paths = export_power_series_png_and_dat(
+                    folder,
+                    cube=options.power_kkp_cube,
+                    params=kkp_params,
+                    records=options.power_kkp_records,
+                    group_key=f"KKp_{options.power_kkp_group_key}",
+                    y_axis_log=options.power_axis_log,
+                    background=options.power_background,
+                )
+                log.emit(f"Exported PNG: {kk_paths['png'].name}, {kkp_paths['png'].name}")
+                log.emit(f"Exported DAT: {kk_paths['dat'].name}, {kkp_paths['dat'].name}")
+                out_folder = str(kk_paths["png"].parent)
+                files_to_move = list(
+                    dict.fromkeys(
+                        [getattr(record, "file_name", "") for record in options.power_kk_records]
+                        + [getattr(record, "file_name", "") for record in options.power_kkp_records]
+                    )
+                )
+            else:
+                paths = export_power_series_png_and_dat(
+                    folder,
+                    cube=options.drr_cube,
+                    params=options.params,
+                    records=loaded.power_records,
+                    group_key=loaded.power_group_key,
+                    y_axis_log=options.power_axis_log,
+                    background=options.power_background,
+                )
+                log.emit(f"Exported PNG: {paths['png'].name}")
+                log.emit(f"Exported DAT: {paths['dat'].name}")
+                out_folder = str(paths["png"].parent)
+                files_to_move = list(loaded.selected_files)
         elif mode == "Compare" and loaded.compare_cubes:
             paths = export_compare_panels(
                 folder,

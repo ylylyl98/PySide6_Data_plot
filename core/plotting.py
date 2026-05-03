@@ -26,6 +26,7 @@ class HeatmapParams:
     ylim: tuple[float, float]
     cmap: str = "viridis"
     log_scale: bool = False
+    y_axis_log: bool = False
     center_zero: bool = False
     clip_outliers: bool = False
 
@@ -58,10 +59,20 @@ def _sanitize_limits(requested: tuple[float, float], data_min: float, data_max: 
     return (lo, hi)
 
 
-def _axis_edges_from_centers(values: np.ndarray) -> np.ndarray:
+def _axis_edges_from_centers(values: np.ndarray, *, log_scale: bool = False) -> np.ndarray:
     v = np.asarray(values, float).ravel()
     if v.size == 0:
         raise ValueError("Axis cannot be empty.")
+    if log_scale:
+        if np.any(~np.isfinite(v)) or np.any(v <= 0):
+            raise ValueError("Log axis requires finite positive coordinates.")
+        if v.size == 1:
+            factor = 10.0 ** 0.05
+            return np.asarray([float(v[0]) / factor, float(v[0]) * factor], float)
+        mids = np.sqrt(v[:-1] * v[1:])
+        first = float(v[0]) / np.sqrt(float(v[1]) / float(v[0]))
+        last = float(v[-1]) * np.sqrt(float(v[-1]) / float(v[-2]))
+        return np.concatenate(([first], mids, [last]))
     if v.size == 1:
         pad = max(1e-9, abs(float(v[0])) * 1e-6, 0.5)
         return np.asarray([float(v[0]) - pad, float(v[0]) + pad], float)
@@ -79,7 +90,7 @@ def plot_heatmap(ax: Axes, cube: DataCube, params: HeatmapParams):
     e = np.asarray(cube.energy, float).ravel()
     g = np.asarray(cube.gate, float).ravel()
     e_edges = _axis_edges_from_centers(e)
-    g_edges = _axis_edges_from_centers(g)
+    g_edges = _axis_edges_from_centers(g, log_scale=bool(params.y_axis_log))
     im = ax.pcolormesh(
         e_edges,
         g_edges,
@@ -101,6 +112,14 @@ def plot_heatmap(ax: Axes, cube: DataCube, params: HeatmapParams):
     xmin, xmax = _sanitize_limits(params.xlim, float(np.nanmin(cube.energy)), float(np.nanmax(cube.energy)))
     ymin, ymax = _sanitize_limits(params.ylim, float(np.nanmin(cube.gate)), float(np.nanmax(cube.gate)))
     ax.set_xlim((xmin, xmax))
+    if params.y_axis_log:
+        if ymin <= 0 or ymax <= 0:
+            positive = g[np.isfinite(g) & (g > 0)]
+            if positive.size == 0:
+                raise ValueError("Log power axis requires positive power values.")
+            ymin = float(np.nanmin(positive))
+            ymax = float(np.nanmax(positive))
+        ax.set_yscale("log")
     ax.set_ylim((ymin, ymax))
     return im
 
@@ -125,6 +144,7 @@ def plot_compare_panel(ax: Axes, label: str, cube: DataCube, params: HeatmapPara
         ylim=params.ylim,
         cmap=params.cmap,
         log_scale=params.log_scale,
+        y_axis_log=params.y_axis_log,
         center_zero=params.center_zero,
         clip_outliers=params.clip_outliers,
     )

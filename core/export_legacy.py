@@ -16,7 +16,7 @@ from matplotlib.ticker import FixedFormatter, FixedLocator, FuncFormatter, NullF
 
 from core.loader import DataCube
 from core.plotting import COMPARE_PANEL_ORDER, HeatmapParams
-from core.processing import background_correct_cube, parse_compare_gate_condition, valley_polarization_cube
+from core.processing import background_correct_cube, parse_compare_gate_condition, power_group_title, valley_polarization_cube
 from core.processing_run import save_as_dat
 
 
@@ -253,10 +253,20 @@ def _cb_fmt_sci0(x: float, _pos: float | None = None) -> str:
     return f"{mant}e{int(exp)}"
 
 
-def _axis_edges_from_centers(values: np.ndarray) -> np.ndarray:
+def _axis_edges_from_centers(values: np.ndarray, *, log_scale: bool = False) -> np.ndarray:
     v = np.asarray(values, float).ravel()
     if v.size == 0:
         raise ValueError("Axis cannot be empty.")
+    if log_scale:
+        if np.any(~np.isfinite(v)) or np.any(v <= 0):
+            raise ValueError("Log axis requires finite positive coordinates.")
+        if v.size == 1:
+            factor = 10.0 ** 0.05
+            return np.asarray([float(v[0]) / factor, float(v[0]) * factor], float)
+        mids = np.sqrt(v[:-1] * v[1:])
+        first = float(v[0]) / np.sqrt(float(v[1]) / float(v[0]))
+        last = float(v[-1]) * np.sqrt(float(v[-1]) / float(v[-2]))
+        return np.concatenate(([first], mids, [last]))
     if v.size == 1:
         pad = max(1e-9, abs(float(v[0])) * 1e-6, 0.5)
         return np.asarray([float(v[0]) - pad, float(v[0]) + pad], float)
@@ -297,7 +307,7 @@ def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *,
 
     im = ax.pcolormesh(
         _axis_edges_from_centers(e),
-        _axis_edges_from_centers(g),
+        _axis_edges_from_centers(g, log_scale=bool(params.y_axis_log)),
         z,
         shading="flat",
         cmap=cmap,
@@ -310,6 +320,8 @@ def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *,
     ax.xaxis.get_offset_text().set_visible(False)
     ax.yaxis.get_offset_text().set_visible(False)
     ax.set_xlim(params.xlim)
+    if params.y_axis_log:
+        ax.set_yscale("log")
     ax.set_ylim(params.ylim)
 
     cbar_w = 0.24 * axpos.width
@@ -439,6 +451,217 @@ def export_drr_png_and_dat(
     return {"png": png_path, "dat": dat_path}
 
 
+def power_series_export_base(group_key: str, *, y_axis_log: bool) -> str:
+    axis_tag = "YLog" if bool(y_axis_log) else "YLin"
+    return f"{safe_stem(group_key)}_PowerDep_{axis_tag}"
+
+
+def power_vp_export_base(kk_group_key: str, kkp_group_key: str, *, y_axis_log: bool) -> str:
+    axis_tag = "YLog" if bool(y_axis_log) else "YLin"
+    kk_stem = safe_stem(kk_group_key)
+    kkp_stem = safe_stem(kkp_group_key)
+    kk_parts = kk_stem.split("_")
+    kkp_parts = kkp_stem.split("_")
+    n_common = 0
+    for a, b in zip(kk_parts, kkp_parts):
+        if a == b:
+            n_common += 1
+        else:
+            break
+    if n_common:
+        common = "_".join(kk_parts[:n_common])
+        return f"VP_{common}_KK_KKp_PowerDep_{axis_tag}"
+    return f"VP_{safe_stem(kk_group_key, max_len=50)}_{safe_stem(kkp_group_key, max_len=50)}_PowerDep_{axis_tag}"
+
+
+def export_power_series_png_and_dat(
+    folder: str,
+    *,
+    cube: DataCube,
+    params: HeatmapParams,
+    records: Iterable[object],
+    group_key: str,
+    y_axis_log: bool,
+    background: float = 0.0,
+    processed_name: str = DEFAULT_PROCESSED,
+) -> Dict[str, Path]:
+    out_dir = ensure_processed_dir(folder, processed_name)
+    base = power_series_export_base(group_key, y_axis_log=y_axis_log)
+    png_path = _unique_path(out_dir, base, ".png")
+    _save_heatmap_png(png_path, cube, params, drr=False)
+    dat_path = save_heatmap_dat_streamlit(
+        png_path.with_suffix(".dat"),
+        cube.energy,
+        cube.gate,
+        np.asarray(cube.Z, float),
+        header_lines=[
+            "mode=Power Dependent",
+            f"group_key={group_key}",
+            f"title={cube.title}",
+            f"power_axis_scale={'log' if y_axis_log else 'linear'}",
+            f"background_constant={background}",
+            "corrected=True",
+            "sorted_by=power_uW",
+            *[
+                (
+                    f"source[{idx}]={getattr(record, 'file_name', '')}; "
+                    f"power_uW={getattr(record, 'power_uW', '')}; "
+                    f"stage={getattr(record, 'stage', '')}"
+                )
+                for idx, record in enumerate(records)
+            ],
+        ],
+    )
+    return {"png": png_path, "dat": dat_path}
+
+
+def export_power_vp_pngs_and_dat(
+    folder: str,
+    *,
+    kk_cube: DataCube,
+    kkp_cube: DataCube,
+    vp_cube: DataCube,
+    params: HeatmapParams,
+    params_intensity: "HeatmapParams | None" = None,
+    kk_group_key: str,
+    kkp_group_key: str,
+    kk_records: Iterable[object],
+    kkp_records: Iterable[object],
+    y_axis_log: bool,
+    background: float,
+    pairing_mode: str = "stage",
+    stage_pairs: Iterable[object] = (),
+    processed_name: str = DEFAULT_PROCESSED,
+) -> Dict[str, Path]:
+    out_dir = ensure_processed_dir(folder, processed_name)
+    written: Dict[str, Path] = {}
+
+    kk_base = f"KK_{power_series_export_base(kk_group_key, y_axis_log=y_axis_log)}"
+    kkp_base = f"KKp_{power_series_export_base(kkp_group_key, y_axis_log=y_axis_log)}"
+    vp_base = power_vp_export_base(kk_group_key, kkp_group_key, y_axis_log=y_axis_log)
+
+    if params_intensity is None:
+        _kk_z = np.asarray(kk_cube.Z, float)
+        _kkp_z = np.asarray(kkp_cube.Z, float)
+        _auto_vmin = float(min(np.nanmin(_kk_z), np.nanmin(_kkp_z)))
+        _auto_vmax = float(max(np.nanmax(_kk_z), np.nanmax(_kkp_z)))
+        params_intensity = HeatmapParams(
+            title="",
+            xlabel=params.xlabel,
+            ylabel="",
+            cbar_label="",
+            vmin=_auto_vmin,
+            vmax=_auto_vmax,
+            xlim=params.xlim,
+            ylim=params.ylim,
+            cmap=params.cmap,
+            log_scale=params.log_scale,
+            y_axis_log=params.y_axis_log,
+            center_zero=False,
+            clip_outliers=params.clip_outliers,
+        )
+
+    for label, cube, base, records, group_key in (
+        ("KK", kk_cube, kk_base, kk_records, kk_group_key),
+        ("KKp", kkp_cube, kkp_base, kkp_records, kkp_group_key),
+    ):
+        panel_params = HeatmapParams(
+            title=power_group_title(group_key),
+            xlabel=params_intensity.xlabel,
+            ylabel=cube.gate_label,
+            cbar_label=cube.cbar_label,
+            vmin=params_intensity.vmin,
+            vmax=params_intensity.vmax,
+            xlim=params_intensity.xlim,
+            ylim=params_intensity.ylim,
+            cmap=params_intensity.cmap,
+            log_scale=params_intensity.log_scale,
+            y_axis_log=params_intensity.y_axis_log,
+            center_zero=False,
+            clip_outliers=params_intensity.clip_outliers,
+        )
+        png_path = _unique_path(out_dir, base, ".png")
+        _save_heatmap_png(png_path, cube, panel_params, drr=False)
+        dat_path = save_heatmap_dat_streamlit(
+            png_path.with_suffix(".dat"),
+            cube.energy,
+            cube.gate,
+            np.asarray(cube.Z, float),
+            header_lines=[
+                "mode=Power Dependent",
+                f"panel={label}",
+                f"group_key={group_key}",
+                f"title={cube.title}",
+                f"power_axis_scale={'log' if y_axis_log else 'linear'}",
+                f"background_constant={background}",
+                "corrected=True",
+                f"pairing_mode={pairing_mode}",
+                "power_alignment=stage_pair_average_power" if pairing_mode == "stage" else "power_interpolation_overlap",
+                *[
+                    (
+                        f"source[{idx}]={getattr(record, 'file_name', '')}; "
+                        f"power_uW={getattr(record, 'power_uW', '')}; "
+                        f"stage={getattr(record, 'stage', '')}"
+                    )
+                    for idx, record in enumerate(records)
+                ],
+            ],
+        )
+        written[f"{label}_png"] = png_path
+        written[f"{label}_dat"] = dat_path
+
+    vp_params = HeatmapParams(
+        title=vp_cube.title,
+        xlabel=params.xlabel,
+        ylabel=vp_cube.gate_label,
+        cbar_label="VP",
+        vmin=-1.0,
+        vmax=1.0,
+        xlim=params.xlim,
+        ylim=params.ylim,
+        cmap="RdBu_r",
+        log_scale=False,
+        y_axis_log=params.y_axis_log,
+        center_zero=True,
+        clip_outliers=False,
+    )
+    png_path = _unique_path(out_dir, vp_base, ".png")
+    _save_heatmap_png(png_path, vp_cube, vp_params, drr=False)
+    dat_path = save_heatmap_dat_streamlit(
+        png_path.with_suffix(".dat"),
+        vp_cube.energy,
+        vp_cube.gate,
+        np.asarray(vp_cube.Z, float),
+        header_lines=[
+            "mode=Power Dependent VP",
+            f"source_KK_group={kk_group_key}",
+            f"source_KKp_group={kkp_group_key}",
+            f"title={vp_cube.title}",
+            f"power_axis_scale={'log' if y_axis_log else 'linear'}",
+            f"background_constant={background}",
+            "formula=(KK_corr-KKp_corr)/(KK_corr+KKp_corr)",
+            f"pairing_mode={pairing_mode}",
+            "power_alignment=stage_pair_average_power" if pairing_mode == "stage" else "power_interpolation_overlap",
+            "vmin=-1.0",
+            "vmax=1.0",
+            *[
+                (
+                    f"pair[{idx}]=stage={getattr(pair, 'stage', '')}; "
+                    f"power_KK={getattr(pair, 'power_kk', '')}; "
+                    f"power_KKp={getattr(pair, 'power_kkp', '')}; "
+                    f"power_axis_value={getattr(pair, 'power_axis', '')}; "
+                    f"KK={getattr(pair, 'kk_file', '')}; "
+                    f"KKp={getattr(pair, 'kkp_file', '')}"
+                )
+                for idx, pair in enumerate(stage_pairs)
+            ],
+        ],
+    )
+    written["VP_png"] = png_path
+    written["VP_dat"] = dat_path
+    return written
+
+
 def save_heatmap_dat_streamlit(
     path: Path,
     energy: Iterable[float],
@@ -454,17 +677,19 @@ def save_heatmap_dat_streamlit(
     if zm.shape != (g.size, e.size):
         raise ValueError(f"Z shape {zm.shape} != (len(gate), len(energy)) = {(g.size, e.size)}")
 
-    arr = np.empty((g.size + 1, e.size + 1), dtype=float)
-    arr[0, 0] = np.nan
-    arr[0, 1:] = e
-    arr[1:, 0] = g
-    arr[1:, 1:] = zm
+    del header_lines
 
-    header = ["format: first row = energy_eV, first col = gate_V, body = Z"]
-    if header_lines:
-        header.extend(header_lines)
+    def fmt(value: float) -> str:
+        value = float(value)
+        if not np.isfinite(value):
+            return "nan"
+        return f"{value:.10g}"
 
-    np.savetxt(path, arr, fmt="%.10g", delimiter="\t", header="\n".join(header), comments="# ")
+    rows: list[list[str]] = [["Photon energy", *[fmt(value) for value in g]]]
+    for energy_value, row in zip(e, zm.T):
+        rows.append([fmt(energy_value), *[fmt(value) for value in row]])
+
+    path.write_text("\n".join("\t".join(row) for row in rows) + "\n", encoding="utf-8")
     return path
 
 

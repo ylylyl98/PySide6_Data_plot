@@ -14,6 +14,8 @@ from core.loader import DataCube
 REP_SUB_SUFFIX_RE = re.compile(r"_rep(?P<rep>\d+)_(?P<sub>\d+)$", re.IGNORECASE)
 REP_ONLY_SUFFIX_RE = re.compile(r"(?:\$_|_)rep(?P<rep>\d{1,3})$", re.IGNORECASE)
 RUN_SUFFIX_RE = re.compile(r"(?:\$_|_)(?P<run>\d{3,})$")
+POWER_TOKEN_RE = re.compile(r"(?P<power>[+-]?\d+(?:[pP\.]\d+)?)\s*uW", re.IGNORECASE)
+STAGE_TOKEN_RE = re.compile(r"(?:^|[_\s-]+)Stage[+-]?\d+(?:[pP\.]\d+)?", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -24,6 +26,84 @@ class Limits:
     xmax: float
     ymin: float
     ymax: float
+
+
+@dataclass(frozen=True)
+class PowerSeriesFile:
+    file_name: str
+    power_uW: float
+    stage: float | None
+    group_key: str
+    title: str
+
+
+@dataclass(frozen=True)
+class PowerStagePair:
+    stage: float
+    power_kk: float
+    power_kkp: float
+    power_axis: float
+    kk_file: str
+    kkp_file: str
+
+
+def _parse_power_number(text: str) -> float:
+    return float(str(text).replace("p", ".").replace("P", "."))
+
+
+def _compact_power_group_stem(file_name: str) -> str:
+    stem = Path(file_name).stem.replace("$", "")
+    stem = POWER_TOKEN_RE.sub("", stem)
+    stem = STAGE_TOKEN_RE.sub("", stem)
+    stem = re.sub(r'[<>:"/\\|?*]+', "_", stem)
+    stem = re.sub(r"_+", "_", stem)
+    stem = re.sub(r"[\s-]+", "_", stem)
+    return stem.strip("_")
+
+
+def power_group_title(group_key: str) -> str:
+    title = str(group_key).replace("_", " ")
+    title = re.sub(r"\s+", " ", title).strip()
+    return title
+
+
+def parse_power_series_file(file_name: str) -> PowerSeriesFile | None:
+    stem = Path(file_name).stem
+    power_match = POWER_TOKEN_RE.search(stem)
+    if not power_match:
+        return None
+    stage_match = re.search(r"Stage(?P<stage>[+-]?\d+(?:[pP\.]\d+)?)", stem, flags=re.IGNORECASE)
+    group_key = _compact_power_group_stem(file_name)
+    if not group_key:
+        return None
+    return PowerSeriesFile(
+        file_name=file_name,
+        power_uW=_parse_power_number(power_match.group("power")),
+        stage=_parse_power_number(stage_match.group("stage")) if stage_match else None,
+        group_key=group_key,
+        title=power_group_title(group_key),
+    )
+
+
+def group_power_series_files(files: Sequence[str]) -> Dict[str, List[PowerSeriesFile]]:
+    groups: Dict[str, List[PowerSeriesFile]] = {}
+    for file_name in files:
+        parsed = parse_power_series_file(file_name)
+        if parsed is None:
+            continue
+        groups.setdefault(parsed.group_key, []).append(parsed)
+
+    out: Dict[str, List[PowerSeriesFile]] = {}
+    for key in sorted(groups):
+        out[key] = sorted(
+            groups[key],
+            key=lambda item: (
+                float(item.power_uW),
+                float(item.stage) if item.stage is not None else 0.0,
+                item.file_name,
+            ),
+        )
+    return out
 
 
 def split_group_and_sort_key(filename: str) -> tuple[str, tuple[int, int, int]]:
@@ -155,8 +235,8 @@ def classify_compare_channel(
     in_angle, out_angle = parse_compare_in_out_angles(file_name)
     if in_angle is None or out_angle is None:
         return None
-    in_is_k = abs(((float(in_angle) - float(in_k_angle) + 180.0) % 360.0) - 180.0) <= float(tolerance)
-    out_is_k = abs(((float(out_angle) - float(out_k_angle) + 180.0) % 360.0) - 180.0) <= float(tolerance)
+    in_is_k = abs(((float(in_angle) - float(in_k_angle) + 180.0) % 360.0) - 180.0) < float(tolerance)
+    out_is_k = abs(((float(out_angle) - float(out_k_angle) + 180.0) % 360.0) - 180.0) < float(tolerance)
     if in_is_k and out_is_k:
         return "KK"
     if in_is_k and (not out_is_k):
@@ -164,6 +244,67 @@ def classify_compare_channel(
     if (not in_is_k) and out_is_k:
         return "KpK"
     return "KpKp"
+
+
+def _compare_file_power(file_name: str) -> float:
+    match = POWER_TOKEN_RE.search(str(Path(file_name).stem))
+    if not match:
+        return float("-inf")
+    return _parse_power_number(match.group("power"))
+
+
+def _compare_context_key(file_name: str) -> str:
+    stem = Path(file_name).stem.replace("$", "")
+    stem = POWER_TOKEN_RE.sub("", stem)
+    stem = re.sub(
+        r"(?:^|[_\s-]+)Rot\s*2[^_\s-]*(?:deg|degree)",
+        "_",
+        stem,
+        flags=re.IGNORECASE,
+    )
+    stem = re.sub(r'[<>:"/\\|?*]+', "_", stem)
+    stem = re.sub(r"_+", "_", stem)
+    stem = re.sub(r"[\s-]+", "_", stem)
+    return stem.strip("_").lower()
+
+
+def _select_compare_records(records: Sequence[tuple[int, str, str]]) -> tuple[dict[str, str], dict[str, list[str]]]:
+    contexts: dict[str, list[tuple[int, str, str]]] = {}
+    for record in records:
+        contexts.setdefault(_compare_context_key(record[2]), []).append(record)
+
+    def context_score(item: tuple[str, list[tuple[int, str, str]]]) -> tuple[int, int, int, float, int]:
+        _context, context_records = item
+        keys = {key for _idx, key, _file_name in context_records}
+        has_kk_pair = int("KK" in keys and "KKp" in keys)
+        finite_powers = [
+            _compare_file_power(file_name)
+            for _idx, _key, file_name in context_records
+            if np.isfinite(_compare_file_power(file_name))
+        ]
+        mean_power = float(np.mean(finite_powers)) if finite_powers else float("-inf")
+        first_idx = min(idx for idx, _key, _file_name in context_records)
+        return (has_kk_pair, len(keys), len(context_records), mean_power, -first_idx)
+
+    _selected_context, selected_records = max(contexts.items(), key=context_score)
+    found: dict[str, str] = {}
+    for _idx, key, file_name in sorted(
+        selected_records,
+        key=lambda item: (-_compare_file_power(item[2]), item[0]),
+    ):
+        if key not in found:
+            found[key] = file_name
+
+    duplicates: dict[str, list[str]] = {}
+    by_key: dict[str, list[str]] = {}
+    for _idx, key, file_name in records:
+        by_key.setdefault(key, []).append(file_name)
+    for key, names in by_key.items():
+        if len(names) <= 1 or key not in found:
+            continue
+        ordered = [found[key]] + [name for name in names if name != found[key]]
+        duplicates[key] = ordered
+    return found, duplicates
 
 
 def coherent_compare_auto_assignment(
@@ -195,13 +336,7 @@ def coherent_compare_auto_assignment(
         return (has_kk_pair, len(keys), len(records), -first_idx)
 
     selected_gate, records = max(groups.items(), key=_score)
-    found: dict[str, str] = {}
-    duplicates: dict[str, list[str]] = {}
-    for _idx, key, file_name in sorted(records, key=lambda item: item[0]):
-        if key in found:
-            duplicates.setdefault(key, [found[key]]).append(file_name)
-            continue
-        found[key] = file_name
+    found, duplicates = _select_compare_records(records)
 
     gate_groups = [gate for gate in groups if gate != "__ungrouped__"]
     gate_label = "" if selected_gate == "__ungrouped__" else selected_gate
@@ -261,6 +396,175 @@ def background_correct_cube(cube: DataCube, background: float, *, title: str | N
         title=title if title is not None else cube.title,
         cbar_label="PL corr. (a.u.)",
     )
+
+
+def _interp_rows_to_energy(cube: DataCube, energy_ref: np.ndarray) -> np.ndarray:
+    e = np.asarray(cube.energy, float).ravel()
+    z = np.asarray(cube.Z, float)
+    if z.shape != (np.asarray(cube.gate).size, e.size):
+        if z.shape == (e.size, np.asarray(cube.gate).size):
+            z = z.T
+        else:
+            raise ValueError(f"Z shape {z.shape} does not match power/energy axes.")
+    energy_ref = np.asarray(energy_ref, float).ravel()
+    if e.shape == energy_ref.shape and np.allclose(e, energy_ref, rtol=1e-7, atol=1e-10):
+        return z.astype(float, copy=True)
+    out = np.empty((z.shape[0], energy_ref.size), dtype=float)
+    for idx, row in enumerate(z):
+        finite = np.isfinite(e) & np.isfinite(row)
+        if np.count_nonzero(finite) < 2:
+            out[idx, :] = np.nan
+        else:
+            order = np.argsort(e[finite])
+            out[idx, :] = np.interp(energy_ref, e[finite][order], row[finite][order], left=np.nan, right=np.nan)
+    return out
+
+
+def _interp_power_rows(power_src: np.ndarray, z_src: np.ndarray, power_ref: np.ndarray) -> np.ndarray:
+    p = np.asarray(power_src, float).ravel()
+    z = np.asarray(z_src, float)
+    pref = np.asarray(power_ref, float).ravel()
+    if z.shape[0] != p.size:
+        raise ValueError(f"Z rows ({z.shape[0]}) do not match power axis ({p.size}).")
+    order = np.argsort(p)
+    p = p[order]
+    z = z[order, :]
+    unique_p, unique_idx = np.unique(p, return_index=True)
+    p = unique_p
+    z = z[unique_idx, :]
+    out = np.empty((pref.size, z.shape[1]), dtype=float)
+    for col in range(z.shape[1]):
+        y = z[:, col]
+        finite = np.isfinite(p) & np.isfinite(y)
+        if np.count_nonzero(finite) < 2:
+            out[:, col] = np.nan
+        else:
+            out[:, col] = np.interp(pref, p[finite], y[finite], left=np.nan, right=np.nan)
+    return out
+
+
+def align_power_series_cubes(
+    kk_cube: DataCube,
+    kkp_cube: DataCube,
+    *,
+    title_kk: str = "KK",
+    title_kkp: str = "KKp",
+) -> tuple[DataCube, DataCube]:
+    energy_ref = np.asarray(kk_cube.energy, float).ravel()
+    kk_z_e = _interp_rows_to_energy(kk_cube, energy_ref)
+    kkp_z_e = _interp_rows_to_energy(kkp_cube, energy_ref)
+    kk_power = np.asarray(kk_cube.gate, float).ravel()
+    kkp_power = np.asarray(kkp_cube.gate, float).ravel()
+    p0 = max(float(np.nanmin(kk_power)), float(np.nanmin(kkp_power)))
+    p1 = min(float(np.nanmax(kk_power)), float(np.nanmax(kkp_power)))
+    if not np.isfinite(p0) or not np.isfinite(p1) or p0 > p1:
+        raise ValueError("Power VP: KK and KKp power axes do not overlap.")
+    power_ref = kk_power[np.isfinite(kk_power) & (kk_power >= p0) & (kk_power <= p1)]
+    if power_ref.size < 2:
+        power_ref = np.unique(np.concatenate([kk_power, kkp_power]))
+        power_ref = power_ref[np.isfinite(power_ref) & (power_ref >= p0) & (power_ref <= p1)]
+    if power_ref.size < 2:
+        raise ValueError("Power VP needs at least two overlapping power values.")
+    power_ref = np.asarray(sorted(np.unique(power_ref)), float)
+    kk_aligned = _interp_power_rows(kk_power, kk_z_e, power_ref)
+    kkp_aligned = _interp_power_rows(kkp_power, kkp_z_e, power_ref)
+    return (
+        DataCube(energy_ref.copy(), power_ref.copy(), kk_aligned, "Power (uW)", title_kk, kk_cube.cbar_label),
+        DataCube(energy_ref.copy(), power_ref.copy(), kkp_aligned, "Power (uW)", title_kkp, kkp_cube.cbar_label),
+    )
+
+
+def power_valley_polarization_cube(
+    kk_cube: DataCube,
+    kkp_cube: DataCube,
+    *,
+    background: float,
+    title: str = "Power VP",
+    denom_eps: float = 1e-12,
+) -> tuple[DataCube, DataCube, DataCube]:
+    kk_corr = background_correct_cube(kk_cube, background, title="KK")
+    kkp_corr = background_correct_cube(kkp_cube, background, title="KKp")
+    kk_aligned, kkp_aligned = align_power_series_cubes(kk_corr, kkp_corr, title_kk="KK", title_kkp="KKp")
+    vp = vp_map(kk_aligned.Z, kkp_aligned.Z, eps=denom_eps)
+    vp_cube = DataCube(
+        np.asarray(kk_aligned.energy, float).copy(),
+        np.asarray(kk_aligned.gate, float).copy(),
+        vp,
+        "Power (uW)",
+        title,
+        "VP",
+    )
+    return kk_aligned, kkp_aligned, vp_cube
+
+
+def _record_stage_map(records: Sequence[PowerSeriesFile]) -> dict[float, tuple[int, PowerSeriesFile]]:
+    out: dict[float, tuple[int, PowerSeriesFile]] = {}
+    for idx, record in enumerate(records):
+        if record.stage is None:
+            continue
+        key = float(record.stage)
+        if key not in out:
+            out[key] = (idx, record)
+    return out
+
+
+def power_stage_paired_vp_cubes(
+    kk_cube: DataCube,
+    kk_records: Sequence[PowerSeriesFile],
+    kkp_cube: DataCube,
+    kkp_records: Sequence[PowerSeriesFile],
+    *,
+    background: float,
+    title: str = "Power VP",
+    denom_eps: float = 1e-12,
+) -> tuple[DataCube, DataCube, DataCube, tuple[PowerStagePair, ...]]:
+    kk_map = _record_stage_map(kk_records)
+    kkp_map = _record_stage_map(kkp_records)
+    stages = sorted(set(kk_map) & set(kkp_map))
+    if not stages:
+        raise ValueError("Power VP stage pairing found no shared Stage values between KK and KKp groups.")
+
+    energy_ref = np.asarray(kk_cube.energy, float).ravel()
+    kk_z_e = _interp_rows_to_energy(kk_cube, energy_ref)
+    kkp_z_e = _interp_rows_to_energy(kkp_cube, energy_ref)
+    kk_corr = kk_z_e - float(background)
+    kkp_corr = kkp_z_e - float(background)
+
+    kk_rows: list[np.ndarray] = []
+    kkp_rows: list[np.ndarray] = []
+    pairs: list[PowerStagePair] = []
+    for stage in stages:
+        kk_idx, kk_record = kk_map[stage]
+        kkp_idx, kkp_record = kkp_map[stage]
+        if kk_idx >= kk_corr.shape[0] or kkp_idx >= kkp_corr.shape[0]:
+            continue
+        power_axis = 0.5 * (float(kk_record.power_uW) + float(kkp_record.power_uW))
+        pairs.append(
+            PowerStagePair(
+                stage=float(stage),
+                power_kk=float(kk_record.power_uW),
+                power_kkp=float(kkp_record.power_uW),
+                power_axis=float(power_axis),
+                kk_file=kk_record.file_name,
+                kkp_file=kkp_record.file_name,
+            )
+        )
+        kk_rows.append(np.asarray(kk_corr[kk_idx, :], float))
+        kkp_rows.append(np.asarray(kkp_corr[kkp_idx, :], float))
+
+    if not pairs:
+        raise ValueError("Power VP stage pairing produced no usable paired spectra.")
+
+    order = sorted(range(len(pairs)), key=lambda idx: (pairs[idx].power_axis, pairs[idx].stage))
+    pairs = [pairs[idx] for idx in order]
+    kk_arr = np.vstack([kk_rows[idx] for idx in order])
+    kkp_arr = np.vstack([kkp_rows[idx] for idx in order])
+    power_axis = np.asarray([pair.power_axis for pair in pairs], float)
+    vp = vp_map(kk_arr, kkp_arr, eps=denom_eps)
+    kk_out = DataCube(energy_ref.copy(), power_axis.copy(), kk_arr, "Power (uW)", "KK", "PL corr. (a.u.)")
+    kkp_out = DataCube(energy_ref.copy(), power_axis.copy(), kkp_arr, "Power (uW)", "KKp", "PL corr. (a.u.)")
+    vp_out = DataCube(energy_ref.copy(), power_axis.copy(), vp, "Power (uW)", title, "VP")
+    return kk_out, kkp_out, vp_out, tuple(pairs)
 
 
 def estimate_constant_background(
