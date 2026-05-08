@@ -241,6 +241,8 @@ class MainWindow(QMainWindow):
         self.drr_baseline_files_found: List[str] = []
         self.loaded: LoadedState | None = None
         self.last_plotted_mode: str | None = None
+        self._last_export_move_folder = ""
+        self._last_export_move_sources: list[str] = []
         self.log_lines: deque[str] = deque(maxlen=300)
         self._last_plot_params_key: tuple[Any, ...] | None = None
         self._last_plot_cube: DataCube | None = None
@@ -391,6 +393,8 @@ class MainWindow(QMainWindow):
         if not path.exists() or not path.is_dir():
             self._show_error(f"Folder does not exist: {folder}")
             return False
+        if str(path).lower() != self.current_folder.lower():
+            self._invalidate_export_move_sources()
         self.current_folder = str(path)
         self.folder_edit.setText(self.current_folder)
         self._watch_current_folder()
@@ -579,16 +583,6 @@ class MainWindow(QMainWindow):
         pl_matches = self.pl_files.findItems(selected_names[0], Qt.MatchExactly)
         if pl_matches:
             pl_matches[0].setSelected(True)
-
-        self.cmp_files.clearSelection()
-        for name in selected_names:
-            for match in self.cmp_files.findItems(name, Qt.MatchExactly):
-                match.setSelected(True)
-
-        self.power_files.clearSelection()
-        for name in selected_names:
-            for match in self.power_files.findItems(name, Qt.MatchExactly):
-                match.setSelected(True)
 
         self.drr_selected_files = list(selected_names)
         self._update_drr_selection_labels()
@@ -1427,22 +1421,12 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        files = QGroupBox("File")
-        files_layout = QVBoxLayout(files)
-        files_layout.setContentsMargins(6, 6, 6, 6)
-        self.cmp_files = QListWidget()
-        self.cmp_files.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.cmp_files.setMinimumHeight(70)
-        self.cmp_files.setToolTip("Select files to compare (multi-select with Ctrl/Shift)")
-        files_layout.addWidget(self.cmp_files)
-        layout.addWidget(self._make_expander("Available Compare Files", files, expanded=True))
-
         params = QGroupBox("Plot Options")
         params_layout = QVBoxLayout(params)
         params_layout.setContentsMargins(6, 6, 6, 4)
         params_layout.setSpacing(4)
 
-        assignment = QGroupBox("Channel Assignment")
+        assignment = QGroupBox("Assignment")
         assignment_layout = QVBoxLayout(assignment)
         assignment_layout.setContentsMargins(6, 8, 6, 6)
         assignment_layout.setSpacing(6)
@@ -1450,9 +1434,6 @@ class MainWindow(QMainWindow):
         assignment_form.setContentsMargins(0, 0, 0, 0)
         assignment_form.setHorizontalSpacing(6)
         assignment_form.setVerticalSpacing(4)
-        self.cmp_assign_mode_combo = QComboBox()
-        self.cmp_assign_mode_combo.addItems(["Auto by angle", "Manual mapping"])
-        self._style_combo_popup(self.cmp_assign_mode_combo)
         self.cmp_in_k_angle_spin = QDoubleSpinBox()
         self.cmp_in_k_angle_spin.setDecimals(3)
         self.cmp_in_k_angle_spin.setRange(-360.0, 360.0)
@@ -1470,7 +1451,6 @@ class MainWindow(QMainWindow):
         angle_h.addWidget(self.cmp_out_k_angle_spin)
         angle_h.addWidget(self.cmp_auto_assign_btn)
         angle_h.addStretch(1)
-        assignment_form.addRow("Mode", self.cmp_assign_mode_combo)
         assignment_form.addRow("Angle Rule", angle_row)
         assignment_layout.addLayout(assignment_form)
         self.cmp_channel_combos: dict[str, QComboBox] = {}
@@ -1500,7 +1480,7 @@ class MainWindow(QMainWindow):
         summary_form.setVerticalSpacing(4)
         summary_form.addRow("Summary", self.cmp_assignment_summary)
         assignment_layout.addLayout(summary_form)
-        params_layout.addWidget(self._make_expander("Assignment", assignment, expanded=False))
+        layout.addWidget(self._make_expander("Assignment", assignment, expanded=True))
 
         display = QGroupBox("Display Preset")
         display_form = QFormLayout(display)
@@ -1619,15 +1599,6 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        files = QGroupBox("Files")
-        files_layout = QVBoxLayout(files)
-        files_layout.setContentsMargins(6, 6, 6, 6)
-        self.power_files = QListWidget()
-        self.power_files.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.power_files.setMinimumHeight(85)
-        self.power_files.setToolTip("Select power-dependent PL files, or leave empty to scan all CSV files.")
-        files_layout.addWidget(self.power_files)
-
         grouping = QGroupBox("Auto Groups")
         grouping_form = QFormLayout(grouping)
         grouping_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
@@ -1657,17 +1628,13 @@ class MainWindow(QMainWindow):
         grouping_form.addRow("Summary", self.power_group_summary)
         grouping_form.addRow("KK group", self.power_kk_group_combo)
         grouping_form.addRow("KKp group", self.power_kkp_group_combo)
-        files_layout.addWidget(self._make_expander("Power Groups", grouping, expanded=True))
-        layout.addWidget(self._make_expander("Available Power Files", files, expanded=True))
+        layout.addWidget(self._make_expander("Power Groups", grouping, expanded=True))
 
-        params = QGroupBox("Plot Options")
+        params = QWidget()
         params_layout = QVBoxLayout(params)
-        params_layout.setContentsMargins(6, 6, 6, 4)
+        params_layout.setContentsMargins(0, 0, 0, 0)
         params_layout.setSpacing(4)
 
-        cfg = QFormLayout()
-        cfg.setHorizontalSpacing(6)
-        cfg.setVerticalSpacing(4)
         _grid, spins, _, _, cmap, fix_checks = self._build_common_range_grid("power")
         cmap.setCurrentText("turbo")
         self.power_axis_scale_combo = QComboBox()
@@ -1678,29 +1645,6 @@ class MainWindow(QMainWindow):
         self.power_pair_mode_combo.addItems(["Stage", "Power Interpolation"])
         self._style_combo_popup(self.power_pair_mode_combo)
         self.power_pair_mode_combo.setToolTip("Choose how KK and KKp spectra are paired for VP.")
-        scale_row = QWidget()
-        scale_h = QHBoxLayout(scale_row)
-        scale_h.setContentsMargins(0, 0, 0, 0)
-        scale_h.setSpacing(6)
-        scale_h.addWidget(self.power_axis_scale_combo)
-        scale_h.addWidget(QLabel("Cmap"))
-        scale_h.addWidget(cmap)
-        scale_h.addStretch(1)
-        pair_row = QWidget()
-        pair_h = QHBoxLayout(pair_row)
-        pair_h.setContentsMargins(0, 0, 0, 0)
-        pair_h.setSpacing(6)
-        pair_h.addWidget(self.power_pair_mode_combo)
-        pair_h.addStretch(1)
-        cfg.addRow("Power Axis / Cmap", scale_row)
-        cfg.addRow("VP Pair By", pair_row)
-        params_layout.addLayout(cfg)
-
-        background_box = QGroupBox("Background")
-        background_form = QFormLayout(background_box)
-        background_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
-        background_form.setHorizontalSpacing(6)
-        background_form.setVerticalSpacing(UI_METRICS["row_spacing"])
         self.power_background_spin = QDoubleSpinBox()
         self.power_background_spin.setDecimals(6)
         self.power_background_spin.setRange(-1.0e12, 1.0e12)
@@ -1716,8 +1660,23 @@ class MainWindow(QMainWindow):
         bkg_h.addWidget(self.power_background_spin)
         bkg_h.addWidget(self.power_background_auto_chk)
         bkg_h.addStretch(1)
-        background_form.addRow("Constant", bkg_row)
-        params_layout.addWidget(self._make_expander("Background", background_box, expanded=True))
+
+        setup = QGroupBox("Plot Setup")
+        setup_grid = QGridLayout(setup)
+        setup_grid.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
+        setup_grid.setHorizontalSpacing(8)
+        setup_grid.setVerticalSpacing(UI_METRICS["row_spacing"])
+        setup_grid.addWidget(QLabel("Power Axis"), 0, 0)
+        setup_grid.addWidget(self.power_axis_scale_combo, 0, 1)
+        setup_grid.addWidget(QLabel("Cmap"), 0, 2)
+        setup_grid.addWidget(cmap, 0, 3)
+        setup_grid.addWidget(QLabel("VP Pair By"), 1, 0)
+        setup_grid.addWidget(self.power_pair_mode_combo, 1, 1)
+        setup_grid.addWidget(QLabel("Background"), 1, 2)
+        setup_grid.addWidget(bkg_row, 1, 3)
+        setup_grid.setColumnStretch(1, 1)
+        setup_grid.setColumnStretch(3, 1)
+        params_layout.addWidget(self._make_expander("Plot Setup", setup, expanded=True))
 
         for s in spins.values():
             s.setFixedWidth(UI_METRICS["spin_w"])
@@ -1756,19 +1715,17 @@ class MainWindow(QMainWindow):
         flags_h.addStretch(1)
         basic_form.addRow("Color / Clip", flags)
         self._set_form_label_width(basic_form, UI_METRICS["label_col_width"])
-        params_layout.addWidget(self._make_expander("Plot", basic, expanded=True))
+        params_layout.addWidget(self._make_expander("Axis Ranges", basic, expanded=True))
 
         layout.addWidget(self._make_expander("Parameters", params, expanded=True))
         layout.addStretch(1)
         return tab
 
     def _cmp_assign_candidate_files(self) -> list[str]:
-        chosen = self._selected(self.cmp_files)
-        return chosen if chosen else list(self.available_files)
+        return list(self.available_files)
 
     def _power_candidate_files(self) -> list[str]:
-        chosen = self._selected(self.power_files)
-        return chosen if chosen else list(self.available_files)
+        return list(self.available_files)
 
     def _power_axis_log(self) -> bool:
         return hasattr(self, "power_axis_scale_combo") and self.power_axis_scale_combo.currentText() == "Log"
@@ -2199,12 +2156,6 @@ class MainWindow(QMainWindow):
         self.cmp_assignment_summary.setPlainText("\n".join(lines))
         self._cmp_update_title_previews()
 
-    def _cmp_update_assignment_mode(self) -> None:
-        auto_mode = self.cmp_assign_mode_combo.currentText() == "Auto by angle"
-        self.cmp_in_k_angle_spin.setEnabled(auto_mode)
-        self.cmp_out_k_angle_spin.setEnabled(auto_mode)
-        self.cmp_auto_assign_btn.setEnabled(auto_mode)
-
     def _cmp_update_view_mode(self) -> None:
         vp_mode = self._cmp_is_vp_view()
         self.cmp_display_preset_combo.setEnabled(not vp_mode)
@@ -2442,17 +2393,20 @@ class MainWindow(QMainWindow):
         self.plot_action.setToolTip("Plot/update current state")
         self.save_action = QAction(self.style().standardIcon(QStyle.SP_DialogSaveButton), "Save PNG + DAT", self)
         self.save_action.setToolTip("Export for the active tab")
-        self.auto_move_after_export_chk = QCheckBox("Auto Move")
+        self.auto_move_after_export_chk = QCheckBox("Auto move after save")
         self.auto_move_after_export_chk.setChecked(False)
         self.auto_move_after_export_chk.setToolTip("After export, move source CSVs to 'Initial data after processing'.")
-        self.move_now_btn = QPushButton("Move Now")
-        self.move_now_btn.setToolTip("Move current source CSVs to 'Initial data after processing' now.")
+        self.move_now_btn = QPushButton("Move Exported Sources")
+        self.move_now_btn.setEnabled(False)
+        self.move_now_btn.setToolTip("Save first to enable moving exported source files.")
         toolbar.addAction(self.load_action)
         toolbar.addAction(self.plot_action)
         toolbar.addAction(self.save_action)
-        toolbar.addSeparator()
-        toolbar.addWidget(self.move_now_btn)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        toolbar.addWidget(spacer)
         toolbar.addWidget(self.auto_move_after_export_chk)
+        toolbar.addWidget(self.move_now_btn)
 
     def _wire_actions(self) -> None:
         self.browse_btn.clicked.connect(self._browse_folder)
@@ -2483,10 +2437,9 @@ class MainWindow(QMainWindow):
         self.pl_cmap.currentTextChanged.connect(self._on_pl_plot_param_changed)
         self.pl_log_chk.toggled.connect(self._on_pl_plot_param_changed)
         self.pl_clip_chk.toggled.connect(self._on_pl_plot_param_changed)
-        self.cmp_assign_mode_combo.currentTextChanged.connect(self._on_cmp_assignment_mode_changed)
-        self.cmp_in_k_angle_spin.valueChanged.connect(self._on_cmp_assignment_inputs_changed)
-        self.cmp_out_k_angle_spin.valueChanged.connect(self._on_cmp_assignment_inputs_changed)
-        self.cmp_auto_assign_btn.clicked.connect(self._cmp_auto_assign_channels)
+        self.cmp_in_k_angle_spin.valueChanged.connect(self._on_cmp_auto_assign_requested)
+        self.cmp_out_k_angle_spin.valueChanged.connect(self._on_cmp_auto_assign_requested)
+        self.cmp_auto_assign_btn.clicked.connect(self._on_cmp_auto_assign_requested)
         self.cmp_view_intensity_btn.clicked.connect(lambda: self._on_cmp_plot_view_button_clicked("Intensity Compare"))
         self.cmp_view_vp_btn.clicked.connect(lambda: self._on_cmp_plot_view_button_clicked("Valley Polarization"))
         self.cmp_vp_background_spin.valueChanged.connect(self._on_cmp_plot_param_changed)
@@ -2568,7 +2521,6 @@ class MainWindow(QMainWindow):
         for prefix in ("pl", "drr", "cmp"):
             self._update_y_axis_controls(prefix)
         self._cmp_apply_display_preset()
-        self._cmp_update_assignment_mode()
         self._cmp_update_view_mode()
         self._cmp_set_channel_combo_items()
         self._cmp_update_assignment_summary()
@@ -2588,33 +2540,39 @@ class MainWindow(QMainWindow):
     def _selected(self, widget: QListWidget) -> List[str]:
         return [i.text() for i in widget.selectedItems()]
 
+    def _update_move_exported_sources_state(self) -> None:
+        if not hasattr(self, "move_now_btn"):
+            return
+        enabled = bool(self._last_export_move_sources and self._last_export_move_folder)
+        self.move_now_btn.setEnabled(enabled)
+        if enabled:
+            count = len(self._last_export_move_sources)
+            self.move_now_btn.setToolTip(
+                f"Move {count} source file{'s' if count != 1 else ''} used by the most recent successful save."
+            )
+        else:
+            self.move_now_btn.setToolTip("Save first to enable moving exported source files.")
+
+    def _set_export_move_sources(self, folder: str, sources: Sequence[str]) -> None:
+        self._last_export_move_folder = str(folder)
+        self._last_export_move_sources = [name for name in dict.fromkeys(str(s) for s in sources if s)]
+        self._update_move_exported_sources_state()
+
+    def _invalidate_export_move_sources(self) -> None:
+        self._last_export_move_folder = ""
+        self._last_export_move_sources = []
+        self._update_move_exported_sources_state()
+
     def _manual_move_sources(self) -> None:
-        if not self.current_folder:
-            self._show_error("Choose a folder first.")
+        folder = self._last_export_move_folder
+        names = list(self._last_export_move_sources)
+        self._invalidate_export_move_sources()
+        if not folder or not names:
+            self._show_error("Save first to enable moving exported source files.")
             return
-        mode = self._active_mode()
-        names: list[str] = []
-        if mode == "PL":
-            names = self._selected(self.pl_files)
-            if not names and self.loaded and self.loaded.mode == "PL" and self.loaded.primary_file:
-                names = [self.loaded.primary_file]
-        elif mode == "DRR":
-            names = list(self.drr_selected_files) + list(self.drr_baseline_files_manual)
-            if (not names) and self.loaded and self.loaded.mode == "DRR":
-                names = list(self.loaded.selected_files) + list(self.loaded.baseline_files)
-        elif mode == "Compare":
-            names = self._selected(self.cmp_files)
-            if (not names) and self.loaded and self.loaded.mode == "Compare":
-                names = list(self.loaded.compare_sources.values()) if self.loaded.compare_sources else list(self.loaded.selected_files)
-        elif mode == "Power Dependent":
-            names = self._selected(self.power_files)
-            if not names:
-                names = self._power_active_source_files_for_move()
-        if not names:
-            self._show_error("No source files selected to move.")
-            return
-        moved = int(data_io.move_selected_to_archive(self.current_folder, names))
-        self._refresh_file_lists()
+        moved = int(data_io.move_selected_to_archive(folder, names))
+        if self.current_folder and str(Path(folder)).lower() == self.current_folder.lower():
+            self._refresh_file_lists()
         self._append_log(f"Moved {moved} source CSV file(s) to 'Initial data after processing'.")
         self._status(f"Moved {moved} file(s).")
 
@@ -2650,46 +2608,44 @@ class MainWindow(QMainWindow):
             self._start_export(mode)
 
     def _on_drr_derivative_changed(self) -> None:
+        self._invalidate_export_move_sources()
         self._enforce_drr_sg_constraints(show_status=True)
         if self.loaded and self.loaded.mode == "DRR" and not self._suspend_drr_autoplot:
             self._plot_mode("DRR")
 
     def _on_drr_plot_param_changed(self) -> None:
+        self._invalidate_export_move_sources()
         if self.loaded and self.loaded.mode == "DRR" and not self._suspend_drr_autoplot:
             self._plot_mode("DRR")
 
     def _on_pl_plot_param_changed(self) -> None:
+        self._invalidate_export_move_sources()
         if self.loaded and self.loaded.mode == "PL":
             self._plot_mode("PL")
 
     def _on_power_axis_scale_changed(self) -> None:
+        self._invalidate_export_move_sources()
         self._power_update_group_summary()
         self._on_power_plot_param_changed()
 
     def _on_power_background_mode_changed(self, _checked: bool) -> None:
+        self._invalidate_export_move_sources()
         self.power_background_spin.setEnabled(not self._power_background_auto_enabled())
         self._on_power_plot_param_changed()
 
     def _on_power_plot_param_changed(self) -> None:
+        self._invalidate_export_move_sources()
         self._power_update_group_summary()
         if self.loaded and self.loaded.mode == "Power Dependent":
             self._plot_mode("Power Dependent")
 
-    def _on_cmp_assignment_mode_changed(self) -> None:
-        self._cmp_update_assignment_mode()
-        if self.cmp_assign_mode_combo.currentText() == "Auto by angle":
-            self._cmp_auto_assign_channels()
-        else:
-            self._cmp_update_assignment_summary()
-            self._on_cmp_plot_param_changed()
-
-    def _on_cmp_assignment_inputs_changed(self) -> None:
-        if self.cmp_assign_mode_combo.currentText() == "Auto by angle":
-            self._cmp_auto_assign_channels()
-        else:
-            self._cmp_update_assignment_summary()
+    def _on_cmp_auto_assign_requested(self) -> None:
+        self._invalidate_export_move_sources()
+        self._cmp_auto_assign_channels()
+        self._on_cmp_plot_param_changed()
 
     def _on_cmp_display_preset_changed(self) -> None:
+        self._invalidate_export_move_sources()
         self._cmp_apply_display_preset()
         self._cmp_update_assignment_summary()
         self._on_cmp_plot_param_changed()
@@ -2699,26 +2655,31 @@ class MainWindow(QMainWindow):
         self._on_cmp_view_changed()
 
     def _on_power_plot_view_button_clicked(self, mode: str) -> None:
+        self._invalidate_export_move_sources()
         self._power_selected_row_index = None
         self._power_set_view_mode(mode)
         self._on_power_plot_param_changed()
 
     def _on_cmp_view_changed(self) -> None:
+        self._invalidate_export_move_sources()
         self._cmp_update_view_mode()
         self._cmp_update_assignment_summary()
         self._on_cmp_plot_param_changed()
 
     def _on_cmp_background_mode_changed(self, _checked: bool) -> None:
+        self._invalidate_export_move_sources()
         self._cmp_update_background_mode()
         if self.loaded and self.loaded.mode == "Compare" and self.loaded.compare_cubes:
             self._cmp_background_value(self.loaded.compare_cubes)
         self._on_cmp_plot_param_changed()
 
     def _on_tab_changed(self, _index: int) -> None:
+        self._invalidate_export_move_sources()
         self._update_action_states()
         self._update_plot_view_bar_visibility()
 
     def _on_cmp_plot_param_changed(self) -> None:
+        self._invalidate_export_move_sources()
         self._cmp_update_assignment_summary()
         if self.loaded and self.loaded.mode == "Compare":
             self._plot_mode("Compare")
@@ -2755,11 +2716,10 @@ class MainWindow(QMainWindow):
         path = Path(file_path)
         if not self._set_current_folder(str(path.parent)):
             return
-        for lst in (self.pl_files, self.cmp_files, self.power_files):
-            matches = lst.findItems(path.name, Qt.MatchExactly)
-            if matches:
-                lst.clearSelection()
-                matches[0].setSelected(True)
+        matches = self.pl_files.findItems(path.name, Qt.MatchExactly)
+        if matches:
+            self.pl_files.clearSelection()
+            matches[0].setSelected(True)
         self.drr_selected_files = [path.name]
         self._update_drr_selection_labels()
         self._power_refresh_groups()
@@ -2774,33 +2734,25 @@ class MainWindow(QMainWindow):
     def _refresh_file_lists(self, *, auto: bool = False) -> None:
         old_files = set(self.available_files)
         pl_selected = self._selected(self.pl_files)
-        cmp_selected = self._selected(self.cmp_files)
-        power_selected = self._selected(self.power_files)
-        for lst in (self.pl_files, self.cmp_files, self.power_files):
-            lst.clear()
+        self.pl_files.clear()
         if not self.current_folder:
             self.available_files = []
             return
         self.available_files = data_io.list_csv_files(self.current_folder)
         self.pl_files.addItems(self.available_files)
-        self.cmp_files.addItems(self.available_files)
-        self.power_files.addItems(self.available_files)
         self._restore_list_selection(self.pl_files, [f for f in pl_selected if f in self.available_files])
-        self._restore_list_selection(self.cmp_files, [f for f in cmp_selected if f in self.available_files])
-        self._restore_list_selection(self.power_files, [f for f in power_selected if f in self.available_files])
         self._cmp_set_channel_combo_items()
         self._power_refresh_groups()
         self.drr_selected_files = [f for f in self.drr_selected_files if f in self.available_files]
         self.drr_baseline_files_manual = [f for f in self.drr_baseline_files_manual if f in self.available_files]
         self.drr_baseline_files_found = [f for f in self.drr_baseline_files_found if f in self.available_files]
-        if self.cmp_assign_mode_combo.currentText() == "Auto by angle":
-            self._cmp_auto_assign_channels()
-        else:
-            self._cmp_update_assignment_summary()
+        self._cmp_auto_assign_channels()
         self._update_drr_selection_labels()
         new_files = set(self.available_files)
         added = len(new_files - old_files)
         removed = len(old_files - new_files)
+        if added or removed:
+            self._invalidate_export_move_sources()
         if auto and (added or removed):
             parts = []
             if added:
@@ -2996,6 +2948,7 @@ class MainWindow(QMainWindow):
         self.load_action.setEnabled(active_mode is not None)
         self.plot_action.setEnabled(active_mode is not None and loaded_mode == active_mode)
         self.save_action.setEnabled(active_mode is not None and plotted_mode == active_mode)
+        self._update_move_exported_sources_state()
         pl_loaded = loaded_mode == "PL"
         drr_loaded = loaded_mode == "DRR"
         cmp_loaded = loaded_mode == "Compare"
@@ -3282,6 +3235,7 @@ class MainWindow(QMainWindow):
         if not self.current_folder:
             self._show_error("Choose a folder first.")
             return
+        self._invalidate_export_move_sources()
 
         if mode == "PL":
             selected = self._selected(self.pl_files)
@@ -5171,6 +5125,7 @@ class MainWindow(QMainWindow):
         if self.last_plotted_mode != mode:
             self._show_error("Plot/Update before exporting.")
             return
+        self._invalidate_export_move_sources()
 
         power_vp_payload = None
         params_intensity: HeatmapParams | None = None
@@ -5444,17 +5399,33 @@ class MainWindow(QMainWindow):
         if options.auto_move_sources and files_to_move:
             moved = int(data_io.move_selected_to_archive(folder, files_to_move))
             log.emit(f"Moved {moved} source CSV file(s) to 'Initial data after processing'.")
-        return {"out_folder": out_folder or str(Path(folder)), "moved": moved}
+        return {
+            "out_folder": out_folder or str(Path(folder)),
+            "moved": moved,
+            "source_files": list(dict.fromkeys(name for name in files_to_move if name)),
+            "folder": folder,
+            "auto_moved": bool(options.auto_move_sources and files_to_move),
+        }
 
     def _on_export_done(self, result: object) -> None:
         if isinstance(result, dict):
             out_folder = str(result.get("out_folder", self.current_folder or ""))
             moved = int(result.get("moved", 0))
+            source_files = list(result.get("source_files", []))
+            folder = str(result.get("folder", self.current_folder or ""))
+            auto_moved = bool(result.get("auto_moved", False))
         else:
             out_folder = str(result)
             moved = 0
+            source_files = []
+            folder = self.current_folder or ""
+            auto_moved = False
         if moved > 0:
             self._refresh_file_lists()
+        if source_files and not auto_moved:
+            self._set_export_move_sources(folder, source_files)
+        else:
+            self._invalidate_export_move_sources()
         self._set_stage("Exported")
         self._status(f"Export completed: {out_folder}")
 
