@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from core.export_legacy import compare_source_title, export_compare_panels, vp_compare_export_base, vp_compare_title
+from core.export import export_compare_panels, vp_compare_export_base, vp_compare_title
 from core.loader import DataCube
 from core.plotting import HeatmapParams
 from core.processing import (
@@ -164,12 +164,16 @@ class CompareExportTests(unittest.TestCase):
             kk_dat = next(Path(tmp, "Processed Data", name) for name in names if name.startswith("KK_") and name.endswith(".dat"))
             text = kk_dat.read_text()
             lines = text.splitlines()
-            self.assertFalse(any(line.startswith("#") for line in lines))
-            self.assertEqual(lines[0], "Photon energy\t0\t1")
-            self.assertEqual(lines[1], "1\t4\t2")
-            self.assertEqual(lines[2], "2\t8\t6")
+            data_lines = [line for line in lines if not line.startswith("#")]
+            self.assertIn("# panel=KK", lines)
+            self.assertIn("# corrected=True", lines)
+            self.assertEqual(data_lines[0], "Photon energy\t0\t1")
+            self.assertEqual(data_lines[1], "1\t4\t2")
+            self.assertEqual(data_lines[2], "2\t8\t6")
             vp_dat = next(Path(tmp, "Processed Data", name) for name in names if name.startswith("VP_") and name.endswith(".dat"))
-            self.assertTrue(vp_dat.read_text().startswith("Photon energy\t0\t1\n"))
+            vp_lines = vp_dat.read_text().splitlines()
+            self.assertEqual(vp_lines[0], "# panel=VP")
+            self.assertIn("Photon energy\t0\t1", vp_lines)
 
 
 if __name__ == "__main__":

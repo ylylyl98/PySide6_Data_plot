@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
 
 import numpy as np
 from matplotlib.axes import Axes
 from matplotlib.colors import LogNorm, Normalize, TwoSlopeNorm
 
 from core.loader import DataCube
-from core.processing import nearest_gate_spectrum
 
 
 COMPARE_PANEL_ORDER = ("KK", "KKp", "KpK", "KpKp")
@@ -165,43 +163,3 @@ def plot_compare_panel(ax: Axes, label: str, cube: DataCube, params: HeatmapPara
     return im
 
 
-def plot_spectrum(ax: Axes, cube: DataCube, gate_value: float, *, ylabel: str):
-    gate_used, y = nearest_gate_spectrum(cube, gate_value)
-    x = np.asarray(cube.energy, float).ravel()
-    ax.plot(x, np.asarray(y, float), linewidth=1.3)
-    ax.set_title(f"Spectrum @ {gate_used:.6g} V")
-    ax.set_xlabel("Photon Energy (eV)")
-    ax.set_ylabel(ylabel)
-    ax.grid(alpha=0.25)
-
-
-def plot_vp(ax: Axes, energy: np.ndarray, gate: np.ndarray, vp_z: np.ndarray):
-    e = np.asarray(energy, float).ravel()
-    g = np.asarray(gate, float).ravel()
-    z = np.asarray(vp_z, float)
-    im = ax.pcolormesh(
-        _axis_edges_from_centers(e),
-        _axis_edges_from_centers(g),
-        z,
-        shading="flat",
-        cmap="RdBu_r",
-        norm=Normalize(vmin=-1.0, vmax=1.0),
-    )
-    ax.set_title("Valley Polarization")
-    ax.set_xlabel("Photon Energy (eV)")
-    ax.set_ylabel("Gate (V)")
-    return im
-
-
-def render_compare_grid(fig, cubes: Dict[str, DataCube], params: HeatmapParams):
-    keys = [key for key in COMPARE_PANEL_ORDER if key in cubes]
-    if len(keys) <= 2:
-        axes = fig.subplots(1, len(keys))
-        axes = np.atleast_1d(axes)
-    else:
-        axes = np.atleast_1d(fig.subplots(2, 2)).ravel()
-    images = []
-    for idx, key in enumerate(keys):
-        im = plot_compare_panel(axes[idx], key, cubes[key], params)
-        images.append(im)
-    return images

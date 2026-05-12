@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence
 
 import numpy as np
 from scipy.signal import savgol_filter
@@ -343,43 +343,6 @@ def coherent_compare_auto_assignment(
     return found, duplicates, gate_label, gate_groups
 
 
-def subtract_background(
-    z: np.ndarray,
-    energy: np.ndarray,
-    *,
-    method: str,
-    p_low: float,
-    roi: tuple[float, float] | None,
-    clip_to_zero: bool,
-) -> np.ndarray:
-    z = np.asarray(z, float)
-    e = np.asarray(energy, float).ravel()
-
-    if method == "none":
-        out = z.copy()
-    elif method == "scalar_percentile":
-        finite = z[np.isfinite(z)]
-        bg = float(np.nanpercentile(finite, p_low)) if finite.size else 0.0
-        out = z - bg
-    elif method == "roi_median_scalar":
-        if roi is None:
-            out = z.copy()
-        else:
-            r0, r1 = roi
-            mask = (e >= min(r0, r1)) & (e <= max(r0, r1))
-            roi_vals = z[:, mask] if mask.any() else z
-            finite = roi_vals[np.isfinite(roi_vals)]
-            bg = float(np.nanmedian(finite)) if finite.size else 0.0
-            out = z - bg
-    else:
-        bg_e = np.nanpercentile(z, p_low, axis=0)
-        out = z - bg_e[None, :]
-
-    if clip_to_zero:
-        out = np.maximum(out, 0.0)
-    return out
-
-
 def vp_map(a: np.ndarray, b: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     denom = np.asarray(a, float) + np.asarray(b, float)
     out = (np.asarray(a, float) - np.asarray(b, float)) / np.where(denom > eps, denom, np.nan)
@@ -637,26 +600,6 @@ def valley_polarization_cube(
         title=title,
         cbar_label="VP",
     )
-
-
-def vp_curve_vs_gate(
-    energy: np.ndarray,
-    gate: np.ndarray,
-    a: np.ndarray,
-    b: np.ndarray,
-    *,
-    roi: tuple[float, float],
-) -> tuple[np.ndarray, np.ndarray]:
-    e = np.asarray(energy, float).ravel()
-    g = np.asarray(gate, float).ravel()
-    r0, r1 = roi
-    mask = (e >= min(r0, r1)) & (e <= max(r0, r1))
-    if not mask.any():
-        mask = np.ones_like(e, dtype=bool)
-    ia = np.trapezoid(np.asarray(a, float)[:, mask], e[mask], axis=1)
-    ib = np.trapezoid(np.asarray(b, float)[:, mask], e[mask], axis=1)
-    vp = (ia - ib) / np.where((ia + ib) > 1e-12, (ia + ib), np.nan)
-    return g, np.clip(vp, -1.0, 1.0)
 
 
 def _clamp_sg_window(requested: int, *, n_energy: int, polyorder: int) -> int:

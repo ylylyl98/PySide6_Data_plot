@@ -1,18 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, List, Sequence
 
 import numpy as np
 
-from core.file_ops import archive_all, archive_selected, list_root_csvs, restore_all
+from core.file_ops import archive_selected, list_root_csvs
 from core.loader import (
     DataCube,
     build_external_baseline,
     load_drr_avg,
     load_pl,
-    peek_y_axis_options,
 )
 from core.processing import PowerSeriesFile, group_power_series_files, power_group_title
 
@@ -70,22 +68,8 @@ class PowerSeriesResult:
     groups: Dict[str, tuple[PowerSeriesFile, ...]]
 
 
-def processed_dir(folder: str, processed_name: str = DEFAULT_PROCESSED) -> Path:
-    out = Path(folder) / processed_name
-    out.mkdir(parents=True, exist_ok=True)
-    return out
-
-
 def list_csv_files(folder: str) -> List[str]:
     return list_root_csvs(folder)
-
-
-def move_all_to_archive(folder: str, archive_name: str = DEFAULT_ARCHIVE) -> int:
-    return archive_all(folder, archive_name)
-
-
-def restore_all_from_archive(folder: str, archive_name: str = DEFAULT_ARCHIVE) -> int:
-    return restore_all(folder, archive_name)
 
 
 def move_selected_to_archive(folder: str, file_names: Sequence[str], archive_name: str = DEFAULT_ARCHIVE) -> int:
@@ -130,6 +114,7 @@ def load_drr_external_cube(
         bg_mode="external",
         y_axis=y_axis,
         external_vector=np.asarray(baseline["I0"], float),
+        external_energy=np.asarray(baseline["energy"], float),
         derivative=derivative,
     )
 
@@ -211,28 +196,3 @@ def load_power_series_cube(
     return PowerSeriesResult(cube=cube, group_key=selected_key, records=records, groups=groups)
 
 
-def get_y_axis_options(folder: str, file_name: str) -> tuple[list[str], str]:
-    return peek_y_axis_options(folder, file_name)
-
-
-def write_heatmap_csv(path: str | Path, energy: Iterable[float], gate: Iterable[float], z: np.ndarray) -> Path:
-    out_path = Path(path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    e = np.asarray(list(energy), float).ravel()
-    g = np.asarray(list(gate), float).ravel()
-    zm = np.asarray(z, float)
-    if zm.shape != (g.size, e.size):
-        if zm.shape == (e.size, g.size):
-            zm = zm.T
-        else:
-            raise ValueError(f"Z shape {zm.shape} does not match gate/energy axes.")
-
-    table = np.empty((g.size + 1, e.size + 1), float)
-    table[0, 0] = np.nan
-    table[0, 1:] = e
-    table[1:, 0] = g
-    table[1:, 1:] = zm
-
-    np.savetxt(out_path, table, delimiter=",", fmt="%.10g")
-    return out_path

@@ -1,11 +1,10 @@
 import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 
-from core.export_legacy import export_power_series_png_and_dat, export_power_vp_pngs_and_dat, power_series_export_base
+from core.export import export_power_series_png_and_dat, export_power_vp_pngs_and_dat, power_series_export_base
 from core.loader import DataCube
 from core.plotting import HeatmapParams
 from core.processing import (
@@ -109,10 +108,12 @@ class PowerSeriesLoaderExportTests(unittest.TestCase):
             self.assertTrue(paths["png"].name.endswith("_PowerDep_YLog.png"))
             text = paths["dat"].read_text()
             lines = text.splitlines()
-            self.assertFalse(any(line.startswith("#") for line in lines))
-            self.assertEqual(lines[0], "Photon energy\t10\t20")
-            self.assertEqual(lines[1], "1\t1\t3")
-            self.assertEqual(lines[2], "2\t2\t4")
+            data_lines = [line for line in lines if not line.startswith("#")]
+            self.assertIn("# mode=Power Dependent", lines)
+            self.assertIn("# corrected=True", lines)
+            self.assertEqual(data_lines[0], "Photon energy\t10\t20")
+            self.assertEqual(data_lines[1], "1\t1\t3")
+            self.assertEqual(data_lines[2], "2\t2\t4")
 
     def test_power_vp_interpolates_slightly_different_power_axes_after_background(self) -> None:
         energy = np.array([1.0, 2.0])
@@ -222,8 +223,9 @@ class PowerSeriesLoaderExportTests(unittest.TestCase):
             self.assertIn("KKp_dat", paths)
             for key in ("KK_dat", "KKp_dat", "VP_dat"):
                 text = paths[key].read_text()
-                self.assertFalse(any(line.startswith("#") for line in text.splitlines()))
-                self.assertTrue(text.startswith("Photon energy\t10\t20\n"))
+                lines = text.splitlines()
+                self.assertTrue(lines[0].startswith("# mode=Power Dependent"))
+                self.assertIn("Photon energy\t10\t20", lines)
             self.assertIn("1\t0.33\t0.33", paths["VP_dat"].read_text())
 
 

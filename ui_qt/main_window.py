@@ -50,7 +50,7 @@ from scipy.optimize import curve_fit
 from scipy.signal import find_peaks
 
 from core import data_io
-from core.export_legacy import (
+from core.export import (
     build_drr_export_base,
     compare_source_title,
     export_compare_panels,
@@ -77,7 +77,6 @@ from core.processing import (
     power_valley_polarization_cube,
     nearest_gate_spectrum,
     parse_compare_gate_condition,
-    parse_compare_in_out_angles,
     valley_polarization_cube,
 )
 
@@ -1891,19 +1890,6 @@ class MainWindow(QMainWindow):
         kkp_result = self._power_load_group_result(kkp_key)
         return kk_result, kkp_result, kk_key, kkp_key
 
-    def _power_active_source_files_for_move(self) -> list[str]:
-        names: list[str] = []
-        if self._power_has_distinct_role_groups():
-            groups = self._power_current_groups()
-            for key in (self._power_role_group_key("KK"), self._power_role_group_key("KKp")):
-                for record in groups.get(key, ()):
-                    file_name = getattr(record, "file_name", "")
-                    if file_name:
-                        names.append(str(file_name))
-        if not names and self.loaded and self.loaded.mode == "Power Dependent":
-            names = list(self.loaded.selected_files)
-        return list(dict.fromkeys(names))
-
     def _power_has_distinct_role_groups(self) -> bool:
         kk_key = self._power_role_group_key("KK")
         kkp_key = self._power_role_group_key("KKp")
@@ -1963,13 +1949,6 @@ class MainWindow(QMainWindow):
                     combo.setCurrentText(current)
             finally:
                 combo.blockSignals(old)
-
-    @staticmethod
-    def _cmp_angle_distance(a: float, b: float) -> float:
-        return abs(((float(a) - float(b) + 180.0) % 360.0) - 180.0)
-
-    def _cmp_parse_in_out_angles(self, file_name: str) -> tuple[float | None, float | None]:
-        return parse_compare_in_out_angles(file_name)
 
     def _cmp_view_mode(self) -> str:
         if hasattr(self, "cmp_view_vp_btn") and self.cmp_view_vp_btn.isChecked():
@@ -2087,13 +2066,6 @@ class MainWindow(QMainWindow):
         else:
             self.cmp_vp_filename_preview.setText("Assign KK and KKp")
             self.cmp_vp_title_preview.setText("Assign KK and KKp")
-
-    def _cmp_classify_channel(self, file_name: str) -> str | None:
-        return classify_compare_channel(
-            file_name,
-            in_k_angle=float(self.cmp_in_k_angle_spin.value()),
-            out_k_angle=float(self.cmp_out_k_angle_spin.value()),
-        )
 
     def _cmp_current_mapping(self) -> dict[str, str]:
         mapping: dict[str, str] = {}
@@ -2966,10 +2938,6 @@ class MainWindow(QMainWindow):
         self.power_auto_x_btn.setEnabled(power_loaded)
         self.power_auto_y_btn.setEnabled(power_loaded)
 
-    def _reset_params(self, mode: str) -> None:
-        if self.loaded and self.loaded.mode == mode:
-            self._apply_auto_limits_for_loaded()
-
     def _auto_drr_vrange(self) -> None:
         if not self.loaded or self.loaded.mode != "DRR":
             return
@@ -3725,11 +3693,6 @@ class MainWindow(QMainWindow):
             return
         ax.set_yticks(display_power)
         ax.set_yticklabels([f"{float(value):.6g}" for value in true_power])
-
-    def _update_power_spectrum_and_line(self, cube: DataCube) -> None:
-        if self._power_spectrum_ax is None or self._power_heatmap_ax is None:
-            return
-        self._update_power_compare_spectrum_and_lines({"Power": cube})
 
     def _update_power_compare_spectrum_and_lines(self, cubes: Dict[str, DataCube]) -> None:
         if self._power_spectrum_ax is None or not cubes:
@@ -5385,7 +5348,6 @@ class MainWindow(QMainWindow):
                 params=options.params,
                 scale_tag=options.compare_scale_tag,
                 clip_outliers=options.compare_clip,
-                gate_value=options.compare_gate,
                 correction_background=options.compare_background,
                 export_vp=options.compare_export_vp,
             )

@@ -39,7 +39,7 @@ When you choose a data folder, CSV files must be in the folder root (not subfold
   - `Self (last/first frame)` baseline modes.
   - `External` baseline mode from selected baseline files.
 - `Compare`: 2-4 selected files rendered in a compare grid.
-- `Save PNG` exports with fixed size (`1600x1200 @ 200 DPI`) independent of window size.
+- `Save PNG` exports with fixed Streamlit-style geometry (`8.0 x 6.2 in @ 150 DPI`) independent of window size.
 
 ## Smoke Check (No Test Framework Required)
 Run:
@@ -48,6 +48,14 @@ python scripts/smoke_check.py
 ```
 
 This performs lightweight import/path checks for the Qt app and core modules.
+
+Use the project virtual environment for checks and launches:
+```bash
+.venv\Scripts\python.exe scripts\smoke_check.py
+.venv\Scripts\python.exe run_qt.py
+```
+
+`Data_Plot_App.bat` launches without pulling from git by default. Set `DPTK_AUTO_UPDATE=1` before running it if you want the launcher to fetch and fast-forward pull first.
 
 ## Troubleshooting
 - `No CSV files found`: confirm files are directly in the selected folder root and have `.csv` extension.

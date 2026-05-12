@@ -33,6 +33,7 @@ def main() -> int:
         "core.processing",
         "core.plotting",
         "core.export",
+        "core.export_legacy",
         "core.processing_run",
         "ui_qt.main_window",
     ]

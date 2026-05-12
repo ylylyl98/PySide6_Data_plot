@@ -144,7 +144,7 @@ def build_external_baseline(user_folder: str, files: Sequence[str], *, which: st
         which=w,
         save_npz=None,
     )
-    return {"energy": np.asarray(energy), "I0": np.asarray(I0)}
+    return {"energy": np.asarray(energy, dtype=float).copy(), "I0": np.asarray(I0, dtype=float).copy()}
 
 
 def load_drr_avg(
@@ -154,6 +154,7 @@ def load_drr_avg(
     bg_mode: str,
     y_axis: str = "auto",
     external_vector: Optional[np.ndarray] = None,
+    external_energy: Optional[np.ndarray] = None,
     derivative: Optional[int] = None,
     dE_window_pts: int = 20,
     dE_polyorder: int = 2,
@@ -168,6 +169,7 @@ def load_drr_avg(
         bg_mode=bg_mode,
         y_axis=y_axis,
         external_vector=external_vector,
+        external_energy=external_energy,
         use_global_background=False,
         plot_interactive=False,
         save_png=False,

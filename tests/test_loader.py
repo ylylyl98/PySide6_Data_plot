@@ -75,6 +75,32 @@ class LoaderTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 loader.load_pl(str(FIXTURES), "sample.csv")
 
+    def test_external_drr_baseline_uses_energy_alignment(self) -> None:
+        canonical = {
+            "energy": np.array([1.0, 2.0, 3.0]),
+            "gate_axis": np.array([0.0]),
+            "Z": np.array([[11.0, 22.0, 33.0]]),
+            "gate_label": "Gate",
+            "title_name": "scan",
+            "stem": "scan",
+        }
+
+        with patch.object(loader.P, "_load_canonical", return_value=canonical):
+            result = loader.P.process_ref_avg(
+                "unused",
+                ["scan.csv"],
+                bg_mode="external",
+                external_vector=np.array([10.0, 30.0]),
+                external_energy=np.array([1.0, 3.0]),
+                use_global_background=False,
+                plot_interactive=False,
+                save_png=False,
+                save_dat_file=False,
+                move_original=False,
+            )
+
+        self.assertTrue(np.allclose(result["Z_out"], np.array([[0.1, 0.1, 0.1]])))
+
 
 if __name__ == "__main__":
     unittest.main()

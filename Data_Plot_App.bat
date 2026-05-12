@@ -9,6 +9,11 @@ set "GIT_TERMINAL_PROMPT=0"
 set "GCM_INTERACTIVE=Never"
 set "GIT_ASKPASS=echo"
 
+if /i not "%DPTK_AUTO_UPDATE%"=="1" (
+    set "GIT_UPDATE_STATUS=Git auto-update disabled. Set DPTK_AUTO_UPDATE=1 to fetch and pull before launch."
+    goto after_git_pull
+)
+
 git rev-parse --is-inside-work-tree >nul 2>nul
 if errorlevel 1 (
     set "GIT_UPDATE_STATUS=Not a git working tree. Skipping git pull."

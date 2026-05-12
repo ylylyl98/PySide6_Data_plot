@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import re, shutil, os, math
+import re
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List, Sequence, Literal
 import numpy as np
@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize, TwoSlopeNorm, LogNorm
 from matplotlib.widgets import Slider, Button, CheckButtons, RadioButtons
 from matplotlib.font_manager import FontProperties
-from matplotlib.ticker import MaxNLocator, FuncFormatter, LogLocator, FixedLocator, NullLocator, NullFormatter
+from matplotlib.ticker import MaxNLocator, FuncFormatter, NullLocator, NullFormatter
 
 
 def _cb_short_fmt(x, _pos=None):
@@ -1747,6 +1747,7 @@ def process_ref_avg(
     seed_mode: str = "first",
     use_global_background: bool = True,
     external_vector: np.ndarray | None = None,
+    external_energy: np.ndarray | None = None,
     derivative: int | None = None,
     do_dE: bool = False,
     do_d2E: bool = False,
@@ -1768,11 +1769,15 @@ def process_ref_avg(
     move_original: bool = True,
     archived_subfolder: str = "Initial data after processing",
 ) -> dict:
-    assert len(files) >= 1
-    assert bg_mode in ("self_first", "self_last", "external")
+    if len(files) < 1:
+        raise ValueError("process_ref_avg requires at least one file.")
+    if bg_mode not in ("self_first", "self_last", "external"):
+        raise ValueError("bg_mode must be 'self_first', 'self_last', or 'external'.")
     if seed_external_from_first:
-        assert bg_mode == "external"
-        assert seed_mode in ("first", "last")
+        if bg_mode != "external":
+            raise ValueError("seed_external_from_first requires bg_mode='external'.")
+        if seed_mode not in ("first", "last"):
+            raise ValueError("seed_mode must be 'first' or 'last'.")
     if derivative is None:
         derivative = 2 if do_d2E else (1 if do_dE else None)
     if derivative not in (None, 1, 2):
@@ -1788,7 +1793,25 @@ def process_ref_avg(
             I0_ext = Z0[0, :].copy() if seed_mode == "first" else Z0[-1, :].copy()
             save_background_global(energy0, I0_ext)
         elif external_vector is not None:
-            I0_ext = np.asarray(external_vector, float)
+            I0_ext = np.asarray(external_vector, float).ravel()
+            if external_energy is not None:
+                e_ext = np.asarray(external_energy, float).ravel()
+                if e_ext.shape != I0_ext.shape:
+                    raise ValueError(
+                        f"External baseline energy shape {e_ext.shape} != baseline shape {I0_ext.shape}."
+                    )
+                if (e_ext.shape != energy0.shape) or (not np.allclose(e_ext, energy0, rtol=1e-6, atol=1e-9)):
+                    finite = np.isfinite(e_ext) & np.isfinite(I0_ext)
+                    if np.count_nonzero(finite) < 2:
+                        raise ValueError("External baseline energy grid has fewer than two finite points.")
+                    order = np.argsort(e_ext[finite])
+                    I0_ext = np.interp(
+                        energy0,
+                        e_ext[finite][order],
+                        I0_ext[finite][order],
+                        left=np.nan,
+                        right=np.nan,
+                    )
         elif use_global_background:
             I0_ext = _align_bg_energy_or_raise(load_background_global(), energy0)
         else:
@@ -2148,7 +2171,8 @@ def avg_drr_self_by_condition(
     dE_oversample: float = 1.0,
     dE_interp_kind: str = "cubic",
 ) -> Dict[str, List[Dict]]:
-    assert self_from in ("first", "last")
+    if self_from not in ("first", "last"):
+        raise ValueError("self_from must be 'first' or 'last'.")
     p = Path(user_folder)
     root_csvs = sorted([f.name for f in p.glob("*.csv")], key=_nat_key)
     if file_filter_contains:
@@ -2219,11 +2243,16 @@ def avg_process_mcd(
 ):
     import re as _re
     from collections import defaultdict
-    assert left_bg_mode  in ("external","self_first","self_last")
-    assert right_bg_mode in ("external","self_first","self_last")
-    assert bg_from_left in ("first","last") and bg_from_right in ("first","last")
-    assert mcd_reflectance_mode in ("reconstruct", "raw")
-    assert avg_times_left >= 1 and avg_times_right >= 1
+    if left_bg_mode not in ("external", "self_first", "self_last"):
+        raise ValueError("left_bg_mode must be 'external', 'self_first', or 'self_last'.")
+    if right_bg_mode not in ("external", "self_first", "self_last"):
+        raise ValueError("right_bg_mode must be 'external', 'self_first', or 'self_last'.")
+    if bg_from_left not in ("first", "last") or bg_from_right not in ("first", "last"):
+        raise ValueError("bg_from_left and bg_from_right must be 'first' or 'last'.")
+    if mcd_reflectance_mode not in ("reconstruct", "raw"):
+        raise ValueError("mcd_reflectance_mode must be 'reconstruct' or 'raw'.")
+    if avg_times_left < 1 or avg_times_right < 1:
+        raise ValueError("avg_times_left and avg_times_right must be at least 1.")
     p = Path(user_folder)
     root = sorted([f.name for f in p.glob("*.csv")], key=_nat_key)
     if not root:
