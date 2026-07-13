@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shutil
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -14,6 +16,26 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures" / "y_axis"
 
 
 class CanonicalYAxisResolutionTests(unittest.TestCase):
+    def test_title_keeps_gate_condition_outside_structured_metadata(self) -> None:
+        file_name = "$Yuze320$~$sense$~$1.67K700nm50msx20x1$_0.95TG-BG=20_001.csv"
+        expected = "Yuze320~sense~1.67K700nm50msx20x1~0.95TG-BG=20"
+
+        with tempfile.TemporaryDirectory() as folder:
+            shutil.copyfile(FIXTURES / "plain_scan.csv", Path(folder) / file_name)
+            d = processing_run._load_canonical(folder, file_name, y_axis="auto")
+
+        self.assertEqual(d["title_name"], expected)
+
+    def test_title_does_not_duplicate_wrapped_gate_condition(self) -> None:
+        file_name = "$Yuze320$~$sense$~$0.95TG-BG=20$_001.csv"
+        self.assertEqual(
+            processing_run._title_from_filename(file_name),
+            "Yuze320~sense~0.95TG-BG=20",
+        )
+
+    def test_plain_filename_title_is_unchanged(self) -> None:
+        self.assertEqual(processing_run._title_from_filename("plain_scan_001.csv"), "plain_scan_001")
+
     def test_auto_ratio_from_structured_metadata(self) -> None:
         d = processing_run._load_canonical(str(FIXTURES), "sample$0.9TG+BG$.csv", y_axis="auto")
         expected = np.array([8.8, 8.9, 9.0])

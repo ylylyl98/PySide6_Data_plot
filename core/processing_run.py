@@ -236,6 +236,34 @@ def _extract_gate_tokens(name: str) -> list[str]:
     return [seg.strip() for seg in re.findall(r"\$(.*?)\$", name) if str(seg).strip()]
 
 
+_TITLE_GATE_CONDITION_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])"
+    r"(?P<condition>(?:(?:\d+(?:[pP\.]\d+)?)\s*)?TG\s*[+-]\s*"
+    r"(?:(?:\d+(?:[pP\.]\d+)?)\s*)?BG"
+    r"(?:\s*=\s*[+-]?\d+(?:[pP\.]\d+)?)?)"
+    r"(?![A-Za-z0-9])"
+)
+
+
+def _title_from_filename(name: str) -> str:
+    """Build a readable title without losing gate metadata outside ``$...$`` fields."""
+    stem = Path(name).stem
+    parts = _extract_gate_tokens(stem)
+    if not parts:
+        return stem
+
+    title_parts = list(parts)
+    represented = "~".join(parts).replace(" ", "").casefold()
+    for match in _TITLE_GATE_CONDITION_RE.finditer(stem):
+        condition = match.group("condition").strip()
+        normalized = condition.replace(" ", "").casefold()
+        if normalized and normalized not in represented:
+            title_parts.append(condition)
+            represented += f"~{normalized}"
+
+    return "~".join(title_parts)
+
+
 def _match_gate_mode_token(text: str) -> Optional[Dict[str, float | str]]:
     token = str(text or "").strip()
     if not token:
@@ -1222,7 +1250,7 @@ def _parse_spec_axis_from_colname(col) -> Optional[float]:
     parts = re.findall(r"\$(.*?)\$", origin_name)
     stem  = Path(origin_name).stem
     # FULL human-readable title (use all parts, like interactive)
-    title_full = "~".join(parts) if parts else stem
+    title_full = _title_from_filename(origin_name)
     # --- Decide Y axis robustly (which gate actually varies) ---
     def _is_constant(v, atol=1e-12, rtol=1e-9):
         v = np.asarray(v, float)
@@ -1292,7 +1320,7 @@ def _load_canonical(user_folder: str, origin_name: str, *, y_axis: str = "auto")
 
     parts = re.findall(r"\$(.*?)\$", origin_name)
     stem  = Path(origin_name).stem
-    title_full = "~".join(parts) if parts else stem
+    title_full = _title_from_filename(origin_name)
 
     # --------------------------
     # (B) Header-table format
