@@ -11,6 +11,15 @@ import pandas as pd
 
 
 _NUMERIC_HEADER_RE = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)(?:\.\d+)?\s*(?:nm)?\s*$", re.IGNORECASE)
+_MEASURED_ANGLE_COLUMNS = (
+    "measured_value",
+    "measured value",
+    "measured position",
+    "measured_position",
+    "measuredposition",
+    "measured angle",
+    "measured_angle",
+)
 
 
 def _norm_column(value: object) -> str:
@@ -82,7 +91,20 @@ class ShgSettings:
     include_failed_rows: bool = False
 
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        payload = asdict(self)
+        payload.update(
+            {
+                "integration_wavelength_nm": self.peak_center_nm,
+                "integration_half_range_nm": 0.5 * (self.gate_max_nm - self.gate_min_nm),
+                "integration_interval_nm": [self.gate_min_nm, self.gate_max_nm],
+                "integration_source": "background_subtracted_spectrum",
+                "left_sideband_gap_nm": self.gate_min_nm - self.left_max_nm,
+                "right_sideband_gap_nm": self.right_min_nm - self.gate_max_nm,
+                "left_sideband_width_nm": self.left_max_nm - self.left_min_nm,
+                "right_sideband_width_nm": self.right_max_nm - self.right_min_nm,
+            }
+        )
+        return payload
 
 
 @dataclass(frozen=True)
@@ -114,10 +136,7 @@ def inspect_shg_csv(folder: str, file_name: str) -> bool:
     except Exception:
         return False
     columns = [str(column).strip() for column in frame.columns]
-    measured = _find_column(
-        columns,
-        ["measured position", "measured_position", "measuredposition", "measured angle", "measured_angle"],
-    )
+    measured = _find_column(columns, _MEASURED_ANGLE_COLUMNS)
     wavelengths = [_numeric_header(column) for column in columns]
     return measured is not None and sum(value is not None for value in wavelengths) >= 3
 
@@ -167,12 +186,12 @@ def _load_shg_sweep_cached(
     frame.columns = [str(column).strip() for column in frame.columns]
     columns = list(frame.columns)
 
-    measured_col = _find_column(
-        columns,
-        ["measured position", "measured_position", "measuredposition", "measured angle", "measured_angle"],
-    )
+    measured_col = _find_column(columns, _MEASURED_ANGLE_COLUMNS)
     if measured_col is None:
-        raise ValueError(f"SHG CSV {file_name!r} is missing a 'measured position' column.")
+        raise ValueError(
+            f"SHG CSV {file_name!r} is missing a measured angle column "
+            "('measured_value', 'measured position', or 'measured angle')."
+        )
     target_col = _find_column(columns, ["target_value", "target value", "target_val", "target angle"])
     sweep_col = _find_column(columns, ["sweep_axis", "sweep axis", "sweep_ax"])
     move_ok_col = _find_column(columns, ["move_ok", "move ok"])
@@ -334,11 +353,11 @@ def _trapezoid_weights(x: np.ndarray) -> np.ndarray:
 
 def _validate_settings(settings: ShgSettings, wavelength: np.ndarray) -> None:
     if not (
-        settings.left_min_nm < settings.left_max_nm < settings.gate_min_nm
-        < settings.gate_max_nm < settings.right_min_nm < settings.right_max_nm
+        settings.left_min_nm < settings.left_max_nm <= settings.gate_min_nm
+        < settings.gate_max_nm <= settings.right_min_nm < settings.right_max_nm
     ):
         raise ValueError(
-            "SHG regions must be ordered: left sideband < peak gate < right sideband, without overlap."
+            "SHG regions must be ordered: left sideband <= peak gate <= right sideband, without overlap."
         )
     if settings.left_min_nm < float(np.nanmin(wavelength)) or settings.right_max_nm > float(np.nanmax(wavelength)):
         raise ValueError(
@@ -369,11 +388,11 @@ def process_shg_sweep(
             raise ValueError("SHG angle wrap must be positive.")
         angle = np.mod(angle, settings.angle_wrap_deg)
 
+    gate_mask = (wavelength >= settings.gate_min_nm) & (wavelength <= settings.gate_max_nm)
     sideband = (
         ((wavelength >= settings.left_min_nm) & (wavelength <= settings.left_max_nm))
         | ((wavelength >= settings.right_min_nm) & (wavelength <= settings.right_max_nm))
-    )
-    gate_mask = (wavelength >= settings.gate_min_nm) & (wavelength <= settings.gate_max_nm)
+    ) & ~gate_mask
     if np.count_nonzero(sideband) < 4:
         raise ValueError("SHG background fit needs at least four wavelength points across the two sidebands.")
     if np.count_nonzero(gate_mask) < 2:
@@ -461,6 +480,8 @@ def process_shg_sweep(
             )
             slope[row_index] = float(local_coefficients[0])
             baseline_center[row_index] = float(local_coefficients[1])
+            # The reported SHG area is always calculated from the corrected
+            # spectrum, never from the measured spectrum or fitted baseline.
             x_gate, y_gate = _integration_window(
                 wavelength,
                 corrected[row_index],

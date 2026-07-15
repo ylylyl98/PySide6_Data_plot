@@ -598,9 +598,7 @@ class MainWindow(QMainWindow):
         self._update_drr_selection_labels()
         self._power_refresh_groups()
         self._shg_refresh_sources()
-        shg_index = self.shg_file_combo.findData(selected_names[0])
-        if shg_index >= 0:
-            self.shg_file_combo.setCurrentIndex(shg_index)
+        self._restore_list_selection(self.shg_files, [selected_names[0]])
 
         if len(selected_names) == 1:
             extra = " Ignored 1 non-CSV file." if ignored_count == 1 else f" Ignored {ignored_count} non-CSV files." if ignored_count else ""
@@ -1615,28 +1613,29 @@ class MainWindow(QMainWindow):
         layout.setSpacing(6)
 
         data_box = QGroupBox("SHG Sweep Table")
-        data_form = QFormLayout(data_box)
-        data_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
-        data_form.setSpacing(6)
-        self.shg_file_combo = QComboBox()
+        data_layout = QVBoxLayout(data_box)
+        data_layout.setContentsMargins(6, 6, 6, 6)
+        data_layout.setSpacing(6)
+        self.shg_files = QListWidget()
+        self.shg_files.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.shg_files.setMinimumHeight(60)
+        self.shg_files.setMaximumHeight(120)
+        self.shg_files.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.shg_files.setToolTip("Select an SHG sweep CSV to load")
         self.shg_background_combo = QComboBox()
-        self._style_combo_popup(self.shg_file_combo)
         self._style_combo_popup(self.shg_background_combo)
-        self.shg_detect_btn = QPushButton("Detect")
-        self.shg_detect_btn.setToolTip("Detect wide CSV tables with measured position and numeric wavelength headers.")
-        source_row = QWidget()
-        source_layout = QHBoxLayout(source_row)
-        source_layout.setContentsMargins(0, 0, 0, 0)
-        source_layout.setSpacing(6)
-        source_layout.addWidget(self.shg_file_combo, 1)
-        source_layout.addWidget(self.shg_detect_btn)
         self.shg_summary = QPlainTextEdit()
         self.shg_summary.setReadOnly(True)
         self.shg_summary.setMaximumHeight(105)
-        data_form.addRow("Sweep CSV", source_row)
-        data_form.addRow("Background", self.shg_background_combo)
-        data_form.addRow("Summary", self.shg_summary)
-        self._set_form_label_width(data_form, UI_METRICS["label_col_width"])
+        background_row = QWidget()
+        background_layout = QHBoxLayout(background_row)
+        background_layout.setContentsMargins(0, 0, 0, 0)
+        background_layout.setSpacing(6)
+        background_layout.addWidget(QLabel("External background"))
+        background_layout.addWidget(self.shg_background_combo, 1)
+        data_layout.addWidget(self.shg_files)
+        data_layout.addWidget(background_row)
+        data_layout.addWidget(self.shg_summary)
         layout.addWidget(self._make_expander("Data", data_box, expanded=True))
 
         def wavelength_spin(value: float) -> QDoubleSpinBox:
@@ -1648,17 +1647,16 @@ class MainWindow(QMainWindow):
             spin.setFixedWidth(UI_METRICS["spin_w"] + 12)
             return spin
 
-        integration = QGroupBox("515 nm Integration")
+        integration = QGroupBox("SHG Peak Integration")
         integration_form = QFormLayout(integration)
         integration_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
         integration_form.setSpacing(6)
         self.shg_peak_center_spin = wavelength_spin(515.0)
-        self.shg_gate_min_spin = wavelength_spin(513.0)
-        self.shg_gate_max_spin = wavelength_spin(517.0)
-        self.shg_left_min_spin = wavelength_spin(508.0)
-        self.shg_left_max_spin = wavelength_spin(512.0)
-        self.shg_right_min_spin = wavelength_spin(518.0)
-        self.shg_right_max_spin = wavelength_spin(522.0)
+        self.shg_gate_half_range_spin = wavelength_spin(3.0)
+        self.shg_gate_half_range_spin.setMinimum(0.0001)
+        self.shg_sideband_gap_spin = wavelength_spin(1.0)
+        self.shg_sideband_width_spin = wavelength_spin(4.0)
+        self.shg_sideband_width_spin.setMinimum(0.0001)
         self.shg_background_method_combo = QComboBox()
         self.shg_background_method_combo.addItems(
             ["Local linear", "Local quadratic", "External + local residual", "None"]
@@ -1671,29 +1669,20 @@ class MainWindow(QMainWindow):
         self.shg_sigma_clip_spin.setValue(3.0)
         self.shg_sigma_clip_spin.setFixedWidth(UI_METRICS["spin_w"])
 
-        def range_row(left: QDoubleSpinBox, right: QDoubleSpinBox) -> QWidget:
+        def value_row(spin: QDoubleSpinBox, suffix: str = "nm") -> QWidget:
             widget = QWidget()
             row_layout = QHBoxLayout(widget)
             row_layout.setContentsMargins(0, 0, 0, 0)
             row_layout.setSpacing(6)
-            row_layout.addWidget(left)
-            row_layout.addWidget(QLabel("to"))
-            row_layout.addWidget(right)
-            row_layout.addWidget(QLabel("nm"))
+            row_layout.addWidget(spin)
+            row_layout.addWidget(QLabel(suffix))
             row_layout.addStretch(1)
             return widget
 
-        center_row = QWidget()
-        center_layout = QHBoxLayout(center_row)
-        center_layout.setContentsMargins(0, 0, 0, 0)
-        center_layout.setSpacing(6)
-        center_layout.addWidget(self.shg_peak_center_spin)
-        center_layout.addWidget(QLabel("nm"))
-        center_layout.addStretch(1)
-        integration_form.addRow("Peak center", center_row)
-        integration_form.addRow("Peak gate", range_row(self.shg_gate_min_spin, self.shg_gate_max_spin))
-        integration_form.addRow("Left sideband", range_row(self.shg_left_min_spin, self.shg_left_max_spin))
-        integration_form.addRow("Right sideband", range_row(self.shg_right_min_spin, self.shg_right_max_spin))
+        integration_form.addRow("Integration wavelength", value_row(self.shg_peak_center_spin))
+        integration_form.addRow("Integration range (±)", value_row(self.shg_gate_half_range_spin, "nm on each side"))
+        integration_form.addRow("Sideband gap", value_row(self.shg_sideband_gap_spin, "nm from peak gate"))
+        integration_form.addRow("Sideband width", value_row(self.shg_sideband_width_spin, "nm on each side"))
         integration_form.addRow("Background", self.shg_background_method_combo)
         integration_form.addRow("Sigma clip", self.shg_sigma_clip_spin)
         self._set_form_label_width(integration_form, UI_METRICS["label_col_width"])
@@ -1861,35 +1850,34 @@ class MainWindow(QMainWindow):
         return list(self.available_files)
 
     def _shg_selected_file(self) -> str:
-        return str(self.shg_file_combo.currentData() or "") if hasattr(self, "shg_file_combo") else ""
+        if not hasattr(self, "shg_files"):
+            return ""
+        selected = self._selected(self.shg_files)
+        return selected[0] if selected else ""
 
     def _shg_background_file(self) -> str:
         return str(self.shg_background_combo.currentData() or "") if hasattr(self, "shg_background_combo") else ""
 
     def _shg_refresh_sources(self) -> None:
-        if not hasattr(self, "shg_file_combo"):
+        if not hasattr(self, "shg_files"):
             return
         old_source = self._shg_selected_file()
         old_background = self._shg_background_file()
-        candidates = data_io.list_shg_csv_files(self.current_folder, self.available_files)
-        source_blocked = self.shg_file_combo.blockSignals(True)
+        source_blocked = self.shg_files.blockSignals(True)
         background_blocked = self.shg_background_combo.blockSignals(True)
         try:
-            self.shg_file_combo.clear()
+            self.shg_files.clear()
+            self.shg_files.addItems(self.available_files)
+            if old_source in self.available_files:
+                self._restore_list_selection(self.shg_files, [old_source])
             self.shg_background_combo.clear()
             self.shg_background_combo.addItem("— None —", "")
-            for file_name in candidates:
-                self.shg_file_combo.addItem(file_name, file_name)
+            for file_name in self.available_files:
                 self.shg_background_combo.addItem(file_name, file_name)
-            source_index = self.shg_file_combo.findData(old_source)
-            if source_index < 0 and self.shg_file_combo.count():
-                source_index = 0
-            if source_index >= 0:
-                self.shg_file_combo.setCurrentIndex(source_index)
             background_index = self.shg_background_combo.findData(old_background)
             self.shg_background_combo.setCurrentIndex(background_index if background_index >= 0 else 0)
         finally:
-            self.shg_file_combo.blockSignals(source_blocked)
+            self.shg_files.blockSignals(source_blocked)
             self.shg_background_combo.blockSignals(background_blocked)
         self._shg_update_background_controls()
         self._shg_update_summary()
@@ -1902,14 +1890,20 @@ class MainWindow(QMainWindow):
             "None": "none",
         }
         wrap_map = {"None": None, "0-180°": 180.0, "0-360°": 360.0}
+        integration_wavelength = float(self.shg_peak_center_spin.value())
+        integration_half_range = float(self.shg_gate_half_range_spin.value())
+        sideband_gap = float(self.shg_sideband_gap_spin.value())
+        sideband_width = float(self.shg_sideband_width_spin.value())
+        gate_min = integration_wavelength - integration_half_range
+        gate_max = integration_wavelength + integration_half_range
         return ShgSettings(
-            peak_center_nm=float(self.shg_peak_center_spin.value()),
-            gate_min_nm=float(self.shg_gate_min_spin.value()),
-            gate_max_nm=float(self.shg_gate_max_spin.value()),
-            left_min_nm=float(self.shg_left_min_spin.value()),
-            left_max_nm=float(self.shg_left_max_spin.value()),
-            right_min_nm=float(self.shg_right_min_spin.value()),
-            right_max_nm=float(self.shg_right_max_spin.value()),
+            peak_center_nm=integration_wavelength,
+            gate_min_nm=gate_min,
+            gate_max_nm=gate_max,
+            left_min_nm=gate_min - sideband_gap - sideband_width,
+            left_max_nm=gate_min - sideband_gap,
+            right_min_nm=gate_max + sideband_gap,
+            right_max_nm=gate_max + sideband_gap + sideband_width,
             background_method=method_map.get(self.shg_background_method_combo.currentText(), "local_linear"),
             sigma_clip=float(self.shg_sigma_clip_spin.value()),
             angle_scale=float(self.shg_angle_scale_spin.value()),
@@ -1937,18 +1931,25 @@ class MainWindow(QMainWindow):
                 data.source_file,
                 f"{data.spectra.shape[0]} acquisitions, {data.wavelength_nm.size} wavelengths",
                 f"Wavelength: {float(np.nanmin(data.wavelength_nm)):.6g}-{float(np.nanmax(data.wavelength_nm)):.6g} nm",
+                f"Integrated corrected area: {result.settings.peak_center_nm:g} ± "
+                f"{0.5 * (result.settings.gate_max_nm - result.settings.gate_min_nm):g} nm",
+                f"Background sidebands: {result.settings.left_min_nm:g}-{result.settings.left_max_nm:g} and "
+                f"{result.settings.right_min_nm:g}-{result.settings.right_max_nm:g} nm",
                 f"Angle column: {measured_column}; included: {included}; excluded/warned: {failures}",
             ]
             self.shg_summary.setPlainText("\n".join(lines))
             return
-        candidates = data_io.list_shg_csv_files(self.current_folder, self.available_files)
-        if candidates:
+        if self.available_files:
+            selected = self._shg_selected_file()
+            selected_line = f"Selected: {selected}\n" if selected else "Select one CSV file from the list.\n"
             self.shg_summary.setPlainText(
-                f"Detected {len(candidates)} SHG sweep table(s).\nAngle: measured position; spectra: numeric wavelength headers."
+                selected_line
+                + f"{len(self.available_files)} CSV file(s) available; press Load to validate and process.\n"
+                "The selected file will be validated as an SHG table during loading."
             )
         else:
             self.shg_summary.setPlainText(
-                "No SHG tables detected. Expected measured position plus numeric wavelength headers."
+                "No CSV files are available in the selected folder."
             )
 
     def _on_shg_source_changed(self) -> None:
@@ -2765,8 +2766,7 @@ class MainWindow(QMainWindow):
         self.power_auto_v_btn.clicked.connect(self._auto_power_vrange)
         self.power_auto_x_btn.clicked.connect(self._auto_power_xrange)
         self.power_auto_y_btn.clicked.connect(self._auto_power_yrange)
-        self.shg_detect_btn.clicked.connect(self._shg_refresh_sources)
-        self.shg_file_combo.currentIndexChanged.connect(lambda _idx: self._on_shg_source_changed())
+        self.shg_files.itemSelectionChanged.connect(self._on_shg_source_changed)
         self.shg_background_combo.currentIndexChanged.connect(lambda _idx: self._on_shg_source_changed())
         self.shg_background_method_combo.currentTextChanged.connect(lambda _text: self._on_shg_background_method_changed())
         self.shg_angle_wrap_combo.currentTextChanged.connect(lambda _text: self._on_shg_param_changed())
@@ -2774,12 +2774,9 @@ class MainWindow(QMainWindow):
         self.shg_angle_cursor_spin.valueChanged.connect(lambda _value: self._on_shg_param_changed())
         for spin in (
             self.shg_peak_center_spin,
-            self.shg_gate_min_spin,
-            self.shg_gate_max_spin,
-            self.shg_left_min_spin,
-            self.shg_left_max_spin,
-            self.shg_right_min_spin,
-            self.shg_right_max_spin,
+            self.shg_gate_half_range_spin,
+            self.shg_sideband_gap_spin,
+            self.shg_sideband_width_spin,
             self.shg_sigma_clip_spin,
             self.shg_angle_scale_spin,
             self.shg_angle_offset_spin,
@@ -3038,9 +3035,7 @@ class MainWindow(QMainWindow):
         self._update_drr_selection_labels()
         self._power_refresh_groups()
         self._shg_refresh_sources()
-        shg_index = self.shg_file_combo.findData(path.name)
-        if shg_index >= 0:
-            self.shg_file_combo.setCurrentIndex(shg_index)
+        self._restore_list_selection(self.shg_files, [path.name])
         self._status(f"Selected {path.name}")
 
     def _restore_list_selection(self, widget: QListWidget, names: List[str]) -> None:
@@ -3763,11 +3758,9 @@ class MainWindow(QMainWindow):
                 self.power_group_combo.setCurrentIndex(idx)
         if loaded.mode == "SHG Processing" and loaded.shg_result is not None:
             self._shg_refresh_sources()
-            source_index = self.shg_file_combo.findData(loaded.primary_file or "")
-            if source_index >= 0:
-                blocked = self.shg_file_combo.blockSignals(True)
-                self.shg_file_combo.setCurrentIndex(source_index)
-                self.shg_file_combo.blockSignals(blocked)
+            blocked = self.shg_files.blockSignals(True)
+            self._restore_list_selection(self.shg_files, [loaded.primary_file or ""])
+            self.shg_files.blockSignals(blocked)
             finite = np.flatnonzero(np.isfinite(loaded.shg_result.measured_angle_deg))
             if finite.size:
                 included = finite[loaded.shg_result.included[finite]]
@@ -4837,7 +4830,8 @@ class MainWindow(QMainWindow):
         corrected_ax.plot(wavelength, corrected, color="#11823b", lw=1.0)
         corrected_ax.axhline(0.0, color="#555", lw=0.8, alpha=0.7)
         corrected_ax.set_title(
-            f"Corrected area = {result.integrated_area[selected]:.6g} counts·nm"
+            f"Background-subtracted area ({settings.gate_min_nm:g}-{settings.gate_max_nm:g} nm) "
+            f"= {result.integrated_area[selected]:.6g} counts·nm"
         )
         corrected_ax.set_xlabel("Wavelength (nm)")
         corrected_ax.set_ylabel("Corrected intensity")
@@ -4888,9 +4882,9 @@ class MainWindow(QMainWindow):
                 zorder=6,
                 label="Selected",
             )
-        angle_ax.set_title("Integrated SHG intensity versus measured angle")
+        angle_ax.set_title("Background-subtracted SHG area versus measured angle")
         angle_ax.set_xlabel("Measured angle (deg)")
-        angle_ax.set_ylabel("Integrated intensity (counts·nm)")
+        angle_ax.set_ylabel("Background-subtracted area (counts·nm)")
         angle_ax.grid(alpha=0.25)
         angle_ax.legend(loc="best", fontsize=8)
         self._shg_raw_ax = raw_ax

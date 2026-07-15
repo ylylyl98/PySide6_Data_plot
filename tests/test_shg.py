@@ -43,6 +43,23 @@ def _synthetic_data() -> tuple[ShgSweepData, np.ndarray]:
 
 
 class ShgLoaderTests(unittest.TestCase):
+    def test_tab_table_accepts_measured_value_and_position_error_headers(self) -> None:
+        content = (
+            "sweep_axis\ttarget_value\tmeasured_value\tposition_error\tvalue_unit\t"
+            "move_attempts\tmove_ok\tacquisition_ok\t508.0\t515.0\t522.0\n"
+            "rot1\t1\t0.99442\t0.00558\tdeg\t1\t1\t1\t590\t700\t580\n"
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "measured_value.csv"
+            path.write_text(content, encoding="utf-8")
+            self.assertTrue(inspect_shg_csv(folder, path.name))
+            data = load_shg_sweep_csv(folder, path.name)
+
+        self.assertEqual(data.detected_columns["measured_angle"], "measured_value")
+        self.assertEqual(data.detected_columns["move_error"], "position_error")
+        self.assertTrue(np.allclose(data.measured_angle_deg, [0.99442]))
+        self.assertTrue(np.allclose(data.move_error_deg, [0.00558]))
+
     def test_wide_table_loader_uses_measured_position_and_numeric_headers(self) -> None:
         file_name = "shg_wide_table.csv"
         self.assertTrue(inspect_shg_csv(str(FIXTURES), file_name))
@@ -58,6 +75,16 @@ class ShgLoaderTests(unittest.TestCase):
 
 
 class ShgProcessingTests(unittest.TestCase):
+    def test_integration_gate_may_touch_sideband_boundaries(self) -> None:
+        data, expected_area = _synthetic_data()
+        settings = ShgSettings(
+            gate_min_nm=512.0,
+            gate_max_nm=518.0,
+            background_method="local_quadratic",
+        )
+        result = process_shg_sweep(data, settings)
+        self.assertTrue(np.allclose(result.integrated_area, expected_area, rtol=0.02, atol=0.1))
+
     def test_quadratic_sideband_fit_recovers_known_gaussian_area(self) -> None:
         data, expected_area = _synthetic_data()
         settings = ShgSettings(background_method="local_quadratic")
@@ -122,10 +149,14 @@ class ShgProcessingTests(unittest.TestCase):
             lines = paths["csv"].read_text(encoding="utf-8").splitlines()
             self.assertIn("measured_angle_deg", lines[0])
             self.assertIn("source_row", lines[0])
+            self.assertIn("background_subtracted_integrated_area_counts_nm", lines[0])
+            self.assertIn("integration_half_range_nm", lines[0])
             self.assertTrue(lines[1].startswith("rot1,0,-0.01"))
             self.assertIn("synthetic.csv", lines[1])
             settings_text = paths["settings"].read_text(encoding="utf-8")
             self.assertIn('"background_method": "local_quadratic"', settings_text)
+            self.assertIn('"integration_source": "background_subtracted_spectrum"', settings_text)
+            self.assertIn('"integration_half_range_nm": 2.0', settings_text)
 
 
 if __name__ == "__main__":

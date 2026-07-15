@@ -42,8 +42,10 @@ When you choose a data folder, CSV files must be in the folder root (not subfold
   power token such as `37.96uW` in each filename remain supported.
 - `SHG Processing`: load a wide sweep table containing `measured position`, motion
   and acquisition status columns, and numeric wavelength headers. The tab removes
-  a per-angle local background around 515 nm, integrates a fixed peak gate, plots
-  intensity versus the measured angle, and exports a sorted CSV plus JSON settings.
+  a per-angle local background, integrates the background-subtracted spectrum over
+  a configurable center wavelength and ± half-range, and automatically positions
+  symmetric background sidebands using a configurable gap and width. It plots area
+  versus the measured angle and exports a sorted CSV plus JSON settings.
 - `DRR`:
   - `Self (last/first frame)` baseline modes.
   - `External` baseline mode from selected baseline files.
