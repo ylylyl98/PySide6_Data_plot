@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from unittest.mock import patch
+from pathlib import Path
 
 import numpy as np
 
@@ -53,6 +54,89 @@ class PowerSeriesParserTests(unittest.TestCase):
 
 
 class PowerSeriesLoaderExportTests(unittest.TestCase):
+    def test_single_csv_power_sweep_uses_power_column_and_numeric_spectral_headers(self) -> None:
+        fixture_folder = Path(__file__).resolve().parent / "fixtures"
+        file_name = "power_sweep_table.csv"
+
+        self.assertTrue(data_io.inspect_power_sweep_csv(str(fixture_folder), file_name))
+        result = data_io.load_power_series_cube(str(fixture_folder), [file_name])
+
+        self.assertEqual(result.group_key, f"csv::{file_name}")
+        self.assertEqual(result.cube.gate.tolist(), [10.0, 20.0])
+        self.assertEqual(result.cube.gate_label, "Power (uW)")
+        self.assertTrue(np.all(np.diff(result.cube.energy) > 0))
+        self.assertTrue(np.allclose(result.cube.Z[0], [100.0, 101.0, 102.0]))
+        self.assertEqual([record.stage for record in result.records], [25.0, 0.0])
+        self.assertEqual([record.row_index for record in result.records], [3, 2])
+
+    def test_single_csv_power_sweep_rejects_duplicate_power_values(self) -> None:
+        fixture_folder = Path(__file__).resolve().parent / "fixtures"
+        with self.assertRaisesRegex(ValueError, "duplicate Power_uW"):
+            data_io.load_power_series_cube(
+                str(fixture_folder),
+                ["power_sweep_duplicate.csv"],
+            )
+
+    def test_single_csv_power_sweep_reports_missing_spectral_headers(self) -> None:
+        fixture_folder = Path(__file__).resolve().parent / "fixtures"
+        file_name = "power_sweep_missing_spectrum.csv"
+        self.assertTrue(data_io.inspect_power_sweep_csv(str(fixture_folder), file_name))
+        with self.assertRaisesRegex(ValueError, "at least two numeric wavelength/energy columns"):
+            data_io.load_power_series_cube(str(fixture_folder), [file_name])
+
+    def test_single_csv_power_sweep_stage_rows_support_vp_pairing(self) -> None:
+        fixture_folder = Path(__file__).resolve().parent / "fixtures"
+        result = data_io.load_power_series_cube(str(fixture_folder), ["power_sweep_table.csv"])
+        shifted = DataCube(
+            result.cube.energy.copy(),
+            result.cube.gate.copy(),
+            result.cube.Z * 0.5,
+            result.cube.gate_label,
+            "KKp",
+            result.cube.cbar_label,
+        )
+        _kk, _kkp, vp, pairs = power_stage_paired_vp_cubes(
+            result.cube,
+            result.records,
+            shifted,
+            result.records,
+            background=0.0,
+        )
+        self.assertEqual([pair.stage for pair in pairs], [25.0, 0.0])
+        self.assertEqual([(pair.kk_row, pair.kkp_row) for pair in pairs], [(3, 3), (2, 2)])
+        self.assertTrue(np.allclose(vp.Z, 1.0 / 3.0))
+
+    def test_single_csv_power_sweep_export_uses_source_stem_and_row_provenance(self) -> None:
+        fixture_folder = Path(__file__).resolve().parent / "fixtures"
+        result = data_io.load_power_series_cube(str(fixture_folder), ["power_sweep_table.csv"])
+        cube = result.cube
+        params = HeatmapParams(
+            title=cube.title,
+            xlabel="Photon Energy (eV)",
+            ylabel=cube.gate_label,
+            cbar_label=cube.cbar_label,
+            vmin=float(np.nanmin(cube.Z)),
+            vmax=float(np.nanmax(cube.Z)),
+            xlim=(float(np.nanmin(cube.energy)), float(np.nanmax(cube.energy))),
+            ylim=(float(np.nanmin(cube.gate)), float(np.nanmax(cube.gate))),
+            cmap="turbo",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = export_power_series_png_and_dat(
+                tmp,
+                cube=cube,
+                params=params,
+                records=result.records,
+                group_key=result.group_key,
+                y_axis_log=False,
+            )
+            self.assertTrue(paths["png"].name.startswith("power_sweep_table_PowerDep_YLin"))
+            exported = paths["dat"].read_text(encoding="utf-8")
+            self.assertIn("# source_csv=power_sweep_table.csv", exported)
+            self.assertIn("# power_column=Power_uW", exported)
+            self.assertIn("# stage_column=stage_pos", exported)
+            self.assertIn("row=3; power_uW=10.0; stage=25.0", exported)
+
     def test_loader_stacks_one_spectrum_per_file_sorted_by_power(self) -> None:
         energy = np.array([1.0, 2.0, 3.0])
 

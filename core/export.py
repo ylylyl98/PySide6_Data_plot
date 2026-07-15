@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import csv
+from datetime import datetime, timezone
+import json
 import re
 import textwrap
 from pathlib import Path
@@ -18,6 +21,7 @@ from core.loader import DataCube
 from core.plotting import COMPARE_PANEL_ORDER, HeatmapParams
 from core.processing import background_correct_cube, parse_compare_gate_condition, power_group_title, valley_polarization_cube
 from core.processing_run import save_as_dat
+from core.shg import ShgProcessResult, ShgSettings, ShgSweepData
 
 
 # Match the Streamlit-style export geometry used by the desktop app.
@@ -453,13 +457,66 @@ def export_drr_png_and_dat(
 
 def power_series_export_base(group_key: str, *, y_axis_log: bool) -> str:
     axis_tag = "YLog" if bool(y_axis_log) else "YLin"
-    return f"{safe_stem(group_key)}_PowerDep_{axis_tag}"
+    source_key = str(group_key)
+    if source_key.startswith("csv::"):
+        source_key = Path(source_key[5:]).stem
+    return f"{safe_stem(source_key)}_PowerDep_{axis_tag}"
+
+
+def _power_source_stem(source_key: str) -> str:
+    value = str(source_key)
+    if value.startswith("csv::"):
+        value = Path(value[5:]).stem
+    return safe_stem(value)
+
+
+def _power_record_header_lines(records: Iterable[object]) -> list[str]:
+    record_list = tuple(records)
+    source_files = list(
+        dict.fromkeys(
+            str(getattr(record, "file_name", ""))
+            for record in record_list
+            if str(getattr(record, "file_name", ""))
+        )
+    )
+    table_records = [record for record in record_list if getattr(record, "row_index", None) is not None]
+    lines = [f"power_points={len(record_list)}"]
+    if len(source_files) == 1:
+        lines.append(f"source_csv={source_files[0]}")
+    elif source_files:
+        lines.append(f"source_csvs={';'.join(source_files)}")
+    if table_records:
+        lines.extend(
+            [
+                "power_column=Power_uW",
+                "spectral_axis_source=numeric_header_wavelength_nm_or_energy_eV",
+            ]
+        )
+        stage_columns = list(
+            dict.fromkeys(
+                str(getattr(record, "stage_column", ""))
+                for record in table_records
+                if getattr(record, "stage_column", None)
+            )
+        )
+        if stage_columns:
+            lines.append(f"stage_column={stage_columns[0]}")
+    lines.extend(
+        (
+            f"source[{idx}]={getattr(record, 'file_name', '')}; "
+            f"row={getattr(record, 'row_index', '')}; "
+            f"power_uW={getattr(record, 'power_uW', '')}; "
+            f"stage={getattr(record, 'stage', '')}"
+        )
+        for idx, record in enumerate(record_list)
+    )
+    return lines
 
 
 def power_vp_export_base(kk_group_key: str, kkp_group_key: str, *, y_axis_log: bool) -> str:
     axis_tag = "YLog" if bool(y_axis_log) else "YLin"
-    kk_stem = safe_stem(kk_group_key)
-    kkp_stem = safe_stem(kkp_group_key)
+    kk_stem = _power_source_stem(kk_group_key)
+    kkp_stem = _power_source_stem(kkp_group_key)
     kk_parts = kk_stem.split("_")
     kkp_parts = kkp_stem.split("_")
     n_common = 0
@@ -471,7 +528,7 @@ def power_vp_export_base(kk_group_key: str, kkp_group_key: str, *, y_axis_log: b
     if n_common:
         common = "_".join(kk_parts[:n_common])
         return f"VP_{common}_KK_KKp_PowerDep_{axis_tag}"
-    return f"VP_{safe_stem(kk_group_key, max_len=50)}_{safe_stem(kkp_group_key, max_len=50)}_PowerDep_{axis_tag}"
+    return f"VP_{safe_stem(kk_stem, max_len=50)}_{safe_stem(kkp_stem, max_len=50)}_PowerDep_{axis_tag}"
 
 
 def export_power_series_png_and_dat(
@@ -502,17 +559,106 @@ def export_power_series_png_and_dat(
             f"background_constant={background}",
             "corrected=True",
             "sorted_by=power_uW",
-            *[
-                (
-                    f"source[{idx}]={getattr(record, 'file_name', '')}; "
-                    f"power_uW={getattr(record, 'power_uW', '')}; "
-                    f"stage={getattr(record, 'stage', '')}"
-                )
-                for idx, record in enumerate(records)
-            ],
+            *_power_record_header_lines(records),
         ],
     )
     return {"png": png_path, "dat": dat_path}
+
+
+def export_shg_results(
+    folder: str,
+    *,
+    data: ShgSweepData,
+    result: ShgProcessResult,
+    settings: ShgSettings,
+    processed_name: str = DEFAULT_PROCESSED,
+) -> Dict[str, Path]:
+    """Export a spreadsheet-friendly angle curve and reproducible SHG settings."""
+    out_dir = ensure_processed_dir(folder, processed_name)
+    center_tag = f"{settings.peak_center_nm:g}".replace(".", "p")
+    base = f"{safe_stem(data.source_file)}_SHG_{center_tag}nm_area_vs_measured_angle"
+    csv_path = _unique_path(out_dir, base, ".csv")
+    settings_path = csv_path.with_name(f"{csv_path.stem}_settings.json")
+
+    fields = [
+        "sweep_axis",
+        "target_angle_deg",
+        "measured_angle_deg",
+        "raw_measured_angle_deg",
+        "move_error_deg",
+        "move_ok",
+        "acquisition_ok",
+        "integrated_intensity_counts_nm",
+        "area_uncertainty_counts_nm",
+        "peak_height_counts",
+        "peak_wavelength_nm",
+        "baseline_slope_counts_per_nm",
+        "baseline_at_center_counts",
+        "baseline_rms_counts",
+        "gate_points",
+        "source_csv",
+        "source_row",
+        "included",
+        "quality_flag",
+    ]
+    angle = np.asarray(result.measured_angle_deg, float)
+    order = np.argsort(np.where(np.isfinite(angle), angle, np.inf), kind="stable")
+
+    def _value(array: np.ndarray, index: int) -> object:
+        value = np.asarray(array)[index]
+        if isinstance(value, (np.bool_, bool)):
+            return int(bool(value))
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return value
+        return "" if not np.isfinite(numeric) else f"{numeric:.12g}"
+
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for index in order:
+            idx = int(index)
+            writer.writerow(
+                {
+                    "sweep_axis": data.sweep_axis[idx],
+                    "target_angle_deg": _value(data.target_angle_deg, idx),
+                    "measured_angle_deg": _value(result.measured_angle_deg, idx),
+                    "raw_measured_angle_deg": _value(data.measured_angle_deg, idx),
+                    "move_error_deg": _value(data.move_error_deg, idx),
+                    "move_ok": int(bool(data.move_ok[idx])),
+                    "acquisition_ok": int(bool(data.acquisition_ok[idx])),
+                    "integrated_intensity_counts_nm": _value(result.integrated_area, idx),
+                    "area_uncertainty_counts_nm": _value(result.area_uncertainty, idx),
+                    "peak_height_counts": _value(result.peak_height, idx),
+                    "peak_wavelength_nm": _value(result.peak_wavelength_nm, idx),
+                    "baseline_slope_counts_per_nm": _value(result.baseline_slope, idx),
+                    "baseline_at_center_counts": _value(result.baseline_at_center, idx),
+                    "baseline_rms_counts": _value(result.baseline_rms, idx),
+                    "gate_points": int(result.gate_points[idx]),
+                    "source_csv": data.source_file,
+                    "source_row": int(data.source_rows[idx]),
+                    "included": int(bool(result.included[idx])),
+                    "quality_flag": result.quality_flags[idx],
+                }
+            )
+
+    settings_payload = {
+        "mode": "SHG Processing",
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "source_csv": data.source_file,
+        "background_csv": result.background_file,
+        "detected_columns": data.detected_columns,
+        "wavelength_range_nm": [
+            float(np.nanmin(data.wavelength_nm)),
+            float(np.nanmax(data.wavelength_nm)),
+        ],
+        "acquisition_rows": int(data.spectra.shape[0]),
+        "included_rows": int(np.count_nonzero(result.included)),
+        "settings": settings.to_dict(),
+    }
+    settings_path.write_text(json.dumps(settings_payload, indent=2), encoding="utf-8")
+    return {"csv": csv_path, "settings": settings_path}
 
 
 def export_power_vp_pngs_and_dat(
@@ -597,14 +743,7 @@ def export_power_vp_pngs_and_dat(
                 "corrected=True",
                 f"pairing_mode={pairing_mode}",
                 "power_alignment=stage_pair_average_power" if pairing_mode == "stage" else "power_interpolation_overlap",
-                *[
-                    (
-                        f"source[{idx}]={getattr(record, 'file_name', '')}; "
-                        f"power_uW={getattr(record, 'power_uW', '')}; "
-                        f"stage={getattr(record, 'stage', '')}"
-                    )
-                    for idx, record in enumerate(records)
-                ],
+                *_power_record_header_lines(records),
             ],
         )
         written[f"{label}_png"] = png_path
@@ -651,7 +790,9 @@ def export_power_vp_pngs_and_dat(
                     f"power_KKp={getattr(pair, 'power_kkp', '')}; "
                     f"power_axis_value={getattr(pair, 'power_axis', '')}; "
                     f"KK={getattr(pair, 'kk_file', '')}; "
-                    f"KKp={getattr(pair, 'kkp_file', '')}"
+                    f"KK_row={getattr(pair, 'kk_row', '')}; "
+                    f"KKp={getattr(pair, 'kkp_file', '')}; "
+                    f"KKp_row={getattr(pair, 'kkp_row', '')}"
                 )
                 for idx, pair in enumerate(stage_pairs)
             ],

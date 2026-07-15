@@ -35,6 +35,15 @@ When you choose a data folder, CSV files must be in the folder root (not subfold
 
 ## Usage Notes
 - `PL`: one-file plotting workflow for heatmap + spectrum.
+- `Power Dependent`: select a single header-table CSV containing `Power_uW`, optional
+  `stage_pos`, and numeric wavelength/energy column names. Each row is one power
+  point. Numeric wavelength headers (for example `752.5829`) are converted to
+  photon energy and the rows are sorted by power. Legacy multi-file series with a
+  power token such as `37.96uW` in each filename remain supported.
+- `SHG Processing`: load a wide sweep table containing `measured position`, motion
+  and acquisition status columns, and numeric wavelength headers. The tab removes
+  a per-angle local background around 515 nm, integrates a fixed peak gate, plots
+  intensity versus the measured angle, and exports a sorted CSV plus JSON settings.
 - `DRR`:
   - `Self (last/first frame)` baseline modes.
   - `External` baseline mode from selected baseline files.

@@ -38,6 +38,17 @@ class PowerSeriesFile:
 
 
 @dataclass(frozen=True)
+class PowerSweepPoint:
+    """One spectrum row from a single-file power sweep table."""
+
+    file_name: str
+    power_uW: float
+    stage: float | None
+    row_index: int
+    stage_column: str | None = None
+
+
+@dataclass(frozen=True)
 class PowerStagePair:
     stage: float
     power_kk: float
@@ -45,6 +56,8 @@ class PowerStagePair:
     power_axis: float
     kk_file: str
     kkp_file: str
+    kk_row: int | None = None
+    kkp_row: int | None = None
 
 
 def _parse_power_number(text: str) -> float:
@@ -62,7 +75,10 @@ def _compact_power_group_stem(file_name: str) -> str:
 
 
 def power_group_title(group_key: str) -> str:
-    title = str(group_key).replace("_", " ")
+    raw = str(group_key)
+    if raw.startswith("csv::"):
+        raw = Path(raw[5:]).stem
+    title = raw.replace("_", " ")
     title = re.sub(r"\s+", " ", title).strip()
     return title
 
@@ -460,8 +476,10 @@ def power_valley_polarization_cube(
     return kk_aligned, kkp_aligned, vp_cube
 
 
-def _record_stage_map(records: Sequence[PowerSeriesFile]) -> dict[float, tuple[int, PowerSeriesFile]]:
-    out: dict[float, tuple[int, PowerSeriesFile]] = {}
+def _record_stage_map(
+    records: Sequence[PowerSeriesFile | PowerSweepPoint],
+) -> dict[float, tuple[int, PowerSeriesFile | PowerSweepPoint]]:
+    out: dict[float, tuple[int, PowerSeriesFile | PowerSweepPoint]] = {}
     for idx, record in enumerate(records):
         if record.stage is None:
             continue
@@ -473,9 +491,9 @@ def _record_stage_map(records: Sequence[PowerSeriesFile]) -> dict[float, tuple[i
 
 def power_stage_paired_vp_cubes(
     kk_cube: DataCube,
-    kk_records: Sequence[PowerSeriesFile],
+    kk_records: Sequence[PowerSeriesFile | PowerSweepPoint],
     kkp_cube: DataCube,
-    kkp_records: Sequence[PowerSeriesFile],
+    kkp_records: Sequence[PowerSeriesFile | PowerSweepPoint],
     *,
     background: float,
     title: str = "Power VP",
@@ -510,6 +528,8 @@ def power_stage_paired_vp_cubes(
                 power_axis=float(power_axis),
                 kk_file=kk_record.file_name,
                 kkp_file=kkp_record.file_name,
+                kk_row=getattr(kk_record, "row_index", None),
+                kkp_row=getattr(kkp_record, "row_index", None),
             )
         )
         kk_rows.append(np.asarray(kk_corr[kk_idx, :], float))

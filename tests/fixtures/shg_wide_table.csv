@@ -1,0 +1,3 @@
+sweep_axis,target_value,measured position,move_error,value_unit,move_attempts,move_ok,acquisition_ok,Vbg_set,Vbg_meas,Vtg_set,Vtg_meas,Vbias_set,Vbias_meas,Ibg,Itg,Ibias,508.0,510.0,512.0,514.0,515.0,516.0,518.0,520.0,522.0
+rot1,1,0.9919,0.0081,deg,1,1,1,0,0,0,0,0,0,6e-7,-6e-7,0,786,790,794,818,900,822,806,810,814
+rot1,0,-0.0025,0.0025,deg,1,0,1,0,0,0,0,0,0,6e-7,-6e-7,0,786,790,794,808,850,812,806,810,814

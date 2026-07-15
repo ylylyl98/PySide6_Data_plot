@@ -58,6 +58,7 @@ from core.export import (
     export_pl_pngs_and_dat,
     export_power_series_png_and_dat,
     export_power_vp_pngs_and_dat,
+    export_shg_results,
     vp_compare_export_base,
     vp_compare_title,
 )
@@ -79,6 +80,7 @@ from core.processing import (
     parse_compare_gate_condition,
     valley_polarization_cube,
 )
+from core.shg import ShgProcessResult, ShgSettings, ShgSweepData, process_shg_sweep
 
 UI_METRICS = {
     "left_max_width": 500,
@@ -109,6 +111,9 @@ class LoadedState:
     power_records: tuple[Any, ...] = ()
     power_groups: Dict[str, tuple[Any, ...]] = field(default_factory=dict)
     power_group_key: str = ""
+    shg_data: ShgSweepData | None = None
+    shg_background: ShgSweepData | None = None
+    shg_result: ShgProcessResult | None = None
     drr_mode_label: str = "DR/R Self"
     drr_derivative_label: str = "None"
     drr_baseline_text: str = "Self (last frame)"
@@ -129,6 +134,7 @@ class LoadOptions:
     y_axis_spec: str = "auto"
     compare_sources: Dict[str, str] = field(default_factory=dict)
     power_group_key: str = ""
+    shg_settings: ShgSettings | None = None
 
 
 def _vp_short_title(kk_title: str, kkp_title: str) -> str:
@@ -159,7 +165,7 @@ def _vp_short_title(kk_title: str, kkp_title: str) -> str:
 @dataclass(frozen=True)
 class ExportOptions:
     mode: str
-    params: HeatmapParams
+    params: HeatmapParams | None
     params_linear: HeatmapParams | None = None
     params_log: HeatmapParams | None = None
     params_intensity: HeatmapParams | None = None
@@ -182,6 +188,7 @@ class ExportOptions:
     power_kkp_records: tuple[Any, ...] = ()
     power_pairing_mode: str = "stage"
     power_stage_pairs: tuple[Any, ...] = ()
+    shg_settings: ShgSettings | None = None
     auto_move_sources: bool = False
 
 
@@ -263,6 +270,10 @@ class MainWindow(QMainWindow):
         self._power_active_export_cube: DataCube | None = None
         self._power_active_records: tuple[Any, ...] = ()
         self._power_selected_row_index: int | None = None
+        self._shg_raw_ax = None
+        self._shg_corrected_ax = None
+        self._shg_angle_ax = None
+        self._shg_selected_index: int | None = None
         self._pl_last_plot_cube: DataCube | None = None
         self._gate_line = None
         self._pl_gate_line = None
@@ -586,6 +597,10 @@ class MainWindow(QMainWindow):
         self.drr_selected_files = list(selected_names)
         self._update_drr_selection_labels()
         self._power_refresh_groups()
+        self._shg_refresh_sources()
+        shg_index = self.shg_file_combo.findData(selected_names[0])
+        if shg_index >= 0:
+            self.shg_file_combo.setCurrentIndex(shg_index)
 
         if len(selected_names) == 1:
             extra = " Ignored 1 non-CSV file." if ignored_count == 1 else f" Ignored {ignored_count} non-CSV files." if ignored_count else ""
@@ -686,6 +701,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_drr_tab(), "DRR")
         self.tabs.addTab(self._build_compare_tab(), "Compare")
         self.tabs.addTab(self._build_power_tab(), "Power Dependent")
+        self.tabs.addTab(self._build_shg_tab(), "SHG Processing")
         self.tabs.addTab(self._build_tools_tab(), "Log / Tools")
         layout.addWidget(self.tabs, 1)
         return box
@@ -1592,22 +1608,143 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         return tab
 
+    def _build_shg_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        data_box = QGroupBox("SHG Sweep Table")
+        data_form = QFormLayout(data_box)
+        data_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
+        data_form.setSpacing(6)
+        self.shg_file_combo = QComboBox()
+        self.shg_background_combo = QComboBox()
+        self._style_combo_popup(self.shg_file_combo)
+        self._style_combo_popup(self.shg_background_combo)
+        self.shg_detect_btn = QPushButton("Detect")
+        self.shg_detect_btn.setToolTip("Detect wide CSV tables with measured position and numeric wavelength headers.")
+        source_row = QWidget()
+        source_layout = QHBoxLayout(source_row)
+        source_layout.setContentsMargins(0, 0, 0, 0)
+        source_layout.setSpacing(6)
+        source_layout.addWidget(self.shg_file_combo, 1)
+        source_layout.addWidget(self.shg_detect_btn)
+        self.shg_summary = QPlainTextEdit()
+        self.shg_summary.setReadOnly(True)
+        self.shg_summary.setMaximumHeight(105)
+        data_form.addRow("Sweep CSV", source_row)
+        data_form.addRow("Background", self.shg_background_combo)
+        data_form.addRow("Summary", self.shg_summary)
+        self._set_form_label_width(data_form, UI_METRICS["label_col_width"])
+        layout.addWidget(self._make_expander("Data", data_box, expanded=True))
+
+        def wavelength_spin(value: float) -> QDoubleSpinBox:
+            spin = QDoubleSpinBox()
+            spin.setDecimals(4)
+            spin.setRange(0.0, 5000.0)
+            spin.setSingleStep(0.1)
+            spin.setValue(value)
+            spin.setFixedWidth(UI_METRICS["spin_w"] + 12)
+            return spin
+
+        integration = QGroupBox("515 nm Integration")
+        integration_form = QFormLayout(integration)
+        integration_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
+        integration_form.setSpacing(6)
+        self.shg_peak_center_spin = wavelength_spin(515.0)
+        self.shg_gate_min_spin = wavelength_spin(513.0)
+        self.shg_gate_max_spin = wavelength_spin(517.0)
+        self.shg_left_min_spin = wavelength_spin(508.0)
+        self.shg_left_max_spin = wavelength_spin(512.0)
+        self.shg_right_min_spin = wavelength_spin(518.0)
+        self.shg_right_max_spin = wavelength_spin(522.0)
+        self.shg_background_method_combo = QComboBox()
+        self.shg_background_method_combo.addItems(
+            ["Local linear", "Local quadratic", "External + local residual", "None"]
+        )
+        self._style_combo_popup(self.shg_background_method_combo)
+        self.shg_sigma_clip_spin = QDoubleSpinBox()
+        self.shg_sigma_clip_spin.setDecimals(1)
+        self.shg_sigma_clip_spin.setRange(1.0, 10.0)
+        self.shg_sigma_clip_spin.setSingleStep(0.5)
+        self.shg_sigma_clip_spin.setValue(3.0)
+        self.shg_sigma_clip_spin.setFixedWidth(UI_METRICS["spin_w"])
+
+        def range_row(left: QDoubleSpinBox, right: QDoubleSpinBox) -> QWidget:
+            widget = QWidget()
+            row_layout = QHBoxLayout(widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
+            row_layout.addWidget(left)
+            row_layout.addWidget(QLabel("to"))
+            row_layout.addWidget(right)
+            row_layout.addWidget(QLabel("nm"))
+            row_layout.addStretch(1)
+            return widget
+
+        center_row = QWidget()
+        center_layout = QHBoxLayout(center_row)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(6)
+        center_layout.addWidget(self.shg_peak_center_spin)
+        center_layout.addWidget(QLabel("nm"))
+        center_layout.addStretch(1)
+        integration_form.addRow("Peak center", center_row)
+        integration_form.addRow("Peak gate", range_row(self.shg_gate_min_spin, self.shg_gate_max_spin))
+        integration_form.addRow("Left sideband", range_row(self.shg_left_min_spin, self.shg_left_max_spin))
+        integration_form.addRow("Right sideband", range_row(self.shg_right_min_spin, self.shg_right_max_spin))
+        integration_form.addRow("Background", self.shg_background_method_combo)
+        integration_form.addRow("Sigma clip", self.shg_sigma_clip_spin)
+        self._set_form_label_width(integration_form, UI_METRICS["label_col_width"])
+        layout.addWidget(self._make_expander("Peak Integration", integration, expanded=True))
+
+        angle_box = QGroupBox("Measured Angle")
+        angle_form = QFormLayout(angle_box)
+        angle_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
+        angle_form.setSpacing(6)
+        self.shg_angle_scale_spin = QDoubleSpinBox()
+        self.shg_angle_scale_spin.setDecimals(6)
+        self.shg_angle_scale_spin.setRange(-1.0e6, 1.0e6)
+        self.shg_angle_scale_spin.setValue(1.0)
+        self.shg_angle_offset_spin = QDoubleSpinBox()
+        self.shg_angle_offset_spin.setDecimals(6)
+        self.shg_angle_offset_spin.setRange(-1.0e6, 1.0e6)
+        self.shg_angle_offset_spin.setValue(0.0)
+        self.shg_angle_wrap_combo = QComboBox()
+        self.shg_angle_wrap_combo.addItems(["None", "0-180°", "0-360°"])
+        self._style_combo_popup(self.shg_angle_wrap_combo)
+        self.shg_include_failed_chk = QCheckBox("Include move/acquisition failures")
+        self.shg_angle_cursor_spin = QDoubleSpinBox()
+        self.shg_angle_cursor_spin.setDecimals(6)
+        self.shg_angle_cursor_spin.setRange(-1.0e9, 1.0e9)
+        self.shg_angle_cursor_spin.setSingleStep(1.0)
+        angle_form.addRow("Scale", self.shg_angle_scale_spin)
+        angle_form.addRow("Offset (deg)", self.shg_angle_offset_spin)
+        angle_form.addRow("Wrap", self.shg_angle_wrap_combo)
+        angle_form.addRow("Rows", self.shg_include_failed_chk)
+        angle_form.addRow("Selected angle", self.shg_angle_cursor_spin)
+        self._set_form_label_width(angle_form, UI_METRICS["label_col_width"])
+        layout.addWidget(self._make_expander("Angle", angle_box, expanded=False))
+        layout.addStretch(1)
+        return tab
+
     def _build_power_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        grouping = QGroupBox("Auto Groups")
+        grouping = QGroupBox("Power Sweep Files")
         grouping_form = QFormLayout(grouping)
         grouping_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
         grouping_form.setHorizontalSpacing(6)
         grouping_form.setVerticalSpacing(UI_METRICS["row_spacing"])
         self.power_group_combo = QComboBox()
         self._style_combo_popup(self.power_group_combo)
-        self.power_group_combo.setToolTip("Detected groups differ only by power and Stage number.")
-        self.power_refresh_groups_btn = QPushButton("Auto Detect")
-        self.power_refresh_groups_btn.setToolTip("Rebuild groups from selected files, or all files when none are selected.")
+        self.power_group_combo.setToolTip("Select a full-sweep CSV with Power_uW, or a legacy filename-based series.")
+        self.power_refresh_groups_btn = QPushButton("Detect")
+        self.power_refresh_groups_btn.setToolTip("Detect Power_uW tables and legacy filename-based power series.")
         group_row = QWidget()
         group_h = QHBoxLayout(group_row)
         group_h.setContentsMargins(0, 0, 0, 0)
@@ -1621,13 +1758,13 @@ class MainWindow(QMainWindow):
         self.power_kkp_group_combo = QComboBox()
         self._style_combo_popup(self.power_kk_group_combo)
         self._style_combo_popup(self.power_kkp_group_combo)
-        self.power_kk_group_combo.setToolTip("Power group to treat as KK in VP view.")
-        self.power_kkp_group_combo.setToolTip("Power group to treat as KKp in VP view.")
-        grouping_form.addRow("Group", group_row)
+        self.power_kk_group_combo.setToolTip("Power-sweep source to treat as KK in VP view.")
+        self.power_kkp_group_combo.setToolTip("Power-sweep source to treat as KKp in VP view.")
+        grouping_form.addRow("Intensity", group_row)
         grouping_form.addRow("Summary", self.power_group_summary)
-        grouping_form.addRow("KK group", self.power_kk_group_combo)
-        grouping_form.addRow("KKp group", self.power_kkp_group_combo)
-        layout.addWidget(self._make_expander("Power Groups", grouping, expanded=True))
+        grouping_form.addRow("KK sweep", self.power_kk_group_combo)
+        grouping_form.addRow("KKp sweep", self.power_kkp_group_combo)
+        layout.addWidget(self._make_expander("Power Sweep Files", grouping, expanded=True))
 
         params = QWidget()
         params_layout = QVBoxLayout(params)
@@ -1723,6 +1860,125 @@ class MainWindow(QMainWindow):
     def _cmp_assign_candidate_files(self) -> list[str]:
         return list(self.available_files)
 
+    def _shg_selected_file(self) -> str:
+        return str(self.shg_file_combo.currentData() or "") if hasattr(self, "shg_file_combo") else ""
+
+    def _shg_background_file(self) -> str:
+        return str(self.shg_background_combo.currentData() or "") if hasattr(self, "shg_background_combo") else ""
+
+    def _shg_refresh_sources(self) -> None:
+        if not hasattr(self, "shg_file_combo"):
+            return
+        old_source = self._shg_selected_file()
+        old_background = self._shg_background_file()
+        candidates = data_io.list_shg_csv_files(self.current_folder, self.available_files)
+        source_blocked = self.shg_file_combo.blockSignals(True)
+        background_blocked = self.shg_background_combo.blockSignals(True)
+        try:
+            self.shg_file_combo.clear()
+            self.shg_background_combo.clear()
+            self.shg_background_combo.addItem("— None —", "")
+            for file_name in candidates:
+                self.shg_file_combo.addItem(file_name, file_name)
+                self.shg_background_combo.addItem(file_name, file_name)
+            source_index = self.shg_file_combo.findData(old_source)
+            if source_index < 0 and self.shg_file_combo.count():
+                source_index = 0
+            if source_index >= 0:
+                self.shg_file_combo.setCurrentIndex(source_index)
+            background_index = self.shg_background_combo.findData(old_background)
+            self.shg_background_combo.setCurrentIndex(background_index if background_index >= 0 else 0)
+        finally:
+            self.shg_file_combo.blockSignals(source_blocked)
+            self.shg_background_combo.blockSignals(background_blocked)
+        self._shg_update_background_controls()
+        self._shg_update_summary()
+
+    def _shg_settings_from_ui(self) -> ShgSettings:
+        method_map = {
+            "Local linear": "local_linear",
+            "Local quadratic": "local_quadratic",
+            "External + local residual": "external",
+            "None": "none",
+        }
+        wrap_map = {"None": None, "0-180°": 180.0, "0-360°": 360.0}
+        return ShgSettings(
+            peak_center_nm=float(self.shg_peak_center_spin.value()),
+            gate_min_nm=float(self.shg_gate_min_spin.value()),
+            gate_max_nm=float(self.shg_gate_max_spin.value()),
+            left_min_nm=float(self.shg_left_min_spin.value()),
+            left_max_nm=float(self.shg_left_max_spin.value()),
+            right_min_nm=float(self.shg_right_min_spin.value()),
+            right_max_nm=float(self.shg_right_max_spin.value()),
+            background_method=method_map.get(self.shg_background_method_combo.currentText(), "local_linear"),
+            sigma_clip=float(self.shg_sigma_clip_spin.value()),
+            angle_scale=float(self.shg_angle_scale_spin.value()),
+            angle_offset_deg=float(self.shg_angle_offset_spin.value()),
+            angle_wrap_deg=wrap_map.get(self.shg_angle_wrap_combo.currentText()),
+            include_failed_rows=bool(self.shg_include_failed_chk.isChecked()),
+        )
+
+    def _shg_update_background_controls(self) -> None:
+        if hasattr(self, "shg_background_combo"):
+            self.shg_background_combo.setEnabled(
+                self.shg_background_method_combo.currentText() == "External + local residual"
+            )
+
+    def _shg_update_summary(self) -> None:
+        if not hasattr(self, "shg_summary"):
+            return
+        if self.loaded and self.loaded.mode == "SHG Processing" and self.loaded.shg_result is not None:
+            result = self.loaded.shg_result
+            data = result.data
+            included = int(np.count_nonzero(result.included))
+            failures = len(result.quality_flags) - included
+            measured_column = data.detected_columns.get("measured_angle", "measured position")
+            lines = [
+                data.source_file,
+                f"{data.spectra.shape[0]} acquisitions, {data.wavelength_nm.size} wavelengths",
+                f"Wavelength: {float(np.nanmin(data.wavelength_nm)):.6g}-{float(np.nanmax(data.wavelength_nm)):.6g} nm",
+                f"Angle column: {measured_column}; included: {included}; excluded/warned: {failures}",
+            ]
+            self.shg_summary.setPlainText("\n".join(lines))
+            return
+        candidates = data_io.list_shg_csv_files(self.current_folder, self.available_files)
+        if candidates:
+            self.shg_summary.setPlainText(
+                f"Detected {len(candidates)} SHG sweep table(s).\nAngle: measured position; spectra: numeric wavelength headers."
+            )
+        else:
+            self.shg_summary.setPlainText(
+                "No SHG tables detected. Expected measured position plus numeric wavelength headers."
+            )
+
+    def _on_shg_source_changed(self) -> None:
+        self._invalidate_export_move_sources()
+        self._shg_update_summary()
+        if self.loaded and self.loaded.mode == "SHG Processing":
+            self._start_load("SHG Processing")
+
+    def _on_shg_param_changed(self) -> None:
+        self._invalidate_export_move_sources()
+        self._shg_update_background_controls()
+        if self.loaded and self.loaded.mode == "SHG Processing":
+            self._plot_mode("SHG Processing")
+
+    def _on_shg_background_method_changed(self) -> None:
+        self._invalidate_export_move_sources()
+        self._shg_update_background_controls()
+        if not self.loaded or self.loaded.mode != "SHG Processing":
+            return
+        if self.shg_background_method_combo.currentText() == "External + local residual":
+            selected = self._shg_background_file()
+            if not selected:
+                self._status("Select an SHG background CSV for external background mode.")
+                return
+            loaded_name = self.loaded.shg_background.source_file if self.loaded.shg_background is not None else ""
+            if loaded_name != selected:
+                self._start_load("SHG Processing")
+                return
+        self._plot_mode("SHG Processing")
+
     def _power_candidate_files(self) -> list[str]:
         return list(self.available_files)
 
@@ -1764,10 +2020,10 @@ class MainWindow(QMainWindow):
     def _power_role_group_key(self, role: str) -> str:
         combo = self.power_kk_group_combo if role == "KK" else self.power_kkp_group_combo
         data = combo.currentData()
-        return str(data) if data else str(combo.currentText()).strip()
+        return str(data or "")
 
-    def _power_current_groups(self) -> Dict[str, tuple[Any, ...]]:
-        return data_io.get_power_series_groups(self._power_candidate_files())
+    def _power_current_sources(self) -> Dict[str, data_io.PowerSeriesSource]:
+        return data_io.get_power_series_sources(self.current_folder, self._power_candidate_files())
 
     def _power_refresh_groups(self) -> None:
         if not hasattr(self, "power_group_combo"):
@@ -1775,7 +2031,7 @@ class MainWindow(QMainWindow):
         old_key = self._power_selected_group_key()
         old_kk = self._power_role_group_key("KK") if hasattr(self, "power_kk_group_combo") else ""
         old_kkp = self._power_role_group_key("KKp") if hasattr(self, "power_kkp_group_combo") else ""
-        groups = self._power_current_groups()
+        sources = self._power_current_sources()
         old = self.power_group_combo.blockSignals(True)
         old_role_blocks: list[tuple[QComboBox, bool]] = []
         if hasattr(self, "power_kk_group_combo"):
@@ -1788,13 +2044,21 @@ class MainWindow(QMainWindow):
             if hasattr(self, "power_kk_group_combo"):
                 self.power_kk_group_combo.clear()
                 self.power_kkp_group_combo.clear()
-            ordered_groups = sorted(groups.items(), key=lambda item: (-len(item[1]), item[0]))
-            for key, records in ordered_groups:
-                powers = [float(getattr(record, "power_uW", 0.0)) for record in records]
-                if powers:
-                    label = f"{power_group_title(key)}  ({len(records)} files, {min(powers):.4g}-{max(powers):.4g} uW)"
+                self.power_kk_group_combo.addItem("— Not assigned —", "")
+                self.power_kkp_group_combo.addItem("— Not assigned —", "")
+            ordered_sources = sorted(
+                sources.items(),
+                key=lambda item: (0 if item[1].source_format == "table" else 1, item[1].title.lower()),
+            )
+            for key, source in ordered_sources:
+                if source.source_format == "table":
+                    label = f"{source.file_name}  (Power_uW table)"
                 else:
-                    label = f"{power_group_title(key)}  ({len(records)} files)"
+                    powers = [float(record.power_uW) for record in source.records]
+                    if powers:
+                        label = f"{source.title}  ({len(source.records)} files, {min(powers):.4g}-{max(powers):.4g} uW)"
+                    else:
+                        label = f"{source.title}  ({len(source.records)} files)"
                 self.power_group_combo.addItem(label, key)
                 if hasattr(self, "power_kk_group_combo"):
                     self.power_kk_group_combo.addItem(label, key)
@@ -1804,13 +2068,12 @@ class MainWindow(QMainWindow):
                 if idx >= 0:
                     self.power_group_combo.setCurrentIndex(idx)
             if hasattr(self, "power_kk_group_combo"):
-                keys = [key for key, _records in ordered_groups]
                 kk_idx = self.power_kk_group_combo.findData(old_kk)
                 if kk_idx < 0:
-                    kk_idx = 0 if keys else -1
+                    kk_idx = 0
                 kkp_idx = self.power_kkp_group_combo.findData(old_kkp)
                 if kkp_idx < 0:
-                    kkp_idx = 1 if len(keys) > 1 else (0 if keys else -1)
+                    kkp_idx = 0
                 if kk_idx >= 0:
                     self.power_kk_group_combo.setCurrentIndex(kk_idx)
                 if kkp_idx >= 0:
@@ -1825,19 +2088,46 @@ class MainWindow(QMainWindow):
     def _power_update_group_summary(self) -> None:
         if not hasattr(self, "power_group_summary"):
             return
-        groups = self._power_current_groups()
+        sources = self._power_current_sources()
         key = self._power_selected_group_key()
-        records = groups.get(key, ())
-        if not records and groups:
-            key, records = next(iter(sorted(groups.items(), key=lambda item: (-len(item[1]), item[0]))))
-        if not records:
-            self.power_group_summary.setPlainText("No power groups found.")
+        source = sources.get(key)
+        if source is None and sources:
+            source = next(iter(sources.values()))
+            key = source.key
+        if source is None:
+            self.power_group_summary.setPlainText(
+                "No power sweeps found. Expected a Power_uW table or filenames containing values such as 37.96uW."
+            )
             return
-        lines = [f"{power_group_title(key)}", f"{len(records)} files sorted by power:"]
+        if source.source_format == "table":
+            try:
+                result = data_io.load_power_series_cube(
+                    self.current_folder,
+                    self._power_candidate_files(),
+                    group_key=key,
+                    y_axis="auto",
+                )
+            except Exception as exc:
+                self.power_group_summary.setPlainText(f"{source.file_name}\nInvalid power table: {exc}")
+                return
+            records = result.records
+            cube = result.cube
+            stages = [record.stage for record in records if getattr(record, "stage", None) is not None]
+            lines = [
+                f"{source.file_name}",
+                f"{len(records)} power rows: {float(np.nanmin(cube.gate)):.6g}-{float(np.nanmax(cube.gate)):.6g} uW",
+                f"{len(cube.energy)} spectral points: {float(np.nanmin(cube.energy)):.6g}-{float(np.nanmax(cube.energy)):.6g} eV",
+                f"stage_pos: {'available' if stages else 'not available'}",
+            ]
+        else:
+            records = source.records
+            lines = [f"{source.title}", f"{len(records)} legacy files sorted by power:"]
         for record in records[:8]:
             stage = getattr(record, "stage", None)
             stage_text = "" if stage is None else f", Stage {stage:g}"
-            lines.append(f"{getattr(record, 'power_uW', 0.0):.6g} uW{stage_text} -> {getattr(record, 'file_name', '')}")
+            row = getattr(record, "row_index", None)
+            row_text = "" if row is None else f", row {row}"
+            lines.append(f"{getattr(record, 'power_uW', 0.0):.6g} uW{stage_text}{row_text}")
         if len(records) > 8:
             lines.append(f"+{len(records) - 8} more")
         if hasattr(self, "power_kk_group_combo") and self._power_has_distinct_role_groups():
@@ -1883,9 +2173,9 @@ class MainWindow(QMainWindow):
         kk_key = self._power_role_group_key("KK")
         kkp_key = self._power_role_group_key("KKp")
         if not kk_key or not kkp_key:
-            raise ValueError("Assign KK and KKp power groups.")
+            raise ValueError("Assign KK and KKp power-sweep sources.")
         if kk_key == kkp_key:
-            raise ValueError("KK and KKp must use different power groups.")
+            raise ValueError("KK and KKp must use different power-sweep sources.")
         kk_result = self._power_load_group_result(kk_key)
         kkp_result = self._power_load_group_result(kkp_key)
         return kk_result, kkp_result, kk_key, kkp_key
@@ -1901,6 +2191,30 @@ class MainWindow(QMainWindow):
             self.power_view_vp_btn.setEnabled(has_distinct)
         if not has_distinct and self._power_view() == "VP":
             self._power_set_view_mode("Intensity")
+        if hasattr(self, "power_pair_mode_combo"):
+            stage_available = False
+            if has_distinct:
+                try:
+                    kk_result, kkp_result, _kk_key, _kkp_key = self._power_role_payload()
+                    kk_stages = {float(record.stage) for record in kk_result.records if record.stage is not None}
+                    kkp_stages = {float(record.stage) for record in kkp_result.records if record.stage is not None}
+                    stage_available = bool(kk_stages & kkp_stages)
+                except Exception:
+                    stage_available = False
+            item = self.power_pair_mode_combo.model().item(0)
+            if item is not None:
+                item.setEnabled(stage_available)
+            if not stage_available and self.power_pair_mode_combo.currentIndex() == 0:
+                blocked = self.power_pair_mode_combo.blockSignals(True)
+                try:
+                    self.power_pair_mode_combo.setCurrentIndex(1)
+                finally:
+                    self.power_pair_mode_combo.blockSignals(blocked)
+            self.power_pair_mode_combo.setToolTip(
+                "Pair matching stage_pos rows, or interpolate by Power_uW."
+                if stage_available
+                else "Stage pairing needs shared stage_pos values; Power Interpolation is selected."
+            )
 
     def _power_vp_payload(self) -> tuple[DataCube, DataCube, DataCube, tuple[Any, ...], tuple[Any, ...], str, str, float, str, tuple[Any, ...]]:
         kk_result, kkp_result, kk_key, kkp_key = self._power_role_payload()
@@ -2435,8 +2749,8 @@ class MainWindow(QMainWindow):
         self.cmp_auto_y_btn.clicked.connect(self._auto_cmp_yrange)
         self.power_refresh_groups_btn.clicked.connect(self._power_refresh_groups)
         self.power_group_combo.currentIndexChanged.connect(lambda _idx: self._on_power_plot_param_changed())
-        self.power_kk_group_combo.currentIndexChanged.connect(lambda _idx: self._on_power_plot_param_changed())
-        self.power_kkp_group_combo.currentIndexChanged.connect(lambda _idx: self._on_power_plot_param_changed())
+        self.power_kk_group_combo.currentIndexChanged.connect(lambda _idx: self._on_power_source_assignment_changed())
+        self.power_kkp_group_combo.currentIndexChanged.connect(lambda _idx: self._on_power_source_assignment_changed())
         self.power_view_intensity_btn.clicked.connect(lambda: self._on_power_plot_view_button_clicked("Intensity"))
         self.power_view_vp_btn.clicked.connect(lambda: self._on_power_plot_view_button_clicked("VP"))
         self.power_axis_scale_combo.currentTextChanged.connect(self._on_power_axis_scale_changed)
@@ -2451,6 +2765,26 @@ class MainWindow(QMainWindow):
         self.power_auto_v_btn.clicked.connect(self._auto_power_vrange)
         self.power_auto_x_btn.clicked.connect(self._auto_power_xrange)
         self.power_auto_y_btn.clicked.connect(self._auto_power_yrange)
+        self.shg_detect_btn.clicked.connect(self._shg_refresh_sources)
+        self.shg_file_combo.currentIndexChanged.connect(lambda _idx: self._on_shg_source_changed())
+        self.shg_background_combo.currentIndexChanged.connect(lambda _idx: self._on_shg_source_changed())
+        self.shg_background_method_combo.currentTextChanged.connect(lambda _text: self._on_shg_background_method_changed())
+        self.shg_angle_wrap_combo.currentTextChanged.connect(lambda _text: self._on_shg_param_changed())
+        self.shg_include_failed_chk.toggled.connect(lambda _checked: self._on_shg_param_changed())
+        self.shg_angle_cursor_spin.valueChanged.connect(lambda _value: self._on_shg_param_changed())
+        for spin in (
+            self.shg_peak_center_spin,
+            self.shg_gate_min_spin,
+            self.shg_gate_max_spin,
+            self.shg_left_min_spin,
+            self.shg_left_max_spin,
+            self.shg_right_min_spin,
+            self.shg_right_max_spin,
+            self.shg_sigma_clip_spin,
+            self.shg_angle_scale_spin,
+            self.shg_angle_offset_spin,
+        ):
+            spin.editingFinished.connect(self._on_shg_param_changed)
         self.drr_yaxis_combo.currentTextChanged.connect(self._on_drr_plot_param_changed)
         self.drr_yaxis_a_spin.valueChanged.connect(self._on_drr_plot_param_changed)
         self.drr_yaxis_b_spin.valueChanged.connect(self._on_drr_plot_param_changed)
@@ -2498,6 +2832,7 @@ class MainWindow(QMainWindow):
         self._cmp_update_assignment_summary()
         self._power_refresh_groups()
         self._power_update_view_mode()
+        self._shg_refresh_sources()
         if hasattr(self, "power_background_spin"):
             self.power_background_spin.setEnabled(not self._power_background_auto_enabled())
         self._update_plot_view_bar_visibility()
@@ -2562,7 +2897,7 @@ class MainWindow(QMainWindow):
 
     def _active_mode(self) -> str | None:
         text = self.tabs.tabText(self.tabs.currentIndex())
-        return text if text in {"PL", "DRR", "Compare", "Power Dependent"} else None
+        return text if text in {"PL", "DRR", "Compare", "Power Dependent", "SHG Processing"} else None
 
     def _toolbar_load(self) -> None:
         mode = self._active_mode()
@@ -2608,6 +2943,13 @@ class MainWindow(QMainWindow):
     def _on_power_plot_param_changed(self) -> None:
         self._invalidate_export_move_sources()
         self._power_update_group_summary()
+        if self.loaded and self.loaded.mode == "Power Dependent":
+            self._plot_mode("Power Dependent")
+
+    def _on_power_source_assignment_changed(self) -> None:
+        self._invalidate_export_move_sources()
+        self._power_update_group_summary()
+        self._power_update_vp_availability()
         if self.loaded and self.loaded.mode == "Power Dependent":
             self._plot_mode("Power Dependent")
 
@@ -2695,6 +3037,10 @@ class MainWindow(QMainWindow):
         self.drr_selected_files = [path.name]
         self._update_drr_selection_labels()
         self._power_refresh_groups()
+        self._shg_refresh_sources()
+        shg_index = self.shg_file_combo.findData(path.name)
+        if shg_index >= 0:
+            self.shg_file_combo.setCurrentIndex(shg_index)
         self._status(f"Selected {path.name}")
 
     def _restore_list_selection(self, widget: QListWidget, names: List[str]) -> None:
@@ -2715,6 +3061,7 @@ class MainWindow(QMainWindow):
         self._restore_list_selection(self.pl_files, [f for f in pl_selected if f in self.available_files])
         self._cmp_set_channel_combo_items()
         self._power_refresh_groups()
+        self._shg_refresh_sources()
         self.drr_selected_files = [f for f in self.drr_selected_files if f in self.available_files]
         self.drr_baseline_files_manual = [f for f in self.drr_baseline_files_manual if f in self.available_files]
         self.drr_baseline_files_found = [f for f in self.drr_baseline_files_found if f in self.available_files]
@@ -3204,6 +3551,9 @@ class MainWindow(QMainWindow):
             self._show_error("Choose a folder first.")
             return
         self._invalidate_export_move_sources()
+        compare_sources: Dict[str, str] = {}
+        power_group_key = ""
+        shg_settings: ShgSettings | None = None
 
         if mode == "PL":
             selected = self._selected(self.pl_files)
@@ -3238,6 +3588,21 @@ class MainWindow(QMainWindow):
             drr_baseline_which = "last"
             y_axis_spec = self._selected_y_axis_spec("cmp")
             power_group_key = ""
+        elif mode == "SHG Processing":
+            source_file = self._shg_selected_file()
+            shg_settings = self._shg_settings_from_ui()
+            background_file = (
+                self._shg_background_file()
+                if shg_settings.background_method == "external"
+                else ""
+            )
+            selected = [source_file] if source_file else []
+            baselines = [background_file] if background_file else []
+            pl_log = False
+            cmp_log = False
+            drr_baseline = "Self (last frame)"
+            drr_baseline_which = "last"
+            y_axis_spec = "auto"
         else:
             selected = self._power_candidate_files()
             compare_sources = {}
@@ -3265,6 +3630,7 @@ class MainWindow(QMainWindow):
             y_axis_spec=y_axis_spec,
             compare_sources=compare_sources,
             power_group_key=power_group_key,
+            shg_settings=shg_settings,
         )
 
         self._set_stage("Loading...")
@@ -3345,11 +3711,32 @@ class MainWindow(QMainWindow):
                 mode="Power Dependent",
                 folder=folder,
                 primary_file=(result.records[0].file_name if result.records else None),
-                selected_files=[record.file_name for record in result.records],
+                selected_files=list(dict.fromkeys(record.file_name for record in result.records)),
                 cube=result.cube,
                 power_records=result.records,
                 power_groups=result.groups,
                 power_group_key=result.group_key,
+                y_axis_spec="auto",
+            )
+
+        if mode == "SHG Processing":
+            settings = options.shg_settings or ShgSettings()
+            data = data_io.load_shg_sweep(folder, options.selected_files[0])
+            background = (
+                data_io.load_shg_sweep(folder, options.baseline_files[0])
+                if options.baseline_files
+                else None
+            )
+            result = process_shg_sweep(data, settings, background=background)
+            return LoadedState(
+                mode="SHG Processing",
+                folder=folder,
+                primary_file=data.source_file,
+                selected_files=[data.source_file],
+                baseline_files=([background.source_file] if background is not None else []),
+                shg_data=data,
+                shg_background=background,
+                shg_result=result,
                 y_axis_spec="auto",
             )
 
@@ -3374,6 +3761,20 @@ class MainWindow(QMainWindow):
             idx = self.power_group_combo.findData(loaded.power_group_key)
             if idx >= 0:
                 self.power_group_combo.setCurrentIndex(idx)
+        if loaded.mode == "SHG Processing" and loaded.shg_result is not None:
+            self._shg_refresh_sources()
+            source_index = self.shg_file_combo.findData(loaded.primary_file or "")
+            if source_index >= 0:
+                blocked = self.shg_file_combo.blockSignals(True)
+                self.shg_file_combo.setCurrentIndex(source_index)
+                self.shg_file_combo.blockSignals(blocked)
+            finite = np.flatnonzero(np.isfinite(loaded.shg_result.measured_angle_deg))
+            if finite.size:
+                included = finite[loaded.shg_result.included[finite]]
+                selected = int(included[0] if included.size else finite[0])
+                blocked = self.shg_angle_cursor_spin.blockSignals(True)
+                self.shg_angle_cursor_spin.setValue(float(loaded.shg_result.measured_angle_deg[selected]))
+                self.shg_angle_cursor_spin.blockSignals(blocked)
         self._apply_auto_limits_for_loaded()
         self._set_stage("Loaded")
         self._update_action_states()
@@ -3418,13 +3819,24 @@ class MainWindow(QMainWindow):
         return "pl" if mode == "PL" else "drr" if mode == "DRR" else "cmp"
 
     def _current_y_axis_spec_for_mode(self, mode: str) -> str:
-        if mode == "Power Dependent":
+        if mode in {"Power Dependent", "SHG Processing"}:
             return "auto"
         return self._selected_y_axis_spec(self._mode_y_axis_prefix(mode))
 
     def _ensure_loaded_matches_ui_params(self, mode: str) -> bool:
         if not self.loaded or self.loaded.mode != mode:
             return False
+        if mode == "SHG Processing":
+            if self.loaded.shg_data is None:
+                raise ValueError("No SHG sweep table is loaded.")
+            settings = self._shg_settings_from_ui()
+            self.loaded.shg_result = process_shg_sweep(
+                self.loaded.shg_data,
+                settings,
+                background=self.loaded.shg_background,
+            )
+            self._shg_update_summary()
+            return True
         current_spec = self._current_y_axis_spec_for_mode(mode)
         if mode == "DRR" and current_spec == getattr(self.loaded, "y_axis_spec", "auto"):
             return self._ensure_loaded_matches_drr_params()
@@ -3443,7 +3855,7 @@ class MainWindow(QMainWindow):
                 mode="Power Dependent",
                 folder=self.current_folder,
                 primary_file=(result.records[0].file_name if result.records else None),
-                selected_files=[record.file_name for record in result.records],
+                selected_files=list(dict.fromkeys(record.file_name for record in result.records)),
                 cube=result.cube,
                 power_records=result.records,
                 power_groups=result.groups,
@@ -3510,6 +3922,9 @@ class MainWindow(QMainWindow):
         if not self.loaded:
             return
         mode = self.loaded.mode
+        if mode == "SHG Processing":
+            self._shg_update_summary()
+            return
         if mode == "PL" and self.loaded.cube is not None:
             cube = self.loaded.cube
         elif mode == "DRR" and self.loaded.cube is not None:
@@ -4378,6 +4793,110 @@ class MainWindow(QMainWindow):
             return False
         return self._remove_nearest_pl_peak(float(x_click))
 
+    def _plot_shg_result(self, result: ShgProcessResult) -> None:
+        data = result.data
+        settings = result.settings
+        angle = np.asarray(result.measured_angle_deg, float)
+        finite_angles = np.flatnonzero(np.isfinite(angle))
+        if finite_angles.size == 0:
+            raise ValueError("SHG data contains no finite measured angles.")
+        requested = float(self.shg_angle_cursor_spin.value())
+        selected = int(finite_angles[np.argmin(np.abs(angle[finite_angles] - requested))])
+        self._shg_selected_index = selected
+        blocked = self.shg_angle_cursor_spin.blockSignals(True)
+        try:
+            self.shg_angle_cursor_spin.setValue(float(angle[selected]))
+        finally:
+            self.shg_angle_cursor_spin.blockSignals(blocked)
+
+        grid = self.figure.add_gridspec(
+            nrows=2,
+            ncols=2,
+            height_ratios=[1.0, 0.95],
+            wspace=0.25,
+            hspace=0.34,
+        )
+        raw_ax = self.figure.add_subplot(grid[0, 0])
+        corrected_ax = self.figure.add_subplot(grid[0, 1], sharex=raw_ax)
+        angle_ax = self.figure.add_subplot(grid[1, :])
+        wavelength = np.asarray(data.wavelength_nm, float)
+        raw = np.asarray(data.spectra[selected], float)
+        baseline = np.asarray(result.baseline[selected], float)
+        corrected = np.asarray(result.corrected[selected], float)
+
+        raw_ax.plot(wavelength, raw, color="#1769c2", lw=1.0, label="Measured")
+        raw_ax.plot(wavelength, baseline, color="#ef7f1a", lw=1.5, label="Background")
+        raw_ax.set_title(
+            f"{data.source_file} row {int(data.source_rows[selected])} — {angle[selected]:.6g}°"
+        )
+        raw_ax.set_xlabel("Wavelength (nm)")
+        raw_ax.set_ylabel("Intensity (counts)")
+        raw_ax.grid(alpha=0.25)
+        raw_ax.legend(loc="best", fontsize=8)
+
+        corrected_ax.plot(wavelength, corrected, color="#11823b", lw=1.0)
+        corrected_ax.axhline(0.0, color="#555", lw=0.8, alpha=0.7)
+        corrected_ax.set_title(
+            f"Corrected area = {result.integrated_area[selected]:.6g} counts·nm"
+        )
+        corrected_ax.set_xlabel("Wavelength (nm)")
+        corrected_ax.set_ylabel("Corrected intensity")
+        corrected_ax.grid(alpha=0.25)
+
+        for axis in (raw_ax, corrected_ax):
+            axis.axvspan(settings.left_min_nm, settings.left_max_nm, color="#2f80ed", alpha=0.10)
+            axis.axvspan(settings.gate_min_nm, settings.gate_max_nm, color="#eb5757", alpha=0.13)
+            axis.axvspan(settings.right_min_nm, settings.right_max_nm, color="#2f80ed", alpha=0.10)
+            margin = max(0.5, 0.08 * (settings.right_max_nm - settings.left_min_nm))
+            axis.set_xlim(settings.left_min_nm - margin, settings.right_max_nm + margin)
+
+        finite_area = np.isfinite(angle) & np.isfinite(result.integrated_area)
+        valid = finite_area & np.asarray(result.included, bool)
+        invalid = finite_area & ~np.asarray(result.included, bool)
+        if np.any(valid):
+            valid_indices = np.flatnonzero(valid)
+            valid_order = valid_indices[np.argsort(angle[valid_indices], kind="stable")]
+            angle_ax.errorbar(
+                angle[valid_order],
+                result.integrated_area[valid_order],
+                yerr=result.area_uncertainty[valid_order],
+                color="#1769c2",
+                marker="o",
+                markersize=3.5,
+                lw=1.0,
+                capsize=2,
+                label="Included",
+            )
+        if np.any(invalid):
+            angle_ax.scatter(
+                angle[invalid],
+                result.integrated_area[invalid],
+                color="#888",
+                marker="x",
+                s=30,
+                label="Excluded",
+                zorder=4,
+            )
+        if np.isfinite(result.integrated_area[selected]):
+            angle_ax.scatter(
+                [angle[selected]],
+                [result.integrated_area[selected]],
+                color="#d62728",
+                edgecolor="white",
+                linewidth=0.8,
+                s=55,
+                zorder=6,
+                label="Selected",
+            )
+        angle_ax.set_title("Integrated SHG intensity versus measured angle")
+        angle_ax.set_xlabel("Measured angle (deg)")
+        angle_ax.set_ylabel("Integrated intensity (counts·nm)")
+        angle_ax.grid(alpha=0.25)
+        angle_ax.legend(loc="best", fontsize=8)
+        self._shg_raw_ax = raw_ax
+        self._shg_corrected_ax = corrected_ax
+        self._shg_angle_ax = angle_ax
+
     def _plot_mode(self, mode: str, *, auto: bool = False) -> None:
         try:
             if not self.loaded or self.loaded.mode != mode:
@@ -4410,6 +4929,10 @@ class MainWindow(QMainWindow):
             self._power_active_cubes = {}
             self._power_active_export_cube = None
             self._power_active_records = ()
+            self._shg_raw_ax = None
+            self._shg_corrected_ax = None
+            self._shg_angle_ax = None
+            plot_cube = None
             if mode == "PL" and self.loaded.cube is not None:
                 plot_cube = self.loaded.cube
                 params = self._make_params(mode, plot_cube)
@@ -4464,6 +4987,11 @@ class MainWindow(QMainWindow):
                 self._drr_heatmap_fit_artist = None
                 self._set_drr_gate_spin_value(gate_used)
                 self._update_drr_spectrum_and_gate_line(plot_cube)
+            elif mode == "SHG Processing" and self.loaded.shg_result is not None:
+                self._pl_heatmap_ax = None
+                self._pl_spectrum_ax = None
+                self._pl_last_plot_cube = None
+                self._plot_shg_result(self.loaded.shg_result)
             elif mode == "Power Dependent" and self.loaded.cube is not None:
                 self._pl_heatmap_ax = None
                 self._pl_spectrum_ax = None
@@ -4746,6 +5274,15 @@ class MainWindow(QMainWindow):
         }
 
     def _current_plot_params_key(self, mode: str) -> tuple[Any, ...]:
+        if mode == "SHG Processing":
+            settings = self._shg_settings_from_ui()
+            return (
+                mode,
+                self._shg_selected_file(),
+                self._shg_background_file(),
+                *tuple(settings.to_dict().values()),
+                float(self.shg_angle_cursor_spin.value()),
+            )
         if mode == "Power Dependent":
             return (
                 mode,
@@ -4953,6 +5490,10 @@ class MainWindow(QMainWindow):
                 line.set_linestyle("--")
 
     def _on_canvas_motion(self, event: Any) -> None:
+        if self.last_plotted_mode == "SHG Processing":
+            if event.inaxes is self._shg_angle_ax and event.xdata is not None:
+                self.statusBar().showMessage(f"Hover measured angle: {float(event.xdata):.6g} deg")
+            return
         if self.last_plotted_mode == "DRR":
             heatmap_ax = self._drr_heatmap_ax
             cube = self._last_plot_cube
@@ -4992,6 +5533,24 @@ class MainWindow(QMainWindow):
 
     def _on_canvas_click(self, event: Any) -> None:
         if event.button != 1:
+            return
+        if (
+            self.last_plotted_mode == "SHG Processing"
+            and event.inaxes is self._shg_angle_ax
+            and event.xdata is not None
+            and self.loaded is not None
+            and self.loaded.shg_result is not None
+        ):
+            angle = np.asarray(self.loaded.shg_result.measured_angle_deg, float)
+            finite = np.flatnonzero(np.isfinite(angle))
+            if finite.size:
+                index = int(finite[np.argmin(np.abs(angle[finite] - float(event.xdata)))])
+                blocked = self.shg_angle_cursor_spin.blockSignals(True)
+                try:
+                    self.shg_angle_cursor_spin.setValue(float(angle[index]))
+                finally:
+                    self.shg_angle_cursor_spin.blockSignals(blocked)
+                self._plot_mode("SHG Processing")
             return
         # Manual peak delete by clicking near a marker on the bottom spectrum.
         if event.xdata is not None and self.last_plotted_mode == "DRR" and event.inaxes is self._drr_spectrum_ax:
@@ -5093,7 +5652,10 @@ class MainWindow(QMainWindow):
         power_vp_payload = None
         params_intensity: HeatmapParams | None = None
         power_records = tuple(self.loaded.power_records) if self.loaded and self.loaded.mode == "Power Dependent" else ()
-        if mode in {"PL", "DRR", "Power Dependent"} and self.loaded.cube is not None:
+        if mode == "SHG Processing" and self.loaded.shg_result is not None:
+            params = None
+            export_cube = None
+        elif mode in {"PL", "DRR", "Power Dependent"} and self.loaded.cube is not None:
             if mode == "DRR":
                 export_cube = self._drr_cube_for_display()
                 params = self._make_params(mode, export_cube)
@@ -5207,6 +5769,13 @@ class MainWindow(QMainWindow):
                 power_kkp_records=(power_vp_payload[4] if power_vp_payload else ()),
                 power_pairing_mode=(power_vp_payload[8] if power_vp_payload else self._power_pairing_mode()),
                 power_stage_pairs=(power_vp_payload[9] if power_vp_payload else ()),
+                auto_move_sources=bool(self.auto_move_after_export_chk.isChecked()),
+            )
+        elif mode == "SHG Processing":
+            options = ExportOptions(
+                mode=mode,
+                params=None,
+                shg_settings=self._shg_settings_from_ui(),
                 auto_move_sources=bool(self.auto_move_after_export_chk.isChecked()),
             )
         else:
@@ -5340,6 +5909,24 @@ class MainWindow(QMainWindow):
                 log.emit(f"Exported DAT: {paths['dat'].name}")
                 out_folder = str(paths["png"].parent)
                 files_to_move = list(loaded.selected_files)
+        elif (
+            mode == "SHG Processing"
+            and loaded.shg_data is not None
+            and loaded.shg_result is not None
+            and options.shg_settings is not None
+        ):
+            paths = export_shg_results(
+                folder,
+                data=loaded.shg_data,
+                result=loaded.shg_result,
+                settings=options.shg_settings,
+            )
+            log.emit(f"Exported SHG CSV: {paths['csv'].name}")
+            log.emit(f"Exported SHG settings: {paths['settings'].name}")
+            out_folder = str(paths["csv"].parent)
+            files_to_move = list(loaded.selected_files)
+            if loaded.shg_result.background_file:
+                files_to_move.extend(loaded.baseline_files)
         elif mode == "Compare" and loaded.compare_cubes:
             paths = export_compare_panels(
                 folder,

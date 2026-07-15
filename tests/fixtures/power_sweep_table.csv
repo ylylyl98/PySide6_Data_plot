@@ -1,0 +1,3 @@
+Power_uW,stage_pos,Vbg_set,Vbg_meas,Vtg_set,Vtg_meas,Vbias_set,Vbias_meas,Ibg,Itg,Ibias,752.0,751.0,750.0
+20,0,0,0,0,0,0,0,-5.2e-12,-8.3e-12,-2.5e-10,200,201,202
+10,25,0,0,0,0,0,0,-2.3e-12,5.2e-13,-2.8e-10,100,101,102

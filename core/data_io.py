@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 from typing import Dict, List, Sequence
 
 import numpy as np
+import pandas as pd
 
 from core.file_ops import archive_selected, list_root_csvs
 from core.loader import (
@@ -12,7 +15,14 @@ from core.loader import (
     load_drr_avg,
     load_pl,
 )
-from core.processing import PowerSeriesFile, group_power_series_files, power_group_title
+from core import processing_run as processing_impl
+from core.processing import (
+    PowerSeriesFile,
+    PowerSweepPoint,
+    group_power_series_files,
+    power_group_title,
+)
+from core.shg import ShgSweepData, inspect_shg_csv, load_shg_sweep_csv
 
 
 DEFAULT_ARCHIVE = "Initial data after processing"
@@ -64,12 +74,47 @@ class CompareSelection:
 class PowerSeriesResult:
     cube: DataCube
     group_key: str
-    records: tuple[PowerSeriesFile, ...]
-    groups: Dict[str, tuple[PowerSeriesFile, ...]]
+    records: tuple[PowerSeriesFile | PowerSweepPoint, ...]
+    groups: Dict[str, tuple[PowerSeriesFile | PowerSweepPoint, ...]]
+    sources: Dict[str, "PowerSeriesSource"] | None = None
+
+
+@dataclass(frozen=True)
+class PowerSeriesSource:
+    key: str
+    title: str
+    source_format: str
+    file_name: str | None = None
+    records: tuple[PowerSeriesFile, ...] = ()
+
+
+POWER_SWEEP_KEY_PREFIX = "csv::"
+
+
+def power_sweep_source_key(file_name: str) -> str:
+    return f"{POWER_SWEEP_KEY_PREFIX}{Path(file_name).name}"
+
+
+def is_power_sweep_source_key(key: str) -> bool:
+    return str(key).startswith(POWER_SWEEP_KEY_PREFIX)
+
+
+def power_sweep_file_from_key(key: str) -> str:
+    if not is_power_sweep_source_key(key):
+        raise ValueError(f"Not a power-sweep CSV source key: {key}")
+    return Path(str(key)[len(POWER_SWEEP_KEY_PREFIX):]).name
 
 
 def list_csv_files(folder: str) -> List[str]:
     return list_root_csvs(folder)
+
+
+def list_shg_csv_files(folder: str, files: Sequence[str]) -> List[str]:
+    return [file_name for file_name in files if inspect_shg_csv(folder, file_name)]
+
+
+def load_shg_sweep(folder: str, file_name: str) -> ShgSweepData:
+    return load_shg_sweep_csv(folder, file_name)
 
 
 def move_selected_to_archive(folder: str, file_names: Sequence[str], archive_name: str = DEFAULT_ARCHIVE) -> int:
@@ -133,6 +178,192 @@ def get_power_series_groups(files: Sequence[str]) -> Dict[str, tuple[PowerSeries
     return {key: tuple(records) for key, records in group_power_series_files(files).items()}
 
 
+def _find_table_column(columns: Sequence[str], candidates: Sequence[str]) -> str | None:
+    return processing_impl._find_col_by_priority(list(columns), list(candidates))
+
+
+def _power_table_columns(columns: Sequence[str]) -> tuple[str | None, str | None, list[str]]:
+    cols = [str(column).strip() for column in columns]
+    power_col = _find_table_column(
+        cols,
+        ["power_uw", "power (uw)", "poweruw", "laser_power_uw", "laserpoweruw", "power"],
+    )
+    stage_col = _find_table_column(cols, ["stage_pos", "stage position", "stagepos", "stage"])
+    spectrum_cols = [
+        column for column in cols if processing_impl._parse_spec_axis_from_colname(column) is not None
+    ]
+    return power_col, stage_col, spectrum_cols
+
+
+def inspect_power_sweep_csv(folder: str, file_name: str) -> bool:
+    """Return True when a CSV header describes a single-file power sweep."""
+    path = Path(folder) / Path(file_name).name
+    if not path.is_file():
+        return False
+    try:
+        sep = processing_impl._guess_sep_from_first_line(path)
+        columns = pd.read_csv(path, sep=sep, nrows=0).columns
+        power_col, _stage_col, _spectrum_cols = _power_table_columns(columns)
+        # Keep malformed candidates visible in the UI so selecting one produces
+        # the loader's actionable missing-spectrum error.
+        return power_col is not None
+    except Exception:
+        return False
+
+
+def get_power_series_sources(folder: str, files: Sequence[str]) -> Dict[str, PowerSeriesSource]:
+    """Discover table-backed power sweeps first, followed by legacy filename groups."""
+    sources: Dict[str, PowerSeriesSource] = {}
+    table_files: set[str] = set()
+    for file_name in files:
+        if inspect_power_sweep_csv(folder, file_name):
+            table_files.add(Path(file_name).name)
+            key = power_sweep_source_key(file_name)
+            sources[key] = PowerSeriesSource(
+                key=key,
+                title=power_group_title(key),
+                source_format="table",
+                file_name=Path(file_name).name,
+            )
+    legacy_files = [file_name for file_name in files if Path(file_name).name not in table_files]
+    for key, records in get_power_series_groups(legacy_files).items():
+        sources[key] = PowerSeriesSource(
+            key=key,
+            title=power_group_title(key),
+            source_format="legacy",
+            records=tuple(records),
+        )
+    return sources
+
+
+def _power_sweep_signature(folder: str, file_name: str) -> tuple[int, int]:
+    path = Path(folder) / Path(file_name).name
+    if not path.is_file():
+        raise FileNotFoundError(f"CSV not found in folder root: {path}")
+    stat = path.stat()
+    return int(stat.st_mtime_ns), int(stat.st_size)
+
+
+@lru_cache(maxsize=128)
+def _load_power_sweep_csv_cached(
+    folder: str,
+    file_name: str,
+    signature: tuple[int, int],
+) -> tuple[DataCube, tuple[PowerSweepPoint, ...]]:
+    del signature
+    path = Path(folder) / Path(file_name).name
+    sep = processing_impl._guess_sep_from_first_line(path)
+    frame = pd.read_csv(path, sep=sep)
+    frame.columns = [str(column).strip() for column in frame.columns]
+    power_col, stage_col, spectrum_cols = _power_table_columns(frame.columns)
+    if power_col is None:
+        raise ValueError(
+            f"Power sweep CSV {file_name!r} is missing a Power_uW column."
+        )
+    if len(spectrum_cols) < 2:
+        raise ValueError(
+            f"Power sweep CSV {file_name!r} needs at least two numeric wavelength/energy columns."
+        )
+
+    # Pandas may suffix duplicate headers (for example 752.58 and 752.58.1).
+    # Keep the duplicate column containing the most finite measurements.
+    spectral_groups: dict[float, list[str]] = {}
+    for column in spectrum_cols:
+        value = processing_impl._parse_spec_axis_from_colname(column)
+        if value is not None:
+            spectral_groups.setdefault(round(float(value), 9), []).append(column)
+    chosen_columns: list[str] = []
+    spectral_values: list[float] = []
+    for value, candidates in spectral_groups.items():
+        chosen = max(
+            candidates,
+            key=lambda column: int(
+                np.isfinite(pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=float)).sum()
+            ),
+        )
+        chosen_columns.append(chosen)
+        spectral_values.append(float(value))
+
+    spectrum_axis = np.asarray(spectral_values, dtype=float)
+    z = frame[chosen_columns].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+    finite_columns = np.any(np.isfinite(z), axis=0)
+    spectrum_axis = spectrum_axis[finite_columns]
+    z = z[:, finite_columns]
+    if spectrum_axis.size < 2:
+        raise ValueError(
+            f"Power sweep CSV {file_name!r} has fewer than two spectral columns containing numeric data."
+        )
+
+    power = pd.to_numeric(frame[power_col], errors="coerce").to_numpy(dtype=float)
+    invalid_power = np.flatnonzero(~np.isfinite(power))
+    if invalid_power.size:
+        rows = ", ".join(str(int(index) + 2) for index in invalid_power[:8])
+        suffix = "..." if invalid_power.size > 8 else ""
+        raise ValueError(f"Power sweep CSV {file_name!r} has invalid Power_uW values on row(s) {rows}{suffix}.")
+    invalid_spectra = np.flatnonzero(~np.any(np.isfinite(z), axis=1))
+    if invalid_spectra.size:
+        rows = ", ".join(str(int(index) + 2) for index in invalid_spectra[:8])
+        suffix = "..." if invalid_spectra.size > 8 else ""
+        raise ValueError(f"Power sweep CSV {file_name!r} has no numeric spectrum on row(s) {rows}{suffix}.")
+    unique_power, counts = np.unique(power, return_counts=True)
+    duplicates = unique_power[counts > 1]
+    if duplicates.size:
+        values = ", ".join(f"{value:.6g}" for value in duplicates[:8])
+        suffix = "..." if duplicates.size > 8 else ""
+        raise ValueError(
+            f"Power sweep CSV {file_name!r} contains duplicate Power_uW values ({values}{suffix}); "
+            "use unique power values so spectra are not silently averaged."
+        )
+
+    stage_values = (
+        pd.to_numeric(frame[stage_col], errors="coerce").to_numpy(dtype=float)
+        if stage_col is not None
+        else np.full(power.shape, np.nan, dtype=float)
+    )
+    energy = 1240.0 / spectrum_axis if float(np.nanmedian(spectrum_axis)) > 20.0 else spectrum_axis.copy()
+    energy_order = np.argsort(energy)
+    energy = energy[energy_order]
+    z = z[:, energy_order]
+    power_order = np.argsort(power, kind="stable")
+    power = power[power_order]
+    z = z[power_order, :]
+    stage_values = stage_values[power_order]
+
+    records = tuple(
+        PowerSweepPoint(
+            file_name=Path(file_name).name,
+            power_uW=float(power[index]),
+            stage=(float(stage_values[index]) if np.isfinite(stage_values[index]) else None),
+            row_index=int(power_order[index]) + 2,
+            stage_column=stage_col,
+        )
+        for index in range(power.size)
+    )
+    cube = DataCube(
+        energy=np.asarray(energy, dtype=float),
+        gate=np.asarray(power, dtype=float),
+        Z=np.asarray(z, dtype=float),
+        gate_label="Power (uW)",
+        title=power_group_title(power_sweep_source_key(file_name)),
+        cbar_label="PL (a.u.)",
+    )
+    return cube, records
+
+
+def load_power_sweep_csv(folder: str, file_name: str) -> tuple[DataCube, tuple[PowerSweepPoint, ...]]:
+    signature = _power_sweep_signature(folder, file_name)
+    cube, records = _load_power_sweep_csv_cached(folder, Path(file_name).name, signature)
+    copied_cube = DataCube(
+        energy=np.asarray(cube.energy, dtype=float).copy(),
+        gate=np.asarray(cube.gate, dtype=float).copy(),
+        Z=np.asarray(cube.Z, dtype=float).copy(),
+        gate_label=cube.gate_label,
+        title=cube.title,
+        cbar_label=cube.cbar_label,
+    )
+    return copied_cube, tuple(records)
+
+
 def _spectrum_from_cube(cube: DataCube) -> np.ndarray:
     z = np.asarray(cube.Z, float)
     if z.ndim != 2:
@@ -153,13 +384,39 @@ def load_power_series_cube(
     group_key: str | None = None,
     y_axis: str = "auto",
 ) -> PowerSeriesResult:
-    groups = get_power_series_groups(files)
-    if not groups:
-        raise ValueError("No power-dependent groups found. Filenames must contain a power token such as 37.96uW.")
+    sources = get_power_series_sources(folder, files)
+    if not sources:
+        raise ValueError(
+            "No power-dependent data found. Use a CSV with a Power_uW column or filenames containing power such as 37.96uW."
+        )
 
-    selected_key = group_key if group_key in groups else ""
+    selected_key = group_key if group_key in sources else ""
     if not selected_key:
-        selected_key = sorted(groups.keys(), key=lambda key: (-len(groups[key]), key))[0]
+        table_keys = [key for key, source in sources.items() if source.source_format == "table"]
+        if table_keys:
+            selected_key = sorted(table_keys)[0]
+        else:
+            selected_key = sorted(
+                sources,
+                key=lambda key: (-len(sources[key].records), key),
+            )[0]
+    selected_source = sources[selected_key]
+    if selected_source.source_format == "table":
+        assert selected_source.file_name is not None
+        cube, records = load_power_sweep_csv(folder, selected_source.file_name)
+        groups: Dict[str, tuple[PowerSeriesFile | PowerSweepPoint, ...]] = {
+            key: tuple(source.records) for key, source in sources.items()
+        }
+        groups[selected_key] = records
+        return PowerSeriesResult(
+            cube=cube,
+            group_key=selected_key,
+            records=records,
+            groups=groups,
+            sources=sources,
+        )
+
+    groups = {key: tuple(source.records) for key, source in sources.items()}
     records = groups[selected_key]
     if not records:
         raise ValueError("Selected power-dependent group is empty.")
@@ -193,6 +450,12 @@ def load_power_series_cube(
         title=power_group_title(selected_key),
         cbar_label="PL (a.u.)",
     )
-    return PowerSeriesResult(cube=cube, group_key=selected_key, records=records, groups=groups)
+    return PowerSeriesResult(
+        cube=cube,
+        group_key=selected_key,
+        records=records,
+        groups=groups,
+        sources=sources,
+    )
 
 
