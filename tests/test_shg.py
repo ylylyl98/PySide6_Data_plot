@@ -75,6 +75,43 @@ class ShgLoaderTests(unittest.TestCase):
 
 
 class ShgProcessingTests(unittest.TestCase):
+    def test_cosmic_ray_inside_gate_is_removed_before_integration(self) -> None:
+        data, expected_area = _synthetic_data()
+        spike_index = int(np.argmin(np.abs(data.wavelength_nm - 513.0)))
+        spiked_spectra = np.asarray(data.spectra, float).copy()
+        spiked_spectra[0, spike_index] += 4000.0
+        spiked_data = ShgSweepData(**{**data.__dict__, "spectra": spiked_spectra})
+
+        uncleaned = process_shg_sweep(
+            spiked_data,
+            ShgSettings(background_method="local_quadratic", remove_cosmic_rays=False),
+        )
+        cleaned = process_shg_sweep(
+            spiked_data,
+            ShgSettings(background_method="local_quadratic", remove_cosmic_rays=True),
+        )
+
+        self.assertGreater(abs(uncleaned.integrated_area[0] - expected_area[0]), 50.0)
+        self.assertTrue(cleaned.cosmic_ray_mask[0, spike_index])
+        self.assertEqual(cleaned.cosmic_pixels_removed[0], 1)
+        self.assertIn("COSMIC_RAY_REMOVED", cleaned.quality_flags[0])
+        self.assertAlmostEqual(cleaned.integrated_area[0], expected_area[0], delta=1.0)
+
+    def test_cosmic_ray_in_sideband_does_not_bias_background_fit(self) -> None:
+        data, expected_area = _synthetic_data()
+        spike_index = int(np.argmin(np.abs(data.wavelength_nm - 510.0)))
+        spiked_spectra = np.asarray(data.spectra, float).copy()
+        spiked_spectra[1, spike_index] += 3000.0
+        spiked_data = ShgSweepData(**{**data.__dict__, "spectra": spiked_spectra})
+
+        result = process_shg_sweep(
+            spiked_data,
+            ShgSettings(background_method="local_quadratic", remove_cosmic_rays=True),
+        )
+
+        self.assertTrue(result.cosmic_ray_mask[1, spike_index])
+        self.assertAlmostEqual(result.integrated_area[1], expected_area[1], delta=1.0)
+
     def test_integration_gate_may_touch_sideband_boundaries(self) -> None:
         data, expected_area = _synthetic_data()
         settings = ShgSettings(
@@ -92,6 +129,7 @@ class ShgProcessingTests(unittest.TestCase):
         self.assertTrue(np.allclose(result.integrated_area, expected_area, rtol=0.02, atol=0.1))
         self.assertTrue(np.allclose(result.peak_wavelength_nm, 515.0, atol=0.06))
         self.assertEqual(result.included.tolist(), [True, True, False])
+        self.assertEqual(result.cosmic_pixels_removed.tolist(), [0, 0, 0])
         self.assertIn("MOVE_FAILED", result.quality_flags[2])
 
     def test_angle_calibration_wrap_and_include_failed_rows(self) -> None:
@@ -151,11 +189,14 @@ class ShgProcessingTests(unittest.TestCase):
             self.assertIn("source_row", lines[0])
             self.assertIn("background_subtracted_integrated_area_counts_nm", lines[0])
             self.assertIn("integration_half_range_nm", lines[0])
+            self.assertIn("cosmic_pixels_removed", lines[0])
+            self.assertIn("cosmic_ray_flag", lines[0])
             self.assertTrue(lines[1].startswith("rot1,0,-0.01"))
             self.assertIn("synthetic.csv", lines[1])
             settings_text = paths["settings"].read_text(encoding="utf-8")
             self.assertIn('"background_method": "local_quadratic"', settings_text)
-            self.assertIn('"integration_source": "background_subtracted_spectrum"', settings_text)
+            self.assertIn('"integration_source": "cosmic_cleaned_background_subtracted_spectrum"', settings_text)
+            self.assertIn('"cosmic_threshold_mad": 8.0', settings_text)
             self.assertIn('"integration_half_range_nm": 2.0', settings_text)
 
 

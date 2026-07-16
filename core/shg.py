@@ -85,6 +85,10 @@ class ShgSettings:
     right_max_nm: float = 522.0
     background_method: str = "local_linear"
     sigma_clip: float = 3.0
+    remove_cosmic_rays: bool = True
+    cosmic_threshold_mad: float = 8.0
+    cosmic_window_points: int = 7
+    cosmic_max_width_points: int = 3
     angle_scale: float = 1.0
     angle_offset_deg: float = 0.0
     angle_wrap_deg: float | None = None
@@ -97,7 +101,11 @@ class ShgSettings:
                 "integration_wavelength_nm": self.peak_center_nm,
                 "integration_half_range_nm": 0.5 * (self.gate_max_nm - self.gate_min_nm),
                 "integration_interval_nm": [self.gate_min_nm, self.gate_max_nm],
-                "integration_source": "background_subtracted_spectrum",
+                "integration_source": (
+                    "cosmic_cleaned_background_subtracted_spectrum"
+                    if self.remove_cosmic_rays
+                    else "background_subtracted_spectrum"
+                ),
                 "left_sideband_gap_nm": self.gate_min_nm - self.left_max_nm,
                 "right_sideband_gap_nm": self.right_min_nm - self.gate_max_nm,
                 "left_sideband_width_nm": self.left_max_nm - self.left_min_nm,
@@ -112,6 +120,9 @@ class ShgProcessResult:
     data: ShgSweepData
     settings: ShgSettings
     measured_angle_deg: np.ndarray
+    cleaned_spectra: np.ndarray
+    cosmic_ray_mask: np.ndarray
+    cosmic_pixels_removed: np.ndarray
     baseline: np.ndarray
     corrected: np.ndarray
     integrated_area: np.ndarray
@@ -329,6 +340,111 @@ def _robust_fit(design: np.ndarray, values: np.ndarray, sigma_clip: float) -> tu
     return coefficients, keep
 
 
+def _row_noise_from_differences(spectra: np.ndarray) -> np.ndarray:
+    noise = np.full(spectra.shape[0], np.nan, dtype=float)
+    for row_index, row in enumerate(spectra):
+        differences = np.diff(np.asarray(row, float))
+        differences = differences[np.isfinite(differences)]
+        if differences.size:
+            centered = differences - np.nanmedian(differences)
+            noise[row_index] = 1.4826 * float(np.nanmedian(np.abs(centered))) / np.sqrt(2.0)
+        if not np.isfinite(noise[row_index]) or noise[row_index] <= 0:
+            noise[row_index] = float(np.nanstd(differences)) / np.sqrt(2.0) if differences.size else 1.0
+        if not np.isfinite(noise[row_index]) or noise[row_index] <= 0:
+            noise[row_index] = 1.0
+    return noise
+
+
+def _neighbor_angle_reference(spectra: np.ndarray, angle: np.ndarray) -> np.ndarray | None:
+    if spectra.shape[0] < 3:
+        return None
+    reference = np.full_like(spectra, np.nan, dtype=float)
+    finite_angles = np.isfinite(angle)
+    for row_index in range(spectra.shape[0]):
+        if finite_angles[row_index]:
+            distance = np.abs(angle - angle[row_index])
+            distance[~finite_angles] = np.inf
+            distance[row_index] = np.inf
+            neighbors = np.argsort(distance, kind="stable")[: min(4, spectra.shape[0] - 1)]
+            neighbors = neighbors[np.isfinite(distance[neighbors])]
+        else:
+            neighbors = np.asarray(
+                [index for index in range(max(0, row_index - 2), min(spectra.shape[0], row_index + 3)) if index != row_index],
+                dtype=int,
+            )
+        if neighbors.size:
+            reference[row_index] = np.nanmedian(spectra[neighbors], axis=0)
+    return reference
+
+
+def _narrow_candidate_runs(candidates: np.ndarray, max_width: int) -> np.ndarray:
+    accepted = np.zeros_like(candidates, dtype=bool)
+    for row_index, row in enumerate(candidates):
+        indices = np.flatnonzero(row)
+        if not indices.size:
+            continue
+        breaks = np.flatnonzero(np.diff(indices) > 1) + 1
+        for run in np.split(indices, breaks):
+            if 0 < run.size <= max_width:
+                accepted[row_index, run] = True
+    return accepted
+
+
+def _remove_cosmic_ray_spikes(
+    spectra: np.ndarray,
+    wavelength: np.ndarray,
+    angle: np.ndarray,
+    settings: ShgSettings,
+) -> tuple[np.ndarray, np.ndarray]:
+    raw = np.asarray(spectra, float)
+    cleaned = raw.copy()
+    mask = np.zeros(raw.shape, dtype=bool)
+    if not settings.remove_cosmic_rays or raw.shape[1] < settings.cosmic_window_points:
+        return cleaned, mask
+
+    half_window = settings.cosmic_window_points // 2
+    padded = np.pad(raw, ((0, 0), (half_window, half_window)), mode="edge")
+    windows = np.lib.stride_tricks.sliding_window_view(
+        padded,
+        window_shape=settings.cosmic_window_points,
+        axis=1,
+    )
+    local_median = np.nanmedian(windows, axis=-1)
+    spectral_excess = raw - local_median
+    row_noise = _row_noise_from_differences(raw)
+    candidates = np.isfinite(spectral_excess) & (
+        spectral_excess > settings.cosmic_threshold_mad * row_noise[:, None]
+    )
+
+    angle_reference = _neighbor_angle_reference(raw, np.asarray(angle, float))
+    if angle_reference is not None:
+        angle_excess = raw - angle_reference
+        centered = angle_excess - np.nanmedian(angle_excess, axis=0, keepdims=True)
+        angle_noise = 1.4826 * np.nanmedian(np.abs(centered), axis=0)
+        angle_noise = np.where(np.isfinite(angle_noise), angle_noise, 0.0)
+        confirmation_limit = settings.cosmic_threshold_mad * np.maximum(
+            angle_noise[None, :],
+            row_noise[:, None],
+        )
+        candidates &= np.isfinite(angle_excess) & (angle_excess > confirmation_limit)
+
+    mask = _narrow_candidate_runs(candidates, settings.cosmic_max_width_points)
+    for row_index in range(raw.shape[0]):
+        flagged = mask[row_index]
+        if not np.any(flagged):
+            continue
+        clean = ~flagged & np.isfinite(raw[row_index]) & np.isfinite(wavelength)
+        if np.count_nonzero(clean) < 2:
+            mask[row_index] = False
+            continue
+        cleaned[row_index, flagged] = np.interp(
+            wavelength[flagged],
+            wavelength[clean],
+            raw[row_index, clean],
+        )
+    return cleaned, mask
+
+
 def _integration_window(x: np.ndarray, y: np.ndarray, lo: float, hi: float) -> tuple[np.ndarray, np.ndarray]:
     finite = np.isfinite(x) & np.isfinite(y)
     xf = x[finite]
@@ -366,6 +482,12 @@ def _validate_settings(settings: ShgSettings, wavelength: np.ndarray) -> None:
         )
     if settings.background_method not in {"local_linear", "local_quadratic", "external", "none"}:
         raise ValueError(f"Unknown SHG background method: {settings.background_method}")
+    if settings.cosmic_threshold_mad <= 0:
+        raise ValueError("SHG cosmic-ray threshold must be positive.")
+    if settings.cosmic_window_points < 3 or settings.cosmic_window_points % 2 == 0:
+        raise ValueError("SHG cosmic-ray detection window must be an odd number of at least 3 points.")
+    if not (1 <= settings.cosmic_max_width_points < settings.cosmic_window_points):
+        raise ValueError("SHG maximum cosmic-ray width must be at least 1 and smaller than the detection window.")
 
 
 def process_shg_sweep(
@@ -388,6 +510,14 @@ def process_shg_sweep(
             raise ValueError("SHG angle wrap must be positive.")
         angle = np.mod(angle, settings.angle_wrap_deg)
 
+    cleaned_spectra, cosmic_ray_mask = _remove_cosmic_ray_spikes(
+        spectra,
+        wavelength,
+        angle,
+        settings,
+    )
+    cosmic_pixels_removed = np.count_nonzero(cosmic_ray_mask, axis=1).astype(int)
+
     gate_mask = (wavelength >= settings.gate_min_nm) & (wavelength <= settings.gate_max_nm)
     sideband = (
         ((wavelength >= settings.left_min_nm) & (wavelength <= settings.left_max_nm))
@@ -400,7 +530,15 @@ def process_shg_sweep(
 
     background_reference: np.ndarray | None = None
     if background is not None:
-        reference = np.nanmean(np.asarray(background.spectra, float), axis=0)
+        background_spectra = np.asarray(background.spectra, float)
+        background_angles = np.asarray(background.measured_angle_deg, float)
+        cleaned_background, _background_cosmic_mask = _remove_cosmic_ray_spikes(
+            background_spectra,
+            np.asarray(background.wavelength_nm, float),
+            background_angles,
+            settings,
+        )
+        reference = np.nanmean(cleaned_background, axis=0)
         finite = np.isfinite(background.wavelength_nm) & np.isfinite(reference)
         if np.count_nonzero(finite) < 2:
             raise ValueError("External SHG background has insufficient finite spectral data.")
@@ -428,7 +566,7 @@ def process_shg_sweep(
     x_centered = wavelength - settings.peak_center_nm
 
     for row_index in range(count):
-        row = spectra[row_index]
+        row = cleaned_spectra[row_index]
         flags: list[str] = []
         numerical_failure = False
         if not np.isfinite(angle[row_index]):
@@ -438,6 +576,10 @@ def process_shg_sweep(
             flags.append("MOVE_FAILED")
         if not bool(data.acquisition_ok[row_index]):
             flags.append("ACQUISITION_FAILED")
+        if cosmic_pixels_removed[row_index] > 0:
+            flags.append("COSMIC_RAY_REMOVED")
+        if cosmic_pixels_removed[row_index] > max(5, int(np.ceil(0.01 * wavelength.size))):
+            flags.append("COSMIC_RAY_HEAVY")
         try:
             if settings.background_method == "none":
                 row_baseline = np.zeros(wavelength.size, dtype=float)
@@ -514,6 +656,9 @@ def process_shg_sweep(
         data=data,
         settings=settings,
         measured_angle_deg=angle,
+        cleaned_spectra=cleaned_spectra,
+        cosmic_ray_mask=cosmic_ray_mask,
+        cosmic_pixels_removed=cosmic_pixels_removed,
         baseline=baseline,
         corrected=corrected,
         integrated_area=area,

@@ -59,6 +59,7 @@ from core.export import (
     export_power_series_png_and_dat,
     export_power_vp_pngs_and_dat,
     export_shg_results,
+    export_shg_twist_comparison,
     vp_compare_export_base,
     vp_compare_title,
 )
@@ -81,6 +82,14 @@ from core.processing import (
     valley_polarization_cube,
 )
 from core.shg import ShgProcessResult, ShgSettings, ShgSweepData, process_shg_sweep
+from core.shg_fit import (
+    ShgAngularFitResult,
+    ShgFitSettings,
+    ShgTwistFitResult,
+    evaluate_shg_angular_model,
+    fit_shg_angular_result,
+    fit_shg_twist_comparison,
+)
 
 UI_METRICS = {
     "left_max_width": 500,
@@ -114,6 +123,13 @@ class LoadedState:
     shg_data: ShgSweepData | None = None
     shg_background: ShgSweepData | None = None
     shg_result: ShgProcessResult | None = None
+    shg_data_b: ShgSweepData | None = None
+    shg_background_b: ShgSweepData | None = None
+    shg_result_b: ShgProcessResult | None = None
+    shg_fit: ShgAngularFitResult | None = None
+    shg_fit_b: ShgAngularFitResult | None = None
+    shg_twist: ShgTwistFitResult | None = None
+    shg_compare: bool = False
     drr_mode_label: str = "DR/R Self"
     drr_derivative_label: str = "None"
     drr_baseline_text: str = "Self (last frame)"
@@ -135,6 +151,8 @@ class LoadOptions:
     compare_sources: Dict[str, str] = field(default_factory=dict)
     power_group_key: str = ""
     shg_settings: ShgSettings | None = None
+    shg_fit_settings: ShgFitSettings | None = None
+    shg_compare: bool = False
 
 
 def _vp_short_title(kk_title: str, kkp_title: str) -> str:
@@ -189,6 +207,7 @@ class ExportOptions:
     power_pairing_mode: str = "stage"
     power_stage_pairs: tuple[Any, ...] = ()
     shg_settings: ShgSettings | None = None
+    shg_fit_settings: ShgFitSettings | None = None
     auto_move_sources: bool = False
 
 
@@ -1612,6 +1631,12 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
+        self.shg_workflow_tabs = QTabWidget()
+        single_page = QWidget()
+        single_layout = QVBoxLayout(single_page)
+        single_layout.setContentsMargins(4, 4, 4, 4)
+        single_layout.setSpacing(6)
+
         data_box = QGroupBox("SHG Sweep Table")
         data_layout = QVBoxLayout(data_box)
         data_layout.setContentsMargins(6, 6, 6, 6)
@@ -1636,7 +1661,46 @@ class MainWindow(QMainWindow):
         data_layout.addWidget(self.shg_files)
         data_layout.addWidget(background_row)
         data_layout.addWidget(self.shg_summary)
-        layout.addWidget(self._make_expander("Data", data_box, expanded=True))
+        single_layout.addWidget(self._make_expander("Data", data_box, expanded=True))
+        single_layout.addStretch(1)
+        self.shg_workflow_tabs.addTab(single_page, "Single File")
+
+        compare_page = QWidget()
+        compare_layout = QVBoxLayout(compare_page)
+        compare_layout.setContentsMargins(4, 4, 4, 4)
+        compare_layout.setSpacing(6)
+        compare_box = QGroupBox("SHG Twist Comparison")
+        compare_form = QFormLayout(compare_box)
+        compare_form.setContentsMargins(6, 6, 6, 6)
+        compare_form.setSpacing(6)
+        self.shg_compare_reference_combo = QComboBox()
+        self.shg_compare_sample_combo = QComboBox()
+        self.shg_compare_background_a_combo = QComboBox()
+        self.shg_compare_background_b_combo = QComboBox()
+        self.shg_compare_display_combo = QComboBox()
+        self.shg_compare_display_combo.addItems(["Raw area", "Normalized"])
+        for combo in (
+            self.shg_compare_reference_combo,
+            self.shg_compare_sample_combo,
+            self.shg_compare_background_a_combo,
+            self.shg_compare_background_b_combo,
+            self.shg_compare_display_combo,
+        ):
+            self._style_combo_popup(combo)
+        self.shg_compare_summary = QPlainTextEdit()
+        self.shg_compare_summary.setReadOnly(True)
+        self.shg_compare_summary.setMaximumHeight(150)
+        compare_form.addRow("Reference A", self.shg_compare_reference_combo)
+        compare_form.addRow("Sample B", self.shg_compare_sample_combo)
+        compare_form.addRow("Background A", self.shg_compare_background_a_combo)
+        compare_form.addRow("Background B", self.shg_compare_background_b_combo)
+        compare_form.addRow("Plot", self.shg_compare_display_combo)
+        compare_form.addRow(self.shg_compare_summary)
+        self._set_form_label_width(compare_form, UI_METRICS["label_col_width"])
+        compare_layout.addWidget(compare_box)
+        compare_layout.addStretch(1)
+        self.shg_workflow_tabs.addTab(compare_page, "Compare / Twist Angle")
+        layout.addWidget(self.shg_workflow_tabs)
 
         def wavelength_spin(value: float) -> QDoubleSpinBox:
             spin = QDoubleSpinBox()
@@ -1688,6 +1752,35 @@ class MainWindow(QMainWindow):
         self._set_form_label_width(integration_form, UI_METRICS["label_col_width"])
         layout.addWidget(self._make_expander("Peak Integration", integration, expanded=True))
 
+        cosmic_box = QGroupBox("Cosmic Ray Removal")
+        cosmic_form = QFormLayout(cosmic_box)
+        cosmic_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
+        cosmic_form.setSpacing(6)
+        self.shg_cosmic_enable_chk = QCheckBox("Remove narrow positive spikes")
+        self.shg_cosmic_enable_chk.setChecked(True)
+        self.shg_cosmic_threshold_spin = QDoubleSpinBox()
+        self.shg_cosmic_threshold_spin.setDecimals(1)
+        self.shg_cosmic_threshold_spin.setRange(3.0, 30.0)
+        self.shg_cosmic_threshold_spin.setSingleStep(0.5)
+        self.shg_cosmic_threshold_spin.setValue(8.0)
+        self.shg_cosmic_window_spin = QSpinBox()
+        self.shg_cosmic_window_spin.setRange(3, 51)
+        self.shg_cosmic_window_spin.setSingleStep(2)
+        self.shg_cosmic_window_spin.setValue(7)
+        self.shg_cosmic_max_width_spin = QSpinBox()
+        self.shg_cosmic_max_width_spin.setRange(1, 15)
+        self.shg_cosmic_max_width_spin.setValue(3)
+        self.shg_spectrum_view_combo = QComboBox()
+        self.shg_spectrum_view_combo.addItems(["Raw + cleaned", "Raw", "Cosmic-cleaned"])
+        self._style_combo_popup(self.shg_spectrum_view_combo)
+        cosmic_form.addRow(self.shg_cosmic_enable_chk)
+        cosmic_form.addRow("Threshold (MAD)", self.shg_cosmic_threshold_spin)
+        cosmic_form.addRow("Detection window", self.shg_cosmic_window_spin)
+        cosmic_form.addRow("Maximum width", self.shg_cosmic_max_width_spin)
+        cosmic_form.addRow("Spectrum view", self.shg_spectrum_view_combo)
+        self._set_form_label_width(cosmic_form, UI_METRICS["label_col_width"])
+        layout.addWidget(self._make_expander("Cosmic Rays", cosmic_box, expanded=False))
+
         angle_box = QGroupBox("Measured Angle")
         angle_form = QFormLayout(angle_box)
         angle_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
@@ -1715,6 +1808,47 @@ class MainWindow(QMainWindow):
         angle_form.addRow("Selected angle", self.shg_angle_cursor_spin)
         self._set_form_label_width(angle_form, UI_METRICS["label_col_width"])
         layout.addWidget(self._make_expander("Angle", angle_box, expanded=False))
+
+        fit_box = QGroupBox("Angular Fit")
+        fit_form = QFormLayout(fit_box)
+        fit_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
+        fit_form.setSpacing(6)
+        self.shg_fit_enable_chk = QCheckBox("Fit I(θ) = I₀ + A cos²[2(θ-xc)]")
+        self.shg_fit_enable_chk.setChecked(True)
+        self.shg_fit_min_spin = QDoubleSpinBox()
+        self.shg_fit_max_spin = QDoubleSpinBox()
+        for spin, value in ((self.shg_fit_min_spin, 0.0), (self.shg_fit_max_spin, 180.0)):
+            spin.setDecimals(4)
+            spin.setRange(-1.0e6, 1.0e6)
+            spin.setValue(value)
+        fit_range_row = QWidget()
+        fit_range_layout = QHBoxLayout(fit_range_row)
+        fit_range_layout.setContentsMargins(0, 0, 0, 0)
+        fit_range_layout.setSpacing(6)
+        fit_range_layout.addWidget(self.shg_fit_min_spin)
+        fit_range_layout.addWidget(QLabel("to"))
+        fit_range_layout.addWidget(self.shg_fit_max_spin)
+        fit_range_layout.addWidget(QLabel("deg"))
+        self.shg_fit_weighted_chk = QCheckBox("Use area uncertainty weights")
+        self.shg_fit_weighted_chk.setChecked(True)
+        self.shg_fit_include_excluded_chk = QCheckBox("Include excluded acquisition rows")
+        self.shg_fit_branch_spin = QSpinBox()
+        self.shg_fit_branch_spin.setRange(-3, 3)
+        self.shg_fit_branch_spin.setValue(0)
+        self.shg_fit_branch_spin.setEnabled(False)
+        self.shg_fit_branch_spin.setToolTip("Adds 90° per branch to Δxc, equivalent to 60° per twist branch")
+        self.shg_fit_summary = QPlainTextEdit()
+        self.shg_fit_summary.setReadOnly(True)
+        self.shg_fit_summary.setMaximumHeight(150)
+        fit_form.addRow(self.shg_fit_enable_chk)
+        fit_form.addRow("Fit angle range", fit_range_row)
+        fit_form.addRow(self.shg_fit_weighted_chk)
+        fit_form.addRow(self.shg_fit_include_excluded_chk)
+        fit_form.addRow("Phase branch", self.shg_fit_branch_spin)
+        fit_form.addRow(self.shg_fit_summary)
+        self._set_form_label_width(fit_form, UI_METRICS["label_col_width"])
+        layout.addWidget(self._make_expander("Angular Fit", fit_box, expanded=True))
+        self._shg_update_cosmic_controls()
         layout.addStretch(1)
         return tab
 
@@ -1858,13 +1992,41 @@ class MainWindow(QMainWindow):
     def _shg_background_file(self) -> str:
         return str(self.shg_background_combo.currentData() or "") if hasattr(self, "shg_background_combo") else ""
 
+    def _shg_compare_mode(self) -> bool:
+        return hasattr(self, "shg_workflow_tabs") and self.shg_workflow_tabs.currentIndex() == 1
+
+    @staticmethod
+    def _combo_data_text(combo: QComboBox) -> str:
+        return str(combo.currentData() or "")
+
+    def _shg_compare_files(self) -> tuple[str, str]:
+        return (
+            self._combo_data_text(self.shg_compare_reference_combo),
+            self._combo_data_text(self.shg_compare_sample_combo),
+        )
+
+    def _shg_compare_background_files(self) -> tuple[str, str]:
+        return (
+            self._combo_data_text(self.shg_compare_background_a_combo),
+            self._combo_data_text(self.shg_compare_background_b_combo),
+        )
+
     def _shg_refresh_sources(self) -> None:
         if not hasattr(self, "shg_files"):
             return
         old_source = self._shg_selected_file()
         old_background = self._shg_background_file()
+        old_compare = self._shg_compare_files()
+        old_compare_backgrounds = self._shg_compare_background_files()
         source_blocked = self.shg_files.blockSignals(True)
         background_blocked = self.shg_background_combo.blockSignals(True)
+        compare_combos = (
+            self.shg_compare_reference_combo,
+            self.shg_compare_sample_combo,
+            self.shg_compare_background_a_combo,
+            self.shg_compare_background_b_combo,
+        )
+        compare_blocked = [combo.blockSignals(True) for combo in compare_combos]
         try:
             self.shg_files.clear()
             self.shg_files.addItems(self.available_files)
@@ -1876,11 +2038,53 @@ class MainWindow(QMainWindow):
                 self.shg_background_combo.addItem(file_name, file_name)
             background_index = self.shg_background_combo.findData(old_background)
             self.shg_background_combo.setCurrentIndex(background_index if background_index >= 0 else 0)
+            for combo in (self.shg_compare_reference_combo, self.shg_compare_sample_combo):
+                combo.clear()
+                combo.addItem("— Select —", "")
+                for file_name in self.available_files:
+                    combo.addItem(file_name, file_name)
+            for combo in (self.shg_compare_background_a_combo, self.shg_compare_background_b_combo):
+                combo.clear()
+                combo.addItem("— None —", "")
+                for file_name in self.available_files:
+                    combo.addItem(file_name, file_name)
+            for combo, previous in zip(
+                (self.shg_compare_reference_combo, self.shg_compare_sample_combo),
+                old_compare,
+            ):
+                index = combo.findData(previous)
+                combo.setCurrentIndex(index if index >= 0 else 0)
+            for combo, previous in zip(
+                (self.shg_compare_background_a_combo, self.shg_compare_background_b_combo),
+                old_compare_backgrounds,
+            ):
+                index = combo.findData(previous)
+                combo.setCurrentIndex(index if index >= 0 else 0)
+            if old_compare[0] not in self.available_files and self.available_files:
+                self.shg_compare_reference_combo.setCurrentIndex(1)
+            if old_compare[1] not in self.available_files and len(self.available_files) > 1:
+                self.shg_compare_sample_combo.setCurrentIndex(2)
         finally:
             self.shg_files.blockSignals(source_blocked)
             self.shg_background_combo.blockSignals(background_blocked)
+            for combo, blocked in zip(compare_combos, compare_blocked):
+                combo.blockSignals(blocked)
         self._shg_update_background_controls()
         self._shg_update_summary()
+
+    def _shg_fit_settings_from_ui(self) -> ShgFitSettings:
+        angle_min = float(self.shg_fit_min_spin.value())
+        angle_max = float(self.shg_fit_max_spin.value())
+        if angle_min >= angle_max:
+            raise ValueError("SHG fit minimum angle must be smaller than the maximum angle.")
+        return ShgFitSettings(
+            enabled=bool(self.shg_fit_enable_chk.isChecked()),
+            angle_min_deg=angle_min,
+            angle_max_deg=angle_max,
+            use_uncertainty_weights=bool(self.shg_fit_weighted_chk.isChecked()),
+            include_excluded_rows=bool(self.shg_fit_include_excluded_chk.isChecked()),
+            phase_branch=int(self.shg_fit_branch_spin.value()),
+        )
 
     def _shg_settings_from_ui(self) -> ShgSettings:
         method_map = {
@@ -1906,6 +2110,10 @@ class MainWindow(QMainWindow):
             right_max_nm=gate_max + sideband_gap + sideband_width,
             background_method=method_map.get(self.shg_background_method_combo.currentText(), "local_linear"),
             sigma_clip=float(self.shg_sigma_clip_spin.value()),
+            remove_cosmic_rays=bool(self.shg_cosmic_enable_chk.isChecked()),
+            cosmic_threshold_mad=float(self.shg_cosmic_threshold_spin.value()),
+            cosmic_window_points=int(self.shg_cosmic_window_spin.value()),
+            cosmic_max_width_points=int(self.shg_cosmic_max_width_spin.value()),
             angle_scale=float(self.shg_angle_scale_spin.value()),
             angle_offset_deg=float(self.shg_angle_offset_spin.value()),
             angle_wrap_deg=wrap_map.get(self.shg_angle_wrap_combo.currentText()),
@@ -1914,9 +2122,26 @@ class MainWindow(QMainWindow):
 
     def _shg_update_background_controls(self) -> None:
         if hasattr(self, "shg_background_combo"):
-            self.shg_background_combo.setEnabled(
-                self.shg_background_method_combo.currentText() == "External + local residual"
-            )
+            external = self.shg_background_method_combo.currentText() == "External + local residual"
+            self.shg_background_combo.setEnabled(external)
+            self.shg_compare_background_a_combo.setEnabled(external)
+            self.shg_compare_background_b_combo.setEnabled(external)
+
+    def _shg_update_cosmic_controls(self) -> None:
+        if not hasattr(self, "shg_cosmic_enable_chk"):
+            return
+        window = int(self.shg_cosmic_window_spin.value())
+        if window % 2 == 0:
+            window = min(self.shg_cosmic_window_spin.maximum(), window + 1)
+            self.shg_cosmic_window_spin.setValue(window)
+        self.shg_cosmic_max_width_spin.setMaximum(max(1, window - 1))
+        enabled = bool(self.shg_cosmic_enable_chk.isChecked())
+        for widget in (
+            self.shg_cosmic_threshold_spin,
+            self.shg_cosmic_window_spin,
+            self.shg_cosmic_max_width_spin,
+        ):
+            widget.setEnabled(enabled)
 
     def _shg_update_summary(self) -> None:
         if not hasattr(self, "shg_summary"):
@@ -1935,11 +2160,12 @@ class MainWindow(QMainWindow):
                 f"{0.5 * (result.settings.gate_max_nm - result.settings.gate_min_nm):g} nm",
                 f"Background sidebands: {result.settings.left_min_nm:g}-{result.settings.left_max_nm:g} and "
                 f"{result.settings.right_min_nm:g}-{result.settings.right_max_nm:g} nm",
+                f"Cosmic rays: {int(np.sum(result.cosmic_pixels_removed))} pixel(s) removed from "
+                f"{int(np.count_nonzero(result.cosmic_pixels_removed))} acquisition(s)",
                 f"Angle column: {measured_column}; included: {included}; excluded/warned: {failures}",
             ]
             self.shg_summary.setPlainText("\n".join(lines))
-            return
-        if self.available_files:
+        elif self.available_files:
             selected = self._shg_selected_file()
             selected_line = f"Selected: {selected}\n" if selected else "Select one CSV file from the list.\n"
             self.shg_summary.setPlainText(
@@ -1951,17 +2177,96 @@ class MainWindow(QMainWindow):
             self.shg_summary.setPlainText(
                 "No CSV files are available in the selected folder."
             )
+        if hasattr(self, "shg_compare_summary"):
+            if self.loaded and self.loaded.mode == "SHG Processing" and self.loaded.shg_compare:
+                reference_name = self.loaded.shg_data.source_file if self.loaded.shg_data is not None else ""
+                sample_name = self.loaded.shg_data_b.source_file if self.loaded.shg_data_b is not None else ""
+                self.shg_compare_summary.setPlainText(
+                    f"Reference A: {reference_name}\nSample B: {sample_name}\n"
+                    "Both curves use the shared processing settings. Twist sign is Sample B minus Reference A."
+                )
+            else:
+                reference_name, sample_name = self._shg_compare_files()
+                self.shg_compare_summary.setPlainText(
+                    f"Reference A: {reference_name or 'select a file'}\n"
+                    f"Sample B: {sample_name or 'select a different file'}\n"
+                    "Press Load to process and fit both files. Twist sign is Sample B minus Reference A."
+                )
+        self._shg_update_fit_summary()
+
+    def _shg_update_fit_summary(self) -> None:
+        if not hasattr(self, "shg_fit_summary"):
+            return
+        if not self.loaded or self.loaded.mode != "SHG Processing":
+            self.shg_fit_summary.setPlainText("Load SHG data to calculate the angular fit.")
+            return
+        if self.loaded.shg_twist is not None:
+            twist = self.loaded.shg_twist
+            self.shg_fit_summary.setPlainText(
+                f"A xc = {twist.reference_fit.x_center_deg:.6g} ± {twist.reference_fit.x_center_uncertainty_deg:.3g}°\n"
+                f"B xc = {twist.sample_fit.x_center_deg:.6g} ± {twist.sample_fit.x_center_uncertainty_deg:.3g}°\n"
+                f"Δxc = {twist.delta_x_center_deg:.6g} ± {twist.delta_x_center_uncertainty_deg:.3g}°\n"
+                f"Twist = {twist.signed_twist_angle_deg:.6g} ± {twist.twist_uncertainty_deg:.3g}° "
+                f"(|twist| = {twist.absolute_twist_angle_deg:.6g}°)"
+            )
+        elif self.loaded.shg_fit is not None:
+            fit = self.loaded.shg_fit
+            self.shg_fit_summary.setPlainText(
+                f"xc = {fit.x_center_deg:.6g} ± {fit.x_center_uncertainty_deg:.3g}°\n"
+                f"I₀ = {fit.i0:.6g}; A = {fit.amplitude:.6g}\n"
+                f"R² = {fit.r_squared:.6g}; RMSE = {fit.rmse:.6g}; n = {fit.point_count}"
+            )
+        else:
+            self.shg_fit_summary.setPlainText("Angular fit is disabled or unavailable.")
 
     def _on_shg_source_changed(self) -> None:
         self._invalidate_export_move_sources()
         self._shg_update_summary()
-        if self.loaded and self.loaded.mode == "SHG Processing":
+        if (
+            self.loaded
+            and self.loaded.mode == "SHG Processing"
+            and self.loaded.shg_compare == self._shg_compare_mode()
+        ):
             self._start_load("SHG Processing")
+
+    def _on_shg_workflow_changed(self) -> None:
+        compare = self._shg_compare_mode()
+        self.shg_fit_branch_spin.setEnabled(compare)
+        self._shg_update_summary()
+        self._status("SHG Compare / Twist Angle selected." if compare else "SHG Single File selected.")
 
     def _on_shg_param_changed(self) -> None:
         self._invalidate_export_move_sources()
         self._shg_update_background_controls()
-        if self.loaded and self.loaded.mode == "SHG Processing":
+        if (
+            self.loaded
+            and self.loaded.mode == "SHG Processing"
+            and self.loaded.shg_compare == self._shg_compare_mode()
+        ):
+            self._plot_mode("SHG Processing")
+
+    def _on_shg_cosmic_param_changed(self) -> None:
+        self._shg_update_cosmic_controls()
+        self._on_shg_param_changed()
+
+    def _on_shg_fit_param_changed(self) -> None:
+        enabled = bool(self.shg_fit_enable_chk.isChecked())
+        for widget in (
+            self.shg_fit_min_spin,
+            self.shg_fit_max_spin,
+            self.shg_fit_weighted_chk,
+            self.shg_fit_include_excluded_chk,
+        ):
+            widget.setEnabled(enabled)
+        self.shg_fit_branch_spin.setEnabled(enabled and self._shg_compare_mode())
+        self._on_shg_param_changed()
+
+    def _on_shg_spectrum_view_changed(self) -> None:
+        if (
+            self.loaded
+            and self.loaded.mode == "SHG Processing"
+            and self.loaded.shg_compare == self._shg_compare_mode()
+        ):
             self._plot_mode("SHG Processing")
 
     def _on_shg_background_method_changed(self) -> None:
@@ -1970,14 +2275,16 @@ class MainWindow(QMainWindow):
         if not self.loaded or self.loaded.mode != "SHG Processing":
             return
         if self.shg_background_method_combo.currentText() == "External + local residual":
-            selected = self._shg_background_file()
-            if not selected:
+            if self._shg_compare_mode():
+                backgrounds = self._shg_compare_background_files()
+                if not all(backgrounds):
+                    self._status("Select external SHG background CSVs for both comparison files.")
+                    return
+            elif not self._shg_background_file():
                 self._status("Select an SHG background CSV for external background mode.")
                 return
-            loaded_name = self.loaded.shg_background.source_file if self.loaded.shg_background is not None else ""
-            if loaded_name != selected:
-                self._start_load("SHG Processing")
-                return
+            self._start_load("SHG Processing")
+            return
         self._plot_mode("SHG Processing")
 
     def _power_candidate_files(self) -> list[str]:
@@ -2768,7 +3075,18 @@ class MainWindow(QMainWindow):
         self.power_auto_y_btn.clicked.connect(self._auto_power_yrange)
         self.shg_files.itemSelectionChanged.connect(self._on_shg_source_changed)
         self.shg_background_combo.currentIndexChanged.connect(lambda _idx: self._on_shg_source_changed())
+        self.shg_workflow_tabs.currentChanged.connect(lambda _idx: self._on_shg_workflow_changed())
+        for combo in (
+            self.shg_compare_reference_combo,
+            self.shg_compare_sample_combo,
+            self.shg_compare_background_a_combo,
+            self.shg_compare_background_b_combo,
+        ):
+            combo.currentIndexChanged.connect(lambda _idx: self._on_shg_source_changed())
         self.shg_background_method_combo.currentTextChanged.connect(lambda _text: self._on_shg_background_method_changed())
+        self.shg_cosmic_enable_chk.toggled.connect(lambda _checked: self._on_shg_cosmic_param_changed())
+        self.shg_spectrum_view_combo.currentTextChanged.connect(lambda _text: self._on_shg_spectrum_view_changed())
+        self.shg_compare_display_combo.currentTextChanged.connect(lambda _text: self._on_shg_spectrum_view_changed())
         self.shg_angle_wrap_combo.currentTextChanged.connect(lambda _text: self._on_shg_param_changed())
         self.shg_include_failed_chk.toggled.connect(lambda _checked: self._on_shg_param_changed())
         self.shg_angle_cursor_spin.valueChanged.connect(lambda _value: self._on_shg_param_changed())
@@ -2782,6 +3100,18 @@ class MainWindow(QMainWindow):
             self.shg_angle_offset_spin,
         ):
             spin.editingFinished.connect(self._on_shg_param_changed)
+        for spin in (
+            self.shg_cosmic_threshold_spin,
+            self.shg_cosmic_window_spin,
+            self.shg_cosmic_max_width_spin,
+        ):
+            spin.editingFinished.connect(self._on_shg_cosmic_param_changed)
+        self.shg_fit_enable_chk.toggled.connect(lambda _checked: self._on_shg_fit_param_changed())
+        self.shg_fit_weighted_chk.toggled.connect(lambda _checked: self._on_shg_fit_param_changed())
+        self.shg_fit_include_excluded_chk.toggled.connect(lambda _checked: self._on_shg_fit_param_changed())
+        self.shg_fit_min_spin.editingFinished.connect(self._on_shg_fit_param_changed)
+        self.shg_fit_max_spin.editingFinished.connect(self._on_shg_fit_param_changed)
+        self.shg_fit_branch_spin.valueChanged.connect(lambda _value: self._on_shg_fit_param_changed())
         self.drr_yaxis_combo.currentTextChanged.connect(self._on_drr_plot_param_changed)
         self.drr_yaxis_a_spin.valueChanged.connect(self._on_drr_plot_param_changed)
         self.drr_yaxis_b_spin.valueChanged.connect(self._on_drr_plot_param_changed)
@@ -3549,6 +3879,8 @@ class MainWindow(QMainWindow):
         compare_sources: Dict[str, str] = {}
         power_group_key = ""
         shg_settings: ShgSettings | None = None
+        shg_fit_settings: ShgFitSettings | None = None
+        shg_compare = False
 
         if mode == "PL":
             selected = self._selected(self.pl_files)
@@ -3584,15 +3916,32 @@ class MainWindow(QMainWindow):
             y_axis_spec = self._selected_y_axis_spec("cmp")
             power_group_key = ""
         elif mode == "SHG Processing":
-            source_file = self._shg_selected_file()
             shg_settings = self._shg_settings_from_ui()
-            background_file = (
-                self._shg_background_file()
-                if shg_settings.background_method == "external"
-                else ""
-            )
-            selected = [source_file] if source_file else []
-            baselines = [background_file] if background_file else []
+            shg_fit_settings = self._shg_fit_settings_from_ui()
+            shg_compare = self._shg_compare_mode()
+            if shg_compare:
+                reference_file, sample_file = self._shg_compare_files()
+                if reference_file and sample_file and reference_file == sample_file:
+                    self._show_error("Select two different SHG files for twist-angle comparison.")
+                    return
+                selected = [name for name in (reference_file, sample_file) if name]
+                if shg_settings.background_method == "external":
+                    backgrounds = self._shg_compare_background_files()
+                    if not all(backgrounds):
+                        self._show_error("External SHG comparison requires a background file for A and B.")
+                        return
+                    baselines = list(backgrounds)
+                else:
+                    baselines = []
+            else:
+                source_file = self._shg_selected_file()
+                background_file = (
+                    self._shg_background_file()
+                    if shg_settings.background_method == "external"
+                    else ""
+                )
+                selected = [source_file] if source_file else []
+                baselines = [background_file] if background_file else []
             pl_log = False
             cmp_log = False
             drr_baseline = "Self (last frame)"
@@ -3626,6 +3975,8 @@ class MainWindow(QMainWindow):
             compare_sources=compare_sources,
             power_group_key=power_group_key,
             shg_settings=shg_settings,
+            shg_fit_settings=shg_fit_settings,
+            shg_compare=shg_compare,
         )
 
         self._set_stage("Loading...")
@@ -3716,6 +4067,9 @@ class MainWindow(QMainWindow):
 
         if mode == "SHG Processing":
             settings = options.shg_settings or ShgSettings()
+            fit_settings = options.shg_fit_settings or ShgFitSettings(enabled=False)
+            if options.shg_compare and len(options.selected_files) != 2:
+                raise ValueError("SHG Compare / Twist Angle requires exactly two files.")
             data = data_io.load_shg_sweep(folder, options.selected_files[0])
             background = (
                 data_io.load_shg_sweep(folder, options.baseline_files[0])
@@ -3723,15 +4077,48 @@ class MainWindow(QMainWindow):
                 else None
             )
             result = process_shg_sweep(data, settings, background=background)
+            data_b: ShgSweepData | None = None
+            background_b: ShgSweepData | None = None
+            result_b: ShgProcessResult | None = None
+            fit: ShgAngularFitResult | None = None
+            fit_b: ShgAngularFitResult | None = None
+            twist: ShgTwistFitResult | None = None
+            if options.shg_compare:
+                data_b = data_io.load_shg_sweep(folder, options.selected_files[1])
+                background_b = (
+                    data_io.load_shg_sweep(folder, options.baseline_files[1])
+                    if len(options.baseline_files) > 1
+                    else None
+                )
+                result_b = process_shg_sweep(data_b, settings, background=background_b)
+                if fit_settings.enabled:
+                    try:
+                        twist = fit_shg_twist_comparison(result, result_b, fit_settings)
+                        fit = twist.reference_fit
+                        fit_b = twist.sample_fit
+                    except ValueError as exc:
+                        log.emit(f"SHG twist fit unavailable: {exc}")
+            elif fit_settings.enabled:
+                try:
+                    fit = fit_shg_angular_result(result, fit_settings)
+                except ValueError as exc:
+                    log.emit(f"SHG angular fit unavailable: {exc}")
             return LoadedState(
                 mode="SHG Processing",
                 folder=folder,
                 primary_file=data.source_file,
-                selected_files=[data.source_file],
-                baseline_files=([background.source_file] if background is not None else []),
+                selected_files=[item.source_file for item in (data, data_b) if item is not None],
+                baseline_files=[item.source_file for item in (background, background_b) if item is not None],
                 shg_data=data,
                 shg_background=background,
                 shg_result=result,
+                shg_data_b=data_b,
+                shg_background_b=background_b,
+                shg_result_b=result_b,
+                shg_fit=fit,
+                shg_fit_b=fit_b,
+                shg_twist=twist,
+                shg_compare=options.shg_compare,
                 y_axis_spec="auto",
             )
 
@@ -3758,9 +4145,24 @@ class MainWindow(QMainWindow):
                 self.power_group_combo.setCurrentIndex(idx)
         if loaded.mode == "SHG Processing" and loaded.shg_result is not None:
             self._shg_refresh_sources()
-            blocked = self.shg_files.blockSignals(True)
-            self._restore_list_selection(self.shg_files, [loaded.primary_file or ""])
-            self.shg_files.blockSignals(blocked)
+            tab_blocked = self.shg_workflow_tabs.blockSignals(True)
+            self.shg_workflow_tabs.setCurrentIndex(1 if loaded.shg_compare else 0)
+            self.shg_workflow_tabs.blockSignals(tab_blocked)
+            self.shg_fit_branch_spin.setEnabled(loaded.shg_compare and self.shg_fit_enable_chk.isChecked())
+            if loaded.shg_compare:
+                for combo, file_name in zip(
+                    (self.shg_compare_reference_combo, self.shg_compare_sample_combo),
+                    loaded.selected_files,
+                ):
+                    blocked = combo.blockSignals(True)
+                    index = combo.findData(file_name)
+                    if index >= 0:
+                        combo.setCurrentIndex(index)
+                    combo.blockSignals(blocked)
+            else:
+                blocked = self.shg_files.blockSignals(True)
+                self._restore_list_selection(self.shg_files, [loaded.primary_file or ""])
+                self.shg_files.blockSignals(blocked)
             finite = np.flatnonzero(np.isfinite(loaded.shg_result.measured_angle_deg))
             if finite.size:
                 included = finite[loaded.shg_result.included[finite]]
@@ -3768,6 +4170,7 @@ class MainWindow(QMainWindow):
                 blocked = self.shg_angle_cursor_spin.blockSignals(True)
                 self.shg_angle_cursor_spin.setValue(float(loaded.shg_result.measured_angle_deg[selected]))
                 self.shg_angle_cursor_spin.blockSignals(blocked)
+            self._shg_update_summary()
         self._apply_auto_limits_for_loaded()
         self._set_stage("Loaded")
         self._update_action_states()
@@ -3822,12 +4225,42 @@ class MainWindow(QMainWindow):
         if mode == "SHG Processing":
             if self.loaded.shg_data is None:
                 raise ValueError("No SHG sweep table is loaded.")
+            if self.loaded.shg_compare != self._shg_compare_mode():
+                raise ValueError("Press Load after changing the SHG Single/Compare workflow.")
             settings = self._shg_settings_from_ui()
+            fit_settings = self._shg_fit_settings_from_ui()
             self.loaded.shg_result = process_shg_sweep(
                 self.loaded.shg_data,
                 settings,
                 background=self.loaded.shg_background,
             )
+            self.loaded.shg_fit = None
+            self.loaded.shg_fit_b = None
+            self.loaded.shg_twist = None
+            if self.loaded.shg_compare:
+                if self.loaded.shg_data_b is None:
+                    raise ValueError("The SHG comparison sample file is not loaded.")
+                self.loaded.shg_result_b = process_shg_sweep(
+                    self.loaded.shg_data_b,
+                    settings,
+                    background=self.loaded.shg_background_b,
+                )
+                if fit_settings.enabled:
+                    try:
+                        self.loaded.shg_twist = fit_shg_twist_comparison(
+                            self.loaded.shg_result,
+                            self.loaded.shg_result_b,
+                            fit_settings,
+                        )
+                        self.loaded.shg_fit = self.loaded.shg_twist.reference_fit
+                        self.loaded.shg_fit_b = self.loaded.shg_twist.sample_fit
+                    except ValueError as exc:
+                        self._status(f"SHG twist fit unavailable: {exc}")
+            elif fit_settings.enabled:
+                try:
+                    self.loaded.shg_fit = fit_shg_angular_result(self.loaded.shg_result, fit_settings)
+                except ValueError as exc:
+                    self._status(f"SHG angular fit unavailable: {exc}")
             self._shg_update_summary()
             return True
         current_spec = self._current_y_axis_spec_for_mode(mode)
@@ -4803,21 +5236,47 @@ class MainWindow(QMainWindow):
             self.shg_angle_cursor_spin.blockSignals(blocked)
 
         grid = self.figure.add_gridspec(
-            nrows=2,
+            nrows=3,
             ncols=2,
-            height_ratios=[1.0, 0.95],
+            height_ratios=[1.0, 0.9, 0.32],
             wspace=0.25,
-            hspace=0.34,
+            hspace=0.38,
         )
         raw_ax = self.figure.add_subplot(grid[0, 0])
         corrected_ax = self.figure.add_subplot(grid[0, 1], sharex=raw_ax)
         angle_ax = self.figure.add_subplot(grid[1, :])
+        residual_ax = self.figure.add_subplot(grid[2, :], sharex=angle_ax)
         wavelength = np.asarray(data.wavelength_nm, float)
         raw = np.asarray(data.spectra[selected], float)
+        cleaned = np.asarray(result.cleaned_spectra[selected], float)
+        cosmic_mask = np.asarray(result.cosmic_ray_mask[selected], bool)
         baseline = np.asarray(result.baseline[selected], float)
         corrected = np.asarray(result.corrected[selected], float)
 
-        raw_ax.plot(wavelength, raw, color="#1769c2", lw=1.0, label="Measured")
+        spectrum_view = self.shg_spectrum_view_combo.currentText()
+        if spectrum_view in {"Raw + cleaned", "Raw"}:
+            raw_ax.plot(wavelength, raw, color="#1769c2", lw=1.0, label="Raw measured")
+        if spectrum_view in {"Raw + cleaned", "Cosmic-cleaned"}:
+            raw_ax.plot(
+                wavelength,
+                cleaned,
+                color="#7b2cbf",
+                lw=1.1,
+                alpha=0.9,
+                label="Cosmic-cleaned",
+            )
+        if np.any(cosmic_mask):
+            marker_values = raw if spectrum_view != "Cosmic-cleaned" else cleaned
+            raw_ax.scatter(
+                wavelength[cosmic_mask],
+                marker_values[cosmic_mask],
+                color="#d62728",
+                marker="x",
+                s=38,
+                linewidths=1.4,
+                label=f"Removed ({int(np.count_nonzero(cosmic_mask))})",
+                zorder=6,
+            )
         raw_ax.plot(wavelength, baseline, color="#ef7f1a", lw=1.5, label="Background")
         raw_ax.set_title(
             f"{data.source_file} row {int(data.source_rows[selected])} — {angle[selected]:.6g}°"
@@ -4882,6 +5341,33 @@ class MainWindow(QMainWindow):
                 zorder=6,
                 label="Selected",
             )
+        fit = self.loaded.shg_fit if self.loaded is not None else None
+        if fit is not None:
+            dense_angle = np.linspace(
+                float(np.nanmin(angle[fit.fit_mask])),
+                float(np.nanmax(angle[fit.fit_mask])),
+                721,
+            )
+            angle_ax.plot(
+                dense_angle,
+                evaluate_shg_angular_model(dense_angle, fit.i0, fit.amplitude, fit.x_center_deg),
+                color="#d62728",
+                lw=1.6,
+                label=f"Fit xc={fit.x_center_deg:.4g}°",
+            )
+            residual_ax.scatter(
+                angle[fit.fit_mask],
+                fit.residual[fit.fit_mask],
+                color="#1769c2",
+                s=16,
+            )
+            residual_ax.axhline(0.0, color="#555", lw=0.8)
+            residual_ax.set_ylabel("Residual")
+            residual_ax.set_xlabel("Measured angle (deg)")
+            residual_ax.grid(alpha=0.25)
+            angle_ax.set_xlabel("")
+        else:
+            residual_ax.set_visible(False)
         angle_ax.set_title("Background-subtracted SHG area versus measured angle")
         angle_ax.set_xlabel("Measured angle (deg)")
         angle_ax.set_ylabel("Background-subtracted area (counts·nm)")
@@ -4889,6 +5375,122 @@ class MainWindow(QMainWindow):
         angle_ax.legend(loc="best", fontsize=8)
         self._shg_raw_ax = raw_ax
         self._shg_corrected_ax = corrected_ax
+        self._shg_angle_ax = angle_ax
+
+    def _plot_shg_comparison(
+        self,
+        reference: ShgProcessResult,
+        sample: ShgProcessResult,
+    ) -> None:
+        grid = self.figure.add_gridspec(
+            nrows=2,
+            ncols=1,
+            height_ratios=[1.0, 0.32],
+            hspace=0.12,
+        )
+        angle_ax = self.figure.add_subplot(grid[0, 0])
+        residual_ax = self.figure.add_subplot(grid[1, 0], sharex=angle_ax)
+        normalized = self.shg_compare_display_combo.currentText() == "Normalized"
+        plotted_residual = False
+
+        for label, result, fit, color, marker in (
+            ("Reference A", reference, self.loaded.shg_fit if self.loaded else None, "#1769c2", "o"),
+            ("Sample B", sample, self.loaded.shg_fit_b if self.loaded else None, "#d62728", "s"),
+        ):
+            angle = np.asarray(result.measured_angle_deg, float)
+            area = np.asarray(result.integrated_area, float)
+            uncertainty = np.asarray(result.area_uncertainty, float)
+            finite = np.isfinite(angle) & np.isfinite(area)
+            included = finite & np.asarray(result.included, bool)
+            if normalized and fit is not None and fit.amplitude != 0:
+                scale = fit.amplitude
+                offset = fit.i0
+            elif normalized and np.any(finite):
+                offset = float(np.nanmin(area[finite]))
+                scale = max(float(np.nanmax(area[finite]) - offset), np.finfo(float).eps)
+            else:
+                scale = 1.0
+                offset = 0.0
+            plotted_area = (area - offset) / scale
+            plotted_uncertainty = uncertainty / abs(scale)
+            indices = np.flatnonzero(included)
+            order = indices[np.argsort(angle[indices], kind="stable")]
+            if order.size:
+                angle_ax.errorbar(
+                    angle[order],
+                    plotted_area[order],
+                    yerr=plotted_uncertainty[order],
+                    color=color,
+                    marker=marker,
+                    markersize=4.0,
+                    lw=0.9,
+                    capsize=2,
+                    label=f"{label}: {result.data.source_file}",
+                )
+            excluded = finite & ~np.asarray(result.included, bool)
+            if np.any(excluded):
+                angle_ax.scatter(
+                    angle[excluded],
+                    plotted_area[excluded],
+                    color=color,
+                    marker="x",
+                    s=28,
+                    alpha=0.55,
+                )
+            if fit is not None:
+                dense_angle = np.linspace(
+                    float(np.nanmin(angle[fit.fit_mask])),
+                    float(np.nanmax(angle[fit.fit_mask])),
+                    721,
+                )
+                dense_fit = evaluate_shg_angular_model(
+                    dense_angle,
+                    fit.i0,
+                    fit.amplitude,
+                    fit.x_center_deg,
+                )
+                angle_ax.plot(
+                    dense_angle,
+                    (dense_fit - offset) / scale,
+                    color=color,
+                    lw=1.8,
+                    alpha=0.9,
+                    label=f"{label} fit: xc={fit.x_center_deg:.5g}°",
+                )
+                residual_ax.scatter(
+                    angle[fit.fit_mask],
+                    fit.residual[fit.fit_mask] / abs(scale),
+                    color=color,
+                    marker=marker,
+                    s=18,
+                    label=label,
+                )
+                plotted_residual = True
+
+        twist = self.loaded.shg_twist if self.loaded is not None else None
+        if twist is not None:
+            title = (
+                f"SHG twist comparison: Δxc={twist.delta_x_center_deg:.6g}°; "
+                f"twist={twist.signed_twist_angle_deg:.6g} ± {twist.twist_uncertainty_deg:.3g}°"
+            )
+        else:
+            title = "SHG comparison versus measured angle (fit unavailable)"
+        angle_ax.set_title(title)
+        angle_ax.set_ylabel("Normalized area" if normalized else "Background-subtracted area (counts·nm)")
+        angle_ax.grid(alpha=0.25)
+        angle_ax.legend(loc="best", fontsize=8)
+        if plotted_residual:
+            residual_ax.axhline(0.0, color="#555", lw=0.8)
+            residual_ax.set_ylabel("Residual")
+            residual_ax.set_xlabel("Measured angle (deg)")
+            residual_ax.grid(alpha=0.25)
+            residual_ax.legend(loc="best", fontsize=8, ncol=2)
+            angle_ax.tick_params(labelbottom=False)
+        else:
+            residual_ax.set_visible(False)
+            angle_ax.set_xlabel("Measured angle (deg)")
+        self._shg_raw_ax = None
+        self._shg_corrected_ax = None
         self._shg_angle_ax = angle_ax
 
     def _plot_mode(self, mode: str, *, auto: bool = False) -> None:
@@ -4985,7 +5587,10 @@ class MainWindow(QMainWindow):
                 self._pl_heatmap_ax = None
                 self._pl_spectrum_ax = None
                 self._pl_last_plot_cube = None
-                self._plot_shg_result(self.loaded.shg_result)
+                if self.loaded.shg_compare and self.loaded.shg_result_b is not None:
+                    self._plot_shg_comparison(self.loaded.shg_result, self.loaded.shg_result_b)
+                else:
+                    self._plot_shg_result(self.loaded.shg_result)
             elif mode == "Power Dependent" and self.loaded.cube is not None:
                 self._pl_heatmap_ax = None
                 self._pl_spectrum_ax = None
@@ -5270,11 +5875,16 @@ class MainWindow(QMainWindow):
     def _current_plot_params_key(self, mode: str) -> tuple[Any, ...]:
         if mode == "SHG Processing":
             settings = self._shg_settings_from_ui()
+            fit_settings = self._shg_fit_settings_from_ui()
             return (
                 mode,
-                self._shg_selected_file(),
-                self._shg_background_file(),
+                self._shg_compare_mode(),
+                self._shg_compare_files() if self._shg_compare_mode() else self._shg_selected_file(),
+                self._shg_compare_background_files() if self._shg_compare_mode() else self._shg_background_file(),
                 *tuple(settings.to_dict().values()),
+                *tuple(fit_settings.to_dict().values()),
+                self.shg_compare_display_combo.currentText(),
+                self.shg_spectrum_view_combo.currentText(),
                 float(self.shg_angle_cursor_spin.value()),
             )
         if mode == "Power Dependent":
@@ -5770,6 +6380,7 @@ class MainWindow(QMainWindow):
                 mode=mode,
                 params=None,
                 shg_settings=self._shg_settings_from_ui(),
+                shg_fit_settings=self._shg_fit_settings_from_ui(),
                 auto_move_sources=bool(self.auto_move_after_export_chk.isChecked()),
             )
         else:
@@ -5909,17 +6520,56 @@ class MainWindow(QMainWindow):
             and loaded.shg_result is not None
             and options.shg_settings is not None
         ):
-            paths = export_shg_results(
-                folder,
-                data=loaded.shg_data,
-                result=loaded.shg_result,
-                settings=options.shg_settings,
-            )
-            log.emit(f"Exported SHG CSV: {paths['csv'].name}")
-            log.emit(f"Exported SHG settings: {paths['settings'].name}")
-            out_folder = str(paths["csv"].parent)
+            if (
+                loaded.shg_compare
+                and loaded.shg_data_b is not None
+                and loaded.shg_result_b is not None
+                and loaded.shg_twist is not None
+            ):
+                paths = export_shg_twist_comparison(
+                    folder,
+                    reference_data=loaded.shg_data,
+                    reference_result=loaded.shg_result,
+                    sample_data=loaded.shg_data_b,
+                    sample_result=loaded.shg_result_b,
+                    settings=options.shg_settings,
+                    twist=loaded.shg_twist,
+                )
+                log.emit(f"Exported {len(paths)} SHG comparison and twist files.")
+                out_folder = str(paths["combined_csv"].parent)
+            elif loaded.shg_compare and loaded.shg_data_b is not None and loaded.shg_result_b is not None:
+                reference_paths = export_shg_results(
+                    folder,
+                    data=loaded.shg_data,
+                    result=loaded.shg_result,
+                    settings=options.shg_settings,
+                    fit=loaded.shg_fit,
+                )
+                sample_paths = export_shg_results(
+                    folder,
+                    data=loaded.shg_data_b,
+                    result=loaded.shg_result_b,
+                    settings=options.shg_settings,
+                    fit=loaded.shg_fit_b,
+                )
+                paths = {"reference_csv": reference_paths["csv"], "sample_csv": sample_paths["csv"]}
+                log.emit("Exported both SHG processed CSVs; twist summary unavailable because the fit is disabled or failed.")
+                out_folder = str(reference_paths["csv"].parent)
+            else:
+                paths = export_shg_results(
+                    folder,
+                    data=loaded.shg_data,
+                    result=loaded.shg_result,
+                    settings=options.shg_settings,
+                    fit=loaded.shg_fit,
+                )
+                log.emit(f"Exported SHG CSV: {paths['csv'].name}")
+                log.emit(f"Exported SHG settings: {paths['settings'].name}")
+                out_folder = str(paths["csv"].parent)
             files_to_move = list(loaded.selected_files)
-            if loaded.shg_result.background_file:
+            if loaded.shg_result.background_file or (
+                loaded.shg_result_b is not None and loaded.shg_result_b.background_file
+            ):
                 files_to_move.extend(loaded.baseline_files)
         elif mode == "Compare" and loaded.compare_cubes:
             paths = export_compare_panels(

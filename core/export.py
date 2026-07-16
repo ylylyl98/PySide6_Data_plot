@@ -22,6 +22,7 @@ from core.plotting import COMPARE_PANEL_ORDER, HeatmapParams
 from core.processing import background_correct_cube, parse_compare_gate_condition, power_group_title, valley_polarization_cube
 from core.processing_run import save_as_dat
 from core.shg import ShgProcessResult, ShgSettings, ShgSweepData
+from core.shg_fit import ShgAngularFitResult, ShgTwistFitResult
 
 
 # Match the Streamlit-style export geometry used by the desktop app.
@@ -571,6 +572,7 @@ def export_shg_results(
     data: ShgSweepData,
     result: ShgProcessResult,
     settings: ShgSettings,
+    fit: ShgAngularFitResult | None = None,
     processed_name: str = DEFAULT_PROCESSED,
 ) -> Dict[str, Path]:
     """Export a spreadsheet-friendly angle curve and reproducible SHG settings."""
@@ -588,6 +590,8 @@ def export_shg_results(
         "move_error_deg",
         "move_ok",
         "acquisition_ok",
+        "cosmic_pixels_removed",
+        "cosmic_ray_flag",
         "background_subtracted_integrated_area_counts_nm",
         "integration_wavelength_nm",
         "integration_half_range_nm",
@@ -600,6 +604,9 @@ def export_shg_results(
         "baseline_at_center_counts",
         "baseline_rms_counts",
         "gate_points",
+        "fit_intensity_counts_nm",
+        "fit_residual_counts_nm",
+        "fit_included",
         "source_csv",
         "source_row",
         "included",
@@ -632,6 +639,8 @@ def export_shg_results(
                     "move_error_deg": _value(data.move_error_deg, idx),
                     "move_ok": int(bool(data.move_ok[idx])),
                     "acquisition_ok": int(bool(data.acquisition_ok[idx])),
+                    "cosmic_pixels_removed": int(result.cosmic_pixels_removed[idx]),
+                    "cosmic_ray_flag": int(result.cosmic_pixels_removed[idx] > 0),
                     "background_subtracted_integrated_area_counts_nm": _value(result.integrated_area, idx),
                     "integration_wavelength_nm": f"{settings.peak_center_nm:.12g}",
                     "integration_half_range_nm": f"{0.5 * (settings.gate_max_nm - settings.gate_min_nm):.12g}",
@@ -644,6 +653,9 @@ def export_shg_results(
                     "baseline_at_center_counts": _value(result.baseline_at_center, idx),
                     "baseline_rms_counts": _value(result.baseline_rms, idx),
                     "gate_points": int(result.gate_points[idx]),
+                    "fit_intensity_counts_nm": _value(fit.fitted_intensity, idx) if fit is not None else "",
+                    "fit_residual_counts_nm": _value(fit.residual, idx) if fit is not None else "",
+                    "fit_included": int(bool(fit.fit_mask[idx])) if fit is not None else 0,
                     "source_csv": data.source_file,
                     "source_row": int(data.source_rows[idx]),
                     "included": int(bool(result.included[idx])),
@@ -663,11 +675,183 @@ def export_shg_results(
         ],
         "acquisition_rows": int(data.spectra.shape[0]),
         "included_rows": int(np.count_nonzero(result.included)),
-        "integration_source": "background_subtracted_spectrum",
+        "integration_source": settings.to_dict()["integration_source"],
+        "cosmic_pixels_removed": int(np.sum(result.cosmic_pixels_removed)),
+        "cosmic_affected_rows": int(np.count_nonzero(result.cosmic_pixels_removed)),
         "settings": settings.to_dict(),
+        "angular_fit": fit.to_dict() if fit is not None else None,
     }
     settings_path.write_text(json.dumps(settings_payload, indent=2), encoding="utf-8")
     return {"csv": csv_path, "settings": settings_path}
+
+
+def export_shg_twist_comparison(
+    folder: str,
+    *,
+    reference_data: ShgSweepData,
+    reference_result: ShgProcessResult,
+    sample_data: ShgSweepData,
+    sample_result: ShgProcessResult,
+    settings: ShgSettings,
+    twist: ShgTwistFitResult,
+    processed_name: str = DEFAULT_PROCESSED,
+) -> Dict[str, Path]:
+    """Export both SHG curves plus combined fit and twist-angle summaries."""
+    reference_paths = export_shg_results(
+        folder,
+        data=reference_data,
+        result=reference_result,
+        settings=settings,
+        fit=twist.reference_fit,
+        processed_name=processed_name,
+    )
+    sample_paths = export_shg_results(
+        folder,
+        data=sample_data,
+        result=sample_result,
+        settings=settings,
+        fit=twist.sample_fit,
+        processed_name=processed_name,
+    )
+    out_dir = ensure_processed_dir(folder, processed_name)
+    base = (
+        f"{safe_stem(reference_data.source_file, 60)}_vs_"
+        f"{safe_stem(sample_data.source_file, 60)}_SHG_twist"
+    )
+    combined_path = _unique_path(out_dir, f"{base}_combined", ".csv")
+    fit_summary_path = _unique_path(out_dir, f"{base}_fit_summary", ".csv")
+    twist_summary_path = _unique_path(out_dir, f"{base}_twist_summary", ".csv")
+    settings_path = twist_summary_path.with_name(f"{twist_summary_path.stem}_settings.json")
+
+    combined_fields = [
+        "dataset",
+        "source_csv",
+        "source_row",
+        "measured_angle_deg",
+        "background_subtracted_integrated_area_counts_nm",
+        "area_uncertainty_counts_nm",
+        "fit_intensity_counts_nm",
+        "fit_residual_counts_nm",
+        "fit_included",
+        "processing_included",
+        "quality_flag",
+    ]
+    with combined_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=combined_fields)
+        writer.writeheader()
+        for label, data, result, fit in (
+            ("Reference A", reference_data, reference_result, twist.reference_fit),
+            ("Sample B", sample_data, sample_result, twist.sample_fit),
+        ):
+            order = np.argsort(
+                np.where(np.isfinite(result.measured_angle_deg), result.measured_angle_deg, np.inf),
+                kind="stable",
+            )
+            for raw_index in order:
+                index = int(raw_index)
+                writer.writerow(
+                    {
+                        "dataset": label,
+                        "source_csv": data.source_file,
+                        "source_row": int(data.source_rows[index]),
+                        "measured_angle_deg": f"{float(result.measured_angle_deg[index]):.12g}",
+                        "background_subtracted_integrated_area_counts_nm": f"{float(result.integrated_area[index]):.12g}",
+                        "area_uncertainty_counts_nm": f"{float(result.area_uncertainty[index]):.12g}",
+                        "fit_intensity_counts_nm": f"{float(fit.fitted_intensity[index]):.12g}",
+                        "fit_residual_counts_nm": f"{float(fit.residual[index]):.12g}",
+                        "fit_included": int(bool(fit.fit_mask[index])),
+                        "processing_included": int(bool(result.included[index])),
+                        "quality_flag": result.quality_flags[index],
+                    }
+                )
+
+    fit_fields = [
+        "dataset",
+        "source_csv",
+        "i0",
+        "i0_uncertainty",
+        "amplitude",
+        "amplitude_uncertainty",
+        "x_center_deg",
+        "x_center_uncertainty_deg",
+        "r_squared",
+        "rmse",
+        "reduced_chi_squared",
+        "point_count",
+        "angle_span_deg",
+    ]
+    with fit_summary_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fit_fields)
+        writer.writeheader()
+        for label, data, fit in (
+            ("Reference A", reference_data, twist.reference_fit),
+            ("Sample B", sample_data, twist.sample_fit),
+        ):
+            writer.writerow(
+                {
+                    "dataset": label,
+                    "source_csv": data.source_file,
+                    "i0": f"{fit.i0:.12g}",
+                    "i0_uncertainty": f"{fit.i0_uncertainty:.12g}",
+                    "amplitude": f"{fit.amplitude:.12g}",
+                    "amplitude_uncertainty": f"{fit.amplitude_uncertainty:.12g}",
+                    "x_center_deg": f"{fit.x_center_deg:.12g}",
+                    "x_center_uncertainty_deg": f"{fit.x_center_uncertainty_deg:.12g}",
+                    "r_squared": f"{fit.r_squared:.12g}",
+                    "rmse": f"{fit.rmse:.12g}",
+                    "reduced_chi_squared": f"{fit.reduced_chi_squared:.12g}",
+                    "point_count": fit.point_count,
+                    "angle_span_deg": f"{fit.angle_span_deg:.12g}",
+                }
+            )
+
+    twist_fields = [
+        "reference_csv",
+        "sample_csv",
+        "nearest_delta_x_center_deg",
+        "phase_branch",
+        "delta_x_center_deg",
+        "delta_x_center_uncertainty_deg",
+        "signed_twist_angle_deg",
+        "absolute_twist_angle_deg",
+        "twist_uncertainty_deg",
+    ]
+    with twist_summary_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=twist_fields)
+        writer.writeheader()
+        writer.writerow(
+            {
+                "reference_csv": reference_data.source_file,
+                "sample_csv": sample_data.source_file,
+                "nearest_delta_x_center_deg": f"{twist.nearest_delta_x_center_deg:.12g}",
+                "phase_branch": twist.phase_branch,
+                "delta_x_center_deg": f"{twist.delta_x_center_deg:.12g}",
+                "delta_x_center_uncertainty_deg": f"{twist.delta_x_center_uncertainty_deg:.12g}",
+                "signed_twist_angle_deg": f"{twist.signed_twist_angle_deg:.12g}",
+                "absolute_twist_angle_deg": f"{twist.absolute_twist_angle_deg:.12g}",
+                "twist_uncertainty_deg": f"{twist.twist_uncertainty_deg:.12g}",
+            }
+        )
+
+    settings_payload = {
+        "mode": "SHG Compare / Twist Angle",
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "reference_csv": reference_data.source_file,
+        "sample_csv": sample_data.source_file,
+        "processing_settings": settings.to_dict(),
+        "twist_fit": twist.to_dict(),
+    }
+    settings_path.write_text(json.dumps(settings_payload, indent=2), encoding="utf-8")
+    return {
+        "reference_csv": reference_paths["csv"],
+        "reference_settings": reference_paths["settings"],
+        "sample_csv": sample_paths["csv"],
+        "sample_settings": sample_paths["settings"],
+        "combined_csv": combined_path,
+        "fit_summary_csv": fit_summary_path,
+        "twist_summary_csv": twist_summary_path,
+        "comparison_settings": settings_path,
+    }
 
 
 def export_power_vp_pngs_and_dat(

@@ -45,7 +45,13 @@ When you choose a data folder, CSV files must be in the folder root (not subfold
   a per-angle local background, integrates the background-subtracted spectrum over
   a configurable center wavelength and ± half-range, and automatically positions
   symmetric background sidebands using a configurable gap and width. It plots area
-  versus the measured angle and exports a sorted CSV plus JSON settings.
+  versus the measured angle and can conservatively replace narrow positive cosmic-ray
+  spikes before background fitting. Raw and cleaned spectra remain available for
+  inspection, and exports include removal counts plus JSON settings. Nested `Single
+  File` and `Compare / Twist Angle` workflows fit
+  `I(theta) = I0 + A cos^2[2(theta-xc)]`; comparison mode overlays two independently
+  processed curves and reports `twist = (2/3) delta_xc` with explicit 90-degree phase
+  wrapping and branch selection.
 - `DRR`:
   - `Self (last/first frame)` baseline modes.
   - `External` baseline mode from selected baseline files.
