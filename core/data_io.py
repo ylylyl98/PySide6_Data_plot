@@ -171,7 +171,12 @@ def load_compare_cubes(
     log_scale: bool = False,
     y_axis: str = "auto",
 ) -> Dict[str, DataCube]:
-    return {name: load_pl(folder, fn, log_scale=log_scale, y_axis=y_axis) for name, fn in selection.as_pairs().items()}
+    pairs = selection.as_pairs()
+    effective_y_axis = processing_impl.resolve_shared_y_axis_request(list(pairs.values()), y_axis)
+    return {
+        name: load_pl(folder, fn, log_scale=log_scale, y_axis=effective_y_axis)
+        for name, fn in pairs.items()
+    }
 
 
 def get_power_series_groups(files: Sequence[str]) -> Dict[str, tuple[PowerSeriesFile, ...]]:
@@ -421,11 +426,16 @@ def load_power_series_cube(
     if not records:
         raise ValueError("Selected power-dependent group is empty.")
 
+    effective_y_axis = processing_impl.resolve_shared_y_axis_request(
+        [record.file_name for record in records],
+        y_axis,
+    )
+
     ref_energy: np.ndarray | None = None
     spectra: list[np.ndarray] = []
     powers: list[float] = []
     for record in records:
-        cube = load_pl(folder, record.file_name, log_scale=False, y_axis=y_axis)
+        cube = load_pl(folder, record.file_name, log_scale=False, y_axis=effective_y_axis)
         energy = np.asarray(cube.energy, float).ravel()
         spectrum = _spectrum_from_cube(cube)
         if ref_energy is None:

@@ -16,6 +16,13 @@ REP_ONLY_SUFFIX_RE = re.compile(r"(?:\$_|_)rep(?P<rep>\d{1,3})$", re.IGNORECASE)
 RUN_SUFFIX_RE = re.compile(r"(?:\$_|_)(?P<run>\d{3,})$")
 POWER_TOKEN_RE = re.compile(r"(?P<power>[+-]?\d+(?:[pP\.]\d+)?)\s*uW", re.IGNORECASE)
 STAGE_TOKEN_RE = re.compile(r"(?:^|[_\s-]+)Stage[+-]?\d+(?:[pP\.]\d+)?", re.IGNORECASE)
+COMPARE_GATE_CONDITION_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?P<condition>(?:(?P<tg>\d+(?:[pP\.]\d+)?)\s*)?TG\s*(?P<sign>[+-])\s*"
+    r"(?:(?P<bg>\d+(?:[pP\.]\d+)?)\s*)?BG\s*=\s*0(?:\.0+)?)"
+    r"(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -58,6 +65,37 @@ class PowerStagePair:
     kkp_file: str
     kk_row: int | None = None
     kkp_row: int | None = None
+
+
+@dataclass(frozen=True)
+class RotationAngles:
+    """Independently detected compare-arm rotation angles."""
+
+    rot1: float | None = None
+    rot2: float | None = None
+
+
+@dataclass(frozen=True)
+class AngleStateMatch:
+    """Nearest explicit K/Kp reference result for one rotation arm."""
+
+    angle: float
+    state: str | None
+    distance_k: float
+    distance_kp: float | None
+    reason: str
+
+
+@dataclass(frozen=True)
+class CompareAngleInference:
+    """Editable reference suggestions inferred from filename angle clusters."""
+
+    rot1_clusters: tuple[float, ...]
+    rot2_clusters: tuple[float, ...]
+    in_k: float | None = None
+    in_kp: float | None = None
+    out_k: float | None = None
+    out_kp: float | None = None
 
 
 def _parse_power_number(text: str) -> float:
@@ -195,47 +233,169 @@ def _parse_angle_token(text: str) -> float:
     return float(str(text).replace("p", ".").replace("P", "."))
 
 
-def parse_compare_in_out_angles(file_name: str) -> tuple[float | None, float | None]:
+def parse_compare_rotation_angles(file_name: str) -> RotationAngles:
     text = str(Path(file_name).stem)
     number = r"([\-+]?\d+(?:[pP\.]\d+)?)"
     unit = r"\s*(?:deg|degree)(?=$|[^A-Za-z0-9])"
-    named_patterns = (
-        (
-            rf"in[^0-9\-+]*{number}{unit}.*out[^0-9\-+]*{number}{unit}",
-            False,
-        ),
-        (
-            rf"out[^0-9\-+]*{number}{unit}.*in[^0-9\-+]*{number}{unit}",
-            True,
-        ),
-    )
-    for pattern, reverse in named_patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if not match:
-            continue
-        first = _parse_angle_token(match.group(1))
-        second = _parse_angle_token(match.group(2))
-        return (second, first) if reverse else (first, second)
-
+    named_prefix = r"(?:^|[_\s-])"
+    in_match = re.search(rf"{named_prefix}in[^0-9\-+]*{number}{unit}", text, flags=re.IGNORECASE)
+    out_match = re.search(rf"{named_prefix}out[^0-9\-+]*{number}{unit}", text, flags=re.IGNORECASE)
     rot1 = re.search(rf"rot\s*1[^0-9\-+]*{number}{unit}", text, flags=re.IGNORECASE)
     rot2 = re.search(rf"rot\s*2[^0-9\-+]*{number}{unit}", text, flags=re.IGNORECASE)
-    if rot1 and rot2:
-        return _parse_angle_token(rot1.group(1)), _parse_angle_token(rot2.group(1))
+    return RotationAngles(
+        rot1=(
+            _parse_angle_token(in_match.group(1))
+            if in_match
+            else (_parse_angle_token(rot1.group(1)) if rot1 else None)
+        ),
+        rot2=(
+            _parse_angle_token(out_match.group(1))
+            if out_match
+            else (_parse_angle_token(rot2.group(1)) if rot2 else None)
+        ),
+    )
 
-    return None, None
+
+def parse_compare_in_out_angles(file_name: str) -> tuple[float | None, float | None]:
+    """Backward-compatible tuple view of independently parsed Rot1/Rot2 angles."""
+    angles = parse_compare_rotation_angles(file_name)
+    return angles.rot1, angles.rot2
+
+
+def circular_angle_distance(a: float, b: float, *, period: float = 360.0) -> float:
+    period = float(period)
+    if not np.isfinite(period) or period <= 0.0:
+        raise ValueError("Angle period must be finite and positive.")
+    return abs(((float(a) - float(b) + 0.5 * period) % period) - 0.5 * period)
+
+
+def classify_angle_state(
+    angle: float,
+    *,
+    k_angle: float,
+    kp_angle: float | None,
+    tolerance: float,
+    ambiguity_margin: float = 1.0,
+    period: float = 360.0,
+) -> AngleStateMatch:
+    """Classify one angle by nearest explicit reference, with safe rejection."""
+    angle = float(angle)
+    tolerance = float(tolerance)
+    ambiguity_margin = float(ambiguity_margin)
+    if not np.isfinite(angle) or not np.isfinite(k_angle):
+        raise ValueError("Angle references must be finite.")
+    if not np.isfinite(tolerance) or tolerance <= 0.0:
+        raise ValueError("Angle tolerance must be finite and positive.")
+    if not np.isfinite(ambiguity_margin) or ambiguity_margin < 0.0:
+        raise ValueError("Angle ambiguity margin must be finite and non-negative.")
+
+    distance_k = circular_angle_distance(angle, float(k_angle), period=period)
+    if kp_angle is None:
+        # Compatibility for non-UI callers that still provide only a K anchor.
+        state = "K" if distance_k < tolerance else "Kp"
+        return AngleStateMatch(angle, state, distance_k, None, "legacy-single-reference")
+
+    if not np.isfinite(kp_angle):
+        raise ValueError("Kp angle reference must be finite.")
+    distance_kp = circular_angle_distance(angle, float(kp_angle), period=period)
+    nearest = min(distance_k, distance_kp)
+    if nearest > tolerance:
+        return AngleStateMatch(angle, None, distance_k, distance_kp, "outside-tolerance")
+    if abs(distance_k - distance_kp) <= ambiguity_margin:
+        return AngleStateMatch(angle, None, distance_k, distance_kp, "ambiguous")
+    state = "K" if distance_k < distance_kp else "Kp"
+    return AngleStateMatch(angle, state, distance_k, distance_kp, "nearest-reference")
+
+
+def _circular_cluster_center(values: Sequence[float], *, period: float) -> float:
+    radians = np.asarray(values, float) * (2.0 * np.pi / float(period))
+    mean_angle = np.arctan2(float(np.mean(np.sin(radians))), float(np.mean(np.cos(radians))))
+    return float((mean_angle * float(period) / (2.0 * np.pi)) % float(period))
+
+
+def _cluster_compare_angles(
+    values: Sequence[float],
+    *,
+    tolerance: float,
+    period: float,
+) -> tuple[float, ...]:
+    finite = sorted({float(value) for value in values if np.isfinite(value)})
+    if not finite:
+        return ()
+    parents = list(range(len(finite)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    for left in range(len(finite)):
+        for right in range(left + 1, len(finite)):
+            if circular_angle_distance(finite[left], finite[right], period=period) <= float(tolerance):
+                union(left, right)
+
+    groups: dict[int, list[float]] = {}
+    for index, value in enumerate(finite):
+        groups.setdefault(find(index), []).append(value)
+    centers = [_circular_cluster_center(group, period=period) for group in groups.values()]
+    return tuple(sorted(centers))
+
+
+def infer_compare_angle_references(
+    file_names: Sequence[str],
+    *,
+    in_k_anchor: float,
+    out_k_anchor: float,
+    cluster_tolerance: float = 15.0,
+    period: float = 360.0,
+) -> CompareAngleInference:
+    """Suggest K/Kp anchors only when exactly two clusters exist for an arm."""
+    parsed = [parse_compare_rotation_angles(file_name) for file_name in file_names]
+    rot1_clusters = _cluster_compare_angles(
+        [item.rot1 for item in parsed if item.rot1 is not None],
+        tolerance=cluster_tolerance,
+        period=period,
+    )
+    rot2_clusters = _cluster_compare_angles(
+        [item.rot2 for item in parsed if item.rot2 is not None],
+        tolerance=cluster_tolerance,
+        period=period,
+    )
+
+    def assign(clusters: tuple[float, ...], anchor: float) -> tuple[float | None, float | None]:
+        if len(clusters) != 2:
+            return None, None
+        k_index = min(
+            range(2),
+            key=lambda index: circular_angle_distance(clusters[index], anchor, period=period),
+        )
+        return clusters[k_index], clusters[1 - k_index]
+
+    in_k, in_kp = assign(rot1_clusters, float(in_k_anchor))
+    out_k, out_kp = assign(rot2_clusters, float(out_k_anchor))
+    return CompareAngleInference(
+        rot1_clusters=rot1_clusters,
+        rot2_clusters=rot2_clusters,
+        in_k=in_k,
+        in_kp=in_kp,
+        out_k=out_k,
+        out_kp=out_kp,
+    )
+
 
 
 def parse_compare_gate_condition(file_name: str) -> str:
     stem = str(Path(file_name).stem)
-    coeff = r"(?:\d+(?:[pP\.]\d+)?)?"
-    pattern = re.compile(
-        rf"(?<![A-Za-z0-9])({coeff}\s*TG\s*[+-]\s*{coeff}\s*BG\s*=\s*0(?:\.0+)?)(?![A-Za-z0-9])",
-        flags=re.IGNORECASE,
-    )
-    match = pattern.search(stem)
+    match = COMPARE_GATE_CONDITION_RE.search(stem)
     if not match:
         return ""
-    token = re.sub(r"\s+", "", match.group(1))
+    token = re.sub(r"\s+", "", match.group("condition"))
     token = re.sub("tg", "TG", token, flags=re.IGNORECASE)
     token = re.sub("bg", "BG", token, flags=re.IGNORECASE)
     return token
@@ -247,12 +407,47 @@ def classify_compare_channel(
     in_k_angle: float,
     out_k_angle: float,
     tolerance: float = 45.0,
+    fixed_missing_arm: str | None = "K",
+    in_kp_angle: float | None = None,
+    out_kp_angle: float | None = None,
+    ambiguity_margin: float = 1.0,
+    angle_period: float = 360.0,
 ) -> str | None:
     in_angle, out_angle = parse_compare_in_out_angles(file_name)
-    if in_angle is None or out_angle is None:
+    if in_angle is None and out_angle is None:
         return None
-    in_is_k = abs(((float(in_angle) - float(in_k_angle) + 180.0) % 360.0) - 180.0) < float(tolerance)
-    out_is_k = abs(((float(out_angle) - float(out_k_angle) + 180.0) % 360.0) - 180.0) < float(tolerance)
+    missing_state = str(fixed_missing_arm or "").strip().casefold()
+    if (in_angle is None or out_angle is None) and missing_state not in {"k", "kp", "kprime", "k'"}:
+        return None
+    missing_is_k = missing_state == "k"
+    in_match = (
+        None
+        if in_angle is None
+        else classify_angle_state(
+            in_angle,
+            k_angle=in_k_angle,
+            kp_angle=in_kp_angle,
+            tolerance=tolerance,
+            ambiguity_margin=ambiguity_margin,
+            period=angle_period,
+        )
+    )
+    out_match = (
+        None
+        if out_angle is None
+        else classify_angle_state(
+            out_angle,
+            k_angle=out_k_angle,
+            kp_angle=out_kp_angle,
+            tolerance=tolerance,
+            ambiguity_margin=ambiguity_margin,
+            period=angle_period,
+        )
+    )
+    if (in_match is not None and in_match.state is None) or (out_match is not None and out_match.state is None):
+        return None
+    in_is_k = missing_is_k if in_match is None else in_match.state == "K"
+    out_is_k = missing_is_k if out_match is None else out_match.state == "K"
     if in_is_k and out_is_k:
         return "KK"
     if in_is_k and (not out_is_k):
@@ -269,25 +464,34 @@ def _compare_file_power(file_name: str) -> float:
     return _parse_power_number(match.group("power"))
 
 
-def _compare_context_key(file_name: str) -> str:
+def _compare_context_key(file_name: str, *, ignore_gate_condition: bool = False) -> str:
     stem = Path(file_name).stem.replace("$", "")
     stem = POWER_TOKEN_RE.sub("", stem)
     stem = re.sub(
-        r"(?:^|[_\s-]+)Rot\s*2[^_\s-]*(?:deg|degree)",
+        r"(?:^|[_\s-]+)Rot\s*[12][^_\s-]*(?:deg|degree)",
         "_",
         stem,
         flags=re.IGNORECASE,
     )
+    if ignore_gate_condition:
+        stem = COMPARE_GATE_CONDITION_RE.sub("_", stem)
     stem = re.sub(r'[<>:"/\\|?*]+', "_", stem)
     stem = re.sub(r"_+", "_", stem)
     stem = re.sub(r"[\s-]+", "_", stem)
     return stem.strip("_").lower()
 
 
-def _select_compare_records(records: Sequence[tuple[int, str, str]]) -> tuple[dict[str, str], dict[str, list[str]]]:
+def _select_compare_records(
+    records: Sequence[tuple[int, str, str]],
+    *,
+    ignore_gate_condition: bool = False,
+) -> tuple[dict[str, str], dict[str, list[str]]]:
     contexts: dict[str, list[tuple[int, str, str]]] = {}
     for record in records:
-        contexts.setdefault(_compare_context_key(record[2]), []).append(record)
+        contexts.setdefault(
+            _compare_context_key(record[2], ignore_gate_condition=ignore_gate_condition),
+            [],
+        ).append(record)
 
     def context_score(item: tuple[str, list[tuple[int, str, str]]]) -> tuple[int, int, int, float, int]:
         _context, context_records = item
@@ -328,6 +532,11 @@ def coherent_compare_auto_assignment(
     *,
     in_k_angle: float,
     out_k_angle: float,
+    in_kp_angle: float | None = None,
+    out_kp_angle: float | None = None,
+    tolerance: float = 45.0,
+    ambiguity_margin: float = 1.0,
+    angle_period: float = 360.0,
 ) -> tuple[dict[str, str], dict[str, list[str]], str, list[str]]:
     groups: dict[str, list[tuple[int, str, str]]] = {}
     for idx, file_name in enumerate(file_names):
@@ -335,6 +544,11 @@ def coherent_compare_auto_assignment(
             file_name,
             in_k_angle=in_k_angle,
             out_k_angle=out_k_angle,
+            in_kp_angle=in_kp_angle,
+            out_kp_angle=out_kp_angle,
+            tolerance=tolerance,
+            ambiguity_margin=ambiguity_margin,
+            angle_period=angle_period,
         )
         if key is None:
             continue
@@ -352,7 +566,30 @@ def coherent_compare_auto_assignment(
         return (has_kk_pair, len(keys), len(records), -first_idx)
 
     selected_gate, records = max(groups.items(), key=_score)
-    found, duplicates = _select_compare_records(records)
+    selected_keys = {key for _idx, key, _file_name in records}
+    if "KK" in selected_keys and "KKp" in selected_keys:
+        found, duplicates = _select_compare_records(records)
+    else:
+        # A VP pair can be recorded with complementary gate-condition signs.
+        # Only fall back to a sign-insensitive family when no exact gate group
+        # already contains a coherent KK/KKp pair.
+        families: dict[tuple[float, float], list[tuple[int, str, str]]] = {}
+        for gate_records in groups.values():
+            for record in gate_records:
+                match = COMPARE_GATE_CONDITION_RE.search(Path(record[2]).stem)
+                if not match:
+                    continue
+                tg_coeff = _parse_angle_token(match.group("tg") or "1")
+                bg_coeff = _parse_angle_token(match.group("bg") or "1")
+                families.setdefault((tg_coeff, bg_coeff), []).append(record)
+
+        compatible = [item for item in families.items() if {r[1] for r in item[1]} >= {"KK", "KKp"}]
+        if compatible:
+            _family, records = max(compatible, key=lambda item: _score((str(item[0]), item[1])))
+            found, duplicates = _select_compare_records(records, ignore_gate_condition=True)
+            selected_gate = parse_compare_gate_condition(found.get("KK", "")) or selected_gate
+        else:
+            found, duplicates = _select_compare_records(records)
 
     gate_groups = [gate for gate in groups if gate != "__ungrouped__"]
     gate_label = "" if selected_gate == "__ungrouped__" else selected_gate

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List, Sequence, Literal
 import numpy as np
@@ -165,10 +166,10 @@ def _build_linear_combo_label(a: float, b: float, c: float = 0.0) -> str:
             return "TG (V)"
         if abs(b - 1.0) < 1e-12 and abs(a) < 1e-12:
             return "BG (V)"
-        if abs(b + 1.0) < 1e-12 and abs(a) > 1e-12:
-            return _build_ratio_tg_minus_bg_label(a)
-        if abs(a - 1.0) < 1e-12 and abs(b - 1.0) < 1e-12:
-            return "TG+BG (V)"
+        if a > 0.0 and b < 0.0:
+            return _build_tg_minus_bg_label(a, abs(b))
+        if a > 0.0 and b > 0.0:
+            return _build_tg_plus_bg_label(a, b)
 
     terms: list[str] = []
     for coeff, symbol in ((a, "TG"), (b, "BG")):
@@ -319,6 +320,84 @@ def _find_gate_mode_in_stem(stem: str) -> Optional[Dict[str, float | str]]:
             return {"mode": "tgonly", "ratio": 1.0}
         return {"mode": "bgonly", "ratio": 1.0}
     return None
+
+
+@dataclass(frozen=True)
+class GateAxisSpec:
+    """Canonical filename-derived gate axis used by every plot pipeline."""
+
+    request: str
+    label: str
+    tg_coeff: float
+    bg_coeff: float
+    offset: float = 0.0
+
+
+def filename_auto_gate_axis_spec(file_name: str) -> Optional[GateAxisSpec]:
+    """Resolve filename metadata without loading the CSV gate columns."""
+    parts = _extract_gate_tokens(str(file_name))
+    match = _find_gate_mode_in_segments(parts) or _find_gate_mode_in_stem(Path(file_name).stem)
+    if match is None:
+        return None
+
+    mode = str(match["mode"])
+    if mode in {"tg_minus_bg", "tg_plus_bg"}:
+        tg_coeff = float(match.get("tg_coeff", 1.0))
+        bg_magnitude = float(match.get("bg_coeff", 1.0))
+        bg_coeff = -bg_magnitude if mode == "tg_minus_bg" else bg_magnitude
+        label = (
+            _build_tg_minus_bg_label(tg_coeff, bg_magnitude)
+            if bg_coeff < 0
+            else _build_tg_plus_bg_label(tg_coeff, bg_magnitude)
+        )
+        return GateAxisSpec(
+            request=f"linear:{_format_coeff(tg_coeff)},{_format_coeff(bg_coeff)},0",
+            label=label,
+            tg_coeff=tg_coeff,
+            bg_coeff=bg_coeff,
+        )
+    if mode == "tgonly":
+        return GateAxisSpec("tg", "TG (V)", 1.0, 0.0)
+    if mode == "bgonly":
+        return GateAxisSpec("bg", "BG (V)", 0.0, 1.0)
+    return None
+
+
+def resolve_shared_y_axis_request(file_names: Sequence[str], y_axis: str = "auto") -> str:
+    """Resolve Auto once for a multi-file operation; manual requests win."""
+    requested = str(y_axis or "auto").strip()
+    if requested.casefold() not in {"auto", "default"}:
+        return requested
+
+    specs = [
+        (str(file_name), spec)
+        for file_name in file_names
+        if (spec := filename_auto_gate_axis_spec(str(file_name))) is not None
+    ]
+    if not specs:
+        return "auto"
+
+    reference_name, reference = specs[0]
+    for file_name, spec in specs[1:]:
+        same_family = (
+            abs(abs(spec.tg_coeff) - abs(reference.tg_coeff)) < 1e-12
+            and abs(abs(spec.bg_coeff) - abs(reference.bg_coeff)) < 1e-12
+            and abs(spec.offset - reference.offset) < 1e-12
+        )
+        if not same_family:
+            raise ValueError(
+                "Auto gate-axis metadata conflict: "
+                f"{reference_name!r} resolves to {reference.label}, while "
+                f"{file_name!r} resolves to {spec.label}. Select a manual y-axis to override."
+            )
+    # Complementary filename conditions can appear in either channel order.
+    # Prefer the positive TG+...BG plotting coordinate requested for VP rather
+    # than allowing KK/KKp role ordering to flip the shared axis sign.
+    positive_combo = next(
+        (spec for _file_name, spec in specs if spec.tg_coeff > 0.0 and spec.bg_coeff > 0.0),
+        None,
+    )
+    return (positive_combo or reference).request
 
 
 def _legacy_gate_resolution(
@@ -1810,6 +1889,7 @@ def process_ref_avg(
         derivative = 2 if do_d2E else (1 if do_dE else None)
     if derivative not in (None, 1, 2):
         raise ValueError("derivative must be None, 1, or 2")
+    y_axis = resolve_shared_y_axis_request(files, y_axis)
     p_user = Path(user_folder)
     d0 = _load_canonical(user_folder, files[0], y_axis=y_axis)
     energy0, gate0, Z0 = d0["energy"], d0["gate_axis"], d0["Z"]

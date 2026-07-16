@@ -95,7 +95,8 @@ def _load_pl_cached(
 
 def load_pl(user_folder: str, file_name: str, *, log_scale: bool = False, y_axis: str = "auto") -> DataCube:
     csv_sig = _csv_signature(user_folder, file_name)
-    res = _load_pl_cached(user_folder, file_name, bool(log_scale), str(y_axis), csv_sig)
+    effective_y_axis = P.resolve_shared_y_axis_request([file_name], y_axis)
+    res = _load_pl_cached(user_folder, file_name, bool(log_scale), effective_y_axis, csv_sig)
 
     _validate_cube_arrays(res["energy"], res["gate_axis"], res["Z"], context="PL load")
     return DataCube(
@@ -163,11 +164,12 @@ def load_drr_avg(
     dE_origin_like: bool = False,
     dE_pad_flat_edges: bool = True,
 ) -> DataCube:
+    effective_y_axis = P.resolve_shared_y_axis_request(files, y_axis)
     res = P.process_ref_avg(
         user_folder=user_folder,
         files=list(files),
         bg_mode=bg_mode,
-        y_axis=y_axis,
+        y_axis=effective_y_axis,
         external_vector=external_vector,
         external_energy=external_energy,
         use_global_background=False,

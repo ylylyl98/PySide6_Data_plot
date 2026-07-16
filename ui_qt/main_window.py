@@ -69,16 +69,19 @@ from core.processing import (
     apply_sg_derivative_energy,
     background_correct_cube,
     clamp_sg_window,
+    classify_angle_state,
     classify_compare_channel,
     coherent_compare_auto_assignment,
     compute_auto_limits,
     estimate_constant_background,
     group_measurement_files,
+    infer_compare_angle_references,
     power_group_title,
     power_stage_paired_vp_cubes,
     power_valley_polarization_cube,
     nearest_gate_spectrum,
     parse_compare_gate_condition,
+    parse_compare_rotation_angles,
     valley_polarization_cube,
 )
 from core.shg import ShgProcessResult, ShgSettings, ShgSweepData, process_shg_sweep
@@ -1466,24 +1469,51 @@ class MainWindow(QMainWindow):
         assignment_form.setContentsMargins(0, 0, 0, 0)
         assignment_form.setHorizontalSpacing(6)
         assignment_form.setVerticalSpacing(4)
-        self.cmp_in_k_angle_spin = QDoubleSpinBox()
-        self.cmp_in_k_angle_spin.setDecimals(3)
-        self.cmp_in_k_angle_spin.setRange(-360.0, 360.0)
-        self.cmp_out_k_angle_spin = QDoubleSpinBox()
-        self.cmp_out_k_angle_spin.setDecimals(3)
-        self.cmp_out_k_angle_spin.setRange(-360.0, 360.0)
+        def _angle_spin(default: float = 0.0) -> QDoubleSpinBox:
+            spin = QDoubleSpinBox()
+            spin.setDecimals(3)
+            spin.setRange(-360.0, 360.0)
+            spin.setValue(default)
+            spin.setSuffix(" deg")
+            spin.setToolTip("Approximate reference angle; matching uses the tolerance below.")
+            return spin
+
+        self.cmp_in_k_angle_spin = _angle_spin()
+        self.cmp_in_kp_angle_spin = _angle_spin(45.0)
+        self.cmp_out_k_angle_spin = _angle_spin()
+        self.cmp_out_kp_angle_spin = _angle_spin(45.0)
+        self.cmp_angle_tolerance_spin = QDoubleSpinBox()
+        self.cmp_angle_tolerance_spin.setDecimals(2)
+        self.cmp_angle_tolerance_spin.setRange(0.1, 180.0)
+        self.cmp_angle_tolerance_spin.setValue(15.0)
+        self.cmp_angle_tolerance_spin.setSuffix(" deg")
+        self.cmp_angle_tolerance_spin.setToolTip(
+            "Maximum distance from the nearest K or Kp reference. Equal-distance matches are rejected."
+        )
+        self.cmp_infer_angles_btn = QPushButton("Infer Angles")
+        self.cmp_infer_angles_btn.setToolTip(
+            "Suggest editable K/Kp references when exactly two filename-angle clusters are detected."
+        )
         self.cmp_auto_assign_btn = QPushButton("Auto Detect")
-        angle_row = QWidget()
-        angle_h = QHBoxLayout(angle_row)
-        angle_h.setContentsMargins(0, 0, 0, 0)
-        angle_h.setSpacing(6)
-        angle_h.addWidget(QLabel("In K"))
-        angle_h.addWidget(self.cmp_in_k_angle_spin)
-        angle_h.addWidget(QLabel("Out K"))
-        angle_h.addWidget(self.cmp_out_k_angle_spin)
-        angle_h.addWidget(self.cmp_auto_assign_btn)
-        angle_h.addStretch(1)
-        assignment_form.addRow("Angle Rule", angle_row)
+        angle_box = QWidget()
+        angle_grid = QGridLayout(angle_box)
+        angle_grid.setContentsMargins(0, 0, 0, 0)
+        angle_grid.setHorizontalSpacing(6)
+        angle_grid.setVerticalSpacing(4)
+        angle_grid.addWidget(QLabel("In K"), 0, 0)
+        angle_grid.addWidget(self.cmp_in_k_angle_spin, 0, 1)
+        angle_grid.addWidget(QLabel("In Kp"), 0, 2)
+        angle_grid.addWidget(self.cmp_in_kp_angle_spin, 0, 3)
+        angle_grid.addWidget(QLabel("Out K"), 1, 0)
+        angle_grid.addWidget(self.cmp_out_k_angle_spin, 1, 1)
+        angle_grid.addWidget(QLabel("Out Kp"), 1, 2)
+        angle_grid.addWidget(self.cmp_out_kp_angle_spin, 1, 3)
+        angle_grid.addWidget(QLabel("Tolerance"), 2, 0)
+        angle_grid.addWidget(self.cmp_angle_tolerance_spin, 2, 1)
+        angle_grid.addWidget(self.cmp_infer_angles_btn, 2, 2)
+        angle_grid.addWidget(self.cmp_auto_assign_btn, 2, 3)
+        angle_grid.setColumnStretch(4, 1)
+        assignment_form.addRow("Angle Rules", angle_box)
         assignment_layout.addLayout(assignment_form)
         self.cmp_channel_combos: dict[str, QComboBox] = {}
         channels_box = QWidget()
@@ -2783,14 +2813,61 @@ class MainWindow(QMainWindow):
             visible_order=visible,
         )
 
+    def _cmp_infer_angle_references(self) -> None:
+        inference = infer_compare_angle_references(
+            self._cmp_assign_candidate_files(),
+            in_k_anchor=float(self.cmp_in_k_angle_spin.value()),
+            out_k_anchor=float(self.cmp_out_k_angle_spin.value()),
+            cluster_tolerance=float(self.cmp_angle_tolerance_spin.value()),
+        )
+        for spin, value in (
+            (self.cmp_in_k_angle_spin, inference.in_k),
+            (self.cmp_in_kp_angle_spin, inference.in_kp),
+            (self.cmp_out_k_angle_spin, inference.out_k),
+            (self.cmp_out_kp_angle_spin, inference.out_kp),
+        ):
+            if value is None:
+                continue
+            blocked = spin.blockSignals(True)
+            try:
+                spin.setValue(float(value))
+            finally:
+                spin.blockSignals(blocked)
+
+        def _clusters_text(values: tuple[float, ...]) -> str:
+            return ", ".join(f"{value:.3g}" for value in values) if values else "none"
+
+        self._append_log(
+            "Angle inference: "
+            f"Rot1 clusters=[{_clusters_text(inference.rot1_clusters)}], "
+            f"Rot2 clusters=[{_clusters_text(inference.rot2_clusters)}]"
+        )
+        suggestions: list[str] = []
+        if inference.in_k is not None and inference.in_kp is not None:
+            suggestions.append(f"In K={inference.in_k:.3g}, In Kp={inference.in_kp:.3g}")
+        if inference.out_k is not None and inference.out_kp is not None:
+            suggestions.append(f"Out K={inference.out_k:.3g}, Out Kp={inference.out_kp:.3g}")
+        if suggestions:
+            self._append_log("  suggested: " + "; ".join(suggestions))
+        else:
+            self._append_log(
+                "  no references changed: inference requires exactly two clusters for an arm"
+            )
+
     def _cmp_auto_assign_channels(self) -> None:
         candidates = self._cmp_assign_candidate_files()
         in_k = float(self.cmp_in_k_angle_spin.value())
+        in_kp = float(self.cmp_in_kp_angle_spin.value())
         out_k = float(self.cmp_out_k_angle_spin.value())
+        out_kp = float(self.cmp_out_kp_angle_spin.value())
+        tolerance = float(self.cmp_angle_tolerance_spin.value())
         found, duplicates, gate_group, gate_groups = coherent_compare_auto_assignment(
             candidates,
             in_k_angle=in_k,
+            in_kp_angle=in_kp,
             out_k_angle=out_k,
+            out_kp_angle=out_kp,
+            tolerance=tolerance,
         )
         for key, combo in self.cmp_channel_combos.items():
             old = combo.blockSignals(True)
@@ -2802,23 +2879,70 @@ class MainWindow(QMainWindow):
         # --- diagnostic logging ---
         classified_counts: dict[str, int] = {}
         group_keys: dict[str, set[str]] = {}
+        rejected: list[str] = []
         for fname in candidates:
-            ch = classify_compare_channel(fname, in_k_angle=in_k, out_k_angle=out_k)
+            ch = classify_compare_channel(
+                fname,
+                in_k_angle=in_k,
+                in_kp_angle=in_kp,
+                out_k_angle=out_k,
+                out_kp_angle=out_kp,
+                tolerance=tolerance,
+            )
             if ch:
                 classified_counts[ch] = classified_counts.get(ch, 0) + 1
                 gk = parse_compare_gate_condition(fname) or "__ungrouped__"
                 group_keys.setdefault(gk, set()).add(ch)
+                continue
+            angles = parse_compare_rotation_angles(fname)
+            reasons: list[str] = []
+            for arm, angle, k_angle, kp_angle in (
+                ("Rot1", angles.rot1, in_k, in_kp),
+                ("Rot2", angles.rot2, out_k, out_kp),
+            ):
+                if angle is None:
+                    continue
+                match = classify_angle_state(
+                    angle,
+                    k_angle=k_angle,
+                    kp_angle=kp_angle,
+                    tolerance=tolerance,
+                )
+                if match.state is None:
+                    reasons.append(
+                        f"{arm}={angle:g}: {match.reason} "
+                        f"(dK={match.distance_k:.3g}, dKp={match.distance_kp:.3g})"
+                    )
+            if reasons:
+                rejected.append(f"{Path(fname).name}: " + "; ".join(reasons))
         assigned = [k for k in ("KK", "KKp", "KpK", "KpKp") if k in found]
         missing = [k for k in ("KK", "KKp", "KpK", "KpKp") if k not in found]
         self._append_log(
-            f"Auto-assign (InK={in_k:.1f}°, OutK={out_k:.1f}°): "
+            f"Auto-assign (InK={in_k:.1f}, InKp={in_kp:.1f}, "
+            f"OutK={out_k:.1f}, OutKp={out_kp:.1f}, tol={tolerance:.1f} deg): "
             + f"classified {classified_counts} across {len(group_keys)} group(s)"
         )
+        for detail in rejected[:8]:
+            self._append_log(f"  unassigned angle: {detail}")
+        if len(rejected) > 8:
+            self._append_log(f"  +{len(rejected) - 8} more unassigned angle match(es)")
         for gk, keys in sorted(group_keys.items()):
             marker = " <-- selected" if gk == (gate_group or "__ungrouped__") else ""
             self._append_log(f"  group [{gk}]: keys={sorted(keys)}{marker}")
         if assigned:
             self._append_log(f"  assigned: {', '.join(assigned)}")
+            for fname in dict.fromkeys(found[key] for key in assigned):
+                angles = parse_compare_rotation_angles(fname)
+                if (angles.rot1 is None) != (angles.rot2 is None):
+                    detected = (
+                        f"Rot1={angles.rot1:g} deg"
+                        if angles.rot1 is not None
+                        else f"Rot2={angles.rot2:g} deg"
+                    )
+                    fixed = "output" if angles.rot1 is not None else "input"
+                    self._append_log(
+                        f"  partial rotation: {detected}; missing fixed {fixed} arm treated as K"
+                    )
         if missing:
             reason_parts: list[str] = []
             for mk in missing:
@@ -3032,7 +3156,11 @@ class MainWindow(QMainWindow):
         self.pl_log_chk.toggled.connect(self._on_pl_plot_param_changed)
         self.pl_clip_chk.toggled.connect(self._on_pl_plot_param_changed)
         self.cmp_in_k_angle_spin.valueChanged.connect(self._on_cmp_auto_assign_requested)
+        self.cmp_in_kp_angle_spin.valueChanged.connect(self._on_cmp_auto_assign_requested)
         self.cmp_out_k_angle_spin.valueChanged.connect(self._on_cmp_auto_assign_requested)
+        self.cmp_out_kp_angle_spin.valueChanged.connect(self._on_cmp_auto_assign_requested)
+        self.cmp_angle_tolerance_spin.valueChanged.connect(self._on_cmp_auto_assign_requested)
+        self.cmp_infer_angles_btn.clicked.connect(self._on_cmp_infer_angles_requested)
         self.cmp_auto_assign_btn.clicked.connect(self._on_cmp_auto_assign_requested)
         self.cmp_view_intensity_btn.clicked.connect(lambda: self._on_cmp_plot_view_button_clicked("Intensity Compare"))
         self.cmp_view_vp_btn.clicked.connect(lambda: self._on_cmp_plot_view_button_clicked("Valley Polarization"))
@@ -3282,6 +3410,12 @@ class MainWindow(QMainWindow):
 
     def _on_cmp_auto_assign_requested(self) -> None:
         self._invalidate_export_move_sources()
+        self._cmp_auto_assign_channels()
+        self._on_cmp_plot_param_changed()
+
+    def _on_cmp_infer_angles_requested(self) -> None:
+        self._invalidate_export_move_sources()
+        self._cmp_infer_angle_references()
         self._cmp_auto_assign_channels()
         self._on_cmp_plot_param_changed()
 

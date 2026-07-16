@@ -9,17 +9,26 @@ from core.loader import DataCube
 from core.plotting import HeatmapParams
 from core.processing import (
     background_correct_cube,
+    circular_angle_distance,
+    classify_angle_state,
     classify_compare_channel,
     coherent_compare_auto_assignment,
     estimate_constant_background,
+    infer_compare_angle_references,
     nearest_gate_spectrum,
     parse_compare_gate_condition,
     parse_compare_in_out_angles,
+    parse_compare_rotation_angles,
     valley_polarization_cube,
 )
 
 
 class CompareAngleParserTests(unittest.TestCase):
+    EXACT_ROT2_FILES = [
+        "YZD344_pen3_6KPL_690nm1508.355uW_880nmc_1sx1_Rot220p5deg_Stage0_TG-0.8BG=0.csv",
+        "YZD344_pen3_6KPL_690nm1518.648uW_880nmc_1sx1_Rot265p5deg_Stage0_TG+0.8BG=0.csv",
+    ]
+
     def test_rot1_rot2_p_decimal_angles(self) -> None:
         name = "YZ247_pX2_3.6KPL_730nm_2sx1_Rot1195p8deg_Rot295deg_Stage.csv"
         self.assertEqual(parse_compare_in_out_angles(name), (195.8, 95.0))
@@ -31,6 +40,128 @@ class CompareAngleParserTests(unittest.TestCase):
     def test_legacy_in_out_degree_pattern(self) -> None:
         name = "scan_in 195.000 degree_out 95.000 degree.csv"
         self.assertEqual(parse_compare_in_out_angles(name), (195.0, 95.0))
+
+    def test_rot1_and_rot2_are_detected_independently(self) -> None:
+        self.assertEqual(parse_compare_in_out_angles("scan_Rot120p5deg.csv"), (20.5, None))
+        self.assertEqual(parse_compare_in_out_angles("scan_Rot220p5deg.csv"), (None, 20.5))
+        self.assertEqual(parse_compare_rotation_angles("scan_Rot2-12.25degree.csv").rot2, -12.25)
+
+    def test_exact_rot2_filenames_classify_with_fixed_input_k(self) -> None:
+        self.assertEqual(parse_compare_in_out_angles(self.EXACT_ROT2_FILES[0]), (None, 20.5))
+        self.assertEqual(parse_compare_in_out_angles(self.EXACT_ROT2_FILES[1]), (None, 65.5))
+        channels = [
+            classify_compare_channel(name, in_k_angle=0.0, out_k_angle=20.5)
+            for name in self.EXACT_ROT2_FILES
+        ]
+        self.assertEqual(channels, ["KK", "KKp"])
+        self.assertIsNone(
+            classify_compare_channel(
+                self.EXACT_ROT2_FILES[0],
+                in_k_angle=0.0,
+                out_k_angle=20.5,
+                fixed_missing_arm=None,
+            )
+        )
+
+    def test_exact_complementary_gate_files_form_vp_pair(self) -> None:
+        found, duplicates, gate_group, gate_groups = coherent_compare_auto_assignment(
+            self.EXACT_ROT2_FILES,
+            in_k_angle=0.0,
+            out_k_angle=20.5,
+        )
+        self.assertEqual(found, {"KK": self.EXACT_ROT2_FILES[0], "KKp": self.EXACT_ROT2_FILES[1]})
+        self.assertFalse(duplicates)
+        self.assertEqual(gate_group, "TG-0.8BG=0")
+        self.assertEqual(gate_groups, ["TG-0.8BG=0", "TG+0.8BG=0"])
+
+    def test_explicit_kp_reference_classifies_variable_rot2_angles(self) -> None:
+        cases = {
+            65.5: "KK",
+            25.0: "KKp",
+            20.5: "KKp",
+            15.0: "KKp",
+        }
+        for angle, expected in cases.items():
+            with self.subTest(angle=angle):
+                token = str(angle).replace(".", "p")
+                self.assertEqual(
+                    classify_compare_channel(
+                        f"scan_Rot2{token}deg.csv",
+                        in_k_angle=0.0,
+                        in_kp_angle=45.0,
+                        out_k_angle=60.5,
+                        out_kp_angle=20.0,
+                        tolerance=12.0,
+                    ),
+                    expected,
+                )
+
+    def test_explicit_references_reject_ambiguous_and_distant_angles(self) -> None:
+        ambiguous = classify_angle_state(
+            40.0,
+            k_angle=60.0,
+            kp_angle=20.0,
+            tolerance=25.0,
+            ambiguity_margin=1.0,
+        )
+        self.assertIsNone(ambiguous.state)
+        self.assertEqual(ambiguous.reason, "ambiguous")
+        distant = classify_angle_state(
+            40.0,
+            k_angle=65.0,
+            kp_angle=15.0,
+            tolerance=10.0,
+        )
+        self.assertIsNone(distant.state)
+        self.assertEqual(distant.reason, "outside-tolerance")
+        self.assertEqual(circular_angle_distance(358.0, 2.0), 4.0)
+
+    def test_explicit_in_and_out_references_support_all_four_channels(self) -> None:
+        references = {
+            "in_k_angle": 195.0,
+            "in_kp_angle": 150.0,
+            "out_k_angle": 60.0,
+            "out_kp_angle": 20.0,
+            "tolerance": 12.0,
+        }
+        cases = {
+            "scan_Rot1196deg_Rot261deg.csv": "KK",
+            "scan_Rot1196deg_Rot219deg.csv": "KKp",
+            "scan_Rot1151deg_Rot261deg.csv": "KpK",
+            "scan_Rot1151deg_Rot219deg.csv": "KpKp",
+        }
+        for file_name, expected in cases.items():
+            self.assertEqual(classify_compare_channel(file_name, **references), expected)
+
+    def test_angle_inference_clusters_drift_without_fixed_separation(self) -> None:
+        files = [
+            "scan_Rot215deg.csv",
+            "scan_Rot220p5deg.csv",
+            "scan_Rot225deg.csv",
+            "scan_Rot260p5deg.csv",
+            "scan_Rot265p5deg.csv",
+        ]
+        inferred = infer_compare_angle_references(
+            files,
+            in_k_anchor=0.0,
+            out_k_anchor=60.5,
+            cluster_tolerance=12.0,
+        )
+        self.assertEqual(len(inferred.rot2_clusters), 2)
+        self.assertAlmostEqual(float(inferred.out_k), 63.0, places=1)
+        self.assertAlmostEqual(float(inferred.out_kp), 20.2, places=1)
+
+    def test_explicit_references_assign_screenshot_pair_with_20p5_as_kkp(self) -> None:
+        found, _duplicates, _gate_group, _gate_groups = coherent_compare_auto_assignment(
+            self.EXACT_ROT2_FILES,
+            in_k_angle=0.0,
+            in_kp_angle=45.0,
+            out_k_angle=60.5,
+            out_kp_angle=20.5,
+            tolerance=12.0,
+        )
+        self.assertEqual(found["KK"], self.EXACT_ROT2_FILES[1])
+        self.assertEqual(found["KKp"], self.EXACT_ROT2_FILES[0])
 
     def test_gate_condition_parser(self) -> None:
         name = "YZ247_Rot1195p8deg_Rot2145deg_Stage50_TG-BG=0.csv"

@@ -54,6 +54,26 @@ class PowerSeriesParserTests(unittest.TestCase):
 
 
 class PowerSeriesLoaderExportTests(unittest.TestCase):
+    def test_legacy_power_group_uses_one_filename_derived_gate_axis(self) -> None:
+        files = [
+            "device_1uW_Rot220p5deg_Stage0_TG-0.8BG=0.csv",
+            "device_2uW_Rot220p5deg_Stage1_TG-0.8BG=0.csv",
+        ]
+        cube = DataCube(
+            np.array([1.0, 2.0]),
+            np.array([0.0]),
+            np.array([[1.0, 2.0]]),
+            "TG+0.8BG (V)",
+            "PL",
+            "PL (a.u.)",
+        )
+        with patch.object(data_io, "load_pl", return_value=cube) as mock_load_pl:
+            data_io.load_power_series_cube("unused", files, y_axis="auto")
+        self.assertEqual(len(mock_load_pl.call_args_list), 2)
+        self.assertTrue(
+            all(call.kwargs["y_axis"] == "linear:1,0.8,0" for call in mock_load_pl.call_args_list)
+        )
+
     def test_single_csv_power_sweep_uses_power_column_and_numeric_spectral_headers(self) -> None:
         fixture_folder = Path(__file__).resolve().parent / "fixtures"
         file_name = "power_sweep_table.csv"
