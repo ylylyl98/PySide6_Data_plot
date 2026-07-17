@@ -107,6 +107,14 @@ class CanonicalYAxisResolutionTests(unittest.TestCase):
         self.assertTrue(np.allclose(d["gate_axis"], expected))
         self.assertEqual(d["gate_label"], "TG+1.1BG (V)")
 
+    def test_unicode_minus_condition_uses_complementary_plus_axis(self) -> None:
+        file_name = "YZ364_0Tpa_3.6KREF_700nmc_0p1sx10_TG−1.1BG=0.csv"
+        with tempfile.TemporaryDirectory() as folder:
+            shutil.copyfile(FIXTURES / "plain_scan.csv", Path(folder) / file_name)
+            d = processing_run._load_canonical(folder, file_name, y_axis="auto")
+        self.assertTrue(np.allclose(d["gate_axis"], np.array([10.0, 12.1, 14.2])))
+        self.assertEqual(d["gate_label"], "TG+1.1BG (V)")
+
     def test_auto_minus_tg_coefficient_from_stem_uses_complementary_plus_axis(self) -> None:
         d = processing_run._load_canonical(str(FIXTURES), "sample_0.9TG-BG=0_scan.csv", y_axis="auto")
         expected = np.array([9.0, 10.9, 12.8])
@@ -245,6 +253,23 @@ class SharedPipelinePropagationTests(unittest.TestCase):
                 "folder", ["scan_TG-0.8BG=0.csv"], bg_mode="self_last", y_axis="auto"
             )
         self.assertEqual(mock_process.call_args.kwargs["y_axis"], "linear:1,0.8,0")
+
+    def test_drr_auto_resolves_unicode_minus_filename_axis(self) -> None:
+        with patch.object(loader.P, "process_ref_avg") as mock_process:
+            mock_process.return_value = {
+                "energy": np.array([1.0]),
+                "gate_axis": np.array([0.0]),
+                "Z_out": np.array([[1.0]]),
+                "gate_label": "TG+1.1BG (V)",
+                "title": "DRR",
+            }
+            loader.load_drr_avg(
+                "folder",
+                ["YZ364_0Tpa_3.6KREF_700nmc_0p1sx10_TG−1.1BG=0.csv"],
+                bg_mode="self_last",
+                y_axis="auto",
+            )
+        self.assertEqual(mock_process.call_args.kwargs["y_axis"], "linear:1,1.1,0")
 
 
 if __name__ == "__main__":

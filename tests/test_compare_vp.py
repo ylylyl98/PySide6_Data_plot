@@ -167,6 +167,10 @@ class CompareAngleParserTests(unittest.TestCase):
         name = "YZ247_Rot1195p8deg_Rot2145deg_Stage50_TG-BG=0.csv"
         self.assertEqual(parse_compare_gate_condition(name), "TG-BG=0")
 
+    def test_gate_condition_parser_normalizes_unicode_minus(self) -> None:
+        name = "YZ364_Rot1195p8deg_Rot2145deg_TG−1.1BG=0.csv"
+        self.assertEqual(parse_compare_gate_condition(name), "TG-1.1BG=0")
+
     def test_coherent_auto_assignment_does_not_mix_gate_groups(self) -> None:
         files = [
             "YZ247_pX2_3.6KPL_730nm5.37uW_865nmc_2sx1_Rot1195p8deg_Rot295deg_Stage50_TG+BG=0.csv",

@@ -106,8 +106,32 @@ def load_background_npz(path="seed_bg.npz"):
 # -----------------------------
 # Small helpers
 # -----------------------------
+_GATE_SIGN_TRANSLATION = str.maketrans(
+    {
+        "\N{MINUS SIGN}": "-",
+        "\N{HYPHEN}": "-",
+        "\N{NON-BREAKING HYPHEN}": "-",
+        "\N{FIGURE DASH}": "-",
+        "\N{EN DASH}": "-",
+        "\N{EM DASH}": "-",
+        "\N{SMALL HYPHEN-MINUS}": "-",
+        "\N{FULLWIDTH HYPHEN-MINUS}": "-",
+        "\N{FULLWIDTH PLUS SIGN}": "+",
+    }
+)
+
+
+def _normalize_gate_signs(text: str) -> str:
+    """Normalize copied/typographic signs before parsing gate metadata."""
+    return str(text or "").translate(_GATE_SIGN_TRANSLATION)
+
+
 def _extract_tg_bg_ratio(tag: str) -> Optional[float]:
-    m = re.match(r"\s*([0-9]*\.?[0-9]+)\s*TG\s*([+-])\s*BG", tag, flags=re.I)
+    m = re.match(
+        r"\s*([0-9]*\.?[0-9]+)\s*TG\s*([+-])\s*BG",
+        _normalize_gate_signs(tag),
+        flags=re.I,
+    )
     return float(m.group(1)) if m else None
 
 
@@ -248,7 +272,7 @@ _TITLE_GATE_CONDITION_RE = re.compile(
 
 def _title_from_filename(name: str) -> str:
     """Build a readable title without losing gate metadata outside ``$...$`` fields."""
-    stem = Path(name).stem
+    stem = _normalize_gate_signs(Path(name).stem)
     parts = _extract_gate_tokens(stem)
     if not parts:
         return stem
@@ -266,7 +290,7 @@ def _title_from_filename(name: str) -> str:
 
 
 def _match_gate_mode_token(text: str) -> Optional[Dict[str, float | str]]:
-    token = str(text or "").strip()
+    token = _normalize_gate_signs(text).strip()
     if not token:
         return None
 
@@ -299,7 +323,7 @@ def _find_gate_mode_in_segments(parts: Sequence[str]) -> Optional[Dict[str, floa
 
 
 def _find_gate_mode_in_stem(stem: str) -> Optional[Dict[str, float | str]]:
-    bounded = f" {stem or ''} "
+    bounded = f" {_normalize_gate_signs(stem)} "
     patterns = (
         (
             re.compile(
@@ -454,7 +478,9 @@ def _legacy_gate_resolution(
         default_axis = "Vtg"
         default_label = "Top gate (V)"
     else:
-        gate_tag = next((p for p in parts if ("TG" in p or "BG" in p)), "")
+        gate_tag = _normalize_gate_signs(
+            next((p for p in parts if ("TG" in p or "BG" in p)), "")
+        )
         ratio = _extract_tg_bg_ratio(gate_tag) or 1.0
         if "TG+BG" in gate_tag:
             axes["TG+BG"] = ratio * axes["Vtg"] - axes["Vbg"]
@@ -642,8 +668,8 @@ def _gate_tag_from_name(name: str) -> str:
     parts = re.findall(r"\$(.*?)\$", name)
     for p in parts:
         if "TG" in p or "BG" in p:
-            return p
-    return Path(name).stem
+            return _normalize_gate_signs(p)
+    return _normalize_gate_signs(Path(name).stem)
 
 def _wrap_title(s: str, max_chars: int = 32) -> str:
     """Soft-wrap a long title at separators ('~', ' · ', ' - ', ' (')."""
@@ -1341,7 +1367,9 @@ def _parse_spec_axis_from_colname(col) -> Optional[float]:
         return (span <= atol) or (span <= rtol * max(1.0, abs(vmin), abs(vmax)))
     bg_const = _is_constant(vbg)
     tg_const = _is_constant(vtg)
-    gate_tag = next((p for p in parts if ("TG" in p or "BG" in p)), "")
+    gate_tag = _normalize_gate_signs(
+        next((p for p in parts if ("TG" in p or "BG" in p)), "")
+    )
 
     if not bg_const and tg_const:
         # BG varies, TG is fixed  -> show BG on Y

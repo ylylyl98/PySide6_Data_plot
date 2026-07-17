@@ -24,6 +24,24 @@ COMPARE_GATE_CONDITION_RE = re.compile(
     re.IGNORECASE,
 )
 
+_GATE_SIGN_TRANSLATION = str.maketrans(
+    {
+        "\N{MINUS SIGN}": "-",
+        "\N{HYPHEN}": "-",
+        "\N{NON-BREAKING HYPHEN}": "-",
+        "\N{FIGURE DASH}": "-",
+        "\N{EN DASH}": "-",
+        "\N{EM DASH}": "-",
+        "\N{SMALL HYPHEN-MINUS}": "-",
+        "\N{FULLWIDTH HYPHEN-MINUS}": "-",
+        "\N{FULLWIDTH PLUS SIGN}": "+",
+    }
+)
+
+
+def _normalize_gate_signs(text: str) -> str:
+    return str(text or "").translate(_GATE_SIGN_TRANSLATION)
+
 
 @dataclass(frozen=True)
 class Limits:
@@ -391,7 +409,7 @@ def infer_compare_angle_references(
 
 
 def parse_compare_gate_condition(file_name: str) -> str:
-    stem = str(Path(file_name).stem)
+    stem = _normalize_gate_signs(Path(file_name).stem)
     match = COMPARE_GATE_CONDITION_RE.search(stem)
     if not match:
         return ""
@@ -465,7 +483,7 @@ def _compare_file_power(file_name: str) -> float:
 
 
 def _compare_context_key(file_name: str, *, ignore_gate_condition: bool = False) -> str:
-    stem = Path(file_name).stem.replace("$", "")
+    stem = _normalize_gate_signs(Path(file_name).stem).replace("$", "")
     stem = POWER_TOKEN_RE.sub("", stem)
     stem = re.sub(
         r"(?:^|[_\s-]+)Rot\s*[12][^_\s-]*(?:deg|degree)",
@@ -576,7 +594,9 @@ def coherent_compare_auto_assignment(
         families: dict[tuple[float, float], list[tuple[int, str, str]]] = {}
         for gate_records in groups.values():
             for record in gate_records:
-                match = COMPARE_GATE_CONDITION_RE.search(Path(record[2]).stem)
+                match = COMPARE_GATE_CONDITION_RE.search(
+                    _normalize_gate_signs(Path(record[2]).stem)
+                )
                 if not match:
                     continue
                 tg_coeff = _parse_angle_token(match.group("tg") or "1")
