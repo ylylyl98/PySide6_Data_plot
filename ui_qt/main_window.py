@@ -10,7 +10,7 @@ import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 from matplotlib.ticker import PercentFormatter
-from PySide6.QtCore import QFileSystemWatcher, QMimeData, QObject, QRunnable, QSettings, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QFileSystemWatcher, QMimeData, QObject, QRect, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListView,
     QListWidget,
     QMainWindow,
     QMessageBox,
@@ -33,8 +34,11 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QProgressBar,
+    QScrollArea,
     QSpinBox,
     QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QSizePolicy,
     QSplitter,
     QStatusBar,
@@ -64,7 +68,17 @@ from core.export import (
     vp_compare_title,
 )
 from core.loader import DataCube
-from core.plotting import COMPARE_PANEL_ORDER, HeatmapParams, plot_compare_panel, plot_drr, plot_heatmap, plot_pl
+from core.plotting import (
+    COMPARE_PANEL_ORDER,
+    HeatmapParams,
+    HeatmapRender,
+    SplitColorScale,
+    plot_compare_panel,
+    plot_drr,
+    plot_heatmap,
+    plot_pl,
+    resolve_split_boundary,
+)
 from core.processing import (
     apply_sg_derivative_energy,
     background_correct_cube,
@@ -95,7 +109,7 @@ from core.shg_fit import (
 )
 
 UI_METRICS = {
-    "left_max_width": 500,
+    "left_width": 600,
     "main_margin": 12,
     "group_margin": 10,
     "row_spacing": 8,
@@ -240,6 +254,64 @@ class Worker(QRunnable):
             self.signals.finished.emit()
 
 
+class WrappedFilenameDelegate(QStyledItemDelegate):
+    """Paint complete filenames as dynamically sized, wrapped list rows."""
+
+    HORIZONTAL_PADDING = 8
+    VERTICAL_PADDING = 6
+
+    def _text_width(self, option: QStyleOptionViewItem) -> int:
+        view = self.parent()
+        if isinstance(view, QListWidget):
+            width = view.viewport().width()
+        else:
+            width = option.rect.width()
+        return max(80, int(width) - 2 * self.HORIZONTAL_PADDING)
+
+    def sizeHint(self, option: QStyleOptionViewItem, index) -> QSize:
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        text = str(index.data(Qt.DisplayRole) or "")
+        text_rect = opt.fontMetrics.boundingRect(
+            QRect(0, 0, self._text_width(opt), 10000),
+            Qt.AlignLeft | Qt.TextWrapAnywhere,
+            text,
+        )
+        base = super().sizeHint(opt, index)
+        row_width = self._text_width(opt) + 2 * self.HORIZONTAL_PADDING
+        return QSize(
+            row_width,
+            max(base.height(), text_rect.height() + 2 * self.VERTICAL_PADDING),
+        )
+
+    def paint(self, painter, option: QStyleOptionViewItem, index) -> None:
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        text = opt.text
+        opt.text = ""
+        style = opt.widget.style() if opt.widget is not None else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
+
+        painter.save()
+        painter.setPen(
+            opt.palette.highlightedText().color()
+            if opt.state & QStyle.State_Selected
+            else opt.palette.text().color()
+        )
+        text_rect = option.rect.adjusted(
+            self.HORIZONTAL_PADDING,
+            self.VERTICAL_PADDING,
+            -self.HORIZONTAL_PADDING,
+            -self.VERTICAL_PADDING,
+        )
+        painter.drawText(
+            text_rect,
+            Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWrapAnywhere,
+            text,
+        )
+        painter.restore()
+
+
 class MainWindow(QMainWindow):
     SETTINGS_ORG = "DPTK"
     SETTINGS_APP = "PySide6_Data_Plot"
@@ -251,7 +323,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DPTK Desktop (PySide6)")
-        self.setMinimumSize(1100, 700)
+        self.setMinimumSize(1180, 700)
         self.thread_pool = QThreadPool.globalInstance()
         self.settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
         self.current_folder = ""
@@ -642,11 +714,11 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         left = self._build_left_panel()
         right = self._build_plot_panel()
-        left.setMaximumWidth(UI_METRICS["left_max_width"])
+        left.setFixedWidth(UI_METRICS["left_width"])
         splitter.addWidget(left)
         splitter.addWidget(right)
         splitter.setChildrenCollapsible(False)
-        splitter.setSizes([UI_METRICS["left_max_width"] - 20, 980])
+        splitter.setSizes([UI_METRICS["left_width"], 980])
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
 
@@ -673,7 +745,7 @@ class MainWindow(QMainWindow):
 
     def _build_left_panel(self) -> QWidget:
         box = QWidget()
-        box.setMaximumWidth(UI_METRICS["left_max_width"])
+        box.setFixedWidth(UI_METRICS["left_width"])
         layout = QVBoxLayout(box)
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(UI_METRICS["row_spacing"])
@@ -716,15 +788,35 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._make_expander("Data Source", folder_box, expanded=True))
 
         self.tabs = QTabWidget()
-        # Keep DRR tab non-scrollable: do not wrap this panel or parameters in QScrollArea.
-        self.tabs.addTab(self._build_pl_tab(), "PL")
-        self.tabs.addTab(self._build_drr_tab(), "DRR")
-        self.tabs.addTab(self._build_compare_tab(), "Compare")
-        self.tabs.addTab(self._build_power_tab(), "Power Dependent")
-        self.tabs.addTab(self._build_shg_tab(), "SHG Processing")
-        self.tabs.addTab(self._build_tools_tab(), "Log / Tools")
+        self.tabs.tabBar().setExpanding(True)
+        self.tabs.tabBar().setElideMode(Qt.ElideNone)
+        self.tabs.tabBar().setUsesScrollButtons(False)
+        for key, label, tooltip, page in (
+            ("pl", "PL", "Photoluminescence", self._build_pl_tab()),
+            ("drr", "DRR", "Differential reflectance", self._build_drr_tab()),
+            ("cmp", "Compare", "Compare measurement channels", self._build_compare_tab()),
+            ("power", "Power", "Power Dependent", self._build_power_tab()),
+            ("shg", "SHG", "SHG Processing", self._build_shg_tab()),
+            ("tools", "Tools", "Log / Tools", self._build_tools_tab()),
+        ):
+            index = self.tabs.addTab(self._make_scrollable_tab(page, key), label)
+            self.tabs.setTabToolTip(index, tooltip)
         layout.addWidget(self.tabs, 1)
         return box
+
+    def _make_scrollable_tab(self, page: QWidget, key: str) -> QScrollArea:
+        """Keep the tab bar visible while allowing tall control pages to scroll."""
+        scroll = QScrollArea()
+        scroll.setObjectName(f"{key}_tab_scroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        page.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        scroll.setWidget(page)
+        setattr(self, f"{key}_tab_scroll", scroll)
+        return scroll
 
     def _build_common_range_grid(
         self, prefix: str
@@ -822,7 +914,98 @@ class MainWindow(QMainWindow):
         setattr(self, f"{prefix}_clip_chk", clip_chk)
         setattr(self, f"{prefix}_cmap", cmap)
         setattr(self, f"{prefix}_fix_checks", fix_checks)
+        self._build_split_scale_controls(prefix)
         return grid, spins, log_chk, clip_chk, cmap, fix_checks
+
+    def _build_split_scale_controls(self, prefix: str) -> None:
+        toggle = QCheckBox("Use split color scale")
+        toggle.setToolTip("Use independent color limits on the two sides of x0.")
+
+        def split_spin() -> QDoubleSpinBox:
+            spin = QDoubleSpinBox()
+            spin.setDecimals(6)
+            spin.setRange(-1e12, 1e12)
+            spin.setSingleStep(0.01)
+            spin.setFixedWidth(UI_METRICS["spin_w"] + 12)
+            return spin
+
+        split_spins = {
+            "x0": split_spin(),
+            "left_vmin": split_spin(),
+            "left_vmax": split_spin(),
+            "right_vmin": split_spin(),
+            "right_vmax": split_spin(),
+        }
+        split_spins["x0"].setToolTip("Requested boundary between the two x-dependent color scales.")
+        split_spins["left_vmin"].setToolTip("Color minimum from xmin to x0.")
+        split_spins["left_vmax"].setToolTip("Color maximum from xmin to x0.")
+        split_spins["right_vmin"].setToolTip("Color minimum from x0 to xmax.")
+        split_spins["right_vmax"].setToolTip("Color maximum from x0 to xmax.")
+
+        split_fix_checks = {
+            "left_vmin": QCheckBox("Fix"),
+            "left_vmax": QCheckBox("Fix"),
+            "right_vmin": QCheckBox("Fix"),
+            "right_vmax": QCheckBox("Fix"),
+        }
+        for key, check in split_fix_checks.items():
+            region = "left" if key.startswith("left") else "right"
+            bound = "minimum" if key.endswith("vmin") else "maximum"
+            check.setToolTip(
+                f"Keep the {region}-region color {bound} when {region.title()} Auto is used."
+            )
+
+        panel = QGroupBox("Two X-Region Color Limits")
+        grid = QGridLayout(panel)
+        grid.setContentsMargins(6, 8, 6, 6)
+        grid.setHorizontalSpacing(5)
+        grid.setVerticalSpacing(5)
+        show_boundary = QCheckBox("Show boundary")
+        show_boundary.setChecked(True)
+        auto_left = QToolButton()
+        auto_left.setText("Auto Left")
+        auto_left.setToolTip("Automatically set unlocked limits from data between xmin and x0.")
+        auto_right = QToolButton()
+        auto_right.setText("Auto Right")
+        auto_right.setToolTip("Automatically set unlocked limits from data between x0 and xmax.")
+
+        # Region titles get their own rows so the controls remain readable at
+        # the sidebar's minimum width instead of clipping its right edge.
+        grid.addWidget(QLabel("Split position (x0)"), 0, 0, 1, 2)
+        grid.addWidget(split_spins["x0"], 0, 2, 1, 2)
+        grid.addWidget(show_boundary, 0, 4, 1, 2)
+
+        left_title = QLabel("Region 1: xmin → x0")
+        left_title.setStyleSheet("font-weight: 600;")
+        grid.addWidget(left_title, 1, 0, 1, 4)
+        grid.addWidget(auto_left, 1, 4, 1, 2)
+        grid.addWidget(QLabel("vmin"), 2, 0)
+        grid.addWidget(split_spins["left_vmin"], 2, 1, 1, 2)
+        grid.addWidget(split_fix_checks["left_vmin"], 2, 3)
+        grid.addWidget(QLabel("vmax"), 3, 0)
+        grid.addWidget(split_spins["left_vmax"], 3, 1, 1, 2)
+        grid.addWidget(split_fix_checks["left_vmax"], 3, 3)
+
+        right_title = QLabel("Region 2: x0 → xmax")
+        right_title.setStyleSheet("font-weight: 600;")
+        grid.addWidget(right_title, 4, 0, 1, 4)
+        grid.addWidget(auto_right, 4, 4, 1, 2)
+        grid.addWidget(QLabel("vmin"), 5, 0)
+        grid.addWidget(split_spins["right_vmin"], 5, 1, 1, 2)
+        grid.addWidget(split_fix_checks["right_vmin"], 5, 3)
+        grid.addWidget(QLabel("vmax"), 6, 0)
+        grid.addWidget(split_spins["right_vmax"], 6, 1, 1, 2)
+        grid.addWidget(split_fix_checks["right_vmax"], 6, 3)
+        grid.setColumnStretch(4, 1)
+        panel.setVisible(False)
+
+        setattr(self, f"{prefix}_split_scale_chk", toggle)
+        setattr(self, f"{prefix}_split_scale_panel", panel)
+        setattr(self, f"{prefix}_split_spins", split_spins)
+        setattr(self, f"{prefix}_split_fix_checks", split_fix_checks)
+        setattr(self, f"{prefix}_split_boundary_chk", show_boundary)
+        setattr(self, f"{prefix}_split_auto_left_btn", auto_left)
+        setattr(self, f"{prefix}_split_auto_right_btn", auto_right)
 
     def _build_y_axis_controls(self, prefix: str) -> QWidget:
         host = QWidget()
@@ -933,6 +1116,8 @@ class MainWindow(QMainWindow):
             "vmin / vmax",
             self._make_axis_range_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.pl_auto_v_btn, "Auto V"),
         )
+        basic_form.addRow("Color scale", self.pl_split_scale_chk)
+        basic_form.addRow(self.pl_split_scale_panel)
         basic_form.addRow(
             "xmin / xmax",
             self._make_axis_range_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.pl_auto_x_btn, "Auto X"),
@@ -1039,35 +1224,41 @@ class MainWindow(QMainWindow):
         files_layout.setSpacing(6)
 
         meas_row = QWidget()
-        meas_h = QHBoxLayout(meas_row)
-        meas_h.setContentsMargins(0, 0, 0, 0)
-        meas_h.setSpacing(6)
+        meas_grid = QGridLayout(meas_row)
+        meas_grid.setContentsMargins(0, 0, 0, 0)
+        meas_grid.setHorizontalSpacing(6)
+        meas_grid.setVerticalSpacing(4)
         self.drr_measurement_summary = QLabel("Measurement: 0 files")
+        self.drr_measurement_summary.setWordWrap(True)
         self.drr_edit_measurements_btn = QPushButton("Select...")
         self.drr_edit_measurements_btn.setFixedHeight(30)
         self.drr_edit_measurements_btn.setMaximumWidth(92)
         self.drr_clear_measurements_btn = QPushButton("Clear")
         self.drr_clear_measurements_btn.setFixedHeight(30)
         self.drr_clear_measurements_btn.setMaximumWidth(72)
-        meas_h.addWidget(self.drr_measurement_summary, 1)
-        meas_h.addWidget(self.drr_edit_measurements_btn)
-        meas_h.addWidget(self.drr_clear_measurements_btn)
+        meas_grid.addWidget(self.drr_measurement_summary, 0, 0, 1, 3)
+        meas_grid.setColumnStretch(0, 1)
+        meas_grid.addWidget(self.drr_edit_measurements_btn, 1, 1)
+        meas_grid.addWidget(self.drr_clear_measurements_btn, 1, 2)
         files_layout.addWidget(meas_row)
 
         base_row = QWidget()
-        base_h = QHBoxLayout(base_row)
-        base_h.setContentsMargins(0, 0, 0, 0)
-        base_h.setSpacing(6)
+        base_grid = QGridLayout(base_row)
+        base_grid.setContentsMargins(0, 0, 0, 0)
+        base_grid.setHorizontalSpacing(6)
+        base_grid.setVerticalSpacing(4)
         self.drr_baseline_summary = QLabel("Baselines: 0 files")
+        self.drr_baseline_summary.setWordWrap(True)
         self.drr_edit_baselines_btn = QPushButton("Select...")
         self.drr_edit_baselines_btn.setFixedHeight(30)
         self.drr_edit_baselines_btn.setMaximumWidth(92)
         self.drr_baseline_autofind_btn = QPushButton("Auto Find...")
         self.drr_baseline_autofind_btn.setFixedHeight(30)
         self.drr_baseline_autofind_btn.setMaximumWidth(104)
-        base_h.addWidget(self.drr_baseline_summary, 1)
-        base_h.addWidget(self.drr_edit_baselines_btn)
-        base_h.addWidget(self.drr_baseline_autofind_btn)
+        base_grid.addWidget(self.drr_baseline_summary, 0, 0, 1, 3)
+        base_grid.setColumnStretch(0, 1)
+        base_grid.addWidget(self.drr_edit_baselines_btn, 1, 1)
+        base_grid.addWidget(self.drr_baseline_autofind_btn, 1, 2)
         files_layout.addWidget(base_row)
 
         self.drr_baseline_combine_combo = QComboBox()
@@ -1101,13 +1292,13 @@ class MainWindow(QMainWindow):
         for s in spins.values():
             s.setFixedWidth(UI_METRICS["spin_w"])
             s.setFixedHeight(UI_METRICS["input_h"])
-        self.drr_baseline_combo.setMinimumWidth(150)
-        self.drr_baseline_combo.setMaximumWidth(210)
+        self.drr_baseline_combo.setMinimumWidth(120)
+        self.drr_baseline_combo.setMaximumWidth(180)
         self.drr_baseline_combo.setFixedHeight(UI_METRICS["input_h"])
         self.drr_baseline_combo.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.drr_yaxis_controls = self._build_y_axis_controls("drr")
-        cmap.setMinimumWidth(110)
-        cmap.setMaximumWidth(145)
+        cmap.setMinimumWidth(90)
+        cmap.setMaximumWidth(115)
         cmap.setFixedHeight(UI_METRICS["input_h"])
         cmap.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.drr_derivative_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
@@ -1186,6 +1377,8 @@ class MainWindow(QMainWindow):
             "vmin / vmax",
             self._make_axis_range_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.drr_auto_v_btn, "Auto V"),
         )
+        basic_form.addRow("Color scale", self.drr_split_scale_chk)
+        basic_form.addRow(self.drr_split_scale_panel)
         basic_form.addRow(
             "xmin / xmax",
             self._make_axis_range_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.drr_auto_x_btn, "Auto X"),
@@ -1632,6 +1825,8 @@ class MainWindow(QMainWindow):
             "vmin / vmax",
             self._make_axis_range_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.cmp_auto_v_btn, "Auto V"),
         )
+        basic_form.addRow("Color scale", self.cmp_split_scale_chk)
+        basic_form.addRow(self.cmp_split_scale_panel)
         basic_form.addRow(
             "xmin / xmax",
             self._make_axis_range_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.cmp_auto_x_btn, "Auto X"),
@@ -1984,6 +2179,8 @@ class MainWindow(QMainWindow):
             "vmin / vmax",
             self._make_axis_range_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.power_auto_v_btn, "Auto V"),
         )
+        basic_form.addRow("Color scale", self.power_split_scale_chk)
+        basic_form.addRow(self.power_split_scale_panel)
         basic_form.addRow(
             "xmin / xmax",
             self._make_axis_range_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.power_auto_x_btn, "Auto X"),
@@ -3142,6 +3339,31 @@ class MainWindow(QMainWindow):
             for key in ("a", "b", "c"):
                 spin: QDoubleSpinBox = getattr(self, f"{prefix}_yaxis_{key}_spin")
                 spin.valueChanged.connect(lambda _value, p=prefix: self._update_y_axis_controls(p))
+        for prefix in ("pl", "drr", "cmp", "power"):
+            toggle: QCheckBox = getattr(self, f"{prefix}_split_scale_chk")
+            toggle.toggled.connect(
+                lambda checked, p=prefix: self._on_split_scale_toggled(p, checked)
+            )
+            split_spins: Dict[str, QDoubleSpinBox] = getattr(self, f"{prefix}_split_spins")
+            for spin in split_spins.values():
+                spin.editingFinished.connect(
+                    lambda p=prefix: self._on_split_scale_param_changed(p)
+                )
+            split_fix_checks: Dict[str, QCheckBox] = getattr(
+                self, f"{prefix}_split_fix_checks"
+            )
+            for check in split_fix_checks.values():
+                check.toggled.connect(self._update_action_states)
+            boundary_chk: QCheckBox = getattr(self, f"{prefix}_split_boundary_chk")
+            boundary_chk.toggled.connect(
+                lambda _checked, p=prefix: self._on_split_scale_param_changed(p)
+            )
+            getattr(self, f"{prefix}_split_auto_left_btn").clicked.connect(
+                lambda _checked=False, p=prefix: self._auto_split_vrange(p, "left")
+            )
+            getattr(self, f"{prefix}_split_auto_right_btn").clicked.connect(
+                lambda _checked=False, p=prefix: self._auto_split_vrange(p, "right")
+            )
         self.pl_auto_v_btn.clicked.connect(self._auto_pl_vrange)
         self.pl_auto_x_btn.clicked.connect(self._auto_pl_xrange)
         self.pl_auto_y_btn.clicked.connect(self._auto_pl_yrange)
@@ -3352,7 +3574,13 @@ class MainWindow(QMainWindow):
 
     def _active_mode(self) -> str | None:
         text = self.tabs.tabText(self.tabs.currentIndex())
-        return text if text in {"PL", "DRR", "Compare", "Power Dependent", "SHG Processing"} else None
+        return {
+            "PL": "PL",
+            "DRR": "DRR",
+            "Compare": "Compare",
+            "Power": "Power Dependent",
+            "SHG": "SHG Processing",
+        }.get(text)
 
     def _toolbar_load(self) -> None:
         mode = self._active_mode()
@@ -3433,12 +3661,14 @@ class MainWindow(QMainWindow):
         self._invalidate_export_move_sources()
         self._power_selected_row_index = None
         self._power_set_view_mode(mode)
+        self._update_action_states()
         self._on_power_plot_param_changed()
 
     def _on_cmp_view_changed(self) -> None:
         self._invalidate_export_move_sources()
         self._cmp_update_view_mode()
         self._cmp_update_assignment_summary()
+        self._update_action_states()
         self._on_cmp_plot_param_changed()
 
     def _on_cmp_background_mode_changed(self, _checked: bool) -> None:
@@ -3545,13 +3775,10 @@ class MainWindow(QMainWindow):
         def _brief(names: List[str]) -> str:
             if not names:
                 return "none"
-            if len(names) == 1:
-                s = names[0]
-            else:
-                s = f"{names[0]}, {names[1]}" if len(names) > 1 else names[0]
-                if len(names) > 2:
-                    s += f", +{len(names)-2} more"
-            return (s[:46] + "...") if len(s) > 49 else s
+            # Zero-width break opportunities preserve the complete first name
+            # while allowing underscore-heavy measurement names to wrap.
+            first = names[0].replace("_", "_\u200b").replace("-", "-\u200b")
+            return first if len(names) == 1 else f"{first} (+{len(names) - 1} more)"
 
         mode_map = {
             "Last frame of each baseline file": "last",
@@ -3560,8 +3787,18 @@ class MainWindow(QMainWindow):
         }
         mode_short = mode_map.get(self.drr_baseline_combine_combo.currentText(), "last")
         self.drr_measurement_summary.setText(f"Measurement: {len(self.drr_selected_files)} files ({_brief(self.drr_selected_files)})")
+        self.drr_measurement_summary.setToolTip(
+            "Selected measurement files:\n" + "\n".join(self.drr_selected_files)
+            if self.drr_selected_files
+            else "No measurement files selected."
+        )
         self.drr_baseline_summary.setText(
             f"Baselines: {len(self.drr_baseline_files_manual)} files (mode: {mode_short})"
+        )
+        self.drr_baseline_summary.setToolTip(
+            "Selected baseline files:\n" + "\n".join(self.drr_baseline_files_manual)
+            if self.drr_baseline_files_manual
+            else "No external baseline files selected."
         )
 
     def _edit_drr_measurements(self) -> None:
@@ -3602,7 +3839,9 @@ class MainWindow(QMainWindow):
         dlg.setWindowTitle(title)
         if not self.windowIcon().isNull():
             dlg.setWindowIcon(self.windowIcon())
-        dlg.resize(760, 500)
+        dlg.setMinimumSize(760, 520)
+        dlg.resize(1000, 650)
+        dlg.setSizeGripEnabled(True)
         v = QVBoxLayout(dlg)
         top_row = QHBoxLayout()
         filter_edit = QLineEdit()
@@ -3619,30 +3858,69 @@ class MainWindow(QMainWindow):
             top_row.addWidget(auto_group_btn)
         v.addLayout(top_row)
 
-        lists_row = QHBoxLayout()
+        lists_splitter = QSplitter(Qt.Vertical)
         available = QListWidget()
         available.setSelectionMode(QAbstractItemView.ExtendedSelection)
         current = QListWidget()
         current.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        for file_list in (available, current):
+            file_list.setWordWrap(True)
+            file_list.setTextElideMode(Qt.ElideNone)
+            file_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            file_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+            file_list.setUniformItemSizes(False)
+            file_list.setResizeMode(QListView.Adjust)
+            file_list.setSpacing(2)
+            file_list.setItemDelegate(WrappedFilenameDelegate(file_list))
+
         selected_set = set(selected)
         for f in self.available_files:
             if f not in selected_set:
                 available.addItem(f)
         current.addItems(selected)
-        lists_row.addWidget(available, 1)
 
-        mid_btns = QVBoxLayout()
-        add_btn = QPushButton("Add >")
-        remove_btn = QPushButton("< Remove")
-        clear_btn = QPushButton("Clear")
-        mid_btns.addStretch(1)
-        mid_btns.addWidget(add_btn)
-        mid_btns.addWidget(remove_btn)
-        mid_btns.addWidget(clear_btn)
-        mid_btns.addStretch(1)
-        lists_row.addLayout(mid_btns)
-        lists_row.addWidget(current, 1)
-        v.addLayout(lists_row)
+        available_panel = QWidget()
+        available_layout = QVBoxLayout(available_panel)
+        available_layout.setContentsMargins(0, 0, 0, 0)
+        available_layout.setSpacing(4)
+        available_label = QLabel()
+        available_layout.addWidget(available_label)
+        available_layout.addWidget(available, 1)
+
+        current_panel = QWidget()
+        current_layout = QVBoxLayout(current_panel)
+        current_layout.setContentsMargins(0, 0, 0, 0)
+        current_layout.setSpacing(4)
+        current_label = QLabel()
+        current_layout.addWidget(current_label)
+        current_layout.addWidget(current, 1)
+
+        transfer_panel = QWidget()
+        transfer_panel.setFixedHeight(44)
+        transfer_row = QHBoxLayout(transfer_panel)
+        transfer_row.setContentsMargins(0, 4, 0, 4)
+        transfer_row.addStretch(1)
+        add_btn = QPushButton("Add Selected ↓")
+        remove_btn = QPushButton("Remove Selected ↑")
+        clear_btn = QPushButton("Clear Selected")
+        transfer_row.addWidget(add_btn)
+        transfer_row.addWidget(remove_btn)
+        transfer_row.addWidget(clear_btn)
+        transfer_row.addStretch(1)
+
+        lists_splitter.addWidget(available_panel)
+        lists_splitter.addWidget(transfer_panel)
+        lists_splitter.addWidget(current_panel)
+        lists_splitter.setChildrenCollapsible(False)
+        lists_splitter.setStretchFactor(0, 1)
+        lists_splitter.setStretchFactor(1, 0)
+        lists_splitter.setStretchFactor(2, 1)
+        lists_splitter.setSizes([260, 44, 220])
+        v.addWidget(lists_splitter, 1)
+
+        def _update_counts() -> None:
+            available_label.setText(f"Available files ({available.count()})")
+            current_label.setText(f"Selected files ({current.count()})")
 
         def _move(src: QListWidget, dst: QListWidget) -> None:
             items = [i.text() for i in src.selectedItems()]
@@ -3655,6 +3933,7 @@ class MainWindow(QMainWindow):
                     existing.add(name)
             for it in src.selectedItems():
                 src.takeItem(src.row(it))
+            _update_counts()
 
         def _filter() -> None:
             needle = filter_edit.text().strip().lower()
@@ -3665,13 +3944,22 @@ class MainWindow(QMainWindow):
                     continue
                 if not needle or needle in f.lower():
                     available.addItem(f)
+            _update_counts()
+
+        def _clear_selected() -> None:
+            current.clear()
+            _filter()
+
+        def _remove_selected() -> None:
+            _move(current, available)
+            _filter()
 
         add_btn.clicked.connect(lambda: _move(available, current))
-        remove_btn.clicked.connect(lambda: _move(current, available))
-        clear_btn.clicked.connect(lambda: (available.addItems([current.item(i).text() for i in range(current.count())]), current.clear(), _filter()))
+        remove_btn.clicked.connect(_remove_selected)
+        clear_btn.clicked.connect(_clear_selected)
         filter_edit.textChanged.connect(lambda _t: _filter())
         available.itemDoubleClicked.connect(lambda _i: _move(available, current))
-        current.itemDoubleClicked.connect(lambda _i: _move(current, available))
+        current.itemDoubleClicked.connect(lambda _i: _remove_selected())
 
         if enable_back_auto:
             def _auto_back() -> None:
@@ -3694,6 +3982,8 @@ class MainWindow(QMainWindow):
                 _filter()
                 self._status(f"State: Selected group '{largest_key}' ({len(matches)} files).")
             auto_group_btn.clicked.connect(_auto_group)
+
+        _update_counts()
 
         b = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         b.accepted.connect(dlg.accept)
@@ -3731,18 +4021,48 @@ class MainWindow(QMainWindow):
         drr_loaded = loaded_mode == "DRR"
         cmp_loaded = loaded_mode == "Compare"
         power_loaded = loaded_mode == "Power Dependent"
-        self.pl_auto_v_btn.setEnabled(pl_loaded)
+        self.pl_auto_v_btn.setEnabled(pl_loaded and not self.pl_split_scale_chk.isChecked())
         self.pl_auto_x_btn.setEnabled(pl_loaded)
         self.pl_auto_y_btn.setEnabled(pl_loaded)
-        self.drr_auto_v_btn.setEnabled(drr_loaded)
+        self.drr_auto_v_btn.setEnabled(drr_loaded and not self.drr_split_scale_chk.isChecked())
         self.drr_auto_x_btn.setEnabled(drr_loaded)
         self.drr_auto_y_btn.setEnabled(drr_loaded)
-        self.cmp_auto_v_btn.setEnabled(cmp_loaded)
+        self.cmp_auto_v_btn.setEnabled(cmp_loaded and not self.cmp_split_scale_chk.isChecked())
         self.cmp_auto_x_btn.setEnabled(cmp_loaded)
         self.cmp_auto_y_btn.setEnabled(cmp_loaded)
-        self.power_auto_v_btn.setEnabled(power_loaded)
+        self.power_auto_v_btn.setEnabled(power_loaded and not self.power_split_scale_chk.isChecked())
         self.power_auto_x_btn.setEnabled(power_loaded)
         self.power_auto_y_btn.setEnabled(power_loaded)
+        for prefix, enabled in (
+            ("pl", pl_loaded),
+            ("drr", drr_loaded),
+            ("cmp", cmp_loaded and not self._cmp_is_vp_view()),
+            ("power", power_loaded and self._power_view() != "VP"),
+        ):
+            split_enabled = bool(getattr(self, f"{prefix}_split_scale_chk").isChecked())
+            split_fix_checks: Dict[str, QCheckBox] = getattr(
+                self, f"{prefix}_split_fix_checks"
+            )
+            left_fully_fixed = all(
+                split_fix_checks[key].isChecked()
+                for key in ("left_vmin", "left_vmax")
+            )
+            right_fully_fixed = all(
+                split_fix_checks[key].isChecked()
+                for key in ("right_vmin", "right_vmax")
+            )
+            getattr(self, f"{prefix}_split_auto_left_btn").setEnabled(
+                enabled and split_enabled and not left_fully_fixed
+            )
+            getattr(self, f"{prefix}_split_auto_right_btn").setEnabled(
+                enabled and split_enabled and not right_fully_fixed
+            )
+        cmp_split_available = not self._cmp_is_vp_view()
+        power_split_available = self._power_view() != "VP"
+        self.cmp_split_scale_chk.setEnabled(cmp_split_available)
+        self.cmp_split_scale_panel.setEnabled(cmp_split_available)
+        self.power_split_scale_chk.setEnabled(power_split_available)
+        self.power_split_scale_panel.setEnabled(power_split_available)
 
     def _auto_drr_vrange(self) -> None:
         if not self.loaded or self.loaded.mode != "DRR":
@@ -4315,6 +4635,241 @@ class MainWindow(QMainWindow):
         self._load_in_progress = False
         self._status_progress.setVisible(False)
 
+    def _split_prefix_mode(self, prefix: str) -> str:
+        return {
+            "pl": "PL",
+            "drr": "DRR",
+            "cmp": "Compare",
+            "power": "Power Dependent",
+        }[prefix]
+
+    def _on_split_scale_toggled(self, prefix: str, checked: bool) -> None:
+        panel: QWidget = getattr(self, f"{prefix}_split_scale_panel")
+        panel.setVisible(bool(checked))
+        spins = self._mode_spins(self._split_prefix_mode(prefix))
+        checks: Dict[str, QCheckBox] = getattr(self, f"{prefix}_fix_checks")
+        spins["vmin"].setEnabled(not checked)
+        spins["vmax"].setEnabled(not checked)
+        checks["vmin"].setEnabled(not checked)
+        checks["vmax"].setEnabled(not checked)
+
+        split_spins: Dict[str, QDoubleSpinBox] = getattr(self, f"{prefix}_split_spins")
+        xlo, xhi = sorted((float(spins["xmin"].value()), float(spins["xmax"].value())))
+        split_fix_checks: Dict[str, QCheckBox] = getattr(
+            self, f"{prefix}_split_fix_checks"
+        )
+        if checked:
+            values: Dict[str, float] = {}
+            if not xlo < float(split_spins["x0"].value()) < xhi:
+                values["x0"] = 0.5 * (xlo + xhi)
+            for side in ("left", "right"):
+                vmin_key = f"{side}_vmin"
+                vmax_key = f"{side}_vmax"
+                if split_spins[vmax_key].value() <= split_spins[vmin_key].value():
+                    if not split_fix_checks[vmin_key].isChecked():
+                        values[vmin_key] = float(spins["vmin"].value())
+                    if not split_fix_checks[vmax_key].isChecked():
+                        values[vmax_key] = float(spins["vmax"].value())
+            for key, value in values.items():
+                spin = split_spins[key]
+                blocked = spin.blockSignals(True)
+                try:
+                    spin.setValue(value)
+                finally:
+                    spin.blockSignals(blocked)
+        self._on_split_scale_param_changed(prefix)
+        self._update_action_states()
+
+    def _on_split_scale_param_changed(self, prefix: str) -> None:
+        toggle: QCheckBox = getattr(self, f"{prefix}_split_scale_chk")
+        if not toggle.isChecked():
+            return
+        if prefix == "pl":
+            self._on_pl_plot_param_changed()
+        elif prefix == "drr":
+            self._on_drr_plot_param_changed()
+        elif prefix == "cmp":
+            self._on_cmp_plot_param_changed()
+        else:
+            self._on_power_plot_param_changed()
+
+    def _split_scale_for_mode(self, mode: str) -> SplitColorScale | None:
+        # VP views use a fixed diverging [-1, 1] scale, so a remembered
+        # intensity split must not be validated or applied while they are active.
+        if mode == "Compare" and self._cmp_is_vp_view():
+            return None
+        if mode == "Power Dependent" and self._power_view() == "VP":
+            return None
+        prefix = "pl" if mode == "PL" else "drr" if mode == "DRR" else "power" if mode == "Power Dependent" else "cmp"
+        toggle: QCheckBox = getattr(self, f"{prefix}_split_scale_chk")
+        if not toggle.isChecked():
+            return None
+        spins = self._mode_spins(mode)
+        split_spins: Dict[str, QDoubleSpinBox] = getattr(self, f"{prefix}_split_spins")
+        xmin, xmax = sorted((float(spins["xmin"].value()), float(spins["xmax"].value())))
+        x0 = float(split_spins["x0"].value())
+        left_vmin = float(split_spins["left_vmin"].value())
+        left_vmax = float(split_spins["left_vmax"].value())
+        right_vmin = float(split_spins["right_vmin"].value())
+        right_vmax = float(split_spins["right_vmax"].value())
+        if not xmin < x0 < xmax:
+            raise ValueError("Split color scale requires xmin < x0 < xmax.")
+        if left_vmax <= left_vmin or right_vmax <= right_vmin:
+            raise ValueError("Both split color regions require vmin < vmax.")
+        if self._mode_log(mode) and (left_vmin <= 0.0 or right_vmin <= 0.0):
+            raise ValueError("Log split color scale requires positive vmin values in both regions.")
+        return SplitColorScale(
+            split_x=x0,
+            left_vmin=left_vmin,
+            left_vmax=left_vmax,
+            right_vmin=right_vmin,
+            right_vmax=right_vmax,
+            show_boundary=bool(getattr(self, f"{prefix}_split_boundary_chk").isChecked()),
+        )
+
+    def _split_scale_key(self, prefix: str) -> tuple[object, ...]:
+        enabled = bool(getattr(self, f"{prefix}_split_scale_chk").isChecked())
+        if not enabled:
+            return (False,)
+        spins: Dict[str, QDoubleSpinBox] = getattr(self, f"{prefix}_split_spins")
+        return (
+            True,
+            float(spins["x0"].value()),
+            float(spins["left_vmin"].value()),
+            float(spins["left_vmax"].value()),
+            float(spins["right_vmin"].value()),
+            float(spins["right_vmax"].value()),
+            bool(getattr(self, f"{prefix}_split_boundary_chk").isChecked()),
+        )
+
+    def _split_auto_cubes(self, mode: str) -> list[DataCube]:
+        if not self.loaded or self.loaded.mode != mode:
+            return []
+        if mode == "PL" and self.loaded.cube is not None:
+            return [self.loaded.cube]
+        if mode == "DRR" and self.loaded.cube is not None:
+            return [self._drr_cube_for_display()]
+        if mode == "Compare" and self.loaded.compare_cubes:
+            if self._cmp_is_vp_view():
+                return []
+            raw = {
+                key: self.loaded.compare_cubes[key]
+                for key in self._cmp_visible_channels()
+                if key in self.loaded.compare_cubes
+            }
+            return list(
+                self._cmp_corrected_cubes(
+                    raw,
+                    self._cmp_source_mapping(),
+                    background=self._cmp_background_value(raw),
+                ).values()
+            )
+        if mode == "Power Dependent" and self.loaded.cube is not None:
+            if self._power_view() == "VP":
+                return []
+            if self._power_has_distinct_role_groups():
+                kk_result, kkp_result, _kk_key, _kkp_key = self._power_role_payload()
+                background = self._power_background_value([kk_result.cube, kkp_result.cube])
+                return [
+                    self._power_corrected_cube(kk_result.cube, background=background),
+                    self._power_corrected_cube(kkp_result.cube, background=background),
+                ]
+            return [self._power_corrected_cube(self.loaded.cube)]
+        return []
+
+    def _auto_split_vrange(self, prefix: str, side: str) -> None:
+        mode = self._split_prefix_mode(prefix)
+        cubes = self._split_auto_cubes(mode)
+        if not cubes:
+            self._status("Split auto scale is available after loading an intensity heatmap.")
+            return
+        spins = self._mode_spins(mode)
+        split_spins: Dict[str, QDoubleSpinBox] = getattr(self, f"{prefix}_split_spins")
+        xmin, xmax = sorted((float(spins["xmin"].value()), float(spins["xmax"].value())))
+        ymin, ymax = sorted((float(spins["ymin"].value()), float(spins["ymax"].value())))
+        x0 = float(split_spins["x0"].value())
+        if not xmin < x0 < xmax:
+            self._status("Set x0 strictly between xmin and xmax before auto scaling.")
+            return
+
+        values: list[np.ndarray] = []
+        for cube in cubes:
+            x = np.asarray(cube.energy, float).ravel()
+            y = np.asarray(cube.gate, float).ravel()
+            z = np.asarray(cube.Z, float)
+            try:
+                split_index, _applied_boundary = resolve_split_boundary(x, x0)
+            except ValueError:
+                continue
+            column_index = np.arange(x.size)
+            side_mask = column_index < split_index if side == "left" else column_index >= split_index
+            xmask = side_mask & (x >= xmin) & (x <= xmax)
+            ymask = (y >= ymin) & (y <= ymax)
+            if not np.any(xmask) or not np.any(ymask):
+                continue
+            region = z[np.ix_(ymask, xmask)]
+            finite = region[np.isfinite(region)]
+            if self._mode_log(mode):
+                finite = finite[finite > 0.0]
+            if finite.size:
+                values.append(finite)
+        if not values:
+            self._status(f"Auto {side} scale skipped: no finite values in that x region.")
+            return
+        combined = np.concatenate(values)
+        vmin, vmax = (float(v) for v in np.nanpercentile(combined, [0.01, 99.99]))
+        if vmax <= vmin:
+            pad = max(1e-12, abs(vmin) * 0.01, 1e-12)
+            vmin -= pad
+            vmax += pad
+            if self._mode_log(mode):
+                vmin = max(vmin, 1e-12)
+        split_fix_checks: Dict[str, QCheckBox] = getattr(
+            self, f"{prefix}_split_fix_checks"
+        )
+        vmin_key = f"{side}_vmin"
+        vmax_key = f"{side}_vmax"
+        candidate_vmin = (
+            float(split_spins[vmin_key].value())
+            if split_fix_checks[vmin_key].isChecked()
+            else vmin
+        )
+        candidate_vmax = (
+            float(split_spins[vmax_key].value())
+            if split_fix_checks[vmax_key].isChecked()
+            else vmax
+        )
+        if candidate_vmax <= candidate_vmin:
+            self._status(
+                f"Auto {side} scale conflicts with a fixed limit; "
+                "adjust or unfix that value first."
+            )
+            return
+        if self._mode_log(mode) and candidate_vmin <= 0.0:
+            self._status(
+                f"Auto {side} scale conflicts with a non-positive fixed vmin in log mode."
+            )
+            return
+        updated: list[str] = []
+        for key, value in ((vmin_key, candidate_vmin), (vmax_key, candidate_vmax)):
+            if split_fix_checks[key].isChecked():
+                continue
+            blocked = split_spins[key].blockSignals(True)
+            try:
+                split_spins[key].setValue(value)
+            finally:
+                split_spins[key].blockSignals(blocked)
+            updated.append("vmin" if key.endswith("vmin") else "vmax")
+        if not updated:
+            self._status(f"Auto {side} scale skipped: vmin and vmax are fixed.")
+            return
+        locked = [name for name in ("vmin", "vmax") if name not in updated]
+        detail = f"; kept fixed {', '.join(locked)}" if locked else ""
+        self._status(
+            f"Auto {side} color scale = {candidate_vmin:.4g}, {candidate_vmax:.4g}{detail}."
+        )
+        self._on_split_scale_param_changed(prefix)
+
     def _mode_spins(self, mode: str) -> Dict[str, QDoubleSpinBox]:
         if mode == "PL":
             return self.pl_spins
@@ -4527,6 +5082,37 @@ class MainWindow(QMainWindow):
                     spins["ymin"].setValue(float(np.nanmin(positive)))
                 if not self._mode_fix_value(mode, "ymax"):
                     spins["ymax"].setValue(float(np.nanmax(positive)))
+        prefix = "pl" if mode == "PL" else "drr" if mode == "DRR" else "power" if mode == "Power Dependent" else "cmp"
+        if bool(getattr(self, f"{prefix}_split_scale_chk").isChecked()):
+            split_spins: Dict[str, QDoubleSpinBox] = getattr(self, f"{prefix}_split_spins")
+            split_fix_checks: Dict[str, QCheckBox] = getattr(
+                self, f"{prefix}_split_fix_checks"
+            )
+            xmin, xmax = sorted((float(spins["xmin"].value()), float(spins["xmax"].value())))
+            if not xmin < float(split_spins["x0"].value()) < xmax:
+                blocked = split_spins["x0"].blockSignals(True)
+                try:
+                    split_spins["x0"].setValue(0.5 * (xmin + xmax))
+                finally:
+                    split_spins["x0"].blockSignals(blocked)
+            # Initialize only invalid regional pairs. Valid manual/fixed values
+            # survive file changes and x-range updates unchanged.
+            for side in ("left", "right"):
+                vmin_key = f"{side}_vmin"
+                vmax_key = f"{side}_vmax"
+                if split_spins[vmax_key].value() > split_spins[vmin_key].value():
+                    continue
+                for key, value in (
+                    (vmin_key, float(spins["vmin"].value())),
+                    (vmax_key, float(spins["vmax"].value())),
+                ):
+                    if split_fix_checks[key].isChecked():
+                        continue
+                    blocked = split_spins[key].blockSignals(True)
+                    try:
+                        split_spins[key].setValue(value)
+                    finally:
+                        split_spins[key].blockSignals(blocked)
         spins["gate"].setValue(float(np.nanmedian(cube.gate)))
 
     def _make_params(self, mode: str, cube: DataCube) -> HeatmapParams:
@@ -4545,6 +5131,7 @@ class MainWindow(QMainWindow):
             y_axis_log=(mode == "Power Dependent" and self._power_axis_log()),
             center_zero=(mode == "DRR" and bool(self.drr_center_zero_chk.isChecked())),
             clip_outliers=self._mode_clip(mode),
+            split_scale=self._split_scale_for_mode(mode),
         )
 
     def _auto_scale_spectrum_y(self, ax, x: np.ndarray, y: np.ndarray, xlim: tuple[float, float]) -> None:
@@ -5627,6 +6214,29 @@ class MainWindow(QMainWindow):
         self._shg_corrected_ax = None
         self._shg_angle_ax = angle_ax
 
+    def _add_heatmap_colorbar(
+        self,
+        render: HeatmapRender,
+        cax,
+        *,
+        label: str,
+    ) -> None:
+        if not render.is_split:
+            self.figure.colorbar(render.primary, cax=cax, label=label)
+            return
+        cax.set_axis_off()
+        left_cax = cax.inset_axes([0.0, 0.55, 1.0, 0.43])
+        right_cax = cax.inset_axes([0.0, 0.02, 1.0, 0.43])
+        left_cb = self.figure.colorbar(render.primary, cax=left_cax)
+        right_cb = self.figure.colorbar(render.secondary, cax=right_cax)
+        split_text = f"{float(render.split_x):.6g}"
+        left_cb.ax.set_title(f"x ≤ {split_text}", fontsize=8, pad=2)
+        right_cb.ax.set_title(f"x ≥ {split_text}", fontsize=8, pad=2)
+        left_cb.set_label(label, fontsize=8)
+        right_cb.set_label(label, fontsize=8)
+        left_cb.ax.tick_params(labelsize=7)
+        right_cb.ax.tick_params(labelsize=7)
+
     def _plot_mode(self, mode: str, *, auto: bool = False) -> None:
         try:
             if not self.loaded or self.loaded.mode != mode:
@@ -5677,8 +6287,8 @@ class MainWindow(QMainWindow):
                 ax1 = self.figure.add_subplot(gs[0, 0])
                 cax = self.figure.add_subplot(gs[0, 1])
                 ax2 = self.figure.add_subplot(gs[1, 0], sharex=ax1)
-                im = plot_pl(ax1, plot_cube, params)
-                self.figure.colorbar(im, cax=cax, label=params.cbar_label)
+                render = plot_pl(ax1, plot_cube, params)
+                self._add_heatmap_colorbar(render, cax, label=params.cbar_label)
                 self._pl_heatmap_ax = ax1
                 self._pl_spectrum_ax = ax2
                 self._pl_last_plot_cube = plot_cube
@@ -5705,8 +6315,8 @@ class MainWindow(QMainWindow):
                 ax1 = self.figure.add_subplot(gs[0, 0])
                 cax = self.figure.add_subplot(gs[0, 1])
                 ax2 = self.figure.add_subplot(gs[1, 0], sharex=ax1)
-                im = plot_drr(ax1, plot_cube, params)
-                self.figure.colorbar(im, cax=cax, label=params.cbar_label)
+                render = plot_drr(ax1, plot_cube, params)
+                self._add_heatmap_colorbar(render, cax, label=params.cbar_label)
                 gate_val = float(self._mode_spins(mode)["gate"].value())
                 gate_used = self._plot_spectrum_with_roi(
                     ax2, plot_cube, gate_val, ylabel=params.cbar_label, xlim=params.xlim
@@ -5762,9 +6372,9 @@ class MainWindow(QMainWindow):
                     ax1 = self.figure.add_subplot(gs[0, 0])
                     cax = self.figure.add_subplot(gs[0, 1])
                     ax2 = self.figure.add_subplot(gs[1, 0], sharex=ax1)
-                    im = plot_heatmap(ax1, display_cube, params)
+                    render = plot_heatmap(ax1, display_cube, params)
                     self._apply_power_tick_labels(ax1, true_power, display_power)
-                    self.figure.colorbar(im, cax=cax, label=params.cbar_label)
+                    self._add_heatmap_colorbar(render, cax, label=params.cbar_label)
                     self._power_heatmap_ax = ax1
                     self._power_heatmap_axes = {"VP": ax1}
                     self._power_spectrum_ax = ax2
@@ -5811,16 +6421,16 @@ class MainWindow(QMainWindow):
                     heat_axes = [self.figure.add_subplot(gs[0, idx]) for idx in range(n)]
                     cax = self.figure.add_subplot(gs[0, n])
                     ax2 = self.figure.add_subplot(gs[1, :n], sharex=heat_axes[0])
-                    images = []
+                    renders: list[HeatmapRender] = []
                     for ax, (key, cube) in zip(heat_axes, cubes.items()):
                         display_cube, true_power, display_power = self._display_power_cube(cube)
                         panel_params = HeatmapParams(**{**params.__dict__, "title": role_titles.get(key, key) if role_compare else cube.title})
-                        im = plot_heatmap(ax, display_cube, panel_params)
+                        render = plot_heatmap(ax, display_cube, panel_params)
                         self._apply_power_tick_labels(ax, true_power, display_power)
-                        images.append(im)
+                        renders.append(render)
                         self._power_heatmap_axes[key] = ax
-                    if images:
-                        self.figure.colorbar(images[0], cax=cax, label=params.cbar_label)
+                    if renders:
+                        self._add_heatmap_colorbar(renders[0], cax, label=params.cbar_label)
                     self._power_heatmap_ax = heat_axes[0]
                     self._power_spectrum_ax = ax2
                     self._power_last_plot_cube = plot_cube
@@ -5871,7 +6481,7 @@ class MainWindow(QMainWindow):
                     heat_ax = self.figure.add_subplot(gs[0, 0])
                     cax = self.figure.add_subplot(gs[0, 1])
                     line_ax = self.figure.add_subplot(gs[1, 0], sharex=heat_ax)
-                    im = plot_heatmap(heat_ax, vp_cube, vp_params)
+                    render = plot_heatmap(heat_ax, vp_cube, vp_params)
                     heat_ax.text(
                         0.98,
                         0.98,
@@ -5885,7 +6495,7 @@ class MainWindow(QMainWindow):
                         bbox=dict(boxstyle="round,pad=0.22", facecolor="white", edgecolor="none", alpha=0.78),
                         zorder=40,
                     )
-                    self.figure.colorbar(im, cax=cax, label="VP")
+                    self._add_heatmap_colorbar(render, cax, label="VP")
                     gate_used, y = nearest_gate_spectrum(vp_cube, float(self.cmp_spins["gate"].value()))
                     x = np.asarray(vp_cube.energy, float).ravel()
                     line_ax.plot(x, np.asarray(y, float), linewidth=1.3, color="#1f77b4", label="VP")
@@ -5934,13 +6544,13 @@ class MainWindow(QMainWindow):
                         ]
                         line_ax = self.figure.add_subplot(gs[2, :2], sharex=heat_axes[0])
                         cax = self.figure.add_subplot(gs[0:2, 2])
-                    images = []
+                    renders: list[HeatmapRender] = []
                     for ax, key in zip(heat_axes, cubes.keys()):
-                        im = plot_compare_panel(ax, key, cubes[key], params)
-                        images.append(im)
+                        render = plot_compare_panel(ax, key, cubes[key], params)
+                        renders.append(render)
                         self._cmp_heatmap_axes[key] = ax
-                    if images:
-                        self.figure.colorbar(images[0], cax=cax, label="PL corr. (a.u.)")
+                    if renders:
+                        self._add_heatmap_colorbar(renders[0], cax, label="PL corr. (a.u.)")
                     gate_used = self._plot_compare_linecut(
                         line_ax,
                         cubes,
@@ -6044,6 +6654,7 @@ class MainWindow(QMainWindow):
                 float(self.power_spins["gate"].value()),
                 bool(self.power_log_chk.isChecked()),
                 bool(self.power_clip_chk.isChecked()),
+                self._split_scale_key("power"),
             )
         if mode == "Compare":
             return (
@@ -6070,6 +6681,7 @@ class MainWindow(QMainWindow):
                 float(self.cmp_spins["gate"].value()),
                 bool(self.cmp_log_chk.isChecked()),
                 bool(self.cmp_clip_chk.isChecked()),
+                self._split_scale_key("cmp"),
             )
         if mode != "DRR":
             return (mode, int(self.tabs.currentIndex()), self.last_plotted_mode, self._current_y_axis_spec_for_mode(mode))
@@ -6078,6 +6690,7 @@ class MainWindow(QMainWindow):
             "DRR", p["baseline_mode"], p["baseline_which"], p["baseline_files"], p["selected_files"],
             p["y_axis_spec"], p["derivative"], p["sg_window"], p["sg_poly"], p["cmap"], p["vmin"], p["vmax"],
             p["xmin"], p["xmax"], p["ymin"], p["ymax"], p["gate"], p["log"], p["clip"], p["center_zero"],
+            self._split_scale_key("drr"),
         )
 
     def _is_drr_gate_only_change(self, new_key: tuple[Any, ...]) -> bool:
@@ -6474,11 +7087,18 @@ class MainWindow(QMainWindow):
             return
 
         if mode == "PL":
+            log_split = params.split_scale
+            if log_split is not None and (
+                log_split.left_vmin <= 0.0 or log_split.right_vmin <= 0.0
+            ):
+                log_split = None
             options = ExportOptions(
                 mode=mode,
                 params=params,
                 params_linear=HeatmapParams(**{**params.__dict__, "log_scale": False}),
-                params_log=HeatmapParams(**{**params.__dict__, "log_scale": True}),
+                params_log=HeatmapParams(
+                    **{**params.__dict__, "log_scale": True, "split_scale": log_split}
+                ),
                 auto_move_sources=bool(self.auto_move_after_export_chk.isChecked()),
             )
         elif mode == "DRR":

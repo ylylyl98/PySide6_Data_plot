@@ -18,7 +18,7 @@ from matplotlib.font_manager import FontProperties
 from matplotlib.ticker import FixedFormatter, FixedLocator, FuncFormatter, NullFormatter, NullLocator
 
 from core.loader import DataCube
-from core.plotting import COMPARE_PANEL_ORDER, HeatmapParams
+from core.plotting import COMPARE_PANEL_ORDER, HeatmapParams, plot_heatmap, resolve_split_boundary
 from core.processing import background_correct_cube, parse_compare_gate_condition, power_group_title, valley_polarization_cube
 from core.processing_run import save_as_dat
 from core.shg import ShgProcessResult, ShgSettings, ShgSweepData
@@ -285,39 +285,47 @@ def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *,
     e = np.asarray(cube.energy, float).ravel()
     g = np.asarray(cube.gate, float).ravel()
     z = np.asarray(cube.Z, float)
-    if params.clip_outliers:
-        z = np.minimum(z, float(params.vmax))
 
     fig = plt.figure(figsize=EXPORT_FIGSIZE, dpi=EXPORT_DPI, facecolor="white")
     ax = fig.add_axes([0.08, 0.12, 0.84, 0.72])
     axpos = ax.get_position()
 
-    vmin = float(params.vmin)
-    vmax = float(params.vmax)
-    if vmax <= vmin:
-        vmax = vmin * 1.01 if vmin != 0 else 1.0
-    cmap = params.cmap
-    if bool(params.log_scale):
-        if vmin <= 0:
-            pos = z[np.isfinite(z) & (z > 0)]
-            vmin = float(np.nanmin(pos)) if pos.size else 1e-12
-        vmin = max(vmin, 1e-12)
-        vmax = max(vmax, vmin * 1.01)
-        norm = LogNorm(vmin=vmin, vmax=vmax, clip=True)
+    split_render = None
+    if params.split_scale is not None:
+        split_render = plot_heatmap(ax, cube, params)
+        ax.set_title("")
+        im = split_render.primary
+        vmin = float(params.split_scale.left_vmin)
+        vmax = float(params.split_scale.left_vmax)
     else:
-        if bool(params.center_zero) and (vmin < 0.0 < vmax):
-            norm = TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
+        if params.clip_outliers:
+            z = np.minimum(z, float(params.vmax))
+        vmin = float(params.vmin)
+        vmax = float(params.vmax)
+        if vmax <= vmin:
+            vmax = vmin * 1.01 if vmin != 0 else 1.0
+        cmap = params.cmap
+        if bool(params.log_scale):
+            if vmin <= 0:
+                pos = z[np.isfinite(z) & (z > 0)]
+                vmin = float(np.nanmin(pos)) if pos.size else 1e-12
+            vmin = max(vmin, 1e-12)
+            vmax = max(vmax, vmin * 1.01)
+            norm = LogNorm(vmin=vmin, vmax=vmax, clip=True)
         else:
-            norm = Normalize(vmin=vmin, vmax=vmax)
+            if bool(params.center_zero) and (vmin < 0.0 < vmax):
+                norm = TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
+            else:
+                norm = Normalize(vmin=vmin, vmax=vmax)
 
-    im = ax.pcolormesh(
-        _axis_edges_from_centers(e),
-        _axis_edges_from_centers(g, log_scale=bool(params.y_axis_log)),
-        z,
-        shading="flat",
-        cmap=cmap,
-        norm=norm,
-    )
+        im = ax.pcolormesh(
+            _axis_edges_from_centers(e),
+            _axis_edges_from_centers(g, log_scale=bool(params.y_axis_log)),
+            z,
+            shading="flat",
+            cmap=cmap,
+            norm=norm,
+        )
 
     ax.set_xlabel(params.xlabel, fontsize=16)
     ax.set_ylabel(params.ylabel, fontsize=16)
@@ -329,7 +337,7 @@ def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *,
         ax.set_yscale("log")
     ax.set_ylim(params.ylim)
 
-    cbar_w = 0.24 * axpos.width
+    cbar_w = (0.42 if split_render is not None else 0.24) * axpos.width
     cbar_h = 0.018
     cbar_x = axpos.x1 - cbar_w
     cbar_y = axpos.y1 + 0.004
@@ -347,34 +355,59 @@ def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *,
     )
     fig.text(title_left, 0.95, title_wrapped, ha="left", va="top", fontsize=16, fontweight="bold", linespacing=1.0)
 
-    cax = fig.add_axes([cbar_x, cbar_y, cbar_w, cbar_h])
-    cb = fig.colorbar(im, cax=cax, orientation="horizontal")
-    if params.log_scale:
-        mid = float((vmin * vmax) ** 0.5)
-        cb.locator = mticker.LogLocator(base=10, subs=(1.0, 2.0, 5.0))
-        cb.update_ticks()
-    else:
-        mid = 0.0 if (bool(params.center_zero) and (vmin < 0.0 < vmax)) else float(0.5 * (vmin + vmax))
-    cb.set_ticks([vmin, mid, vmax])
     is_derivative = bool(drr and ("d(" in str(params.cbar_label) or "d2(" in str(params.cbar_label)))
-    ticks = [vmin, mid, vmax]
-    if drr and not is_derivative:
-        # Match Streamlit DRR display: fixed 2 decimals for DR/R colorbar ticks.
-        labels = [f"{float(t):.2f}" if np.isfinite(t) else "" for t in ticks]
-        cb.ax.xaxis.set_major_locator(FixedLocator(ticks))
-        cb.ax.xaxis.set_major_formatter(FixedFormatter(labels))
+
+    def _style_colorbar(cb, lo: float, hi: float, *, title: str) -> None:
+        if params.log_scale:
+            mid = float((lo * hi) ** 0.5)
+            cb.locator = mticker.LogLocator(base=10, subs=(1.0, 2.0, 5.0))
+            cb.update_ticks()
+        else:
+            mid = 0.0 if (bool(params.center_zero) and (lo < 0.0 < hi)) else float(0.5 * (lo + hi))
+        ticks = [lo, mid, hi]
+        cb.set_ticks(ticks)
+        if drr and not is_derivative:
+            labels = [f"{float(t):.2f}" if np.isfinite(t) else "" for t in ticks]
+            cb.ax.xaxis.set_major_locator(FixedLocator(ticks))
+            cb.ax.xaxis.set_major_formatter(FixedFormatter(labels))
+        else:
+            formatter = FuncFormatter(_cb_fmt_sci0 if is_derivative else _cb_fmt_compact)
+            cb.ax.xaxis.set_major_formatter(formatter)
+            cb.formatter = formatter
+            cb.update_ticks()
+        cb.ax.xaxis.get_offset_text().set_visible(False)
+        cb.ax.xaxis.set_minor_locator(NullLocator())
+        cb.ax.xaxis.set_minor_formatter(NullFormatter())
+        cb.ax.xaxis.set_ticks_position("top")
+        cb.ax.xaxis.set_label_position("top")
+        cb.ax.tick_params(top=True, labeltop=True, bottom=False, labelbottom=False, pad=1, labelsize=11 if split_render is not None else 14)
+        cb.ax.set_title(title, fontsize=9 if split_render is not None else 16, fontweight="bold", loc="center", pad=1)
+
+    if split_render is None:
+        cax = fig.add_axes([cbar_x, cbar_y, cbar_w, cbar_h])
+        cb = fig.colorbar(im, cax=cax, orientation="horizontal")
+        _style_colorbar(cb, vmin, vmax, title=params.cbar_label)
     else:
-        formatter = FuncFormatter(_cb_fmt_sci0 if is_derivative else _cb_fmt_compact)
-        cb.ax.xaxis.set_major_formatter(formatter)
-        cb.formatter = formatter
-        cb.update_ticks()
-    cb.ax.xaxis.get_offset_text().set_visible(False)
-    cb.ax.xaxis.set_minor_locator(NullLocator())
-    cb.ax.xaxis.set_minor_formatter(NullFormatter())
-    cb.ax.xaxis.set_ticks_position("top")
-    cb.ax.xaxis.set_label_position("top")
-    cb.ax.tick_params(top=True, labeltop=True, bottom=False, labelbottom=False, pad=1, labelsize=14)
-    cb.ax.set_title(params.cbar_label, fontsize=16, fontweight="bold", loc="right", pad=0)
+        split = params.split_scale
+        gap = 0.025 * axpos.width
+        each_w = 0.5 * (cbar_w - gap)
+        left_cax = fig.add_axes([cbar_x, cbar_y, each_w, cbar_h])
+        right_cax = fig.add_axes([cbar_x + each_w + gap, cbar_y, each_w, cbar_h])
+        left_cb = fig.colorbar(split_render.primary, cax=left_cax, orientation="horizontal")
+        right_cb = fig.colorbar(split_render.secondary, cax=right_cax, orientation="horizontal")
+        boundary = float(split_render.split_x)
+        _style_colorbar(
+            left_cb,
+            float(split.left_vmin),
+            float(split.left_vmax),
+            title=f"{params.cbar_label} | x ≤ {boundary:.6g}",
+        )
+        _style_colorbar(
+            right_cb,
+            float(split.right_vmin),
+            float(split.right_vmax),
+            title=f"{params.cbar_label} | x ≥ {boundary:.6g}",
+        )
 
     return fig
 
@@ -514,6 +547,21 @@ def _power_record_header_lines(records: Iterable[object]) -> list[str]:
     return lines
 
 
+def _split_scale_header_lines(params: HeatmapParams) -> list[str]:
+    split = params.split_scale
+    if split is None:
+        return ["split_color_scale=False"]
+    return [
+        "split_color_scale=True",
+        f"split_x_requested={split.split_x}",
+        f"split_left_vmin={split.left_vmin}",
+        f"split_left_vmax={split.left_vmax}",
+        f"split_right_vmin={split.right_vmin}",
+        f"split_right_vmax={split.right_vmax}",
+        f"split_show_boundary={split.show_boundary}",
+    ]
+
+
 def power_vp_export_base(kk_group_key: str, kkp_group_key: str, *, y_axis_log: bool) -> str:
     axis_tag = "YLog" if bool(y_axis_log) else "YLin"
     kk_stem = _power_source_stem(kk_group_key)
@@ -560,6 +608,7 @@ def export_power_series_png_and_dat(
             f"background_constant={background}",
             "corrected=True",
             "sorted_by=power_uW",
+            *_split_scale_header_lines(params),
             *_power_record_header_lines(records),
         ],
     )
@@ -1058,12 +1107,26 @@ def export_compare_panels(
             log_scale=params.log_scale,
             center_zero=False,
             clip_outliers=clip_outliers,
+            split_scale=params.split_scale,
         )
         base = corrected_compare_export_base(key, source_files[key], scale_tag)
         png_path = _unique_path(out_dir, base, ".png")
         _save_heatmap_png(png_path, cube, panel_params, drr=False)
         z_out = np.asarray(cube.Z, float)
-        if clip_outliers and np.isfinite(params.vmin) and np.isfinite(params.vmax) and params.vmax > params.vmin:
+        if clip_outliers and params.split_scale is not None:
+            split_index, _boundary = resolve_split_boundary(cube.energy, params.split_scale.split_x)
+            z_out = z_out.copy()
+            z_out[:, :split_index] = np.clip(
+                z_out[:, :split_index],
+                params.split_scale.left_vmin,
+                params.split_scale.left_vmax,
+            )
+            z_out[:, split_index:] = np.clip(
+                z_out[:, split_index:],
+                params.split_scale.right_vmin,
+                params.split_scale.right_vmax,
+            )
+        elif clip_outliers and np.isfinite(params.vmin) and np.isfinite(params.vmax) and params.vmax > params.vmin:
             z_out = np.clip(z_out, params.vmin, params.vmax)
         dat_path = save_heatmap_dat_streamlit(
             png_path.with_suffix(".dat"),
@@ -1083,6 +1146,7 @@ def export_compare_panels(
                 f"vmax={params.vmax}",
                 f"xlim={params.xlim}",
                 f"ylim={params.ylim}",
+                *_split_scale_header_lines(params),
             ],
         )
         written.extend([png_path, dat_path])

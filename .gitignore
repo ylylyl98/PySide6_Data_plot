@@ -19,6 +19,7 @@ ENV/
 .DS_Store
 .vscode/
 .idea/
+DPTK Desktop.lnk
 
 # Streamlit
 .streamlit/

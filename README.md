@@ -16,6 +16,14 @@ pip install -r requirements.txt
 python run_qt.py
 ```
 
+On Windows, run `Data_Plot_App.bat` once. It creates `DPTK Desktop.lnk` beside
+the launcher with the application icon; use that shortcut for normal launches
+and taskbar pinning. To create a Desktop shortcut instead, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\create_windows_shortcut.ps1 -Desktop
+```
+
 ## Architecture
 - `core/`: UI-agnostic data loading, processing, plotting primitives, and export.
 - `ui_qt/`: PySide6 desktop UI (`QMainWindow`, controls, Matplotlib embed, log/progress).

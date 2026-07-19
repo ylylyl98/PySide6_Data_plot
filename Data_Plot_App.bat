@@ -9,6 +9,12 @@ set "GIT_TERMINAL_PROMPT=0"
 set "GCM_INTERACTIVE=Never"
 set "GIT_ASKPASS=echo"
 
+rem A batch file cannot carry a custom Windows icon. Create an icon-aware
+rem shortcut beside it so Explorer and pinned launches use the DPTK icon.
+if not exist "%~dp0DPTK Desktop.lnk" (
+    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0scripts\create_windows_shortcut.ps1" >nul 2>nul
+)
+
 if /i not "%DPTK_AUTO_UPDATE%"=="1" (
     set "GIT_UPDATE_STATUS=Git auto-update disabled. Set DPTK_AUTO_UPDATE=1 to fetch and pull before launch."
     goto after_git_pull
