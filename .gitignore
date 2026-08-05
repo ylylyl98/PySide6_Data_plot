@@ -17,14 +17,28 @@ ENV/
 
 # IDE / OS
 .DS_Store
+Thumbs.db
+Desktop.ini
 .vscode/
 .idea/
 DPTK Desktop.lnk
+
+# Local AI/tool state
+.agents/
+.claude/settings.local.json
+.codex/visualizations/
+
+# Test and notebook artifacts
+.coverage
+coverage.xml
+htmlcov/
+.ipynb_checkpoints/
 
 # Streamlit
 .streamlit/
 
 # Your app outputs (optional but recommended)
 Processed Data/
+Initial data after processing/
 Archive/
 *.log
