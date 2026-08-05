@@ -54,13 +54,14 @@ class SplitScaleControlTests(unittest.TestCase):
         self.assertEqual(tab_bar.elideMode(), Qt.ElideNone)
         self.assertEqual(
             [self.window.tabs.tabText(i) for i in range(self.window.tabs.count())],
-            ["PL", "DRR", "Compare", "Power", "SHG", "Tools"],
+            ["PL", "DRR", "Compare", "Power", "MCD", "SHG", "Tools"],
         )
         expected_modes = [
             "PL",
             "DRR",
             "Compare",
             "Power Dependent",
+            "MCD",
             "SHG Processing",
             None,
         ]

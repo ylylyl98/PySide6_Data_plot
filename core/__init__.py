@@ -1,5 +1,5 @@
 """Core APIs for data I/O, processing, plotting, and export."""
 
-from . import data_io, export, plotting, processing
+from . import data_io, export, mcd, plotting, processing
 
-__all__ = ["data_io", "processing", "plotting", "export"]
+__all__ = ["data_io", "processing", "plotting", "export", "mcd"]

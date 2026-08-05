@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import traceback
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Sequence
 
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 from matplotlib.ticker import PercentFormatter
+from matplotlib.widgets import SpanSelector
 from PySide6.QtCore import QFileSystemWatcher, QMimeData, QObject, QRect, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtWidgets import (
@@ -18,7 +20,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDockWidget,
-    QDoubleSpinBox,
+    QDoubleSpinBox as _QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -28,6 +30,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListView,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -35,7 +38,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QProgressBar,
     QScrollArea,
-    QSpinBox,
+    QSpinBox as _QSpinBox,
     QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
@@ -43,6 +46,8 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStatusBar,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QPlainTextEdit,
     QToolButton,
@@ -54,6 +59,10 @@ from scipy.optimize import curve_fit
 from scipy.signal import find_peaks
 
 from core import data_io
+from core.mcd import (
+    McdBackgroundSuggestion, McdResult, McdSettings, background_fit_regions, detect_angles,
+    export_mcd_analysis_bundle, pair_window_trace_by_branch, process_mcd, suggest_mcd_background_ranges,
+)
 from core.export import (
     build_drr_export_base,
     compare_source_title,
@@ -109,12 +118,12 @@ from core.shg_fit import (
 )
 
 UI_METRICS = {
-    "left_width": 600,
-    "main_margin": 12,
-    "group_margin": 10,
-    "row_spacing": 8,
+    "left_width": 540,
+    "main_margin": 8,
+    "group_margin": 6,
+    "row_spacing": 6,
     "label_col_width": 86,
-    "input_h": 30,
+    "input_h": 28,
     "spin_w": 88,
     "short_combo_w": 145,
     "deriv_combo_w": 90,
@@ -122,6 +131,26 @@ UI_METRICS = {
     "tool_h": 28,
     "tool_w": 62,
 }
+
+
+class QDoubleSpinBox(_QDoubleSpinBox):
+    """A double spin box that cannot be changed by accidental page scrolling."""
+
+    def wheelEvent(self, event) -> None:
+        if self.hasFocus() and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class QSpinBox(_QSpinBox):
+    """An integer spin box that requires Ctrl+wheel for wheel adjustment."""
+
+    def wheelEvent(self, event) -> None:
+        if self.hasFocus() and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            super().wheelEvent(event)
+        else:
+            event.ignore()
 
 
 @dataclass
@@ -147,6 +176,8 @@ class LoadedState:
     shg_fit_b: ShgAngularFitResult | None = None
     shg_twist: ShgTwistFitResult | None = None
     shg_compare: bool = False
+    mcd_result: McdResult | None = None
+    mcd_settings: McdSettings | None = None
     drr_mode_label: str = "DR/R Self"
     drr_derivative_label: str = "None"
     drr_baseline_text: str = "Self (last frame)"
@@ -170,6 +201,7 @@ class LoadOptions:
     shg_settings: ShgSettings | None = None
     shg_fit_settings: ShgFitSettings | None = None
     shg_compare: bool = False
+    mcd_settings: McdSettings | None = None
 
 
 def _vp_short_title(kk_title: str, kkp_title: str) -> str:
@@ -225,6 +257,18 @@ class ExportOptions:
     power_stage_pairs: tuple[Any, ...] = ()
     shg_settings: ShgSettings | None = None
     shg_fit_settings: ShgFitSettings | None = None
+    mcd_map_name: str = "Combo"
+    mcd_window_center_ev: float = 0.0
+    mcd_window_width_mev: float = 5.0
+    mcd_window_metric: str = "mean"
+    mcd_settings: McdSettings | None = None
+    mcd_show_raw: bool = False
+    mcd_show_signed_mean: bool = True
+    mcd_show_absolute_mean: bool = False
+    mcd_show_unsigned_absolute_mean: bool = False
+    mcd_show_integral: bool = False
+    mcd_fit_near_zero: bool = False
+    mcd_fit_window_t: float = 0.2
     auto_move_sources: bool = False
 
 
@@ -367,6 +411,11 @@ class MainWindow(QMainWindow):
         self._shg_raw_ax = None
         self._shg_corrected_ax = None
         self._shg_angle_ax = None
+        self._mcd_heatmap_ax = None
+        self._mcd_spectrum_ax = None
+        self._mcd_trace_ax = None
+        self._mcd_integral_ax = None
+        self._mcd_background_suggestion: McdBackgroundSuggestion | None = None
         self._shg_selected_index: int | None = None
         self._pl_last_plot_cube: DataCube | None = None
         self._gate_line = None
@@ -392,6 +441,13 @@ class MainWindow(QMainWindow):
         self._drr_heatmap_fit_artist = None
         self._folder_placeholder_text = ""
         self._load_in_progress = False
+        self._active_load_mode: str | None = None
+        self._active_load_succeeded = False
+        self._mcd_reapply_pending = False
+        self._mcd_auto_apply_timer = QTimer(self)
+        self._mcd_auto_apply_timer.setSingleShot(True)
+        self._mcd_auto_apply_timer.setInterval(650)
+        self._mcd_auto_apply_timer.timeout.connect(self._apply_pending_mcd_settings)
 
         self._build_ui()
         self._folder_placeholder_text = self.folder_edit.placeholderText()
@@ -691,6 +747,7 @@ class MainWindow(QMainWindow):
         self.drr_selected_files = list(selected_names)
         self._update_drr_selection_labels()
         self._power_refresh_groups()
+        self._mcd_refresh_sources()
         self._shg_refresh_sources()
         self._restore_list_selection(self.shg_files, [selected_names[0]])
 
@@ -796,6 +853,7 @@ class MainWindow(QMainWindow):
             ("drr", "DRR", "Differential reflectance", self._build_drr_tab()),
             ("cmp", "Compare", "Compare measurement channels", self._build_compare_tab()),
             ("power", "Power", "Power Dependent", self._build_power_tab()),
+            ("mcd", "MCD", "Magnetic circular dichroism", self._build_mcd_tab()),
             ("shg", "SHG", "SHG Processing", self._build_shg_tab()),
             ("tools", "Tools", "Log / Tools", self._build_tools_tab()),
         ):
@@ -813,7 +871,11 @@ class MainWindow(QMainWindow):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        page.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        # MCD has several detailed controls, but it must still fit the fixed
+        # left sidebar.  Ignored lets the form/layout elide controls instead
+        # of imposing its widest child as a horizontal minimum.
+        horizontal_policy = QSizePolicy.Ignored if key == "mcd" else QSizePolicy.Expanding
+        page.setSizePolicy(horizontal_policy, QSizePolicy.Maximum)
         scroll.setWidget(page)
         setattr(self, f"{key}_tab_scroll", scroll)
         return scroll
@@ -1850,6 +1912,285 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         return tab
 
+    def _build_mcd_tab(self) -> QWidget:
+        tab = QWidget()
+        tab.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Maximum)
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+
+        source = QGroupBox("B-sweep source")
+        source_form = QFormLayout(source)
+        source_form.setContentsMargins(6, 4, 6, 4)
+        source_form.setHorizontalSpacing(6)
+        source_form.setVerticalSpacing(3)
+        self.mcd_files = QListWidget()
+        self.mcd_files.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.mcd_files.setMinimumHeight(60)
+        self.mcd_files.setMaximumHeight(120)
+        self.mcd_files.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.mcd_files.setToolTip("Select one B-sweep CSV. Long filenames are clipped here; hover an item to read its full name.")
+        source_form.addRow(self.mcd_files)
+        self.mcd_source_summary = QLabel("Select a B-sweep CSV.")
+        self.mcd_source_summary.setWordWrap(True)
+        self.mcd_source_summary.setMinimumWidth(0)
+        self.mcd_source_summary.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        source_form.addRow("Format", self.mcd_source_summary)
+        layout.addWidget(self._make_expander("Source", source, expanded=True))
+
+        correction = QGroupBox("Angle background correction")
+        correction_layout = QVBoxLayout(correction)
+        correction_layout.setContentsMargins(6, 4, 6, 4)
+        correction_layout.setSpacing(3)
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(6)
+        form.setVerticalSpacing(3)
+        correction_layout.addLayout(form)
+        self.mcd_auto_angles_chk = QCheckBox("Auto-assign sigma+ / sigma-")
+        self.mcd_auto_angles_chk.setChecked(True)
+        self.mcd_auto_angles_chk.setToolTip(
+            "Detect the available angles in the selected CSV. When enabled, the largest angle is assigned to sigma+ and the smallest to sigma-. "
+            "Turn this off to choose the sigma+ and sigma- assignments yourself."
+        )
+        self.mcd_sigma_plus_combo = QComboBox(); self.mcd_sigma_minus_combo = QComboBox()
+        for combo in (self.mcd_sigma_plus_combo, self.mcd_sigma_minus_combo):
+            combo.addItem("-- Select source CSV first --", None)
+            self._style_combo_popup(combo)
+        self.mcd_reference_mode_combo = QComboBox()
+        self.mcd_reference_mode_combo.addItems(["Nearest paired B (recommended)", "Median near-zero window"])
+        self._style_combo_popup(self.mcd_reference_mode_combo)
+        self.mcd_zero_spin = QDoubleSpinBox(); self.mcd_zero_spin.setRange(0.0, 10.0); self.mcd_zero_spin.setDecimals(4); self.mcd_zero_spin.setValue(0.02); self.mcd_zero_spin.setSuffix(" T")
+        self.mcd_zero_spin.setEnabled(False)
+        self.mcd_gap_spin = QSpinBox(); self.mcd_gap_spin.setRange(1, 50); self.mcd_gap_spin.setValue(3)
+        self.mcd_delta_b_spin = QDoubleSpinBox(); self.mcd_delta_b_spin.setRange(0.0001, 10.0); self.mcd_delta_b_spin.setDecimals(4); self.mcd_delta_b_spin.setValue(0.1); self.mcd_delta_b_spin.setSuffix(" T")
+        self.mcd_pair_alignment_combo = QComboBox(); self.mcd_pair_alignment_combo.addItems(["Direct measured pair", "Interpolate both angles to Bpair"])
+        self.mcd_bin_spin = QSpinBox(); self.mcd_bin_spin.setRange(0, 6); self.mcd_bin_spin.setValue(3)
+        self.mcd_gain_combo = QComboBox(); self.mcd_gain_combo.addItems(["Per wavelength", "Smoothed per wavelength", "Scalar (diagnostic only)"])
+        self.mcd_correction_mode_combo = QComboBox(); self.mcd_correction_mode_combo.addItems([
+            "Global reference gain (current)", "Global gain + per-pair scale", "Global gain + per-pair scale/offset",
+            "Global gain + per-pair spectral baseline",
+        ])
+        self.mcd_correction_mode_combo.setCurrentIndex(3)
+        self.mcd_spectral_order_combo = QComboBox(); self.mcd_spectral_order_combo.addItems([
+            "Linear", "Quadratic (default)",
+        ])
+        self.mcd_spectral_order_combo.setCurrentIndex(1)
+        self.mcd_spectral_order_combo.setEnabled(True)
+        self.mcd_background_ranges_edit = QLineEdit()
+        self.mcd_background_ranges_edit.setPlaceholderText("Auto outer 15%, or e.g. 1.50-1.58, 1.73-1.79")
+        self.mcd_suggest_background_btn = QPushButton("Select protected regions")
+        self.mcd_suggest_background_btn.setToolTip(
+            "Draw persistent feature-protection windows on the full-sweep reflection plot. "
+            "Every sufficiently wide unprotected interval updates automatically as a background band."
+        )
+        self.mcd_background_preview = QLabel("Auto outer 15% ranges are shown after loading an MCD sweep.")
+        self.mcd_background_preview.setWordWrap(True)
+        self.mcd_background_preview.setMinimumWidth(0)
+        self.mcd_background_preview.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.mcd_apply_correction_btn = QPushButton("Recalculate now")
+        self.mcd_apply_correction_btn.setToolTip(
+            "MCD processing updates automatically after settings settle. Click to recalculate immediately or retry after an error."
+        )
+        self.mcd_dark_pos_combo = QComboBox(); self.mcd_dark_neg_combo = QComboBox()
+        for combo in (self.mcd_dark_pos_combo, self.mcd_dark_neg_combo):
+            combo.addItem("-- No dark / offset file --", "")
+            self._style_combo_popup(combo)
+        self.mcd_sigma_plus_combo.setToolTip(
+            "Measured waveplate/analyser angle to interpret as sigma+. Changing the sigma+ and sigma- assignments reverses the MCD sign."
+        )
+        self.mcd_sigma_minus_combo.setToolTip(
+            "Measured waveplate/analyser angle to interpret as sigma-. It must be different from the sigma+ choice."
+        )
+        self.mcd_zero_spin.setToolTip(
+            "Only used with Median near-zero window. Paired spectra with |B_pair| at or below this value "
+            "are combined into each angle's reference spectrum."
+        )
+        self.mcd_reference_mode_combo.setToolTip(
+            "Nearest paired B uses the one valid sigma+/sigma- pair with the smallest |B_pair|. "
+            "This is the normal choice when an exact B = 0 spectrum was not acquired. "
+            "Median near-zero window combines all pairs inside the reference window; use it only when several "
+            "near-zero pairs are available and their physical MCD is negligible."
+        )
+        self.mcd_gap_spin.setToolTip(
+            "Maximum separation, in CSV rows, allowed between opposite-angle spectra in one pair. "
+            "A value of 3 accepts an opposite-angle partner within three acquired frames."
+        )
+        self.mcd_delta_b_spin.setToolTip(
+            "Maximum allowed difference between the two raw B-field values in a pair. "
+            "The paired B shown in the app is their average. Reduce this to reject poorly matched field pairs."
+        )
+        self.mcd_pair_alignment_combo.setToolTip(
+            "Direct measured pair uses the two acquired spectra as-is. Interpolate both angle channels to Bpair using neighbours from the same sweep branch, "
+            "which reduces artifacts when the two angles were measured at different B. It never interpolates across a detected field reversal."
+        )
+        self.mcd_bin_spin.setToolTip(
+            "Round each paired B field to this many decimal places before averaging repeated points into the colormap. "
+            "3 means bins spaced by 0.001 T; use fewer decimals only when the field readings are noisy."
+        )
+        self.mcd_gain_combo.setToolTip(
+            "Angle-throughput correction derived from the two near-zero-field reference spectra. "
+            "Per wavelength is the normal choice. Smoothed per wavelength suppresses noisy gain ripples. "
+            "Scalar applies one number to the whole spectrum and is intended only as a diagnostic."
+        )
+        self.mcd_correction_mode_combo.setToolTip(
+            "Global reference gain applies one reference-derived wavelength correction to every pair. "
+            "Per-pair scale additionally corrects intensity drift using only the background energy ranges. "
+            "Scale/offset also removes an additive offset. Spectral baseline robustly fits a smooth energy-dependent "
+            "sigma+/sigma- ratio in the selected background regions and is the default correction. Review protected regions because an overly broad fit can remove real MCD structure."
+        )
+        self.mcd_spectral_order_combo.setToolTip(
+            "Polynomial order for the per-pair spectral baseline. Quadratic is the default and corrects a broad curved mismatch. "
+            "Linear remains available when only a wavelength-dependent tilt is justified; orders above two are intentionally not offered to avoid unstable overfitting."
+        )
+        self.mcd_background_ranges_edit.setToolTip(
+            "Energy intervals used to fit per-pair scale, scale/offset, or the spectral baseline. Separate intervals with commas, for example "
+            "1.50-1.58, 1.73-1.79. Leave blank to use both spectrum ends: the lowest 15% and highest 15% of the measured energy range (30% total). "
+            "Exclude exciton peaks and the MCD feature of interest. Spectral correction requires separated regions spanning at least 25% of the energy range. "
+            "Use Select protected regions to draw resonances that must be excluded; all unprotected background bands recalculate automatically."
+        )
+        self.mcd_dark_pos_combo.setToolTip(
+            "Optional CSV containing the additive dark/stray-light spectrum measured with the positive angle. "
+            "It is subtracted before reference normalization and must have the same wavelength columns."
+        )
+        self.mcd_dark_neg_combo.setToolTip(
+            "Optional CSV containing the additive dark/stray-light spectrum measured with the negative angle. "
+            "It is subtracted before reference normalization and must have the same wavelength columns."
+        )
+        mcd_compact_combos = (
+            self.mcd_sigma_plus_combo, self.mcd_sigma_minus_combo, self.mcd_reference_mode_combo,
+            self.mcd_pair_alignment_combo, self.mcd_gain_combo, self.mcd_correction_mode_combo, self.mcd_spectral_order_combo,
+            self.mcd_dark_pos_combo, self.mcd_dark_neg_combo,
+        )
+        for combo in mcd_compact_combos:
+            # Keep the selected long filename/mode readable by tooltip while
+            # allowing the closed combo box to elide in the narrow sidebar.
+            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(10)
+            combo.setMinimumWidth(0)
+            combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        for widget in (*mcd_compact_combos, self.mcd_zero_spin, self.mcd_gap_spin, self.mcd_delta_b_spin,
+                       self.mcd_bin_spin, self.mcd_background_ranges_edit):
+            widget.setFixedHeight(UI_METRICS["input_h"])
+        form.addRow("Angles", self.mcd_auto_angles_chk)
+        form.addRow("Sigma+ angle", self.mcd_sigma_plus_combo)
+        form.addRow("Sigma- angle", self.mcd_sigma_minus_combo)
+        form.addRow("Reference method", self.mcd_reference_mode_combo)
+        form.addRow("Reference window", self.mcd_zero_spin)
+        form.addRow("Sequence gap", self.mcd_gap_spin)
+        form.addRow("Pair dB", self.mcd_delta_b_spin)
+        form.addRow("Gain", self.mcd_gain_combo)
+        form.addRow("Drift correction", self.mcd_correction_mode_combo)
+        form.addRow("", self.mcd_apply_correction_btn)
+        advanced_correction = QGroupBox("Advanced correction")
+        advanced_form = QFormLayout(advanced_correction)
+        advanced_form.setContentsMargins(4, 3, 4, 3)
+        advanced_form.setHorizontalSpacing(6)
+        advanced_form.setVerticalSpacing(3)
+        advanced_form.addRow("Pair B alignment", self.mcd_pair_alignment_combo)
+        advanced_form.addRow("B bin decimals", self.mcd_bin_spin)
+        advanced_form.addRow("Fit bg E (eV)", self.mcd_background_ranges_edit)
+        advanced_form.addRow("", self.mcd_suggest_background_btn)
+        advanced_form.addRow("Background", self.mcd_background_preview)
+        advanced_form.addRow("Spectral fit", self.mcd_spectral_order_combo)
+        advanced_form.addRow("Dark sigma+", self.mcd_dark_pos_combo)
+        advanced_form.addRow("Dark sigma-", self.mcd_dark_neg_combo)
+        correction_layout.addWidget(self._make_expander("Advanced", advanced_correction, expanded=False))
+        layout.addWidget(self._make_expander("Correction", correction, expanded=True))
+
+        diagnostics = QGroupBox("Pair diagnostics")
+        diagnostics_layout = QVBoxLayout(diagnostics)
+        self.mcd_diagnostics_text = QPlainTextEdit()
+        self.mcd_diagnostics_text.setReadOnly(True)
+        self.mcd_diagnostics_text.setMinimumHeight(125)
+        self.mcd_diagnostics_text.setToolTip(
+            "One row per sigma+/sigma- pair. Large |dB|, a large relative RMS residual, or a rapidly changing fitted scale "
+            "indicates a pair that may not be corrected reliably. Spectral mode also reports log-gain slope/curvature, "
+            "the applied gain range, and background RMS before/after fitting. The full table is exported with MCD results."
+        )
+        diagnostics_layout.addWidget(self.mcd_diagnostics_text)
+        layout.addWidget(self._make_expander("Diagnostics", diagnostics, expanded=False))
+
+        display = QGroupBox("Display and MCD(B)")
+        display_form = QFormLayout(display)
+        display_form.setContentsMargins(6, 4, 6, 4)
+        display_form.setHorizontalSpacing(6)
+        display_form.setVerticalSpacing(3)
+        self.mcd_map_combo = QComboBox(); self.mcd_map_combo.addItem("Combo")
+        _grid, self.mcd_spins, _a, _b, self.mcd_cmap, _mcd_unused_fix_checks = self._build_common_range_grid("mcd")
+        # MCD does not expose fixed-range controls. Keeping only the visible
+        # widgets avoids retaining unparented QCheckBoxes after construction.
+        self.mcd_fix_checks: Dict[str, QCheckBox] = {}
+        unused_mcd_cursor = self.mcd_spins.pop("gate")
+        unused_mcd_cursor.deleteLater()
+        for spin in self.mcd_spins.values():
+            # The shared range helper uses generous numerical spin-box hints
+            # for the main plot tabs.  Here they appear in compact pairs, so
+            # cap their width while retaining a usable minimum.  They must not
+            # be Ignored: the trailing stretch in _pair_row would then shrink
+            # the Energy/B-field inputs to zero width.
+            spin.setMinimumWidth(72)
+            spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.mcd_cmap.setCurrentText("RdBu_r")
+        self.mcd_center_zero_chk = QCheckBox("Zero-centered"); self.mcd_center_zero_chk.setChecked(True)
+        self.mcd_auto_v_btn = QPushButton("Auto color")
+        self.mcd_pair_b_combo = QComboBox(); self._style_combo_popup(self.mcd_pair_b_combo)
+        self.mcd_pair_b_combo.setToolTip("Choose the paired measurement used for the spectra and MCD linecut. Clicking a B field on the colormap selects the nearest pair here.")
+        self.mcd_window_center_spin = QDoubleSpinBox(); self.mcd_window_center_spin.setRange(0.0, 10.0); self.mcd_window_center_spin.setDecimals(6)
+        self.mcd_window_width_spin = QDoubleSpinBox(); self.mcd_window_width_spin.setRange(0.01, 1000); self.mcd_window_width_spin.setDecimals(3); self.mcd_window_width_spin.setValue(5.0); self.mcd_window_width_spin.setSuffix(" meV")
+        self.mcd_window_metric_combo = QComboBox(); self.mcd_window_metric_combo.addItems(["Field-signed absolute mean", "Signed mean", "Signed integral", "Unsigned absolute mean (diagnostic)"])
+        self.mcd_window_metric_combo.setCurrentText("Signed mean")
+        self.mcd_show_raw_chk = QCheckBox("Raw"); self.mcd_show_raw_chk.setChecked(False)
+        self.mcd_show_signed_mean_chk = QCheckBox("Signed mean"); self.mcd_show_signed_mean_chk.setChecked(True)
+        self.mcd_show_absolute_mean_chk = QCheckBox("B*|MCD|"); self.mcd_show_absolute_mean_chk.setChecked(False)
+        self.mcd_show_unsigned_absolute_mean_chk = QCheckBox("|MCD|"); self.mcd_show_unsigned_absolute_mean_chk.setChecked(False)
+        self.mcd_show_integral_chk = QCheckBox("Integral"); self.mcd_show_integral_chk.setChecked(False)
+        trace_visibility = QWidget(); trace_visibility_layout = QGridLayout(trace_visibility)
+        trace_visibility_layout.setContentsMargins(0, 0, 0, 0)
+        trace_visibility_layout.setHorizontalSpacing(6); trace_visibility_layout.setVerticalSpacing(2)
+        trace_visibility_layout.addWidget(self.mcd_show_raw_chk, 0, 0)
+        trace_visibility_layout.addWidget(self.mcd_show_signed_mean_chk, 0, 1)
+        trace_visibility_layout.addWidget(self.mcd_show_absolute_mean_chk, 1, 0)
+        trace_visibility_layout.addWidget(self.mcd_show_unsigned_absolute_mean_chk, 1, 1)
+        trace_visibility_layout.addWidget(self.mcd_show_integral_chk, 2, 0)
+        trace_visibility_layout.setColumnStretch(0, 1)
+        trace_visibility_layout.setColumnStretch(1, 1)
+        self.mcd_window_metric_combo.setToolTip("Selects the primary MCD(B) metric recorded in export settings. The Origin-ready MCD(B) CSV contains corrected signed mean, field-signed absolute mean, and signed integral for both B-sweep directions.")
+        self.mcd_show_raw_chk.setToolTip("Add dashed raw-MCD curves for comparison with the corrected curves.")
+        self.mcd_show_signed_mean_chk.setToolTip("Average signed MCD inside the selected energy window.")
+        self.mcd_show_absolute_mean_chk.setToolTip("MCD magnitude multiplied by the sign of Bpair. It avoids cancellation between opposite spectral lobes while following the positive/negative field sides.")
+        self.mcd_show_unsigned_absolute_mean_chk.setToolTip("Pure MCD magnitude, always non-negative. Keep this off unless you need a correction/noise diagnostic.")
+        self.mcd_show_integral_chk.setToolTip("Signed energy integral of MCD. It uses the right axis because its unit is MCD eV and changes with the selected window width.")
+        self.mcd_fit_zero_chk = QCheckBox("Near-zero fit")
+        self.mcd_fit_b_window_spin = QDoubleSpinBox(); self.mcd_fit_b_window_spin.setRange(0.001, 10.0); self.mcd_fit_b_window_spin.setDecimals(3); self.mcd_fit_b_window_spin.setValue(0.2); self.mcd_fit_b_window_spin.setSuffix(" T")
+        for combo in (self.mcd_map_combo, self.mcd_pair_b_combo, self.mcd_cmap, self.mcd_window_metric_combo):
+            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(10)
+            combo.setMinimumWidth(0)
+            combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        display_form.addRow("Map", self.mcd_map_combo)
+        display_form.addRow("Color", self._pair_row(self.mcd_spins["vmin"], self.mcd_spins["vmax"], self.mcd_auto_v_btn))
+        display_form.addRow("Energy", self._pair_row(self.mcd_spins["xmin"], self.mcd_spins["xmax"]))
+        display_form.addRow("B field", self._pair_row(self.mcd_spins["ymin"], self.mcd_spins["ymax"]))
+        display_form.addRow("Selected pair", self.mcd_pair_b_combo)
+        display_form.addRow("Color map", self.mcd_cmap)
+        display_form.addRow("Scale", self.mcd_center_zero_chk)
+        display_form.addRow("MCD(B) E0", self.mcd_window_center_spin)
+        display_form.addRow("MCD(B) width", self.mcd_window_width_spin)
+        display_form.addRow("MCD(B) traces", trace_visibility)
+        display_form.addRow("Primary export metric", self.mcd_window_metric_combo)
+        display_form.addRow("Near-zero fit", self._pair_row(self.mcd_fit_zero_chk, self.mcd_fit_b_window_spin))
+        layout.addWidget(self._make_expander("Plot", display, expanded=True))
+        layout.addStretch(1)
+        return tab
+
+    @staticmethod
+    def _pair_row(*widgets: QWidget) -> QWidget:
+        row = QWidget(); h = QHBoxLayout(row); h.setContentsMargins(0, 0, 0, 0); h.setSpacing(6)
+        for widget in widgets: h.addWidget(widget)
+        h.addStretch(1)
+        return row
+
     def _build_shg_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -2298,6 +2639,556 @@ class MainWindow(QMainWindow):
                 combo.blockSignals(blocked)
         self._shg_update_background_controls()
         self._shg_update_summary()
+
+    def _mcd_refresh_sources(self) -> None:
+        if not hasattr(self, "mcd_files"):
+            return
+        selected = self._selected(self.mcd_files)
+        dark_pos = str(self.mcd_dark_pos_combo.currentData() or "")
+        dark_neg = str(self.mcd_dark_neg_combo.currentData() or "")
+        widgets = (self.mcd_files, self.mcd_dark_pos_combo, self.mcd_dark_neg_combo)
+        blocked = [widget.blockSignals(True) for widget in widgets]
+        try:
+            self.mcd_files.clear()
+            for file_name in self.available_files:
+                item = QListWidgetItem(file_name)
+                item.setToolTip(file_name)
+                self.mcd_files.addItem(item)
+            self._restore_list_selection(self.mcd_files, [file_name for file_name in selected if file_name in self.available_files])
+            for combo, old in ((self.mcd_dark_pos_combo, dark_pos), (self.mcd_dark_neg_combo, dark_neg)):
+                combo.clear(); combo.addItem("-- No dark / offset file --", "")
+                for file_name in self.available_files:
+                    combo.addItem(file_name, file_name)
+                combo.setCurrentIndex(max(0, combo.findData(old)))
+        finally:
+            for widget, state in zip(widgets, blocked):
+                widget.blockSignals(state)
+        self._mcd_detect_available_angles()
+
+    def _mcd_detect_available_angles(self) -> None:
+        if not self.current_folder:
+            return
+        selected = self._selected(self.mcd_files)
+        source = selected[0] if selected else ""
+        if not source:
+            return
+        try:
+            angles = detect_angles(str(Path(self.current_folder) / source))
+        except Exception as exc:
+            self.mcd_source_summary.setText(f"Could not read MCD angles: {str(exc).splitlines()[0]}")
+            return
+        if len(angles) < 2:
+            self.mcd_source_summary.setText("MCD CSV needs at least two distinct angle values.")
+            return
+        plus_old = self.mcd_sigma_plus_combo.currentData()
+        minus_old = self.mcd_sigma_minus_combo.currentData()
+        combos = (self.mcd_sigma_plus_combo, self.mcd_sigma_minus_combo)
+        blocked = [combo.blockSignals(True) for combo in combos]
+        try:
+            for combo in combos:
+                combo.clear()
+                for angle in angles:
+                    combo.addItem(f"{angle:g} deg", float(angle))
+            if self.mcd_auto_angles_chk.isChecked():
+                self.mcd_sigma_plus_combo.setCurrentIndex(len(angles) - 1)
+                self.mcd_sigma_minus_combo.setCurrentIndex(0)
+            else:
+                plus_index = self.mcd_sigma_plus_combo.findData(plus_old)
+                minus_index = self.mcd_sigma_minus_combo.findData(minus_old)
+                self.mcd_sigma_plus_combo.setCurrentIndex(plus_index if plus_index >= 0 else len(angles) - 1)
+                self.mcd_sigma_minus_combo.setCurrentIndex(minus_index if minus_index >= 0 else 0)
+        finally:
+            for combo, state in zip(combos, blocked):
+                combo.blockSignals(state)
+        self.mcd_source_summary.setText("Detected angles: " + ", ".join(f"{angle:g} deg" for angle in angles))
+
+    def _mcd_settings_from_ui(self) -> McdSettings:
+        gain = {
+            "Per wavelength": "per_wavelength",
+            "Smoothed per wavelength": "smoothed",
+            "Scalar (diagnostic only)": "scalar",
+        }.get(self.mcd_gain_combo.currentText(), "per_wavelength")
+        sigma_plus = self.mcd_sigma_plus_combo.currentData()
+        sigma_minus = self.mcd_sigma_minus_combo.currentData()
+        if sigma_plus is None or sigma_minus is None:
+            raise ValueError("Select an MCD source CSV so its sigma+ and sigma- angles can be detected.")
+        background_ranges: list[tuple[float, float]] = []
+        range_text = self.mcd_background_ranges_edit.text().replace(";", ",").replace("–", "-").strip()
+        for item in (part.strip() for part in range_text.split(",") if part.strip()):
+            values = item.split("-")
+            if len(values) != 2:
+                raise ValueError("Fit background energies must be comma-separated ranges such as 1.50-1.58, 1.73-1.79.")
+            try:
+                start, stop = (float(value.strip()) for value in values)
+            except ValueError as exc:
+                raise ValueError("Fit background energies must be numeric eV ranges.") from exc
+            if start >= stop:
+                raise ValueError("Each fit background energy range must increase from left to right.")
+            background_ranges.append((start, stop))
+        correction_mode = {
+            "Global reference gain (current)": "global",
+            "Global gain + per-pair scale": "pair_scale",
+            "Global gain + per-pair scale/offset": "pair_affine",
+            "Global gain + per-pair spectral baseline": "pair_spectral",
+        }.get(self.mcd_correction_mode_combo.currentText(), "global")
+        suggestion = self._mcd_background_suggestion
+        suggestion_active = bool(
+            suggestion is not None
+            and range_text == self._format_mcd_background_ranges(suggestion.ranges)
+        )
+        selection_mode = "suggested" if suggestion_active else ("manual" if background_ranges else "auto")
+        return McdSettings(
+            pos_angle=float(sigma_plus),
+            neg_angle=float(sigma_minus),
+            max_sequence_gap=int(self.mcd_gap_spin.value()), max_delta_b=float(self.mcd_delta_b_spin.value()),
+            pair_b_alignment=("interpolate" if self.mcd_pair_alignment_combo.currentIndex() == 1 else "direct"),
+            zero_window_t=float(self.mcd_zero_spin.value()),
+            reference_mode=("nearest" if self.mcd_reference_mode_combo.currentIndex() == 0 else "window"),
+            bin_decimals=int(self.mcd_bin_spin.value()),
+            gain_mode=gain, correction_mode=correction_mode,
+            spectral_order=(2 if self.mcd_spectral_order_combo.currentIndex() == 1 else 1),
+            background_ranges_ev=tuple(background_ranges),
+            background_selection=selection_mode,
+            suggestion_protected_ranges_ev=(suggestion.protected_ranges if suggestion_active else ()),
+            manual_protected_ranges_ev=(suggestion.manual_protected_ranges if suggestion_active else ()),
+            suggestion_linear_validation_rms=(suggestion.linear_validation_rms if suggestion_active else None),
+            suggestion_quadratic_validation_rms=(suggestion.quadratic_validation_rms if suggestion_active else None),
+            suggestion_algorithm=("manual_unprotected_bands_v3" if suggestion_active else None),
+            dark_pos_file=str(self.mcd_dark_pos_combo.currentData() or "") or None,
+            dark_neg_file=str(self.mcd_dark_neg_combo.currentData() or "") or None,
+        )
+
+    @staticmethod
+    def _format_mcd_background_ranges(ranges: Sequence[tuple[float, float]]) -> str:
+        return ", ".join(f"{float(start):.4f}-{float(stop):.4f}" for start, stop in ranges)
+
+    def _update_mcd_background_preview(self) -> None:
+        if not self.loaded or self.loaded.mode != "MCD" or self.loaded.mcd_result is None:
+            self.mcd_background_preview.setText("Auto outer 15% ranges are shown after loading an MCD sweep.")
+            return
+        text = self.mcd_background_ranges_edit.text().strip()
+        if text:
+            self.mcd_background_preview.setText("Manual ranges are active. Blue shading shows the ranges used.")
+            return
+        ranges = background_fit_regions(self.loaded.mcd_result.energy_ev, ())
+        self.mcd_background_preview.setText(f"Using: {self._format_mcd_background_ranges(ranges)} eV")
+
+    def _suggest_mcd_background_ranges(self) -> None:
+        if not self.loaded or self.loaded.mode != "MCD" or self.loaded.mcd_result is None:
+            self._show_error("Load an MCD sweep before requesting a full-sweep background suggestion.")
+            return
+        result = self.loaded.mcd_result
+        energy = np.asarray(result.energy_ev, float)
+        center = float(self.mcd_window_center_spin.value())
+        if not np.isfinite(center) or center <= float(np.nanmin(energy)) or center >= float(np.nanmax(energy)):
+            center = float(np.nanmedian(energy))
+        # Protect the active MCD(B) window plus a guard.  Feature protection
+        # is deliberately manual: the review plot opens ready for the user to
+        # drag exactly across each resonance they want excluded.
+        guard_ev = max(0.010, float(self.mcd_window_width_spin.value()) * 1e-3)
+        protected = ((center - guard_ev, center + guard_ev),)
+        prior_manual: tuple[tuple[float, float], ...] = ()
+        if self._mcd_background_suggestion is not None:
+            prior_manual = tuple(self._mcd_background_suggestion.manual_protected_ranges)
+        elif self.loaded.mcd_settings is not None:
+            prior_manual = tuple(self.loaded.mcd_settings.manual_protected_ranges_ev)
+        try:
+            suggestion = suggest_mcd_background_ranges(
+                result,
+                protected_ranges_ev=protected + prior_manual,
+                auto_detect_features=False,
+                use_all_unprotected_bands=True,
+            )
+            suggestion = replace(
+                suggestion,
+                requested_protected_ranges=protected,
+                manual_protected_ranges=prior_manual,
+            )
+        except Exception as exc:
+            self._show_error(f"Could not suggest MCD background ranges: {exc}")
+            return
+        self._show_mcd_background_suggestion_dialog(result, suggestion)
+
+    def _show_mcd_background_suggestion_dialog_legacy(self, suggestion: McdBackgroundSuggestion) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Review MCD background suggestion")
+        if not self.windowIcon().isNull():
+            dlg.setWindowIcon(self.windowIcon())
+        dlg.setMinimumSize(760, 560)
+        dlg.resize(930, 680)
+        layout = QVBoxLayout(dlg)
+        figure = Figure(figsize=(8.2, 4.8), dpi=100)
+        canvas = FigureCanvasQTAgg(figure)
+        spectrum_ax, score_ax = figure.subplots(2, 1, sharex=True, height_ratios=[2.2, 1.0])
+        energy = np.asarray(suggestion.energy_ev, float)
+        spectrum_ax.plot(energy, suggestion.median_reflectance, color="#303030", lw=1.1, label="full-sweep median reflectance")
+        for index, (start, stop) in enumerate(suggestion.ranges):
+            spectrum_ax.axvspan(start, stop, color="#5790b7", alpha=0.24, label="suggested fit band" if index == 0 else "_nolegend_")
+        for index, (start, stop) in enumerate(suggestion.detected_feature_ranges):
+            spectrum_ax.axvspan(start, stop, color="#e28743", alpha=0.20, label="auto-detected feature" if index == 0 else "_nolegend_")
+        for index, (start, stop) in enumerate(suggestion.requested_protected_ranges):
+            spectrum_ax.axvspan(start, stop, color="#c94c00", alpha=0.22, label="active protected window" if index == 0 else "_nolegend_")
+        spectrum_ax.set_ylabel("Reflection (a.u.)")
+        spectrum_ax.grid(alpha=0.22)
+        spectrum_ax.legend(fontsize=8, loc="best")
+        score_ax.plot(energy, suggestion.suitability, color="#6a3d9a", lw=0.9)
+        for start, stop in suggestion.ranges:
+            score_ax.axvspan(start, stop, color="#5790b7", alpha=0.24)
+        for start, stop in suggestion.detected_feature_ranges:
+            score_ax.axvspan(start, stop, color="#e28743", alpha=0.20)
+        for start, stop in suggestion.requested_protected_ranges:
+            score_ax.axvspan(start, stop, color="#c94c00", alpha=0.22)
+        score_ax.set_xlabel("Energy (eV)")
+        score_ax.set_ylabel("feature / noise score")
+        score_ax.grid(alpha=0.22)
+        figure.tight_layout(pad=1.0)
+        layout.addWidget(canvas, 1)
+        linear = suggestion.linear_validation_rms
+        quadratic = suggestion.quadratic_validation_rms
+        summary = QPlainTextEdit()
+        summary.setReadOnly(True)
+        summary.setMaximumHeight(132)
+        summary.setPlainText(
+            "Suggested manual background ranges (eV):\n"
+            f"{self._format_mcd_background_ranges(suggestion.ranges)}\n\n"
+            f"Active protected window: {self._format_mcd_background_ranges(suggestion.requested_protected_ranges)} eV\n"
+            f"Auto-detected feature windows: {self._format_mcd_background_ranges(suggestion.detected_feature_ranges) or 'none'} eV\n"
+            f"All excluded windows: {self._format_mcd_background_ranges(suggestion.protected_ranges)} eV\n"
+            f"Coverage: {100.0 * suggestion.coverage_fraction:.1f}% of valid spectral points; "
+            f"span: {100.0 * suggestion.span_fraction:.1f}% of the energy axis\n"
+            f"Held-out RMS — linear: {linear:.4g}; quadratic: {quadratic:.4g}\n"
+            f"Held-out diagnostic preference: {'Quadratic' if suggestion.suggested_order == 2 else 'Linear'} (does not change your selected order)\n\n"
+            + "\n".join(f"- {note}" for note in suggestion.notes)
+        )
+        layout.addWidget(summary)
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        accept = buttons.addButton("Use suggestion", QDialogButtonBox.AcceptRole)
+        accept.setToolTip("Copy the suggested ranges and model into the MCD controls. It will not reprocess until Apply is clicked.")
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self._mcd_background_suggestion = suggestion
+        self.mcd_background_ranges_edit.setText(self._format_mcd_background_ranges(suggestion.ranges))
+        self.mcd_correction_mode_combo.setCurrentText("Global gain + per-pair spectral baseline")
+        self._update_mcd_background_preview()
+        self._on_mcd_params_changed()
+        self._mcd_auto_apply_timer.start(0)
+        self._status("Selected protection regions saved; MCD recalculation is starting automatically.")
+
+    def _show_mcd_background_suggestion_dialog(self, result: McdResult, suggestion: McdBackgroundSuggestion) -> None:
+        """Let the user draw exact feature-protection windows before fitting."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Select MCD feature-protection regions")
+        if not self.windowIcon().isNull():
+            dlg.setWindowIcon(self.windowIcon())
+        dlg.setMinimumSize(800, 660)
+        dlg.resize(980, 820)
+        layout = QVBoxLayout(dlg)
+        figure = Figure(figsize=(8.2, 4.7), dpi=100)
+        canvas = FigureCanvasQTAgg(figure)
+        spectrum_ax, score_ax = figure.subplots(2, 1, sharex=True, height_ratios=[2.2, 1.0])
+        layout.addWidget(canvas, 1)
+        energy = np.asarray(suggestion.energy_ev, float)
+        energy_min, energy_max = float(np.nanmin(energy)), float(np.nanmax(energy))
+
+        feature_box = QGroupBox("Feature-protection windows")
+        feature_layout = QVBoxLayout(feature_box)
+        note = QLabel(
+            "Drag horizontally on the reflection plot to add a protection window. "
+            "Only the active MCD(B) window and the regions you select are excluded from the blue background-fit bands."
+        )
+        note.setWordWrap(True)
+        feature_layout.addWidget(note)
+        table = QTableWidget(0, 8)
+        table.setHorizontalHeaderLabels(["Use", "Type", "Center (eV)", "Start (eV)", "Stop (eV)", "Width (meV)", "SNR", "Status"])
+        table.horizontalHeader().setStretchLastSection(True)
+        table.setMaximumHeight(180)
+        feature_layout.addWidget(table)
+        controls = QHBoxLayout()
+        remove = QPushButton("Remove selected")
+        select_range = QPushButton("Draw protection region")
+        select_range.setToolTip("Drag horizontally on the upper reflection plot to protect exactly that energy region.")
+        controls.addWidget(remove)
+        controls.addStretch(1)
+        controls.addWidget(select_range)
+        feature_layout.addLayout(controls)
+        layout.addWidget(feature_box)
+
+        summary = QPlainTextEdit()
+        summary.setReadOnly(True)
+        summary.setMaximumHeight(125)
+        layout.addWidget(summary)
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        accept = buttons.addButton("Use selected regions", QDialogButtonBox.AcceptRole)
+        accept.setToolTip("Copy fit ranges recalculated from your selected protection regions. Processing starts only after Apply.")
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        row_sources: list[str] = []
+        row_features: list[object | None] = []
+        current: dict[str, McdBackgroundSuggestion] = {"value": suggestion}
+        is_refreshing = {"value": False}
+        selection_state: dict[str, object] = {"active": True, "selector": None}
+
+        def on_manual_span(left: float, right: float) -> None:
+            if abs(float(right) - float(left)) < 5e-4:
+                return
+            selection_state["active"] = True
+            add_row("Manual", min(left, right), max(left, right), source="manual")
+            select_range.setText("Drawing: drag another region")
+            refresh()
+
+        def configure_span_selector() -> None:
+            old_selector = selection_state.get("selector")
+            if old_selector is not None and hasattr(old_selector, "disconnect_events"):
+                old_selector.disconnect_events()
+            selector = SpanSelector(
+                spectrum_ax, on_manual_span, "horizontal", useblit=False,
+                props={"facecolor": "#8e44ad", "alpha": 0.25}, interactive=False,
+            )
+            selector.set_active(bool(selection_state["active"]))
+            selection_state["selector"] = selector
+
+        def selected_windows() -> tuple[tuple[tuple[float, float], ...], tuple[tuple[float, float], ...], tuple[tuple[float, float], ...], tuple[str, ...]]:
+            active: list[tuple[float, float]] = []
+            automatic: list[tuple[float, float]] = []
+            manual: list[tuple[float, float]] = []
+            automatic_kinds: list[str] = []
+            for row in range(table.rowCount()):
+                checkbox = table.cellWidget(row, 0)
+                left = table.cellWidget(row, 3)
+                right = table.cellWidget(row, 4)
+                if not isinstance(checkbox, QCheckBox) or not checkbox.isChecked():
+                    continue
+                if not isinstance(left, QDoubleSpinBox) or not isinstance(right, QDoubleSpinBox):
+                    continue
+                window = tuple(sorted((float(left.value()), float(right.value()))))
+                source = row_sources[row]
+                if source == "active":
+                    active.append(window)
+                elif source == "auto":
+                    automatic.append(window)
+                    label = table.item(row, 1).text() if table.item(row, 1) else "feature"
+                    automatic_kinds.append(label.removeprefix("Auto "))
+                else:
+                    manual.append(window)
+            return tuple(active), tuple(automatic), tuple(manual), tuple(automatic_kinds)
+
+        def merged_enabled_windows() -> tuple[tuple[float, float], ...]:
+            active, automatic, manual, _kinds = selected_windows()
+            windows = sorted(tuple(active) + tuple(automatic) + tuple(manual))
+            merged: list[tuple[float, float]] = []
+            for left, right in windows:
+                if not merged or left > merged[-1][1] + 1e-12:
+                    merged.append((left, right))
+                else:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], right))
+            return tuple(merged)
+
+        def unchecked_auto_windows() -> tuple[tuple[float, float], ...]:
+            windows: list[tuple[float, float]] = []
+            for row, source in enumerate(row_sources):
+                if source != "auto":
+                    continue
+                checkbox = table.cellWidget(row, 0)
+                left = table.cellWidget(row, 3)
+                right = table.cellWidget(row, 4)
+                if isinstance(checkbox, QCheckBox) and not checkbox.isChecked() and isinstance(left, QDoubleSpinBox) and isinstance(right, QDoubleSpinBox):
+                    windows.append(tuple(sorted((float(left.value()), float(right.value())))))
+            return tuple(windows)
+
+        def redraw() -> None:
+            displayed = current["value"]
+            active, automatic, manual, _kinds = selected_windows()
+            unchecked_auto = unchecked_auto_windows()
+            spectrum_ax.clear()
+            score_ax.clear()
+            spectrum_ax.plot(energy, displayed.median_reflectance, color="#303030", lw=1.1, label="full-sweep median reflection")
+            if np.any(np.isfinite(displayed.feature_baseline)):
+                spectrum_ax.plot(energy, np.exp(displayed.feature_baseline), color="#8c8c8c", lw=0.9, ls="--", label="broad reflection baseline")
+            for index, (left, right) in enumerate(displayed.ranges):
+                spectrum_ax.axvspan(left, right, color="#5790b7", alpha=0.24, label="suggested fit band" if index == 0 else "_nolegend_")
+            for index, (left, right) in enumerate(active):
+                spectrum_ax.axvspan(left, right, color="#c94c00", alpha=0.22, label="active MCD(B) window" if index == 0 else "_nolegend_")
+            for index, (left, right) in enumerate(automatic):
+                spectrum_ax.axvspan(left, right, color="#e28743", alpha=0.22, label="enabled auto feature" if index == 0 else "_nolegend_")
+            for index, (left, right) in enumerate(manual):
+                spectrum_ax.axvspan(left, right, color="#8e44ad", alpha=0.20, label="manual protection" if index == 0 else "_nolegend_")
+            for index, (left, right) in enumerate(unchecked_auto):
+                spectrum_ax.axvspan(left, right, facecolor="none", edgecolor="#e28743", lw=0.9, ls="--", alpha=0.8, label="review-only candidate" if index == 0 else "_nolegend_")
+            for feature in suggestion.detected_features:
+                marker = "^" if feature.kind == "peak" else "v"
+                color = "#e28743" if feature.recommended else "#b27b4d"
+                y = float(np.interp(feature.center_ev, energy, displayed.median_reflectance))
+                spectrum_ax.plot(feature.center_ev, y, marker=marker, color=color, ms=5, zorder=4)
+                if feature.recommended:
+                    spectrum_ax.annotate(
+                        f"{feature.center_ev:.4f} eV\nSNR {feature.snr:.1f}",
+                        (feature.center_ev, y), xytext=(0, 8), textcoords="offset points",
+                        ha="center", va="bottom", fontsize=7, color=color,
+                    )
+            spectrum_ax.set_ylabel("Reflection (a.u.)")
+            spectrum_ax.grid(alpha=0.22)
+            spectrum_ax.legend(fontsize=8, loc="best")
+            score_ax.plot(energy, displayed.suitability, color="#6a3d9a", lw=0.9, label="background unsuitability")
+            if np.any(np.isfinite(displayed.feature_detection_score)):
+                score_ax.plot(energy, displayed.feature_detection_score, color="#e28743", lw=0.8, alpha=0.85, label="feature SNR score")
+            for left, right in displayed.ranges:
+                score_ax.axvspan(left, right, color="#5790b7", alpha=0.24)
+            for left, right in active:
+                score_ax.axvspan(left, right, color="#c94c00", alpha=0.18)
+            for left, right in automatic:
+                score_ax.axvspan(left, right, color="#e28743", alpha=0.18)
+            for left, right in manual:
+                score_ax.axvspan(left, right, color="#8e44ad", alpha=0.16)
+            score_ax.set_xlabel("Energy (eV)")
+            score_ax.set_ylabel("background / feature score")
+            score_ax.grid(alpha=0.22)
+            score_ax.legend(fontsize=8, loc="best")
+            figure.tight_layout(pad=1.0)
+            candidate_lines = [
+                f"{feature.center_ev:.4f} eV  {feature.kind}  width {1000.0 * feature.width_ev:.1f} meV  "
+                f"prominence {100.0 * np.expm1(feature.prominence_log):.1f}%  SNR {feature.snr:.1f}  "
+                f"{'recommended' if feature.recommended else 'review only'}"
+                for feature in suggestion.detected_features
+            ]
+            summary.setPlainText(
+                "Suggested manual background ranges (eV):\n"
+                f"{self._format_mcd_background_ranges(displayed.ranges)}\n\n"
+                f"Enabled protection windows: {self._format_mcd_background_ranges(displayed.protected_ranges) or 'none'} eV\n"
+                f"Coverage: {100.0 * displayed.coverage_fraction:.1f}% of valid spectral points; "
+                f"span: {100.0 * displayed.span_fraction:.1f}% of the energy axis\n"
+                f"Held-out RMS - linear: {displayed.linear_validation_rms:.4g}; quadratic: {displayed.quadratic_validation_rms:.4g}\n"
+                f"Held-out diagnostic preference: {'Quadratic' if displayed.suggested_order == 2 else 'Linear'} (does not change your selected order)\n\n"
+                + "\n".join(f"- {item}" for item in displayed.notes)
+                + ("\n\nDetected reflection candidates:\n" + "\n".join(candidate_lines) if candidate_lines else "")
+            )
+            configure_span_selector()
+            canvas.draw_idle()
+
+        def refresh() -> None:
+            if is_refreshing["value"]:
+                return
+            is_refreshing["value"] = True
+            try:
+                active, automatic, manual, automatic_kinds = selected_windows()
+                selected = merged_enabled_windows()
+                recalculated = suggest_mcd_background_ranges(
+                    result,
+                    protected_ranges_ev=selected,
+                    auto_detect_features=False,
+                    use_all_unprotected_bands=True,
+                )
+                current["value"] = replace(
+                    recalculated,
+                    requested_protected_ranges=active,
+                    manual_protected_ranges=manual,
+                    detected_feature_ranges=automatic,
+                    detected_feature_kinds=automatic_kinds,
+                    feature_baseline=suggestion.feature_baseline,
+                    feature_residual=suggestion.feature_residual,
+                    feature_detection_score=suggestion.feature_detection_score,
+                    detected_features=suggestion.detected_features,
+                )
+                redraw()
+            except Exception as exc:
+                summary.setPlainText(f"No usable fit bands remain for these protection windows:\n{exc}")
+            finally:
+                is_refreshing["value"] = False
+
+        def connect_row(row: int) -> None:
+            checkbox = table.cellWidget(row, 0)
+            left = table.cellWidget(row, 3)
+            right = table.cellWidget(row, 4)
+            if isinstance(checkbox, QCheckBox):
+                checkbox.toggled.connect(refresh)
+            if isinstance(left, QDoubleSpinBox):
+                left.valueChanged.connect(refresh)
+            if isinstance(right, QDoubleSpinBox):
+                right.valueChanged.connect(refresh)
+            def update_width() -> None:
+                left_control = table.cellWidget(row, 3)
+                right_control = table.cellWidget(row, 4)
+                width_item = table.item(row, 5)
+                if isinstance(left_control, QDoubleSpinBox) and isinstance(right_control, QDoubleSpinBox) and width_item is not None:
+                    width_item.setText(f"{1000.0 * abs(right_control.value() - left_control.value()):.2f}")
+            if isinstance(left, QDoubleSpinBox):
+                left.valueChanged.connect(update_width)
+            if isinstance(right, QDoubleSpinBox):
+                right.valueChanged.connect(update_width)
+
+        def add_row(kind: str, left: float, right: float, *, source: str, enabled: bool = True, feature: object | None = None) -> None:
+            row = table.rowCount()
+            table.insertRow(row)
+            checkbox = QCheckBox()
+            checkbox.setChecked(enabled)
+            table.setCellWidget(row, 0, checkbox)
+            label = QTableWidgetItem(kind)
+            label.setFlags(label.flags() & ~Qt.ItemIsEditable)
+            table.setItem(row, 1, label)
+            center = float(getattr(feature, "center_ev", 0.5 * (left + right)))
+            center_item = QTableWidgetItem(f"{center:.6f}")
+            center_item.setFlags(center_item.flags() & ~Qt.ItemIsEditable)
+            table.setItem(row, 2, center_item)
+            for column, value in ((3, left), (4, right)):
+                spin = QDoubleSpinBox()
+                spin.setRange(energy_min, energy_max)
+                spin.setDecimals(6)
+                spin.setSingleStep(0.001)
+                spin.setValue(float(value))
+                table.setCellWidget(row, column, spin)
+            width_item = QTableWidgetItem(f"{1000.0 * (right - left):.2f}")
+            width_item.setFlags(width_item.flags() & ~Qt.ItemIsEditable)
+            table.setItem(row, 5, width_item)
+            snr = getattr(feature, "snr", None)
+            snr_item = QTableWidgetItem(f"{float(snr):.1f}" if snr is not None else "-")
+            snr_item.setFlags(snr_item.flags() & ~Qt.ItemIsEditable)
+            table.setItem(row, 6, snr_item)
+            status = "recommended" if bool(getattr(feature, "recommended", False)) else ("manual" if source == "manual" else "active" if source == "active" else "review only")
+            status_item = QTableWidgetItem(status)
+            status_item.setFlags(status_item.flags() & ~Qt.ItemIsEditable)
+            table.setItem(row, 7, status_item)
+            row_sources.append(source)
+            row_features.append(feature)
+            connect_row(row)
+
+        for left, right in suggestion.requested_protected_ranges:
+            add_row("Active MCD(B)", left, right, source="active")
+        for left, right in suggestion.manual_protected_ranges:
+            add_row("Manual", left, right, source="manual")
+        def begin_manual_selection() -> None:
+            selection_state["active"] = True
+            selector = selection_state.get("selector")
+            if selector is not None:
+                selector.set_active(True)
+            select_range.setText("Drag on reflection plot…")
+            select_range.setToolTip("Drag across the reflection plot to protect exactly that energy region.")
+
+        def remove_selected() -> None:
+            row = table.currentRow()
+            if row < 0:
+                return
+            table.removeRow(row)
+            row_sources.pop(row)
+            row_features.pop(row)
+            refresh()
+
+        select_range.clicked.connect(begin_manual_selection)
+        remove.clicked.connect(remove_selected)
+        redraw()
+        if dlg.exec() != QDialog.Accepted:
+            return
+        accepted = current["value"]
+        self._mcd_background_suggestion = accepted
+        self.mcd_background_ranges_edit.setText(self._format_mcd_background_ranges(accepted.ranges))
+        self.mcd_correction_mode_combo.setCurrentText("Global gain + per-pair spectral baseline")
+        self._update_mcd_background_preview()
+        self._on_mcd_params_changed()
+        self._mcd_auto_apply_timer.start(0)
+        self._status("Selected protection regions saved; MCD recalculation is starting automatically.")
 
     def _shg_fit_settings_from_ui(self) -> ShgFitSettings:
         angle_min = float(self.shg_fit_min_spin.value())
@@ -3490,6 +4381,41 @@ class MainWindow(QMainWindow):
         self.drr_fit_btn.clicked.connect(self._on_drr_fit_lorentz)
         self.drr_fit_clear_btn.clicked.connect(self._on_drr_clear_fit)
         self.drr_fit_show_chk.toggled.connect(self._on_drr_analysis_view_changed)
+        self.mcd_files.itemSelectionChanged.connect(self._on_mcd_source_changed)
+        self.mcd_auto_angles_chk.toggled.connect(self._on_mcd_angle_assignment_changed)
+        self.mcd_sigma_plus_combo.currentIndexChanged.connect(self._on_mcd_params_changed)
+        self.mcd_sigma_minus_combo.currentIndexChanged.connect(self._on_mcd_params_changed)
+        self.mcd_reference_mode_combo.currentTextChanged.connect(self._on_mcd_reference_mode_changed)
+        self.mcd_zero_spin.valueChanged.connect(self._on_mcd_params_changed)
+        self.mcd_gap_spin.valueChanged.connect(self._on_mcd_params_changed)
+        self.mcd_delta_b_spin.valueChanged.connect(self._on_mcd_params_changed)
+        self.mcd_pair_alignment_combo.currentTextChanged.connect(self._on_mcd_params_changed)
+        self.mcd_bin_spin.valueChanged.connect(self._on_mcd_params_changed)
+        self.mcd_gain_combo.currentTextChanged.connect(self._on_mcd_params_changed)
+        self.mcd_correction_mode_combo.currentTextChanged.connect(self._on_mcd_correction_mode_changed)
+        self.mcd_spectral_order_combo.currentTextChanged.connect(self._on_mcd_params_changed)
+        self.mcd_background_ranges_edit.editingFinished.connect(self._on_mcd_background_ranges_changed)
+        self.mcd_suggest_background_btn.clicked.connect(self._suggest_mcd_background_ranges)
+        self.mcd_apply_correction_btn.clicked.connect(self._apply_mcd_now)
+        self.mcd_dark_pos_combo.currentIndexChanged.connect(self._on_mcd_params_changed)
+        self.mcd_dark_neg_combo.currentIndexChanged.connect(self._on_mcd_params_changed)
+        self.mcd_map_combo.currentTextChanged.connect(self._on_mcd_plot_changed)
+        self.mcd_auto_v_btn.clicked.connect(self._auto_mcd_vrange)
+        for key in ("vmin", "vmax", "xmin", "xmax", "ymin", "ymax"):
+            self.mcd_spins[key].valueChanged.connect(self._on_mcd_plot_changed)
+        self.mcd_cmap.currentTextChanged.connect(self._on_mcd_plot_changed)
+        self.mcd_center_zero_chk.toggled.connect(self._on_mcd_plot_changed)
+        self.mcd_window_center_spin.valueChanged.connect(self._on_mcd_plot_changed)
+        self.mcd_window_width_spin.valueChanged.connect(self._on_mcd_plot_changed)
+        self.mcd_pair_b_combo.currentIndexChanged.connect(self._on_mcd_pair_selection_changed)
+        self.mcd_window_metric_combo.currentTextChanged.connect(self._on_mcd_plot_changed)
+        self.mcd_show_raw_chk.toggled.connect(self._on_mcd_plot_changed)
+        self.mcd_show_signed_mean_chk.toggled.connect(self._on_mcd_plot_changed)
+        self.mcd_show_absolute_mean_chk.toggled.connect(self._on_mcd_plot_changed)
+        self.mcd_show_unsigned_absolute_mean_chk.toggled.connect(self._on_mcd_plot_changed)
+        self.mcd_show_integral_chk.toggled.connect(self._on_mcd_plot_changed)
+        self.mcd_fit_zero_chk.toggled.connect(self._on_mcd_plot_changed)
+        self.mcd_fit_b_window_spin.valueChanged.connect(self._on_mcd_plot_changed)
         self.pl_peak_find_btn.clicked.connect(self._on_pl_find_peaks)
         self.pl_peak_show_chk.toggled.connect(self._on_pl_analysis_view_changed)
         self.pl_peak_mode_combo.currentTextChanged.connect(self._on_pl_analysis_view_changed)
@@ -3509,6 +4435,7 @@ class MainWindow(QMainWindow):
         self._cmp_update_assignment_summary()
         self._power_refresh_groups()
         self._power_update_view_mode()
+        self._mcd_refresh_sources()
         self._shg_refresh_sources()
         if hasattr(self, "power_background_spin"):
             self.power_background_spin.setEnabled(not self._power_background_auto_enabled())
@@ -3579,6 +4506,7 @@ class MainWindow(QMainWindow):
             "DRR": "DRR",
             "Compare": "Compare",
             "Power": "Power Dependent",
+            "MCD": "MCD",
             "SHG": "SHG Processing",
         }.get(text)
 
@@ -3612,6 +4540,99 @@ class MainWindow(QMainWindow):
         self._invalidate_export_move_sources()
         if self.loaded and self.loaded.mode == "PL":
             self._plot_mode("PL")
+
+    def _on_mcd_params_changed(self) -> None:
+        self._invalidate_export_move_sources()
+        self._update_mcd_background_preview()
+        if self.loaded and self.loaded.mode == "MCD":
+            self.mcd_apply_correction_btn.setText("Pending update...")
+            self._status("MCD processing settings changed; recalculation is scheduled automatically.")
+            self._mcd_auto_apply_timer.start()
+
+    def _apply_mcd_now(self) -> None:
+        self._mcd_auto_apply_timer.stop()
+        self._apply_pending_mcd_settings()
+
+    def _apply_pending_mcd_settings(self) -> None:
+        """Apply the newest MCD settings once after a burst of UI changes."""
+        if not self.loaded or self.loaded.mode != "MCD":
+            return
+        if self._load_in_progress:
+            self._mcd_reapply_pending = True
+            self.mcd_apply_correction_btn.setText("Pending update...")
+            return
+        if not self._selected(self.mcd_files):
+            self.mcd_apply_correction_btn.setText("Recalculate now")
+            return
+        try:
+            self._mcd_settings_from_ui()
+        except Exception as exc:
+            self.mcd_apply_correction_btn.setText("Fix settings")
+            self._status(f"MCD automatic recalculation paused: {exc}")
+            return
+        self._mcd_reapply_pending = False
+        self.mcd_apply_correction_btn.setText("Applying...")
+        self._status("Applying updated MCD processing settings...")
+        self._start_load("MCD")
+
+    def _on_mcd_correction_mode_changed(self, text: str) -> None:
+        self.mcd_spectral_order_combo.setEnabled("spectral baseline" in text.lower())
+        self._on_mcd_params_changed()
+
+    def _on_mcd_background_ranges_changed(self) -> None:
+        self._mcd_background_suggestion = None
+        self._on_mcd_params_changed()
+
+    def _on_mcd_source_changed(self) -> None:
+        self._mcd_background_suggestion = None
+        self._mcd_detect_available_angles()
+        self._on_mcd_params_changed()
+
+    def _on_mcd_angle_assignment_changed(self, automatic: bool) -> None:
+        self.mcd_sigma_plus_combo.setEnabled(not automatic)
+        self.mcd_sigma_minus_combo.setEnabled(not automatic)
+        if automatic:
+            self._mcd_detect_available_angles()
+        self._on_mcd_params_changed()
+
+    def _on_mcd_reference_mode_changed(self, _text: str) -> None:
+        self.mcd_zero_spin.setEnabled(self.mcd_reference_mode_combo.currentIndex() == 1)
+        self._on_mcd_params_changed()
+
+    def _on_mcd_plot_changed(self) -> None:
+        self._invalidate_export_move_sources()
+        if self.loaded and self.loaded.mode == "MCD":
+            self._plot_mode("MCD")
+
+    def _select_mcd_pair_at_b(self, requested_b: float, *, clicked: bool = False) -> None:
+        """Select the nearest real pair for a B value requested on the map."""
+        if not self.loaded or self.loaded.mode != "MCD" or self.loaded.mcd_result is None:
+            return
+        result = self.loaded.mcd_result
+        if result.pair_b.size == 0:
+            return
+        distance = np.abs(result.pair_b - float(requested_b))
+        pair_index = int(np.nanargmin(distance))
+        # If two sweep branches have the same nearest B, retaining the active
+        # branch makes repeated clicking at that field deterministic.
+        nearest = float(distance[pair_index])
+        candidates = np.flatnonzero(np.isclose(distance, nearest, atol=1e-10, rtol=0.0))
+        current_index = self.mcd_pair_b_combo.currentData()
+        if current_index is not None and int(current_index) in candidates:
+            pair_index = int(current_index)
+        selected_b = float(result.pair_b[pair_index])
+        combo_blocked = self.mcd_pair_b_combo.blockSignals(True)
+        self.mcd_pair_b_combo.setCurrentIndex(pair_index)
+        self.mcd_pair_b_combo.blockSignals(combo_blocked)
+        if clicked:
+            self._status(f"Clicked {float(requested_b):.4g} T; showing nearest paired measurement {selected_b:.4g} T.")
+        self._on_mcd_plot_changed()
+
+    def _on_mcd_pair_selection_changed(self, _index: int) -> None:
+        """Redraw all MCD pair displays after a manual pair selection."""
+        if not self.loaded or self.loaded.mode != "MCD" or self.loaded.mcd_result is None:
+            return
+        self._on_mcd_plot_changed()
 
     def _on_power_axis_scale_changed(self) -> None:
         self._invalidate_export_move_sources()
@@ -3728,6 +4749,7 @@ class MainWindow(QMainWindow):
         self.drr_selected_files = [path.name]
         self._update_drr_selection_labels()
         self._power_refresh_groups()
+        self._mcd_refresh_sources()
         self._shg_refresh_sources()
         self._restore_list_selection(self.shg_files, [path.name])
         self._status(f"Selected {path.name}")
@@ -3750,6 +4772,7 @@ class MainWindow(QMainWindow):
         self._restore_list_selection(self.pl_files, [f for f in pl_selected if f in self.available_files])
         self._cmp_set_channel_combo_items()
         self._power_refresh_groups()
+        self._mcd_refresh_sources()
         self._shg_refresh_sources()
         self.drr_selected_files = [f for f in self.drr_selected_files if f in self.available_files]
         self.drr_baseline_files_manual = [f for f in self.drr_baseline_files_manual if f in self.available_files]
@@ -4021,6 +5044,7 @@ class MainWindow(QMainWindow):
         drr_loaded = loaded_mode == "DRR"
         cmp_loaded = loaded_mode == "Compare"
         power_loaded = loaded_mode == "Power Dependent"
+        mcd_loaded = loaded_mode == "MCD"
         self.pl_auto_v_btn.setEnabled(pl_loaded and not self.pl_split_scale_chk.isChecked())
         self.pl_auto_x_btn.setEnabled(pl_loaded)
         self.pl_auto_y_btn.setEnabled(pl_loaded)
@@ -4033,6 +5057,7 @@ class MainWindow(QMainWindow):
         self.power_auto_v_btn.setEnabled(power_loaded and not self.power_split_scale_chk.isChecked())
         self.power_auto_x_btn.setEnabled(power_loaded)
         self.power_auto_y_btn.setEnabled(power_loaded)
+        self.mcd_auto_v_btn.setEnabled(mcd_loaded)
         for prefix, enabled in (
             ("pl", pl_loaded),
             ("drr", drr_loaded),
@@ -4099,6 +5124,21 @@ class MainWindow(QMainWindow):
         spins["vmax"].setValue(vmax)
         self._status(f"State: Auto vmin/vmax (ROI) = {vmin:.4g}, {vmax:.4g}")
         self._plot_mode("DRR")
+
+    def _auto_mcd_vrange(self) -> None:
+        if not self.loaded or self.loaded.mode != "MCD" or self.loaded.mcd_result is None:
+            return
+        cube = self.loaded.mcd_result.cube(self.mcd_map_combo.currentText())
+        finite = np.asarray(cube.Z, float)[np.isfinite(cube.Z)]
+        if not finite.size:
+            return
+        bound = float(np.nanpercentile(np.abs(finite), 99.5))
+        if self.mcd_center_zero_chk.isChecked():
+            self.mcd_spins["vmin"].setValue(-bound); self.mcd_spins["vmax"].setValue(bound)
+        else:
+            lo, hi = np.nanpercentile(finite, [0.5, 99.5])
+            self.mcd_spins["vmin"].setValue(float(lo)); self.mcd_spins["vmax"].setValue(float(hi))
+        self._plot_mode("MCD")
 
     def _auto_pl_vrange(self) -> None:
         if not self.loaded or self.loaded.mode != "PL" or self.loaded.cube is None:
@@ -4335,6 +5375,7 @@ class MainWindow(QMainWindow):
         shg_settings: ShgSettings | None = None
         shg_fit_settings: ShgFitSettings | None = None
         shg_compare = False
+        mcd_settings: McdSettings | None = None
 
         if mode == "PL":
             selected = self._selected(self.pl_files)
@@ -4369,6 +5410,26 @@ class MainWindow(QMainWindow):
             drr_baseline_which = "last"
             y_axis_spec = self._selected_y_axis_spec("cmp")
             power_group_key = ""
+        elif mode == "MCD":
+            # Reprocessing rebuilds the pair list.  Remember the physical
+            # linecut (field and sweep branch), rather than its temporary
+            # combo-box index, so Apply does not jump back to the 0-T pair.
+            self._mcd_pair_selection_to_restore = None
+            if self.loaded and self.loaded.mode == "MCD" and self.loaded.mcd_result is not None:
+                pair_index = self.mcd_pair_b_combo.currentData()
+                if pair_index is not None:
+                    pair_index = int(pair_index)
+                    previous = self.loaded.mcd_result
+                    if 0 <= pair_index < previous.pair_b.size:
+                        self._mcd_pair_selection_to_restore = (
+                            float(previous.pair_b[pair_index]),
+                            str(previous.pair_labels[pair_index]),
+                        )
+            selected = self._selected(self.mcd_files)
+            baselines = []
+            pl_log = False; cmp_log = False
+            drr_baseline = "Self (last frame)"; drr_baseline_which = "last"; y_axis_spec = "auto"; power_group_key = ""
+            mcd_settings = self._mcd_settings_from_ui()
         elif mode == "SHG Processing":
             shg_settings = self._shg_settings_from_ui()
             shg_fit_settings = self._shg_fit_settings_from_ui()
@@ -4431,10 +5492,13 @@ class MainWindow(QMainWindow):
             shg_settings=shg_settings,
             shg_fit_settings=shg_fit_settings,
             shg_compare=shg_compare,
+            mcd_settings=mcd_settings,
         )
 
         self._set_stage("Loading...")
         self._load_in_progress = True
+        self._active_load_mode = mode
+        self._active_load_succeeded = False
         worker = Worker(self._load_task, options)
         worker.signals.log.connect(self._append_log)
         worker.signals.result.connect(self._on_loaded)
@@ -4498,6 +5562,19 @@ class MainWindow(QMainWindow):
                 drr_baseline_text=baseline,
                 drr_baseline_which=options.drr_baseline_which,
                 y_axis_spec=options.y_axis_spec,
+            )
+
+        if mode == "MCD":
+            source_path = Path(folder) / options.selected_files[0]
+            settings = options.mcd_settings or McdSettings()
+            if settings.dark_pos_file:
+                settings = McdSettings(**{**settings.__dict__, "dark_pos_file": str(Path(folder) / settings.dark_pos_file)})
+            if settings.dark_neg_file:
+                settings = McdSettings(**{**settings.__dict__, "dark_neg_file": str(Path(folder) / settings.dark_neg_file)})
+            result = process_mcd(str(source_path), settings)
+            return LoadedState(
+                mode="MCD", folder=folder, primary_file=options.selected_files[0],
+                selected_files=options.selected_files, mcd_result=result, mcd_settings=settings,
             )
 
         if mode == "Power Dependent":
@@ -4588,6 +5665,8 @@ class MainWindow(QMainWindow):
         )
 
     def _on_loaded(self, loaded: LoadedState) -> None:
+        if loaded.mode == self._active_load_mode:
+            self._active_load_succeeded = True
         self.loaded = loaded
         self.last_plotted_mode = None
         self._last_plot_params_key = None
@@ -4597,6 +5676,82 @@ class MainWindow(QMainWindow):
             idx = self.power_group_combo.findData(loaded.power_group_key)
             if idx >= 0:
                 self.power_group_combo.setCurrentIndex(idx)
+        if loaded.mode == "MCD" and loaded.mcd_result is not None:
+            blocked = self.mcd_map_combo.blockSignals(True)
+            self.mcd_map_combo.clear()
+            self.mcd_map_combo.addItems(list(loaded.mcd_result.maps))
+            self.mcd_map_combo.setCurrentText("Combo")
+            self.mcd_map_combo.blockSignals(blocked)
+            pair_blocked = self.mcd_pair_b_combo.blockSignals(True)
+            self.mcd_pair_b_combo.clear()
+            for index, (field, direction) in enumerate(zip(loaded.mcd_result.pair_b, loaded.mcd_result.pair_labels)):
+                self.mcd_pair_b_combo.addItem(f"{float(field):.6g} T  ({direction}, pair {index + 1})", int(index))
+            restored_pair = getattr(self, "_mcd_pair_selection_to_restore", None)
+            if restored_pair is None:
+                pair_index = int(np.argmin(np.abs(loaded.mcd_result.pair_b - np.nanmedian(loaded.mcd_result.pair_b))))
+            else:
+                target_b, target_branch = restored_pair
+                # Prefer the same field-sweep branch.  If the updated pairing
+                # no longer has that branch, fall back to its nearest B pair.
+                same_branch = np.asarray(loaded.mcd_result.pair_labels, dtype=str) == target_branch
+                candidates = np.flatnonzero(same_branch)
+                if candidates.size == 0:
+                    candidates = np.arange(loaded.mcd_result.pair_b.size)
+                pair_index = int(candidates[np.argmin(np.abs(loaded.mcd_result.pair_b[candidates] - target_b))])
+            self.mcd_pair_b_combo.setCurrentIndex(pair_index)
+            self._mcd_pair_selection_to_restore = None
+            self.mcd_pair_b_combo.blockSignals(pair_blocked)
+            reference_mode = str(loaded.mcd_result.summary["reference_mode"])
+            reference_b = float(loaded.mcd_result.summary["reference_b_t"])
+            if reference_mode == "nearest":
+                reference_text = f"nearest reference pair: Bpair = {reference_b:.4g} T"
+            else:
+                reference_text = f"median reference: {loaded.mcd_result.summary['zero_pairs']} near-zero pairs (median Bpair = {reference_b:.4g} T)"
+            self.mcd_source_summary.setText(
+                f"{loaded.mcd_result.summary['pairs']} angle pairs; sigma+ {loaded.mcd_result.pos_angle:g} deg; "
+                f"sigma- {loaded.mcd_result.neg_angle:g} deg; {reference_text}."
+            )
+            self._update_mcd_background_preview()
+            result = loaded.mcd_result
+            warning_delta_b = 0.5 * float(result.summary["max_delta_b_t"])
+            spectral_mode = str(result.summary.get("correction_mode", "global")) == "pair_spectral"
+            if spectral_mode:
+                diagnostic_lines = [
+                    "#    Bpair       B+       B-       dB  gap gain@Ec slope/eV curve/eV2 gain min:max  RMS before->after  flags"
+                ]
+            else:
+                diagnostic_lines = ["#    Bpair       B+       B-       dB  gap  scale    offset  RMS before->after  flags"]
+            for index in range(result.pair_b.size):
+                rms = float(result.pair_background_rms[index])
+                rms_before = float(result.pair_background_rms_before[index])
+                flags = []
+                if abs(float(result.pair_delta_b[index])) > warning_delta_b:
+                    flags.append("large dB")
+                if np.isfinite(rms) and rms > 0.02:
+                    flags.append("high residual")
+                if result.pair_interpolated_pos[index] or result.pair_interpolated_neg[index]:
+                    flags.append("B-aligned")
+                if spectral_mode:
+                    if not np.isfinite(rms):
+                        flags.append("spectral fit unavailable")
+                    elif np.isfinite(rms_before) and rms >= 0.98 * rms_before:
+                        flags.append("little fit improvement")
+                    diagnostic_lines.append(
+                        f"{index + 1:>2} {result.pair_b[index]:>8.4f} {result.pair_b_pos[index]:>8.4f} "
+                        f"{result.pair_b_neg[index]:>8.4f} {result.pair_delta_b[index]:>+8.4f} "
+                        f"{result.pair_sequence_gap[index]:>3} {result.pair_scale[index]:>7.4f} "
+                        f"{result.pair_spectral_slope[index]:>+8.3g} {result.pair_spectral_curvature[index]:>+9.3g} "
+                        f"{result.pair_correction_min[index]:>5.3f}:{result.pair_correction_max[index]:<5.3f} "
+                        f"{rms_before:>7.3g}->{rms:<7.3g}  {', '.join(flags)}"
+                    )
+                else:
+                    diagnostic_lines.append(
+                        f"{index + 1:>2} {result.pair_b[index]:>8.4f} {result.pair_b_pos[index]:>8.4f} "
+                        f"{result.pair_b_neg[index]:>8.4f} {result.pair_delta_b[index]:>+8.4f} "
+                        f"{result.pair_sequence_gap[index]:>3} {result.pair_scale[index]:>6.3f} "
+                        f"{result.pair_offset[index]:>9.2g} {rms_before:>7.3g}->{rms:<7.3g}  {', '.join(flags)}"
+                    )
+            self.mcd_diagnostics_text.setPlainText("\n".join(diagnostic_lines))
         if loaded.mode == "SHG Processing" and loaded.shg_result is not None:
             self._shg_refresh_sources()
             tab_blocked = self.shg_workflow_tabs.blockSignals(True)
@@ -4632,8 +5787,23 @@ class MainWindow(QMainWindow):
         self._plot_mode(loaded.mode, auto=True)
 
     def _on_load_finished(self) -> None:
+        finished_mode = self._active_load_mode
+        succeeded = self._active_load_succeeded
         self._load_in_progress = False
+        self._active_load_mode = None
+        self._active_load_succeeded = False
         self._status_progress.setVisible(False)
+        if finished_mode == "MCD":
+            if self._mcd_reapply_pending:
+                self._mcd_reapply_pending = False
+                self.mcd_apply_correction_btn.setText("Pending update...")
+                self._mcd_auto_apply_timer.start(0)
+            elif self._mcd_auto_apply_timer.isActive():
+                self.mcd_apply_correction_btn.setText("Pending update...")
+            elif succeeded:
+                self.mcd_apply_correction_btn.setText("Up to date")
+            else:
+                self.mcd_apply_correction_btn.setText("Recalculate now")
 
     def _split_prefix_mode(self, prefix: str) -> str:
         return {
@@ -4694,6 +5864,8 @@ class MainWindow(QMainWindow):
             self._on_power_plot_param_changed()
 
     def _split_scale_for_mode(self, mode: str) -> SplitColorScale | None:
+        if mode == "MCD":
+            return None
         # VP views use a fixed diverging [-1, 1] scale, so a remembered
         # intensity split must not be validated or applied while they are active.
         if mode == "Compare" and self._cmp_is_vp_view():
@@ -4877,16 +6049,18 @@ class MainWindow(QMainWindow):
             return self.drr_spins
         if mode == "Power Dependent":
             return self.power_spins
+        if mode == "MCD":
+            return self.mcd_spins
         return self.cmp_spins
 
     def _mode_cmap(self, mode: str) -> QComboBox:
-        return self.pl_cmap if mode == "PL" else self.drr_cmap if mode == "DRR" else self.power_cmap if mode == "Power Dependent" else self.cmp_cmap
+        return self.pl_cmap if mode == "PL" else self.drr_cmap if mode == "DRR" else self.power_cmap if mode == "Power Dependent" else self.mcd_cmap if mode == "MCD" else self.cmp_cmap
 
     def _mode_log(self, mode: str) -> bool:
-        return bool(self.pl_log_chk.isChecked()) if mode == "PL" else bool(self.drr_log_chk.isChecked()) if mode == "DRR" else bool(self.power_log_chk.isChecked()) if mode == "Power Dependent" else bool(self.cmp_log_chk.isChecked())
+        return False if mode == "MCD" else bool(self.pl_log_chk.isChecked()) if mode == "PL" else bool(self.drr_log_chk.isChecked()) if mode == "DRR" else bool(self.power_log_chk.isChecked()) if mode == "Power Dependent" else bool(self.cmp_log_chk.isChecked())
 
     def _mode_clip(self, mode: str) -> bool:
-        return bool(self.pl_clip_chk.isChecked()) if mode == "PL" else bool(self.drr_clip_chk.isChecked()) if mode == "DRR" else bool(self.power_clip_chk.isChecked()) if mode == "Power Dependent" else bool(self.cmp_clip_chk.isChecked())
+        return False if mode == "MCD" else bool(self.pl_clip_chk.isChecked()) if mode == "PL" else bool(self.drr_clip_chk.isChecked()) if mode == "DRR" else bool(self.power_clip_chk.isChecked()) if mode == "Power Dependent" else bool(self.cmp_clip_chk.isChecked())
 
     def _mode_fix_value(self, mode: str, key: str) -> bool:
         if mode == "PL":
@@ -4895,6 +6069,8 @@ class MainWindow(QMainWindow):
             checks = self.drr_fix_checks
         elif mode == "Power Dependent":
             checks = self.power_fix_checks
+        elif mode == "MCD":
+            checks = self.mcd_fix_checks
         else:
             checks = self.cmp_fix_checks
         chk = checks.get(key)
@@ -4904,7 +6080,7 @@ class MainWindow(QMainWindow):
         return "pl" if mode == "PL" else "drr" if mode == "DRR" else "cmp"
 
     def _current_y_axis_spec_for_mode(self, mode: str) -> str:
-        if mode in {"Power Dependent", "SHG Processing"}:
+        if mode in {"Power Dependent", "SHG Processing", "MCD"}:
             return "auto"
         return self._selected_y_axis_spec(self._mode_y_axis_prefix(mode))
 
@@ -4922,6 +6098,18 @@ class MainWindow(QMainWindow):
                 self.loaded.shg_data,
                 settings,
                 background=self.loaded.shg_background,
+            )
+        if mode == "MCD":
+            return (
+                mode, self.mcd_map_combo.currentText(), float(self.mcd_spins["vmin"].value()), float(self.mcd_spins["vmax"].value()),
+                float(self.mcd_spins["xmin"].value()), float(self.mcd_spins["xmax"].value()), float(self.mcd_spins["ymin"].value()),
+                float(self.mcd_spins["ymax"].value()), self.mcd_cmap.currentText(),
+                bool(self.mcd_center_zero_chk.isChecked()), int(self.mcd_pair_b_combo.currentData() or 0),
+                float(self.mcd_window_center_spin.value()), float(self.mcd_window_width_spin.value()), self.mcd_window_metric_combo.currentText(),
+                bool(self.mcd_show_raw_chk.isChecked()), bool(self.mcd_show_signed_mean_chk.isChecked()),
+                bool(self.mcd_show_absolute_mean_chk.isChecked()), bool(self.mcd_show_unsigned_absolute_mean_chk.isChecked()),
+                bool(self.mcd_show_integral_chk.isChecked()),
+                bool(self.mcd_fit_zero_chk.isChecked()), float(self.mcd_fit_b_window_spin.value()),
             )
             self.loaded.shg_fit = None
             self.loaded.shg_fit_b = None
@@ -5057,6 +6245,8 @@ class MainWindow(QMainWindow):
                     cube = self._power_corrected_cube(self.loaded.cube)
             else:
                 cube = self._power_corrected_cube(self.loaded.cube)
+        elif mode == "MCD" and self.loaded.mcd_result is not None:
+            cube = self.loaded.mcd_result.cube(self.mcd_map_combo.currentText())
         else:
             return
 
@@ -5082,6 +6272,10 @@ class MainWindow(QMainWindow):
                     spins["ymin"].setValue(float(np.nanmin(positive)))
                 if not self._mode_fix_value(mode, "ymax"):
                     spins["ymax"].setValue(float(np.nanmax(positive)))
+        if mode == "MCD":
+            # MCD cursor selection is tied to the selected raw measurement
+            # pair.  Do not overwrite it with the binned-colormap median.
+            return
         prefix = "pl" if mode == "PL" else "drr" if mode == "DRR" else "power" if mode == "Power Dependent" else "cmp"
         if bool(getattr(self, f"{prefix}_split_scale_chk").isChecked()):
             split_spins: Dict[str, QDoubleSpinBox] = getattr(self, f"{prefix}_split_spins")
@@ -5129,7 +6323,7 @@ class MainWindow(QMainWindow):
             cmap=self._mode_cmap(mode).currentText(),
             log_scale=self._mode_log(mode),
             y_axis_log=(mode == "Power Dependent" and self._power_axis_log()),
-            center_zero=(mode == "DRR" and bool(self.drr_center_zero_chk.isChecked())),
+            center_zero=(bool(self.mcd_center_zero_chk.isChecked()) if mode == "MCD" else mode == "DRR" and bool(self.drr_center_zero_chk.isChecked())),
             clip_outliers=self._mode_clip(mode),
             split_scale=self._split_scale_for_mode(mode),
         )
@@ -6220,15 +7414,28 @@ class MainWindow(QMainWindow):
         cax,
         *,
         label: str,
+        ticks_on_left: bool = False,
+        ticks_on_top: bool = False,
+        orientation: str = "vertical",
     ) -> None:
         if not render.is_split:
-            self.figure.colorbar(render.primary, cax=cax, label=label)
+            colorbar = self.figure.colorbar(render.primary, cax=cax, label=label, orientation=orientation)
+            if ticks_on_left and orientation == "vertical":
+                colorbar.ax.yaxis.set_ticks_position("left")
+                colorbar.ax.yaxis.set_label_position("left")
+            if ticks_on_top and orientation == "horizontal":
+                colorbar.ax.xaxis.set_ticks_position("top")
+                colorbar.ax.xaxis.set_label_position("top")
             return
         cax.set_axis_off()
-        left_cax = cax.inset_axes([0.0, 0.55, 1.0, 0.43])
-        right_cax = cax.inset_axes([0.0, 0.02, 1.0, 0.43])
-        left_cb = self.figure.colorbar(render.primary, cax=left_cax)
-        right_cb = self.figure.colorbar(render.secondary, cax=right_cax)
+        if orientation == "horizontal":
+            left_cax = cax.inset_axes([0.00, 0.0, 0.46, 1.0])
+            right_cax = cax.inset_axes([0.54, 0.0, 0.46, 1.0])
+        else:
+            left_cax = cax.inset_axes([0.0, 0.55, 1.0, 0.43])
+            right_cax = cax.inset_axes([0.0, 0.02, 1.0, 0.43])
+        left_cb = self.figure.colorbar(render.primary, cax=left_cax, orientation=orientation)
+        right_cb = self.figure.colorbar(render.secondary, cax=right_cax, orientation=orientation)
         split_text = f"{float(render.split_x):.6g}"
         left_cb.ax.set_title(f"x ≤ {split_text}", fontsize=8, pad=2)
         right_cb.ax.set_title(f"x ≥ {split_text}", fontsize=8, pad=2)
@@ -6236,6 +7443,14 @@ class MainWindow(QMainWindow):
         right_cb.set_label(label, fontsize=8)
         left_cb.ax.tick_params(labelsize=7)
         right_cb.ax.tick_params(labelsize=7)
+        if ticks_on_left and orientation == "vertical":
+            for colorbar in (left_cb, right_cb):
+                colorbar.ax.yaxis.set_ticks_position("left")
+                colorbar.ax.yaxis.set_label_position("left")
+        if ticks_on_top and orientation == "horizontal":
+            for colorbar in (left_cb, right_cb):
+                colorbar.ax.xaxis.set_ticks_position("top")
+                colorbar.ax.xaxis.set_label_position("top")
 
     def _plot_mode(self, mode: str, *, auto: bool = False) -> None:
         try:
@@ -6327,6 +7542,170 @@ class MainWindow(QMainWindow):
                 self._drr_heatmap_fit_artist = None
                 self._set_drr_gate_spin_value(gate_used)
                 self._update_drr_spectrum_and_gate_line(plot_cube)
+            elif mode == "MCD" and self.loaded.mcd_result is not None:
+                result = self.loaded.mcd_result
+                plot_cube = result.cube(self.mcd_map_combo.currentText())
+                params = self._make_params(mode, plot_cube)
+                # Match the PL/DRR hierarchy: the heatmap occupies the
+                # upper-left, the selected spectrum sits below, and the
+                # derived MCD traces live in a separate right column.  A
+                # dedicated header above the map holds its title and colorbar
+                # without covering any measured data.
+                gs = self.figure.add_gridspec(
+                    nrows=2, ncols=3,
+                    width_ratios=[1.0, 1.0, 1.0],
+                    height_ratios=[1.05, 0.95],
+                    left=0.075, right=0.910, bottom=0.085, top=0.935,
+                    wspace=0.50, hspace=0.34,
+                )
+                map_grid = gs[0, :2].subgridspec(2, 1, height_ratios=[0.10, 1.0], hspace=0.06)
+                header_ax = self.figure.add_subplot(map_grid[0, 0])
+                header_ax.set_axis_off()
+                header_ax.text(0.0, 0.23, plot_cube.title, transform=header_ax.transAxes, ha="left", va="center", fontsize=12)
+                cax = header_ax.inset_axes([0.66, 0.04, 0.30, 0.38])
+                heat_ax = self.figure.add_subplot(map_grid[1, 0])
+                trace_ax = self.figure.add_subplot(gs[0, 2])
+                pair_ax = self.figure.add_subplot(gs[1, :2], sharex=heat_ax)
+                linecut_ax = self.figure.add_subplot(gs[1, 2], sharex=heat_ax)
+                pair_index = int(self.mcd_pair_b_combo.currentData() or 0)
+                pair_index = int(np.clip(pair_index, 0, result.pair_b.size - 1))
+                pair_b = float(result.pair_b[pair_index])
+                energy = np.asarray(result.energy_ev, float)
+                energy_order = np.argsort(1239.841984 / result.wavelength_nm)
+                correction_mode = str(result.summary.get("correction_mode", "global"))
+                drift_fit_used = correction_mode in {"pair_scale", "pair_affine", "pair_spectral"}
+                if drift_fit_used:
+                    settings = self.loaded.mcd_settings or McdSettings()
+                    for start, stop in background_fit_regions(energy, settings.background_ranges_ev):
+                        pair_ax.axvspan(start, stop, color="#5790b7", alpha=0.13, zorder=0)
+                pair_ax.plot(energy, result.pair_raw_pos[pair_index, energy_order], label=f"raw {result.pos_angle:g} deg", lw=1.0, ls="--", alpha=0.65)
+                pair_ax.plot(energy, result.pair_raw_neg[pair_index, energy_order], label=f"raw {result.neg_angle:g} deg", lw=1.0, ls="--", alpha=0.65)
+                pair_ax.plot(energy, result.pair_corrected_pos[pair_index, energy_order], label=f"corrected {result.pos_angle:g} deg", lw=1.35)
+                pair_ax.plot(energy, result.pair_corrected_neg[pair_index, energy_order], label=f"final corrected {result.neg_angle:g} deg", lw=1.35)
+                linecut_ax.plot(energy, result.pair_mcd_raw[pair_index, energy_order], label="raw MCD", lw=1.1, alpha=0.8)
+                linecut_ax.plot(energy, result.pair_mcd_corrected[pair_index, energy_order], label="corrected MCD", lw=1.4)
+                e0 = float(self.mcd_window_center_spin.value()); width = float(self.mcd_window_width_spin.value())
+                if e0 <= 0:
+                    e0 = float(np.nanmedian(energy)); self.mcd_window_center_spin.blockSignals(True); self.mcd_window_center_spin.setValue(e0); self.mcd_window_center_spin.blockSignals(False)
+                half = width * 5e-4
+                for axis in (pair_ax, linecut_ax):
+                    axis.axvline(e0, color="#333", ls=":", lw=0.9); axis.axvspan(e0 - half, e0 + half, color="#333", alpha=0.10)
+                    axis.set_xlim(self._safe_spectrum_xlim(energy, params.xlim)); axis.grid(alpha=0.22); axis.legend(fontsize=7, frameon=False)
+                    axis.set_xlabel("Energy (eV)")
+                residual = float(result.pair_background_rms[pair_index])
+                residual_before = float(result.pair_background_rms_before[pair_index])
+                residual_text = f"{residual:.3g}" if np.isfinite(residual) else "--"
+                residual_before_text = f"{residual_before:.3g}" if np.isfinite(residual_before) else "--"
+                pair_ax.set_title(f"Paired spectra: B = {pair_b:.5g} T")
+                pair_ax.set_ylabel("Intensity")
+                # Keep correction diagnostics readable without covering the
+                # high-energy spectrum.  The upper-left corner is the quiet
+                # region for the usual rising PL background, and putting the
+                # values in the legend makes them visually consistent with
+                # the trace labels rather than a floating annotation.
+                pair_handles, pair_labels = pair_ax.get_legend_handles_labels()
+                correction_handle = Line2D([], [], linestyle="None", marker=None)
+                if correction_mode == "pair_spectral":
+                    fit_name = "quadratic" if int(result.summary.get("spectral_order", 1)) == 2 else "linear"
+                    correction_label = (
+                        f"spectral {fit_name}: gain@Ec={result.pair_scale[pair_index]:.4g}; "
+                        f"slope={result.pair_spectral_slope[pair_index]:+.3g}/eV\n"
+                        f"RMS {residual_before_text}->{residual_text}; gain range "
+                        f"{result.pair_correction_min[pair_index]:.3g}-{result.pair_correction_max[pair_index]:.3g}"
+                    )
+                else:
+                    correction_label = (
+                        f"correction: scale={result.pair_scale[pair_index]:.4g}; "
+                        f"offset={result.pair_offset[pair_index]:.3g}; RMS={residual_text}"
+                    )
+                if drift_fit_used:
+                    correction_label += " (blue regions used)"
+                pair_ax.legend(
+                    [*pair_handles, correction_handle], [*pair_labels, correction_label],
+                    loc="upper left", fontsize=7, frameon=True, framealpha=0.88,
+                    facecolor="white", edgecolor="#b7b7b7", handlelength=2.0,
+                    borderpad=0.45, labelspacing=0.35,
+                )
+                delta_b = float(result.pair_delta_b[pair_index])
+                alignment = "; aligned" if (result.pair_interpolated_pos[pair_index] or result.pair_interpolated_neg[pair_index]) else ""
+                linecut_ax.set_title(f"MCD linecut: B = {pair_b:.5g} T")
+                linecut_ax.set_ylabel("MCD"); linecut_ax.axhline(0, color="#555", lw=0.7)
+                linecut_ax.text(
+                    0.98, 0.04, f"dB = {delta_b:+.4g} T{alignment}",
+                    transform=linecut_ax.transAxes, ha="right", va="bottom", fontsize=7,
+                )
+                render = plot_heatmap(heat_ax, plot_cube, params)
+                heat_ax.set_title("")
+                # The paired spectrum below shares the energy axis, so it
+                # owns the x label.  Suppressing the redundant heatmap label
+                # leaves clear space for the lower-panel title.
+                heat_ax.set_xlabel("")
+                heat_ax.tick_params(labelbottom=False)
+                self._add_heatmap_colorbar(render, cax, label="MCD", ticks_on_top=True, orientation="horizontal")
+                # The cursor always represents the selected measured pair,
+                # rather than a separate (and visually confusing) map-only B.
+                heat_ax.axhline(pair_b, color="#222", ls="--", lw=1.0)
+                heat_ax.axvline(e0, color="#222", ls=":", lw=1.0); heat_ax.axvspan(e0 - half, e0 + half, color="#333", alpha=0.12)
+                traces = pair_window_trace_by_branch(result, e0, width)
+                integral_ax = trace_ax.twinx()
+                trace_specs = (
+                    ("mean", "Signed mean", "#1666b0", self.mcd_show_signed_mean_chk.isChecked()),
+                    ("field_signed_absolute_mean", "Field-signed |MCD|", "#c94c00", self.mcd_show_absolute_mean_chk.isChecked()),
+                    ("absolute_mean", "Unsigned |MCD|", "#777777", self.mcd_show_unsigned_absolute_mean_chk.isChecked()),
+                    ("integral", "Signed integral", "#6a3d9a", self.mcd_show_integral_chk.isChecked()),
+                )
+                show_raw = self.mcd_show_raw_chk.isChecked()
+                for metric_name, label, color, visible in trace_specs:
+                    if not visible:
+                        continue
+                    axis = integral_ax if metric_name == "integral" else trace_ax
+                    for branch, line_style, marker_fill in (("B increasing", "-", color), ("B decreasing", "--", "white")):
+                        for source, alpha in (("corrected", 1.0), ("raw", 0.72)):
+                            if source == "raw" and not show_raw:
+                                continue
+                            b_trace, values = traces[branch][f"{source}_{metric_name}"]
+                            axis.plot(
+                                b_trace, values, f"o{line_style}", ms=3.1, lw=1.25,
+                                color=color, alpha=alpha, markerfacecolor=marker_fill,
+                                markeredgecolor=color, markeredgewidth=0.9, label="_nolegend_",
+                            )
+                    if self.mcd_fit_zero_chk.isChecked() and metric_name == "mean":
+                        for branch in ("B increasing", "B decreasing"):
+                            b_trace, values = traces[branch][f"corrected_{metric_name}"]
+                            fit_mask = np.isfinite(b_trace) & np.isfinite(values) & (np.abs(b_trace) <= float(self.mcd_fit_b_window_spin.value()))
+                            if np.count_nonzero(fit_mask) >= 2:
+                                slope, intercept = np.polyfit(b_trace[fit_mask], values[fit_mask], 1)
+                                trace_ax.plot(b_trace, slope * b_trace + intercept, ":", color=color, lw=1.1, label="_nolegend_")
+                trace_ax.axhline(0, color="#555", lw=0.7)
+                trace_ax.set_title(f"MCD(B): E = {e0:.6g} eV", pad=3)
+                trace_ax.set_xlabel("B field (T)")
+                trace_ax.set_ylabel("MCD (mean / absolute mean)", labelpad=10)
+                trace_ax.grid(alpha=0.25)
+                if self.mcd_show_integral_chk.isChecked():
+                    integral_ax.set_ylabel("Integrated MCD (eV)", labelpad=2)
+                else:
+                    integral_ax.set_yticks([]); integral_ax.spines["right"].set_visible(False)
+                branch_legend = trace_ax.legend(
+                    [
+                        Line2D([0], [0], color="#333", marker="o", markerfacecolor="#333", lw=1.15),
+                        Line2D([0], [0], color="#333", marker="o", markerfacecolor="white", lw=1.15, ls="--"),
+                    ],
+                    ["B increasing", "B decreasing"],
+                    title="Branch", fontsize=5.8, title_fontsize=6.0, frameon=True, framealpha=0.88, loc="upper left",
+                )
+                trace_ax.add_artist(branch_legend)
+                metric_handles: list[Line2D] = []
+                metric_labels: list[str] = []
+                for metric_name, label, color, visible in trace_specs:
+                    if not visible:
+                        continue
+                    metric_handles.append(Line2D([0], [0], color=color, lw=1.5))
+                    metric_labels.append(f"{label} (right axis)" if metric_name == "integral" else label)
+                if metric_handles:
+                    trace_ax.legend(metric_handles, metric_labels, title="Metric", fontsize=5.8, title_fontsize=6.0, frameon=True, framealpha=0.88, loc="lower right")
+                self._mcd_heatmap_ax, self._mcd_spectrum_ax, self._mcd_trace_ax = heat_ax, linecut_ax, trace_ax
+                self._mcd_integral_ax = integral_ax
+                self._mcd_colorbar_ax = cax
             elif mode == "SHG Processing" and self.loaded.shg_result is not None:
                 self._pl_heatmap_ax = None
                 self._pl_spectrum_ax = None
@@ -6929,6 +8308,12 @@ class MainWindow(QMainWindow):
             if self._remove_peak_from_pl_heatmap_click(float(event.xdata), float(event.ydata)):
                 return
 
+        if self.last_plotted_mode == "MCD":
+            if event.inaxes is not self._mcd_heatmap_ax or event.ydata is None:
+                return
+            self._select_mcd_pair_at_b(float(event.ydata), clicked=True)
+            return
+
         if self.last_plotted_mode == "DRR":
             if self._drr_heatmap_ax is None or self._last_plot_cube is None:
                 return
@@ -7006,6 +8391,9 @@ class MainWindow(QMainWindow):
         if mode == "SHG Processing" and self.loaded.shg_result is not None:
             params = None
             export_cube = None
+        elif mode == "MCD" and self.loaded.mcd_result is not None:
+            export_cube = self.loaded.mcd_result.cube(self.mcd_map_combo.currentText())
+            params = self._make_params(mode, export_cube)
         elif mode in {"PL", "DRR", "Power Dependent"} and self.loaded.cube is not None:
             if mode == "DRR":
                 export_cube = self._drr_cube_for_display()
@@ -7137,6 +8525,28 @@ class MainWindow(QMainWindow):
                 shg_fit_settings=self._shg_fit_settings_from_ui(),
                 auto_move_sources=bool(self.auto_move_after_export_chk.isChecked()),
             )
+        elif mode == "MCD":
+            options = ExportOptions(
+                mode=mode, params=params, drr_cube=export_cube,
+                mcd_map_name=self.mcd_map_combo.currentText(),
+                mcd_window_center_ev=float(self.mcd_window_center_spin.value()),
+                mcd_window_width_mev=float(self.mcd_window_width_spin.value()),
+                mcd_window_metric={
+                    "Field-signed absolute mean": "field_signed_absolute_mean",
+                    "Signed mean": "mean",
+                    "Signed integral": "integral",
+                    "Unsigned absolute mean (diagnostic)": "absolute_mean",
+                }.get(self.mcd_window_metric_combo.currentText(), "mean"),
+                mcd_settings=self.loaded.mcd_settings,
+                mcd_show_raw=bool(self.mcd_show_raw_chk.isChecked()),
+                mcd_show_signed_mean=bool(self.mcd_show_signed_mean_chk.isChecked()),
+                mcd_show_absolute_mean=bool(self.mcd_show_absolute_mean_chk.isChecked()),
+                mcd_show_unsigned_absolute_mean=bool(self.mcd_show_unsigned_absolute_mean_chk.isChecked()),
+                mcd_show_integral=bool(self.mcd_show_integral_chk.isChecked()),
+                mcd_fit_near_zero=bool(self.mcd_fit_zero_chk.isChecked()),
+                mcd_fit_window_t=float(self.mcd_fit_b_window_spin.value()),
+                auto_move_sources=bool(self.auto_move_after_export_chk.isChecked()),
+            )
         else:
             compare_background = self._cmp_background_value(
                 self.loaded.compare_cubes
@@ -7194,6 +8604,41 @@ class MainWindow(QMainWindow):
             log.emit(f"Exported DAT: {paths['dat'].name}")
             out_folder = str(paths["png"].parent)
             files_to_move = list(loaded.selected_files) + list(loaded.baseline_files)
+        elif mode == "MCD" and options.drr_cube is not None and loaded.mcd_result is not None and loaded.primary_file:
+            base = f"{Path(loaded.primary_file).stem}_MCD_{options.mcd_map_name.replace(' ', '_')}"
+            # Use the same title and colorbar presentation as a PL export:
+            # the source-file stem is the title, while the MCD map identity is
+            # carried by the export filename (for example, ``_MCD_Combo``).
+            mcd_export_params = HeatmapParams(
+                **{**options.params.__dict__, "title": Path(loaded.primary_file).stem}
+            )
+            paths = export_drr_png_and_dat(
+                folder,
+                cube=options.drr_cube,
+                params=mcd_export_params,
+                export_base=base,
+                drr_style=False,
+            )
+            analysis_paths = export_mcd_analysis_bundle(
+                loaded.mcd_result, str(paths["png"].parent), trace_map=options.mcd_map_name,
+                center_ev=options.mcd_window_center_ev, width_mev=options.mcd_window_width_mev,
+                metric=options.mcd_window_metric,
+                settings=options.mcd_settings,
+                show_raw=options.mcd_show_raw,
+                show_signed_mean=options.mcd_show_signed_mean,
+                show_field_signed_absolute_mean=options.mcd_show_absolute_mean,
+                show_unsigned_absolute_mean=options.mcd_show_unsigned_absolute_mean,
+                show_integral=options.mcd_show_integral,
+                fit_near_zero=options.mcd_fit_near_zero,
+                fit_window_t=options.mcd_fit_window_t,
+            )
+            log.emit(f"Exported PNG: {paths['png'].name}")
+            log.emit(f"Exported DAT: {paths['dat'].name}")
+            log.emit(f"Exported PNG: {analysis_paths['mcd_vs_b_png'].name}")
+            log.emit(f"Exported CSV: {analysis_paths['mcd_vs_b_csv'].name}, {analysis_paths['pair_diagnostics'].name}")
+            log.emit(f"Exported settings: {analysis_paths['settings'].name}")
+            out_folder = str(paths["png"].parent)
+            files_to_move = [loaded.primary_file]
         elif mode == "Power Dependent" and options.drr_cube is not None:
             if options.power_view == "VP":
                 if options.power_kk_cube is None or options.power_kkp_cube is None or options.power_vp_cube is None:

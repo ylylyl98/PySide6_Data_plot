@@ -63,6 +63,31 @@ When you choose a data folder, CSV files must be in the folder root (not subfold
 - `DRR`:
   - `Self (last/first frame)` baseline modes.
   - `External` baseline mode from selected baseline files.
+- `MCD`: load one B-sweep CSV with numeric `B_T`, angle, and wavelength columns.
+  The tab pairs opposite-angle frames, subtracts optional angle-specific dark/offset
+  spectra, normalizes each angle with its own near-zero-field reference, and shows
+  raw paired spectra, corrected paired spectra, and raw/corrected MCD linecuts at
+  a chosen B field. Drift modes include global gain, per-pair scale/offset, and an
+  optional robust linear or quadratic spectral-background correction constrained
+  to selected non-resonant energy intervals. **Select protected regions** opens
+  a reflection plot where you directly drag across each resonance that must be
+  protected. Only the active MCD(B) window and the regions you select are excluded;
+  every sufficiently wide unprotected interval becomes a blue background-fit
+  band and recalculates immediately as you add, edit,
+  enable, or remove a region before the tool compares linear/quadratic models on
+  held-out candidate points. The full B-versus-energy MCD map
+  shares the selected energy window with those linecuts. MCD(B) supports signed
+  mean, field-signed absolute mean, and signed integral traces for separate
+  increasing/decreasing sweep branches. The compact export contains the displayed
+  map PNG/DAT, MCD(B) PNG/CSV, pair diagnostics, and reproducible settings JSON.
+  Manually drawn protection regions survive recalculation and are restored when
+  the selector is reopened. Processing-setting changes are applied automatically
+  after a short debounce; **Recalculate now** remains available as a retry. Spin
+  boxes ignore ordinary mouse-wheel scrolling and require Ctrl+wheel when focused.
+  New MCD sessions default to global gain plus a quadratic per-pair spectral
+  baseline. MCD(B) displays only signed mean initially, and signed mean is also
+  the primary PNG/settings export metric; magnitude and integral traces remain
+  available as optional diagnostics, while the CSV retains all metric columns.
 - `Compare`: 2-4 selected files rendered in a compare grid.
 - `Save PNG` exports with fixed Streamlit-style geometry (`8.0 x 6.2 in @ 150 DPI`) independent of window size.
 

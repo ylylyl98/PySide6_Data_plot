@@ -1,0 +1,65 @@
+<div id="mcd-layout-preview">
+  <svg viewBox="0 0 760 520" width="100%" role="img" aria-labelledby="mcd-layout-title mcd-layout-desc">
+    <title id="mcd-layout-title">Proposed MCD plotting layout</title>
+    <desc id="mcd-layout-desc">A large MCD colormap with its colorbar on the upper left, paired spectra beneath it, and MCD versus B plus the selected linecut in a right-hand column.</desc>
+    <defs>
+      <linearGradient id="mcd-heat" x1="0" x2="1">
+        <stop offset="0" style="stop-color:var(--viz-series-1)" stop-opacity="0.72"></stop>
+        <stop offset="0.5" style="stop-color:var(--muted)" stop-opacity="0.22"></stop>
+        <stop offset="1" style="stop-color:var(--viz-series-2)" stop-opacity="0.72"></stop>
+      </linearGradient>
+      <linearGradient id="mcd-scale" x1="0" x2="0" y1="1" y2="0">
+        <stop offset="0" style="stop-color:var(--viz-series-1)"></stop>
+        <stop offset="0.5" style="stop-color:var(--muted)"></stop>
+        <stop offset="1" style="stop-color:var(--viz-series-2)"></stop>
+      </linearGradient>
+    </defs>
+    <g fill="none" stroke="var(--border)" stroke-width="1">
+      <rect x="70" y="34" width="425" height="194"></rect>
+      <rect x="510" y="34" width="14" height="194"></rect>
+      <rect x="555" y="34" width="165" height="194"></rect>
+      <rect x="70" y="298" width="425" height="166"></rect>
+      <rect x="555" y="298" width="165" height="166"></rect>
+    </g>
+    <rect x="71" y="35" width="423" height="192" fill="url(#mcd-heat)"></rect>
+    <rect x="511" y="35" width="12" height="192" fill="url(#mcd-scale)"></rect>
+    <g stroke="var(--foreground)" stroke-opacity="0.33" stroke-width="1">
+      <line x1="210" y1="35" x2="210" y2="227"></line>
+      <line x1="280" y1="35" x2="280" y2="227"></line>
+      <line x1="350" y1="35" x2="350" y2="227"></line>
+      <line x1="420" y1="35" x2="420" y2="227"></line>
+      <line x1="71" y1="131" x2="494" y2="131"></line>
+      <line x1="302" y1="35" x2="302" y2="227" stroke="var(--foreground)" stroke-dasharray="4 3"></line>
+      <line x1="316" y1="35" x2="316" y2="227" stroke="var(--foreground)" stroke-dasharray="4 3"></line>
+    </g>
+    <g fill="var(--foreground)">
+      <text x="282" y="20" text-anchor="middle">MCD colormap</text>
+      <text x="517" y="20" text-anchor="middle">MCD</text>
+      <text x="638" y="20" text-anchor="middle">MCD(B)</text>
+      <text x="282" y="284" text-anchor="middle">Paired spectra: B = selected pair</text>
+      <text x="638" y="284" text-anchor="middle">MCD linecut: selected pair</text>
+      <text x="282" y="250" text-anchor="middle">Photon energy (eV)</text>
+      <text x="44" y="133" text-anchor="middle" transform="rotate(-90 44 133)">B field (T)</text>
+      <text x="282" y="488" text-anchor="middle">Photon energy (eV)</text>
+      <text x="44" y="381" text-anchor="middle" transform="rotate(-90 44 381)">Intensity</text>
+      <text x="638" y="488" text-anchor="middle">Photon energy (eV)</text>
+    </g>
+    <g fill="none" stroke-width="2">
+      <path d="M565 204 C585 188 600 176 612 152 S640 104 650 89 S684 60 710 55" stroke="var(--viz-series-1)"></path>
+      <path d="M565 201 C582 188 600 178 614 149 S641 101 652 88 S682 66 710 58" stroke="var(--viz-series-2)"></path>
+      <path d="M79 422 C130 410 167 380 210 391 S270 358 315 366 S390 330 486 350" stroke="var(--viz-series-1)"></path>
+      <path d="M79 425 C130 406 167 387 210 395 S270 355 315 372 S390 333 486 354" stroke="var(--viz-series-2)"></path>
+      <path d="M565 425 C590 388 600 430 620 364 S649 434 670 350 S697 404 710 370" stroke="var(--viz-series-1)"></path>
+      <path d="M565 429 C590 393 600 426 620 370 S649 428 670 356 S697 399 710 374" stroke="var(--viz-series-2)"></path>
+    </g>
+    <g fill="var(--muted-foreground)">
+      <text x="530" y="48">+</text>
+      <text x="530" y="225">-</text>
+      <text x="540" y="136">0</text>
+      <text x="565" y="65">signed mean</text>
+      <text x="565" y="81">B*|MCD|</text>
+      <text x="80" y="320">raw / corrected</text>
+      <text x="565" y="320">raw / corrected</text>
+    </g>
+  </svg>
+</div>

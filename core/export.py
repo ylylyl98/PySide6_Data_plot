@@ -469,10 +469,17 @@ def export_drr_png_and_dat(
     params: HeatmapParams,
     export_base: str,
     processed_name: str = DEFAULT_PROCESSED,
+    drr_style: bool = True,
 ) -> Dict[str, Path]:
+    """Export one heatmap and its DAT table.
+
+    ``drr_style`` preserves the historic DRR colorbar number formatting.  A
+    non-DRR map (currently MCD) can use the PL heatmap presentation by passing
+    ``False`` while still sharing the same data-export path.
+    """
     out_dir = ensure_processed_dir(folder, processed_name)
     png_path = out_dir / f"{export_base}.png"
-    _save_heatmap_png(png_path, cube, params, drr=True)
+    _save_heatmap_png(png_path, cube, params, drr=drr_style)
     dat_path = Path(
         save_as_dat(
             cube.gate,
