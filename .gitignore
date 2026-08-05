@@ -29,6 +29,7 @@ DPTK Desktop.lnk
 .codex/visualizations/
 
 # Test and notebook artifacts
+tests/_tmp/
 .coverage
 coverage.xml
 htmlcov/
