@@ -880,13 +880,20 @@ def valley_polarization_cube(
 
 
 def _clamp_sg_window(requested: int, *, n_energy: int, polyorder: int) -> int:
+    n_energy = int(n_energy)
+    polyorder = int(polyorder)
+    min_valid = max(3, polyorder + 1)
+    if min_valid % 2 == 0:
+        min_valid += 1
+    max_valid = n_energy if n_energy % 2 == 1 else n_energy - 1
+    if min_valid > max_valid:
+        raise ValueError(
+            f"Savitzky-Golay polynomial order {polyorder} is too high "
+            f"for {n_energy} energy points."
+        )
     win = int(requested)
     if win % 2 == 0:
         win += 1
-    min_valid = max(3, polyorder + 2)
-    if min_valid % 2 == 0:
-        min_valid += 1
-    max_valid = max(min_valid, int(n_energy) if int(n_energy) % 2 == 1 else int(n_energy) - 1)
     win = max(min_valid, min(win, max_valid))
     if win % 2 == 0:
         win = max(min_valid, win - 1)
@@ -915,21 +922,51 @@ def apply_sg_derivative_energy(
         raise ValueError("Derivative needs 2D data with at least 5 energy points.")
 
     used_win = _clamp_sg_window(int(window_length), n_energy=e.size, polyorder=int(polyorder))
-    delta = float(np.nanmedian(np.diff(e)))
-    if not np.isfinite(delta) or delta == 0:
-        delta = float(np.nanmean(np.diff(e)))
-    if not np.isfinite(delta) or delta == 0:
-        delta = 1.0
 
-    z_out = savgol_filter(
-        z,
-        window_length=int(used_win),
-        polyorder=int(polyorder),
-        deriv=int(derivative),
-        delta=delta,
-        axis=1,
-        mode="interp",
-    )
+    diffs = np.diff(e)
+    finite_diffs = diffs[np.isfinite(diffs)]
+    spacing_uniform = False
+    delta = 1.0
+    if finite_diffs.size:
+        delta = float(np.nanmedian(finite_diffs))
+        spacing_uniform = bool(
+            np.isfinite(delta)
+            and delta != 0
+            and np.allclose(finite_diffs, delta, rtol=1e-6, atol=1e-12)
+        )
+    elif np.all(np.isfinite(diffs)):
+        # Degenerate energy axis fallback; keep the old behavior as best effort.
+        spacing_uniform = True
+
+    has_invalid_z = bool(np.any(~np.isfinite(z)))
+    if spacing_uniform and not has_invalid_z:
+        z_out = savgol_filter(
+            z,
+            window_length=int(used_win),
+            polyorder=int(polyorder),
+            deriv=int(derivative),
+            delta=delta,
+            axis=1,
+            mode="interp",
+        )
+    else:
+        # The batch DRR pipeline regrids uneven or gappy spectra before
+        # taking a Savitzky-Golay derivative.  Match that behavior here so
+        # wavelength-derived energy axes and NaN-containing rows do not get
+        # silently wrong derivative values.
+        from core.processing_run import sg_derivative_origin_rows
+
+        z_out = sg_derivative_origin_rows(
+            z,
+            e,
+            deriv=int(derivative),
+            window_pts=int(used_win),
+            polyorder=int(polyorder),
+            oversample=1.0,
+            interp_kind="cubic",
+            origin_like=False,
+            pad_flat_edges=True,
+        )
     cbar = "d(DR/R)/dE" if int(derivative) == 1 else "d2(DR/R)/dE2"
     title = cube.title if cube.title else "DR/R"
     title = f"{title} ({cbar})"
