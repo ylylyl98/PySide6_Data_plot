@@ -2,6 +2,17 @@
 
 Desktop data plotting app built with PySide6. It loads measurement CSV files, renders PL/DRR/Compare views with Matplotlib, and exports CSV/PNG outputs.
 
+## Download for Windows
+
+1. Open the repository's **Releases** page.
+2. Download the latest `PySide6_Data_Plot-vX.Y.Z-Windows-x64.zip`.
+3. Extract the ZIP.
+4. Open the extracted `PySide6_Data_Plot` folder.
+5. Double-click `PySide6_Data_Plot.exe`.
+
+Python and other development tools are not required. After launch, the app can
+be pinned to the Windows taskbar normally.
+
 ## Installation
 ```bash
 git clone https://github.com/ylylyl98/PySide6_Data_plot.git
@@ -23,6 +34,35 @@ and taskbar pinning. To create a Desktop shortcut instead, run:
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\create_windows_shortcut.ps1 -Desktop
 ```
+
+## Build and Release
+
+For a local Windows build, install the build dependency and run:
+
+```powershell
+python -m pip install -r requirements.txt -r requirements-build.txt
+.\build_windows.bat
+```
+
+The portable application is created at
+`dist\PySide6_Data_Plot\PySide6_Data_Plot.exe`. PyInstaller uses an `onedir`
+layout, so distribute the entire `PySide6_Data_Plot` directory rather than the
+EXE alone.
+
+To test packaging on GitHub without publishing a release, open **Actions**,
+select **Windows Build**, choose **Run workflow**, and download the
+`PySide6_Data_Plot-Windows-x64` artifact after the run completes.
+
+To publish a version, push a tag:
+
+```powershell
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+GitHub Actions runs the tests, builds the Windows application, and attaches
+`PySide6_Data_Plot-v1.0.0-Windows-x64.zip` to the corresponding GitHub Release.
+Generated `build/` and `dist/` content stays local and is not committed.
 
 ## Architecture
 - `core/`: UI-agnostic data loading, processing, plotting primitives, and export.
