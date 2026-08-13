@@ -2,16 +2,34 @@
 
 Desktop data plotting app built with PySide6. It loads measurement CSV files, renders PL/DRR/Compare views with Matplotlib, and exports CSV/PNG outputs.
 
-## Download for Windows
+## Recommended Windows installation
 
 1. Open the repository's **Releases** page.
-2. Download the latest `PySide6_Data_Plot-vX.Y.Z-Windows-x64.zip`.
-3. Extract the ZIP.
-4. Open the extracted `PySide6_Data_Plot` folder.
-5. Double-click `PySide6_Data_Plot.exe`.
+2. Download `DPTK-Setup-vX.Y.Z-Windows-x64.exe` from the latest release.
+3. Run the installer.
+4. Launch DPTK from the Start Menu.
 
 Python and other development tools are not required. After launch, the app can
 be pinned to the Windows taskbar normally.
+
+Unsigned installers may initially show a Microsoft Defender SmartScreen warning.
+DPTK does not bypass or disable Windows security checks.
+
+### Updating
+
+Use **Help → Check for Updates...** at any time. By default DPTK also performs
+one unobtrusive background check after startup and shows a small notification
+only when a newer stable version exists. DPTK never downloads or installs an
+update automatically, never launches an installer automatically, and never
+closes or restarts an active session. Downloading and launching an installer
+each require an explicit user choice, and downloaded installers are checked
+against the release's `SHA256SUMS.txt` before they can be launched.
+
+### Portable version
+
+Download `DPTK-vX.Y.Z-Windows-x64.zip`, extract it, open the
+`PySide6_Data_Plot` folder, and run `PySide6_Data_Plot.exe`. The portable ZIP
+remains available for restricted systems and users who prefer no installation.
 
 ## Installation
 ```bash
@@ -49,9 +67,16 @@ The portable application is created at
 layout, so distribute the entire `PySide6_Data_Plot` directory rather than the
 EXE alone.
 
+To build the installer locally, install NSIS and run:
+
+```powershell
+.\scripts\build_installer.ps1 -Version 1.0.0 -OutputFile DPTK-Setup-Windows-x64.exe
+```
+
 To test packaging on GitHub without publishing a release, open **Actions**,
 select **Windows Build**, choose **Run workflow**, and download the
-`PySide6_Data_Plot-Windows-x64` artifact after the run completes.
+`DPTK-Windows-x64` artifact after the run completes. It contains the portable
+ZIP, installer, and `SHA256SUMS.txt`.
 
 To publish a version, push a tag:
 
@@ -60,8 +85,10 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-GitHub Actions runs the tests, builds the Windows application, and attaches
-`PySide6_Data_Plot-v1.0.0-Windows-x64.zip` to the corresponding GitHub Release.
+GitHub Actions first verifies that the tag matches `app_version.py`, then runs
+the tests, builds the Windows application and installer, and attaches
+`DPTK-v1.0.0-Windows-x64.zip`, `DPTK-Setup-v1.0.0-Windows-x64.exe`, and
+`SHA256SUMS.txt` to the corresponding GitHub Release.
 Generated `build/` and `dist/` content stays local and is not committed.
 
 ## Architecture

@@ -43,3 +43,6 @@ Processed Data/
 Initial data after processing/
 Archive/
 *.log
+DPTK-*.exe
+DPTK-*.zip
+SHA256SUMS.txt

@@ -6,6 +6,7 @@ from pathlib import Path
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import QApplication
 
+from app_version import __version__
 from ui_qt.main_window import MainWindow
 
 APP_USER_MODEL_ID = "com.ylylyl98.dptk_desktop.data_plot"
@@ -278,6 +279,7 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName("DPTK Desktop")
+    app.setApplicationVersion(__version__)
     app.setOrganizationName("ylylyl98")
     app.setStyle("Fusion")
     app.setFont(QFont("Segoe UI", 10))
