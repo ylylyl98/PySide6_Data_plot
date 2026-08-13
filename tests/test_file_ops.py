@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from core.file_ops import archive_all, list_root_csvs, restore_all
+from core.file_ops import archive_all, archive_selected, list_root_csvs, restore_all
 
 
 class FileOpsTests(unittest.TestCase):
@@ -39,6 +39,19 @@ class FileOpsTests(unittest.TestCase):
             restored = restore_all(str(p), "archive")
             self.assertEqual(restored, 2)
             self.assertEqual(list_root_csvs(str(p)), ["a.csv", "b.csv"])
+
+    def test_archive_selected_ignores_path_outside_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td)
+            root = p / "root"
+            root.mkdir()
+            outside = p / "outside.csv"
+            outside.write_text("outside")
+
+            moved = archive_selected(str(root), ["../outside.csv"], "archive")
+
+            self.assertEqual(moved, 0)
+            self.assertTrue(outside.exists())
 
 
 if __name__ == "__main__":

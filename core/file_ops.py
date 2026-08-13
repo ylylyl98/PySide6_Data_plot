@@ -98,6 +98,8 @@ def archive_selected(user_folder: str, file_names: List[str], archive_name: str)
         if not nm or nm in seen:
             continue
         seen.add(nm)
+        if Path(nm).is_absolute() or Path(nm).name != nm or nm in {".", ".."}:
+            continue
         src = p / nm
         if (not src.exists()) or (not src.is_file()):
             continue
