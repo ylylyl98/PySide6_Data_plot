@@ -2,34 +2,44 @@
 
 Desktop data plotting app built with PySide6. It loads measurement CSV files, renders PL/DRR/Compare views with Matplotlib, and exports CSV/PNG outputs.
 
-## Recommended Windows installation
+## Windows download
 
-1. Open the repository's **Releases** page.
-2. Download `DPTK-Setup-vX.Y.Z-Windows-x64.exe` from the latest release.
-3. Run the installer.
-4. Launch DPTK from the Start Menu.
+The easiest way to get DPTK is the installer:
 
-Python and other development tools are not required. After launch, the app can
-be pinned to the Windows taskbar normally.
+1. Open the project's [**GitHub Releases**](https://github.com/ylylyl98/PySide6_Data_plot/releases) page.
+2. Open the latest release.
+3. Download `DPTK-Setup-vX.Y.Z-Windows-x64.exe`.
+4. Run the installer.
+5. Launch DPTK from the Start Menu.
+
+The installer is the recommended option for normal users. Python and other
+development tools are not required.
+
+Download DPTK from GitHub **Releases**, not from GitHub Actions artifacts.
+Actions artifacts are build outputs for development and testing, not user
+downloads.
 
 Unsigned installers may initially show a Microsoft Defender SmartScreen warning.
 DPTK does not bypass or disable Windows security checks.
 
 ### Updating
 
-Use **Help → Check for Updates...** at any time. By default DPTK also performs
-one unobtrusive background check after startup and shows a small notification
-only when a newer stable version exists. DPTK never downloads or installs an
-update automatically, never launches an installer automatically, and never
-closes or restarts an active session. Downloading and launching an installer
-each require an explicit user choice, and downloaded installers are checked
-against the release's `SHA256SUMS.txt` before they can be launched.
+Use **Help → Check for Updates...** at any time. DPTK may notify you when a
+newer stable version is available, but DPTK never installs updates
+automatically. Downloading and installing an update always stays under your
+control.
 
 ### Portable version
 
-Download `DPTK-vX.Y.Z-Windows-x64.zip`, extract it, open the
-`PySide6_Data_Plot` folder, and run `PySide6_Data_Plot.exe`. The portable ZIP
-remains available for restricted systems and users who prefer no installation.
+If you prefer not to install, download `DPTK-vX.Y.Z-Windows-x64.zip` from the
+latest release:
+
+1. Download the ZIP.
+2. Extract it.
+3. Run `DPTK.exe`.
+
+The portable ZIP remains available for restricted systems and users who prefer
+no installation.
 
 ## Installation
 ```bash
