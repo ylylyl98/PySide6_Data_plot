@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 import traceback
 from collections import deque
 from dataclasses import dataclass, field, replace
@@ -12,8 +13,8 @@ from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.ticker import PercentFormatter
 from matplotlib.widgets import SpanSelector
-from PySide6.QtCore import QFileSystemWatcher, QMimeData, QObject, QRect, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QAction, QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent
+from PySide6.QtCore import QFileSystemWatcher, QMimeData, QObject, QRect, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QDesktopServices, QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -58,7 +59,17 @@ from PySide6.QtWidgets import (
 from scipy.optimize import curve_fit
 from scipy.signal import find_peaks
 
+from app_version import __version__
 from core import data_io
+from core.update_checker import (
+    CheckResult,
+    DownloadResult,
+    check_for_update,
+    download_installer,
+    expected_installer_name,
+    format_version,
+    sha256_file,
+)
 from core.mcd import (
     McdBackgroundSuggestion, McdResult, McdSettings, background_fit_regions, detect_angles,
     export_mcd_analysis_bundle, pair_window_trace_by_branch, process_mcd, suggest_mcd_background_ranges,
@@ -362,6 +373,7 @@ class MainWindow(QMainWindow):
     SETTINGS_LAST_DATA_FOLDER = "data/last_folder"
     SETTINGS_LAST_PARENT_FOLDER = "data/last_parent_folder"
     SETTINGS_RECENT_FOLDERS = "data/recent_folders"
+    SETTINGS_AUTO_UPDATE_CHECK = "updates/check_automatically"
     MAX_RECENT_FOLDERS = 8
 
     def __init__(self):
@@ -370,6 +382,8 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1180, 700)
         self.thread_pool = QThreadPool.globalInstance()
         self.settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
+        self._pending_update: CheckResult | None = None
+        self._download_in_progress = False
         self.current_folder = ""
         self._watched_folder = ""
         self.folder_watcher = QFileSystemWatcher(self)
@@ -459,6 +473,7 @@ class MainWindow(QMainWindow):
         self._update_action_states()
         self._restore_last_folder()
         self.setAcceptDrops(True)
+        self._schedule_automatic_update_check()
 
     def _load_recent_folders(self) -> List[str]:
         raw = self.settings.value(self.SETTINGS_RECENT_FOLDERS, [])
@@ -797,6 +812,15 @@ class MainWindow(QMainWindow):
         sb.addPermanentWidget(self._status_progress)
         self.setStatusBar(sb)
         self.statusBar().showMessage("Ready")
+        self._update_status_button = QPushButton()
+        self._update_status_button.setFlat(True)
+        self._update_status_button.setCursor(Qt.PointingHandCursor)
+        self._update_status_button.setStyleSheet(
+            "QPushButton { color: #0071e3; font-weight: 600; }"
+        )
+        self._update_status_button.setVisible(False)
+        self._update_status_button.clicked.connect(self._on_update_status_clicked)
+        self.statusBar().addPermanentWidget(self._update_status_button)
         self._build_log_dock()
         self._build_menu_and_toolbar()
 
@@ -4191,6 +4215,15 @@ class MainWindow(QMainWindow):
         self.show_log_action.setText("Show Log")
         menu.addAction(self.show_log_action)
 
+        help_menu = self.menuBar().addMenu("Help")
+        self.check_updates_action = QAction("Check for Updates...", self)
+        self.auto_update_check_action = QAction("Check for Updates Automatically", self)
+        self.auto_update_check_action.setCheckable(True)
+        self.auto_update_check_action.setChecked(self._auto_update_check_enabled())
+        self.about_action = QAction("About", self)
+        help_menu.addAction(self.check_updates_action)
+        help_menu.addAction(self.auto_update_check_action)
+        help_menu.addAction(self.about_action)
         toolbar = self.addToolBar("Main")
         toolbar.setMovable(False)
         self.load_action = QAction(self.style().standardIcon(QStyle.SP_DirOpenIcon), "Load", self)
@@ -4223,6 +4256,9 @@ class MainWindow(QMainWindow):
         self.plot_action.triggered.connect(self._toolbar_plot)
         self.save_action.triggered.connect(self._toolbar_save)
         self.move_now_btn.clicked.connect(self._manual_move_sources)
+        self.check_updates_action.triggered.connect(self._manual_check_updates)
+        self.about_action.triggered.connect(self._show_about)
+        self.auto_update_check_action.toggled.connect(self._on_auto_update_check_toggled)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         for prefix in ("pl", "drr", "cmp"):
             combo: QComboBox = getattr(self, f"{prefix}_yaxis_combo")
@@ -8820,4 +8856,176 @@ class MainWindow(QMainWindow):
             self._invalidate_export_move_sources()
         self._set_stage("Exported")
         self._status(f"Export completed: {out_folder}")
+    def _auto_update_check_enabled(self) -> bool:
+        value = self.settings.value(self.SETTINGS_AUTO_UPDATE_CHECK, True)
+        if value is None:
+            return True
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
+    def _on_auto_update_check_toggled(self, checked: bool) -> None:
+        self.settings.setValue(self.SETTINGS_AUTO_UPDATE_CHECK, bool(checked))
+    def _schedule_automatic_update_check(self) -> None:
+        if not self._auto_update_check_enabled():
+            return
+        QTimer.singleShot(1500, self._run_automatic_update_check)
+    def _run_automatic_update_check(self) -> None:
+        self._start_update_check(automatic=True)
+    def _manual_check_updates(self) -> None:
+        self._start_update_check(automatic=False)
+    def _start_update_check(self, *, automatic: bool) -> None:
+        if automatic and not self._auto_update_check_enabled():
+            return
+        worker = Worker(self._update_check_task)
+        worker.signals.result.connect(lambda result: self._on_update_check_done(automatic, result))
+        worker.signals.error.connect(lambda message: self._on_update_check_error(message, automatic))
+        self.thread_pool.start(worker)
+        if not automatic:
+            self._status('Checking for updates...')
+    def _update_check_task(self, *, progress, log) -> CheckResult:
+        return check_for_update(__version__)
+    def _on_update_check_done(self, automatic: bool, result: object) -> None:
+        if not isinstance(result, CheckResult):
+            return
+        if result.status == 'error':
+            self._pending_update = None
+            self._hide_update_status_indicator()
+            if not automatic:
+                self._show_update_error(result.message)
+            return
+        if result.status == 'update_available':
+            self._pending_update = result
+            if automatic:
+                self._show_update_status_indicator(result)
+            else:
+                self._show_update_available_dialog(result)
+        else:
+            self._pending_update = None
+            self._hide_update_status_indicator()
+            if not automatic:
+                self._show_up_to_date(result.message)
+    def _on_update_check_error(self, message: str, automatic: bool) -> None:
+        self._pending_update = None
+        self._hide_update_status_indicator()
+        self._status('Update check failed')
+        if not automatic:
+            QMessageBox.warning(self, 'Check for Updates', self._safe_update_message(message))
+    def _safe_update_message(self, message: str) -> str:
+        return (message or 'The update check failed.').splitlines()[0]
+    def _show_update_available_dialog(self, result: CheckResult) -> None:
+        latest = format_version(result.latest_version) if result.latest_version else 'a newer version'
+        box = QMessageBox(self)
+        box.setWindowTitle('Update Available')
+        box.setIcon(QMessageBox.Information)
+        box.setText(f'A new version of DPTK Desktop is available: {latest}.')
+        box.setInformativeText(f'You are running {__version__}.')
+        release_notes_btn = box.addButton('View Release Notes', QMessageBox.ActionRole)
+        download_btn = box.addButton('Download Update', QMessageBox.AcceptRole)
+        box.addButton('Later', QMessageBox.RejectRole)
+        box.setDefaultButton(download_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is release_notes_btn:
+            self._view_release_notes(result)
+        elif clicked is download_btn:
+            self._start_update_download(result)
+    def _show_up_to_date(self, message: str) -> None:
+        QMessageBox.information(self, 'Check for Updates', message)
+    def _show_update_error(self, message: str) -> None:
+        QMessageBox.warning(self, 'Check for Updates', self._safe_update_message(message))
+    def _show_update_status_indicator(self, result: CheckResult) -> None:
+        latest = format_version(result.latest_version) if result.latest_version else 'new version'
+        self._update_status_button.setText(f'Update available: v{latest}')
+        self._update_status_button.setVisible(True)
+    def _hide_update_status_indicator(self) -> None:
+        self._update_status_button.setText('')
+        self._update_status_button.setVisible(False)
+    def _on_update_status_clicked(self) -> None:
+        result = self._pending_update
+        if result is not None:
+            self._show_update_available_dialog(result)
+    def _view_release_notes(self, result: CheckResult) -> None:
+        if result.release is not None and result.release.html_url:
+            QDesktopServices.openUrl(QUrl(result.release.html_url))
+    def _download_directory(self) -> Path:
+        downloads = Path.home() / 'Downloads'
+        if downloads.is_dir():
+            return downloads
+        return Path(tempfile.gettempdir())
+    def _start_update_download(self, result: CheckResult) -> None:
+        if self._download_in_progress:
+            return
+        if not result.installer_url or not result.sums_url or result.latest_version is None:
+            self._show_update_error('This update is missing its installer files.')
+            return
+        filename = expected_installer_name(result.latest_version)
+        dest_dir = str(self._download_directory())
+        self._download_in_progress = True
+        self._status('Downloading update...')
+        worker = Worker(self._download_task, result.installer_url, result.sums_url, filename, dest_dir)
+        worker.signals.result.connect(self._on_update_download_done)
+        worker.signals.error.connect(self._on_update_download_error)
+        self.thread_pool.start(worker)
+    def _download_task(self, installer_url: str, sums_url: str, filename: str, dest_dir: str, *, progress, log) -> DownloadResult:
+        return download_installer(installer_url, sums_url, filename, dest_dir, progress=progress.emit)
+    def _on_update_download_done(self, result: object) -> None:
+        self._download_in_progress = False
+        if not isinstance(result, DownloadResult):
+            self._show_update_error('Download failed.')
+            return
+        if result.status != 'ok':
+            self._show_update_error(result.message)
+            return
+        self._show_download_complete_dialog(result)
+    def _on_update_download_error(self, message: str) -> None:
+        self._download_in_progress = False
+        self._status('Download failed')
+        QMessageBox.warning(self, 'Download Update', self._safe_update_message(message))
+    def _show_download_complete_dialog(self, result: DownloadResult) -> None:
+        path = Path(result.installer_path) if result.installer_path else None
+        box = QMessageBox(self)
+        box.setWindowTitle('Download Complete')
+        box.setIcon(QMessageBox.Information)
+        box.setText('The update has been downloaded and verified.')
+        if path is not None:
+            box.setInformativeText(str(path))
+        install_btn = box.addButton('Install Now', QMessageBox.AcceptRole)
+        open_folder_btn = box.addButton('Open Folder', QMessageBox.ActionRole)
+        box.addButton('Later', QMessageBox.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is install_btn and path is not None:
+            self._confirm_and_launch_installer(path, result.expected_sha256)
+        elif clicked is open_folder_btn and path is not None:
+            self._open_download_folder(path)
+    def _confirm_and_launch_installer(self, path: Path, expected_sha256: str | None) -> None:
+        if not path.is_file():
+            QMessageBox.warning(self, 'Install Update', 'The downloaded installer could not be found.')
+            return
+        if not expected_sha256:
+            QMessageBox.critical(self, 'Install Update', 'The installer checksum could not be verified. It will not be launched.')
+            return
+        self._status('Verifying installer...')
+        worker = Worker(self._verify_installer_task, path)
+        worker.signals.result.connect(lambda digest: self._on_installer_verified(path, expected_sha256, digest))
+        worker.signals.error.connect(self._on_installer_verify_error)
+        self.thread_pool.start(worker)
+    def _verify_installer_task(self, path: Path, *, progress, log) -> str:
+        return sha256_file(path)
+    def _on_installer_verified(self, path: Path, expected_sha256: str, digest: object) -> None:
+        if not isinstance(digest, str) or digest.lower() != expected_sha256.lower():
+            QMessageBox.critical(self, 'Install Update', 'The installer checksum no longer matches. It will not be launched.')
+            return
+        confirm = QMessageBox.question(self, 'Install Update', 'Launch the installer now? The installer will guide you through the remaining steps.', QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if confirm == QMessageBox.Yes:
+            self._launch_installer(path)
+    def _on_installer_verify_error(self, message: str) -> None:
+        self._status('Installer verification failed')
+        QMessageBox.critical(self, 'Install Update', 'The installer could not be verified. It will not be launched.')
+    def _launch_installer(self, path: Path) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+    def _open_download_folder(self, path: Path) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
+    def _show_about(self) -> None:
+        QMessageBox.about(self, 'About DPTK Desktop', f'DPTK Desktop - Version {__version__}')
 

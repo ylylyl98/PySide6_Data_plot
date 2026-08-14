@@ -2,6 +2,9 @@ name: Windows Build
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches:
+      - main
   push:
     tags:
       - "v*"
@@ -12,79 +15,159 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
           cache: pip
-
       - name: Install dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt -r requirements-build.txt
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
 
+          function Find-Makensis {
+              $cmd = Get-Command makensis.exe -ErrorAction SilentlyContinue
+              if ($cmd) { return $cmd.Source }
+
+              $locations = @(
+                  "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+                  "$env:ProgramFiles\NSIS\makensis.exe"
+              )
+              foreach ($loc in $locations) {
+                  if (Test-Path -LiteralPath $loc -PathType Leaf) { return $loc }
+              }
+              return $null
+          }
+
+          $makensis = Find-Makensis
+
+          if (-not $makensis) {
+              $maxAttempts = 3
+              for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+                  Write-Host "NSIS not found; installing with Chocolatey (attempt $attempt/$maxAttempts)..."
+                  choco install nsis --yes --no-progress
+                  if ($LASTEXITCODE -eq 0) {
+                      $makensis = Find-Makensis
+                      if ($makensis) {
+                          Write-Host "NSIS installed: $makensis"
+                          break
+                      }
+                      Write-Host "Chocolatey reported success but makensis.exe was not found."
+                  } else {
+                      Write-Host "Chocolatey install failed with exit code $LASTEXITCODE."
+                  }
+
+                  if ($attempt -lt $maxAttempts) {
+                      Start-Sleep -Seconds 15
+                  }
+              }
+          }
+
+          if (-not $makensis) {
+              throw "NSIS installation failed: makensis.exe was not found after $maxAttempts attempt(s)."
+          }
+
+          & $makensis /VERSION
+          if ($LASTEXITCODE -ne 0) {
+              throw "makensis.exe is unusable (version check failed with exit code $LASTEXITCODE)."
+          }
+
+          "MAKENSIS_PATH=$makensis" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "MAKENSIS_PATH=$makensis"
+      - name: Resolve and validate version
+        shell: pwsh
+        run: |
+          $version = python scripts/validate_release_version.py --print-version
+          if ($LASTEXITCODE -ne 0) { throw "Could not read application version" }
+          if ("${{ github.ref_type }}" -eq "tag") {
+            python scripts/validate_release_version.py --tag "${{ github.ref_name }}"
+            if ($LASTEXITCODE -ne 0) { throw "Tag and application version do not match" }
+            $zipName = "DPTK-${{ github.ref_name }}-Windows-x64.zip"
+            $setupName = "DPTK-Setup-${{ github.ref_name }}-Windows-x64.exe"
+          } else {
+            $zipName = "DPTK-Windows-x64.zip"
+            $setupName = "DPTK-Setup-Windows-x64.exe"
+          }
+          "APP_VERSION=$version" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "ZIP_NAME=$zipName" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "SETUP_NAME=$setupName" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
-
       - name: Run smoke check
         run: python scripts/smoke_check.py
-
       - name: Build Windows application
         run: .\build_windows.bat
-
       - name: Verify executable
         shell: pwsh
         run: |
-          $exe = "dist\PySide6_Data_Plot\PySide6_Data_Plot.exe"
-          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
-            throw "Expected executable was not produced: $exe"
-          }
-
-      - name: Package distributable
+          if (-not (Test-Path -LiteralPath "dist\PySide6_Data_Plot\PySide6_Data_Plot.exe" -PathType Leaf)) { throw "Expected executable was not produced" }
+      - name: Package portable application
+        shell: pwsh
+        run: Compress-Archive -Path "dist\PySide6_Data_Plot" -DestinationPath "${{ env.ZIP_NAME }}" -Force
+      - name: Build installer
+        shell: pwsh
+        run: .\scripts\build_installer.ps1 -Version "${{ env.APP_VERSION }}" -OutputFile "${{ env.SETUP_NAME }}" -MakensisPath "${{ env.MAKENSIS_PATH }}"
+      - name: Generate checksums
         shell: pwsh
         run: |
-          if ("${{ github.ref_type }}" -eq "tag") {
-            $zipName = "PySide6_Data_Plot-${{ github.ref_name }}-Windows-x64.zip"
-          } else {
-            $zipName = "PySide6_Data_Plot-Windows-x64.zip"
+          $files = @("${{ env.ZIP_NAME }}", "${{ env.SETUP_NAME }}")
+          $lines = foreach ($file in $files) {
+            $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $file"
           }
-          Compress-Archive -Path "dist\PySide6_Data_Plot" -DestinationPath $zipName -Force
-          "ZIP_NAME=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Upload Windows ZIP
+          $lines | Set-Content -LiteralPath SHA256SUMS.txt -Encoding ascii
+      - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.ref_type == 'tag' && format('PySide6_Data_Plot-{0}-Windows-x64', github.ref_name) || 'PySide6_Data_Plot-Windows-x64' }}
-          path: ${{ env.ZIP_NAME }}
+          name: DPTK-Windows-x64
+          path: |
+            ${{ env.ZIP_NAME }}
+            ${{ env.SETUP_NAME }}
+            SHA256SUMS.txt
           if-no-files-found: error
 
   release:
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: build
     runs-on: windows-latest
     permissions:
       contents: write
-
     steps:
-      - name: Download release artifact
+      - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
-          name: PySide6_Data_Plot-${{ github.ref_name }}-Windows-x64
+          name: DPTK-Windows-x64
           path: release-assets
-
       - name: Create or update GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "${{ github.ref_name }}"
-          $zip = "release-assets\PySide6_Data_Plot-$tag-Windows-x64.zip"
+          $zipName = "DPTK-$tag-Windows-x64.zip"
+          $setupName = "DPTK-Setup-$tag-Windows-x64.exe"
+          $downloaded = @(Get-ChildItem -LiteralPath release-assets -File)
+          if ($downloaded.Count -ne 3) {
+            throw "Expected exactly 3 release assets, found $($downloaded.Count)"
+          }
+          $assets = @(
+            (Join-Path "release-assets" $zipName),
+            (Join-Path "release-assets" $setupName),
+            (Join-Path "release-assets" "SHA256SUMS.txt")
+          )
+          foreach ($asset in $assets) {
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
+              throw "Missing release asset: $asset"
+            }
+          }
           gh release view $tag --repo "${{ github.repository }}" *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $zip --clobber --repo "${{ github.repository }}"
+            gh release upload $tag @assets --clobber --repo "${{ github.repository }}"
           } else {
-            gh release create $tag $zip --generate-notes --repo "${{ github.repository }}" --title $tag
+            gh release create $tag @assets --generate-notes --repo "${{ github.repository }}" --title $tag
           }
