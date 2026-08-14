@@ -2,15 +2,15 @@
 
 Desktop data plotting app built with PySide6. It loads measurement CSV files, renders PL/DRR/Compare views with Matplotlib, and exports CSV/PNG outputs.
 
-## Windows download
+## Download DPTK for Windows
+
+**[Download the latest Windows release](https://github.com/ylylyl98/PySide6_Data_plot/releases/latest)**
 
 The easiest way to get DPTK is the installer:
 
-1. Open the project's [**GitHub Releases**](https://github.com/ylylyl98/PySide6_Data_plot/releases) page.
-2. Open the latest release.
-3. Download `DPTK-Setup-vX.Y.Z-Windows-x64.exe`.
-4. Run the installer.
-5. Launch DPTK from the Start Menu.
+1. Download `DPTK-Setup-vX.Y.Z-Windows-x64.exe`.
+2. Run the installer.
+3. Launch DPTK from the Start Menu.
 
 The installer is the recommended option for normal users. Python and other
 development tools are not required.
