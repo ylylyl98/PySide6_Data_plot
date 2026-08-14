@@ -61,6 +61,7 @@ from scipy.signal import find_peaks
 
 from app_version import __version__
 from core import data_io
+from core.colormaps import CUSTOM_COLORMAPS, STANDARD_COLORMAPS, register_colormaps, resolve_cmap
 from core.update_checker import (
     CheckResult,
     DownloadResult,
@@ -378,6 +379,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        register_colormaps()
         self.setWindowTitle("DPTK Desktop (PySide6)")
         self.setMinimumSize(1180, 700)
         self.thread_pool = QThreadPool.globalInstance()
@@ -905,7 +907,7 @@ class MainWindow(QMainWindow):
         return scroll
 
     def _build_common_range_grid(
-        self, prefix: str
+        self, prefix: str, default_cmap: str
     ) -> tuple[QGridLayout, Dict[str, QDoubleSpinBox], QCheckBox, QCheckBox, QComboBox, Dict[str, QCheckBox]]:
         grid = QGridLayout()
         grid.setHorizontalSpacing(8)
@@ -982,7 +984,13 @@ class MainWindow(QMainWindow):
         log_chk.setToolTip("Use logarithmic color normalization")
         clip_chk.setToolTip("Clip values above vmax for cleaner contrast")
         cmap = QComboBox()
-        cmap.addItems(["turbo", "viridis", "plasma", "inferno", "magma", "cividis", "RdBu_r"])
+        cmap.addItem("Default", default_cmap)
+        for cmap_id, label in CUSTOM_COLORMAPS:
+            cmap.addItem(label, cmap_id)
+        for name in STANDARD_COLORMAPS:
+            cmap.addItem(name, name)
+        cmap.setCurrentIndex(0)
+        cmap.setProperty("default_cmap", default_cmap)
         cmap.setToolTip("Colormap for heatmap rendering")
         self._style_combo_popup(cmap)
 
@@ -1171,8 +1179,7 @@ class MainWindow(QMainWindow):
         cfg = QFormLayout()
         cfg.setHorizontalSpacing(6)
         cfg.setVerticalSpacing(4)
-        _grid, spins, _, _, cmap, fix_checks = self._build_common_range_grid("pl")
-        cmap.setCurrentText("turbo")
+        _grid, spins, _, _, cmap, fix_checks = self._build_common_range_grid("pl", "turbo")
         self.pl_yaxis_controls = self._build_y_axis_controls("pl")
         _pl_yc_row = QWidget()
         _pl_yc_h = QHBoxLayout(_pl_yc_row)
@@ -1373,7 +1380,7 @@ class MainWindow(QMainWindow):
         self.drr_derivative_combo.addItems(["None", "dE", "d2E"])
         self.drr_derivative_combo.setToolTip("Apply derivative transform to DRR")
         self._style_combo_popup(self.drr_derivative_combo)
-        _grid, spins, log_chk, clip_chk, cmap, fix_checks = self._build_common_range_grid("drr")
+        _grid, spins, log_chk, clip_chk, cmap, fix_checks = self._build_common_range_grid("drr", "RdBu_r")
 
         for s in spins.values():
             s.setFixedWidth(UI_METRICS["spin_w"])
@@ -1391,7 +1398,6 @@ class MainWindow(QMainWindow):
         self.drr_derivative_combo.setMinimumContentsLength(3)
         self.drr_derivative_combo.setFixedWidth(UI_METRICS["deriv_combo_w"])
         self.drr_derivative_combo.setFixedHeight(UI_METRICS["input_h"])
-        cmap.setCurrentText("RdBu_r")
         self.drr_sg_window_spin = QSpinBox()
         self.drr_sg_window_spin.setRange(5, 401)
         self.drr_sg_window_spin.setSingleStep(2)
@@ -1881,8 +1887,7 @@ class MainWindow(QMainWindow):
         cfg = QFormLayout()
         cfg.setHorizontalSpacing(6)
         cfg.setVerticalSpacing(4)
-        _grid, spins, _, _, cmap, fix_checks = self._build_common_range_grid("cmp")
-        cmap.setCurrentText("turbo")
+        _grid, spins, _, _, cmap, fix_checks = self._build_common_range_grid("cmp", "turbo")
         self.cmp_yaxis_controls = self._build_y_axis_controls("cmp")
         _cmp_yc_row = QWidget()
         _cmp_yc_h = QHBoxLayout(_cmp_yc_row)
@@ -2141,7 +2146,7 @@ class MainWindow(QMainWindow):
         display_form.setHorizontalSpacing(6)
         display_form.setVerticalSpacing(3)
         self.mcd_map_combo = QComboBox(); self.mcd_map_combo.addItem("Combo")
-        _grid, self.mcd_spins, _a, _b, self.mcd_cmap, _mcd_unused_fix_checks = self._build_common_range_grid("mcd")
+        _grid, self.mcd_spins, _a, _b, self.mcd_cmap, _mcd_unused_fix_checks = self._build_common_range_grid("mcd", "RdBu_r")
         # MCD does not expose fixed-range controls. Keeping only the visible
         # widgets avoids retaining unparented QCheckBoxes after construction.
         self.mcd_fix_checks: Dict[str, QCheckBox] = {}
@@ -2155,7 +2160,6 @@ class MainWindow(QMainWindow):
             # the Energy/B-field inputs to zero width.
             spin.setMinimumWidth(72)
             spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.mcd_cmap.setCurrentText("RdBu_r")
         self.mcd_center_zero_chk = QCheckBox("Zero-centered"); self.mcd_center_zero_chk.setChecked(True)
         self.mcd_auto_v_btn = QPushButton("Auto color")
         self.mcd_pair_b_combo = QComboBox(); self._style_combo_popup(self.mcd_pair_b_combo)
@@ -2484,8 +2488,7 @@ class MainWindow(QMainWindow):
         params_layout.setContentsMargins(0, 0, 0, 0)
         params_layout.setSpacing(4)
 
-        _grid, spins, _, _, cmap, fix_checks = self._build_common_range_grid("power")
-        cmap.setCurrentText("turbo")
+        _grid, spins, _, _, cmap, fix_checks = self._build_common_range_grid("power", "turbo")
         self.power_axis_scale_combo = QComboBox()
         self.power_axis_scale_combo.addItems(["Linear", "Log"])
         self._style_combo_popup(self.power_axis_scale_combo)
@@ -6092,6 +6095,13 @@ class MainWindow(QMainWindow):
     def _mode_cmap(self, mode: str) -> QComboBox:
         return self.pl_cmap if mode == "PL" else self.drr_cmap if mode == "DRR" else self.power_cmap if mode == "Power Dependent" else self.mcd_cmap if mode == "MCD" else self.cmp_cmap
 
+    def _resolved_cmap(self, combo: QComboBox) -> str:
+        value = combo.currentData()
+        if value is None or value == "":
+            value = combo.currentText()
+        default = combo.property("default_cmap") or ""
+        return resolve_cmap(str(value), str(default))
+
     def _mode_log(self, mode: str) -> bool:
         return False if mode == "MCD" else bool(self.pl_log_chk.isChecked()) if mode == "PL" else bool(self.drr_log_chk.isChecked()) if mode == "DRR" else bool(self.power_log_chk.isChecked()) if mode == "Power Dependent" else bool(self.cmp_log_chk.isChecked())
 
@@ -6139,7 +6149,7 @@ class MainWindow(QMainWindow):
             return (
                 mode, self.mcd_map_combo.currentText(), float(self.mcd_spins["vmin"].value()), float(self.mcd_spins["vmax"].value()),
                 float(self.mcd_spins["xmin"].value()), float(self.mcd_spins["xmax"].value()), float(self.mcd_spins["ymin"].value()),
-                float(self.mcd_spins["ymax"].value()), self.mcd_cmap.currentText(),
+                float(self.mcd_spins["ymax"].value()), self._resolved_cmap(self.mcd_cmap),
                 bool(self.mcd_center_zero_chk.isChecked()), int(self.mcd_pair_b_combo.currentData() or 0),
                 float(self.mcd_window_center_spin.value()), float(self.mcd_window_width_spin.value()), self.mcd_window_metric_combo.currentText(),
                 bool(self.mcd_show_raw_chk.isChecked()), bool(self.mcd_show_signed_mean_chk.isChecked()),
@@ -6356,7 +6366,7 @@ class MainWindow(QMainWindow):
             vmax=float(spins["vmax"].value()),
             xlim=(float(spins["xmin"].value()), float(spins["xmax"].value())),
             ylim=(float(spins["ymin"].value()), float(spins["ymax"].value())),
-            cmap=self._mode_cmap(mode).currentText(),
+            cmap=self._resolved_cmap(self._mode_cmap(mode)),
             log_scale=self._mode_log(mode),
             y_axis_log=(mode == "Power Dependent" and self._power_axis_log()),
             center_zero=(bool(self.mcd_center_zero_chk.isChecked()) if mode == "MCD" else mode == "DRR" and bool(self.drr_center_zero_chk.isChecked())),
@@ -8018,7 +8028,7 @@ class MainWindow(QMainWindow):
             "derivative": self.drr_derivative_combo.currentText(),
             "sg_window": int(self.drr_sg_window_spin.value()),
             "sg_poly": int(self.drr_sg_poly_spin.value()),
-            "cmap": self.drr_cmap.currentText(),
+            "cmap": self._resolved_cmap(self.drr_cmap),
             "vmin": float(s["vmin"].value()),
             "vmax": float(s["vmax"].value()),
             "xmin": float(s["xmin"].value()),
@@ -8059,7 +8069,7 @@ class MainWindow(QMainWindow):
                 float(self._power_background_value(
                     [self.loaded.cube] if self.loaded and self.loaded.mode == "Power Dependent" and self.loaded.cube is not None else None
                 )),
-                self.power_cmap.currentText(),
+                self._resolved_cmap(self.power_cmap),
                 float(self.power_spins["vmin"].value()),
                 float(self.power_spins["vmax"].value()),
                 float(self.power_spins["xmin"].value()),
@@ -8086,7 +8096,7 @@ class MainWindow(QMainWindow):
                     )
                 ),
                 self._current_y_axis_spec_for_mode(mode),
-                self.cmp_cmap.currentText(),
+                self._resolved_cmap(self.cmp_cmap),
                 float(self.cmp_spins["vmin"].value()),
                 float(self.cmp_spins["vmax"].value()),
                 float(self.cmp_spins["xmin"].value()),
