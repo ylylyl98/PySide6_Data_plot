@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][ValidatePattern('^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$')][string]$Version,
-    [string]$OutputFile = "DPTK-Setup-Windows-x64.exe"
+    [string]$OutputFile = "DPTK-Setup-Windows-x64.exe",
+    [string]$MakensisPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,10 +11,20 @@ $script = Join-Path $repo "packaging\installer.nsi"
 $output = [System.IO.Path]::GetFullPath((Join-Path $repo $OutputFile))
 if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "Build the PyInstaller application first: $exe" }
 
-$makensis = (Get-Command makensis.exe -ErrorAction SilentlyContinue).Source
-if (-not $makensis) {
-    $candidate = Join-Path ${env:ProgramFiles(x86)} "NSIS\makensis.exe"
-    if (Test-Path -LiteralPath $candidate) { $makensis = $candidate }
+$makensis = $null
+if ($MakensisPath) {
+    $makensis = [System.IO.Path]::GetFullPath($MakensisPath)
+    if (-not (Test-Path -LiteralPath $makensis -PathType Leaf)) { throw "Provided makensis.exe path does not exist: $makensis" }
+} else {
+    $makensis = (Get-Command makensis.exe -ErrorAction SilentlyContinue).Source
+    if (-not $makensis -and ${env:ProgramFiles(x86)}) {
+        $candidate = Join-Path ${env:ProgramFiles(x86)} "NSIS\makensis.exe"
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { $makensis = $candidate }
+    }
+    if (-not $makensis -and $env:ProgramFiles) {
+        $candidate = Join-Path $env:ProgramFiles "NSIS\makensis.exe"
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { $makensis = $candidate }
+    }
 }
 if (-not $makensis) { throw "NSIS makensis.exe was not found." }
 
