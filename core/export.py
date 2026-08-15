@@ -446,20 +446,46 @@ def export_pl_pngs_and_dat(
     return {"png_linear": png_linear, "png_log": png_log, "dat": dat_path}
 
 
+def _drr_grid_token(sg_mode_label: str) -> str:
+    """Map the desktop grid-mode label to its concise filesystem-safe token."""
+    return "OriginLike" if str(sg_mode_label) == "Origin-like" else "Regrid"
+
+
+_TERMINAL_DRR_DERIVATIVE_RE = re.compile(
+    r"_(?:dE|d2E)(?:_W\d+_O\d+)?_(?:Regrid|OriginLike)$"
+)
+
+
+def _strip_terminal_drr_derivative_suffix(stem: str) -> str:
+    """Remove one terminal generated DRR derivative suffix, if present.
+
+    Only suffixes this module itself generates are recognized, so ordinary user
+    filename text such as sample_dE_scan is left untouched.
+    """
+    return _TERMINAL_DRR_DERIVATIVE_RE.sub("", stem)
+
+
 def build_drr_export_base(
     first_file: str,
     avg_count: int,
     mode_label: str,
-    derivative_label: str,
+    derivative_order: int | None,
+    sg_window: int,
+    sg_polyorder: int,
     sg_mode_label: str,
 ) -> str:
-    safe = f"{Path(first_file).stem}_avg{avg_count}"
+    stem = Path(first_file).stem
+    if derivative_order in (1, 2):
+        stem = _strip_terminal_drr_derivative_suffix(stem)
+    safe = f"{stem}_avg{avg_count}"
     suffix = mode_label.replace("/", "_").replace(" ", "_")
-    deriv_tag = "" if derivative_label == "None" else f"_{derivative_label}"
-    sg_tag = ""
-    if derivative_label != "None":
-        sg_tag = "_OriginLike" if sg_mode_label == "Origin-like" else "_Regrid"
-    return f"{safe}_{suffix}{deriv_tag}{sg_tag}"
+    if derivative_order in (1, 2):
+        deriv_tok = "dE" if derivative_order == 1 else "d2E"
+        grid_tok = _drr_grid_token(sg_mode_label)
+        deriv_tag = f"_{deriv_tok}_W{int(sg_window)}_O{int(sg_polyorder)}_{grid_tok}"
+    else:
+        deriv_tag = ""
+    return f"{safe}_{suffix}{deriv_tag}"
 
 
 def export_drr_png_and_dat(
