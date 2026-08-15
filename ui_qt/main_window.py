@@ -249,7 +249,10 @@ class ExportOptions:
     params_log: HeatmapParams | None = None
     params_intensity: HeatmapParams | None = None
     drr_cube: DataCube | None = None
-    drr_derivative_label: str = "None"
+    drr_derivative_order: int | None = None
+    drr_sg_window: int = 20
+    drr_sg_polyorder: int = 2
+    drr_sg_mode_label: str = "More correct (regrid)"
     compare_scale_tag: str = "linear"
     compare_clip: bool = True
     compare_gate: float = 0.0
@@ -396,6 +399,7 @@ class MainWindow(QMainWindow):
         self.folder_refresh_timer.timeout.connect(self._refresh_watched_folder)
         self.recent_folders: List[str] = self._load_recent_folders()
         self.available_files: List[str] = []
+        self.available_map_files: List[str] = []
         self.drr_selected_files: List[str] = []
         self.drr_baseline_files_manual: List[str] = []
         self.drr_baseline_files_found: List[str] = []
@@ -642,7 +646,7 @@ class MainWindow(QMainWindow):
             if not url.isLocalFile():
                 continue
             path = Path(url.toLocalFile())
-            if path.is_dir() or path.suffix.lower() == ".csv":
+            if path.is_dir() or path.suffix.lower() in {".csv", ".xlsx"}:
                 return True
         return False
 
@@ -719,11 +723,11 @@ class MainWindow(QMainWindow):
 
         folders = [path for path in valid_paths if path.is_dir()]
         files = [path for path in valid_paths if path.is_file()]
-        csv_files = [path for path in files if path.suffix.lower() == ".csv"]
-        ignored_count = len(files) - len(csv_files)
+        data_files = [path for path in files if path.suffix.lower() in {".csv", ".xlsx"}]
+        ignored_count = len(files) - len(data_files)
 
-        if folders and csv_files:
-            self._status("Drop ignored: drop either one folder or CSV files from one folder")
+        if folders and data_files:
+            self._status("Drop ignored: drop either one folder or data files from one folder")
             return False
         if len(folders) > 1:
             self._status("Drop ignored: only one folder can be dropped at a time")
@@ -732,17 +736,17 @@ class MainWindow(QMainWindow):
             folder = str(folders[0])
             if not self._set_current_folder(folder):
                 return False
-            self._status(f"Folder set: {folders[0].name} — {len(self.available_files)} CSV files found")
+            self._status(f"Folder set: {folders[0].name} — {len(self.available_map_files)} data files found")
             return True
 
-        if not csv_files:
+        if not data_files:
             if ignored_count > 0:
-                self._status("Drop ignored: only .csv files are supported")
+                self._status("Drop ignored: only .csv or .xlsx files are supported")
             else:
                 self._status("Drop ignored: no supported files detected")
             return False
 
-        parent_folders = list(dict.fromkeys(str(path.parent) for path in csv_files))
+        parent_folders = list(dict.fromkeys(str(path.parent) for path in data_files))
         if len(parent_folders) != 1:
             self._status("Drop ignored: all files must be from the same folder")
             return False
@@ -750,10 +754,10 @@ class MainWindow(QMainWindow):
         if not self._set_current_folder(parent_folders[0]):
             return False
 
-        dropped_names = list(dict.fromkeys(path.name for path in csv_files))
-        selected_names = [name for name in dropped_names if name in self.available_files]
+        dropped_names = list(dict.fromkeys(path.name for path in data_files))
+        selected_names = [name for name in dropped_names if name in self.available_map_files]
         if not selected_names:
-            self._status("Drop ignored: dropped CSV files were not found in the selected folder")
+            self._status("Drop ignored: dropped data files were not found in the selected folder")
             return False
 
         self.pl_files.clearSelection()
@@ -769,15 +773,15 @@ class MainWindow(QMainWindow):
         self._restore_list_selection(self.shg_files, [selected_names[0]])
 
         if len(selected_names) == 1:
-            extra = " Ignored 1 non-CSV file." if ignored_count == 1 else f" Ignored {ignored_count} non-CSV files." if ignored_count else ""
+            extra = " Ignored 1 unsupported file." if ignored_count == 1 else f" Ignored {ignored_count} unsupported files." if ignored_count else ""
             self._status(f"Dropped: {selected_names[0]} — select a tab and press Load.{extra}")
             return True
 
         extra = ""
         if ignored_count == 1:
-            extra = " Ignored 1 non-CSV file."
+            extra = " Ignored 1 unsupported file."
         elif ignored_count > 1:
-            extra = f" Ignored {ignored_count} non-CSV files."
+            extra = f" Ignored {ignored_count} unsupported files."
         self._status(f"Dropped: {len(selected_names)} files from {Path(self.current_folder).name} — select a tab and press Load.{extra}")
         return True
 
@@ -1169,6 +1173,7 @@ class MainWindow(QMainWindow):
         self.pl_files.setMaximumHeight(120)
         self.pl_files.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.pl_files.setToolTip("Select a PL measurement file to load")
+        self.pl_files.itemSelectionChanged.connect(self._on_pl_selection_changed)
         files_layout.addWidget(self.pl_files)
         layout.addWidget(self._make_expander("Measurement File", files, expanded=True))
 
@@ -1688,6 +1693,10 @@ class MainWindow(QMainWindow):
             return "bg"
         if text == "Bias":
             return "bias"
+        if text == "Doping (V)":
+            return "doping"
+        if text == "Efield (V)":
+            return "efield"
         if text == "Advanced...":
             a = float(getattr(self, f"{prefix}_yaxis_a_spin").value())
             b = float(getattr(self, f"{prefix}_yaxis_b_spin").value())
@@ -1696,6 +1705,38 @@ class MainWindow(QMainWindow):
                 raise ValueError("Manual linear-combination coefficients must be finite.")
             return f"linear:{self._format_axis_coeff(a)},{self._format_axis_coeff(b)},{self._format_axis_coeff(c)}"
         raise ValueError(f"Unknown y-axis selection: {text}")
+
+    def _csv_yaxis_items(self) -> list[str]:
+        return ["Auto / Default", "TG", "BG", "Bias", "Advanced..."]
+
+    def _xlsx_yaxis_items(self) -> list[str]:
+        return ["Auto / Default", *data_io.XLSX_Y_LABEL_OPTIONS]
+
+    def _repopulate_yaxis_combo(self, prefix: str, *, xlsx: bool) -> None:
+        combo: QComboBox = getattr(self, f"{prefix}_yaxis_combo", None)
+        if combo is None:
+            return
+        items = self._xlsx_yaxis_items() if xlsx else self._csv_yaxis_items()
+        current = combo.currentText()
+        blocked = combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItems(items)
+            combo.setCurrentText(current if current in items else "Auto / Default")
+        finally:
+            combo.blockSignals(blocked)
+        self._update_y_axis_controls(prefix)
+
+    def _on_pl_selection_changed(self) -> None:
+        selected = self._selected(self.pl_files)
+        file_name = selected[0] if selected else ""
+        self._repopulate_yaxis_combo("pl", xlsx=data_io.is_xlsx_map_file(file_name))
+
+    def _repopulate_drr_yaxis(self) -> None:
+        if not hasattr(self, "drr_yaxis_combo"):
+            return
+        first = self.drr_selected_files[0] if self.drr_selected_files else ""
+        self._repopulate_yaxis_combo("drr", xlsx=data_io.is_xlsx_map_file(first))
 
     def _make_expander(self, title: str, content: QWidget, *, expanded: bool = True) -> QWidget:
         box = QWidget()
@@ -4775,7 +4816,9 @@ class MainWindow(QMainWindow):
 
     def _open_file(self) -> None:
         start = self.current_folder or self._browse_start_folder()
-        file_path, _ = QFileDialog.getOpenFileName(self, "Open CSV File", start, "CSV (*.csv)")
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Open Data File", start, "Data files (*.csv *.xlsx)"
+        )
         if not file_path:
             return
         path = Path(file_path)
@@ -4805,15 +4848,17 @@ class MainWindow(QMainWindow):
         self.pl_files.clear()
         if not self.current_folder:
             self.available_files = []
+            self.available_map_files = []
             return
         self.available_files = data_io.list_csv_files(self.current_folder)
-        self.pl_files.addItems(self.available_files)
-        self._restore_list_selection(self.pl_files, [f for f in pl_selected if f in self.available_files])
+        self.available_map_files = data_io.list_map_input_files(self.current_folder)
+        self.pl_files.addItems(self.available_map_files)
+        self._restore_list_selection(self.pl_files, [f for f in pl_selected if f in self.available_map_files])
         self._cmp_set_channel_combo_items()
         self._power_refresh_groups()
         self._mcd_refresh_sources()
         self._shg_refresh_sources()
-        self.drr_selected_files = [f for f in self.drr_selected_files if f in self.available_files]
+        self.drr_selected_files = [f for f in self.drr_selected_files if f in self.available_map_files]
         self.drr_baseline_files_manual = [f for f in self.drr_baseline_files_manual if f in self.available_files]
         self.drr_baseline_files_found = [f for f in self.drr_baseline_files_found if f in self.available_files]
         self._cmp_auto_assign_channels()
@@ -4862,14 +4907,27 @@ class MainWindow(QMainWindow):
             if self.drr_baseline_files_manual
             else "No external baseline files selected."
         )
+        self._repopulate_drr_yaxis()
+
+    def _reject_mixed_xlsx_selection(self, selected: List[str]) -> None:
+        if not selected:
+            return
+        xlsx = [name for name in selected if data_io.is_xlsx_map_file(name)]
+        if not xlsx:
+            return
+        if len(xlsx) != 1 or len(selected) != 1:
+            raise ValueError("Select exactly one XLSX map for direct DR/R display (XLSX maps cannot be mixed with CSV measurements).")
 
     def _edit_drr_measurements(self) -> None:
-        self.drr_selected_files = self._open_dual_list_dialog(
+        selected = self._open_dual_list_dialog(
             title="Measurement Files",
             selected=self.drr_selected_files,
             enable_group_auto=True,
             enable_back_auto=False,
+            candidates=self.available_map_files,
         )
+        self._reject_mixed_xlsx_selection(selected)
+        self.drr_selected_files = selected
         self._update_drr_selection_labels()
         if self.loaded and self.loaded.mode == "DRR":
             self._start_load("DRR")
@@ -4896,7 +4954,10 @@ class MainWindow(QMainWindow):
         selected: List[str],
         enable_group_auto: bool,
         enable_back_auto: bool,
+        candidates: List[str] | None = None,
     ) -> List[str]:
+        if candidates is None:
+            candidates = self.available_files
         dlg = QDialog(self)
         dlg.setWindowTitle(title)
         if not self.windowIcon().isNull():
@@ -4936,7 +4997,7 @@ class MainWindow(QMainWindow):
             file_list.setItemDelegate(WrappedFilenameDelegate(file_list))
 
         selected_set = set(selected)
-        for f in self.available_files:
+        for f in candidates:
             if f not in selected_set:
                 available.addItem(f)
         current.addItems(selected)
@@ -5001,7 +5062,7 @@ class MainWindow(QMainWindow):
             needle = filter_edit.text().strip().lower()
             selected_now = [current.item(i).text() for i in range(current.count())]
             available.clear()
-            for f in self.available_files:
+            for f in candidates:
                 if f in selected_now:
                     continue
                 if not needle or needle in f.lower():
@@ -5025,7 +5086,7 @@ class MainWindow(QMainWindow):
 
         if enable_back_auto:
             def _auto_back() -> None:
-                matches = [f for f in self.available_files if "back" in f.lower()]
+                matches = [f for f in candidates if "back" in f.lower()]
                 current.clear()
                 current.addItems(matches)
                 _filter()
@@ -5034,7 +5095,7 @@ class MainWindow(QMainWindow):
 
         if enable_group_auto:
             def _auto_group() -> None:
-                groups = group_measurement_files(self.available_files)
+                groups = group_measurement_files(candidates)
                 if not groups:
                     return
                 largest_key = max(groups.keys(), key=lambda k: len(groups[k]))
@@ -5385,7 +5446,12 @@ class MainWindow(QMainWindow):
                 self._status(f"State: SG window clamped to {used_win} (odd, valid for order={poly}).")
         return used_win
 
-    def _drr_cube_for_display(self) -> DataCube:
+    def _drr_cube_with_metadata(self) -> tuple[DataCube, int | None, int, int]:
+        """Return the DRR cube plus the derivative parameters actually applied.
+
+        The window is the clamped/validated value returned by the calculation,
+        not the raw UI request.
+        """
         if not self.loaded or self.loaded.mode != "DRR" or self.loaded.cube is None:
             raise ValueError("No DRR data loaded.")
         deriv = self._drr_derivative_value()
@@ -5399,6 +5465,10 @@ class MainWindow(QMainWindow):
         )
         if deriv is not None and used_win != req_win:
             self._status(f"State: SG window adjusted to {used_win}.")
+        return cube, deriv, used_win, poly
+
+    def _drr_cube_for_display(self) -> DataCube:
+        cube, _deriv, _used_win, _poly = self._drr_cube_with_metadata()
         return cube
 
     def _start_load(self, mode: str) -> None:
@@ -5566,6 +5636,24 @@ class MainWindow(QMainWindow):
             )
 
         if mode == "DRR":
+            self._reject_mixed_xlsx_selection(options.selected_files)
+            if options.selected_files and data_io.is_xlsx_map_file(options.selected_files[0]):
+                cube = data_io.load_drr_map_cube(
+                    folder, options.selected_files[0], y_axis=options.y_axis_spec
+                )
+                return LoadedState(
+                    mode="DRR",
+                    folder=folder,
+                    primary_file=options.selected_files[0],
+                    selected_files=options.selected_files,
+                    baseline_files=[],
+                    cube=cube,
+                    drr_mode_label="DR/R Map",
+                    drr_derivative_label="None",
+                    drr_baseline_text="None",
+                    drr_baseline_which="last",
+                    y_axis_spec=options.y_axis_spec,
+                )
             baseline = options.drr_baseline_text
             if baseline == "External":
                 if not options.baseline_files:
@@ -8152,7 +8240,12 @@ class MainWindow(QMainWindow):
             or y_axis_spec != getattr(self.loaded, "y_axis_spec", "auto")
         )
         if needs_reload:
-            if baseline_text == "External":
+            self._reject_mixed_xlsx_selection(selected)
+            if selected and data_io.is_xlsx_map_file(selected[0]):
+                cube = data_io.load_drr_map_cube(self.current_folder, selected[0], y_axis=y_axis_spec)
+                mode_label = "DR/R Map"
+                baselines = []
+            elif baseline_text == "External":
                 if not baselines:
                     raise ValueError("External DRR mode requires baseline files.")
                 cube = data_io.load_drr_external_cube(
@@ -8434,6 +8527,9 @@ class MainWindow(QMainWindow):
         power_vp_payload = None
         params_intensity: HeatmapParams | None = None
         power_records = tuple(self.loaded.power_records) if self.loaded and self.loaded.mode == "Power Dependent" else ()
+        drr_deriv: int | None = None
+        drr_used_win = 0
+        drr_poly = 0
         if mode == "SHG Processing" and self.loaded.shg_result is not None:
             params = None
             export_cube = None
@@ -8442,7 +8538,7 @@ class MainWindow(QMainWindow):
             params = self._make_params(mode, export_cube)
         elif mode in {"PL", "DRR", "Power Dependent"} and self.loaded.cube is not None:
             if mode == "DRR":
-                export_cube = self._drr_cube_for_display()
+                export_cube, drr_deriv, drr_used_win, drr_poly = self._drr_cube_with_metadata()
                 params = self._make_params(mode, export_cube)
             elif mode == "Power Dependent":
                 if self._power_view() == "VP":
@@ -8540,7 +8636,10 @@ class MainWindow(QMainWindow):
                 mode=mode,
                 params=params,
                 drr_cube=export_cube,
-                drr_derivative_label=self.drr_derivative_combo.currentText(),
+                drr_derivative_order=drr_deriv,
+                drr_sg_window=drr_used_win,
+                drr_sg_polyorder=drr_poly,
+                drr_sg_mode_label="More correct (regrid)",
                 auto_move_sources=bool(self.auto_move_after_export_chk.isChecked()),
             )
         elif mode == "Power Dependent":
@@ -8642,8 +8741,10 @@ class MainWindow(QMainWindow):
                 loaded.primary_file,
                 len(loaded.selected_files),
                 loaded.drr_mode_label,
-                options.drr_derivative_label,
-                "More correct (regrid)",
+                options.drr_derivative_order,
+                options.drr_sg_window,
+                options.drr_sg_polyorder,
+                options.drr_sg_mode_label,
             )
             paths = export_drr_png_and_dat(folder, cube=options.drr_cube, params=options.params, export_base=base)
             log.emit(f"Exported PNG: {paths['png'].name}")

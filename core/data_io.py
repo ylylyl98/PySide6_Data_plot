@@ -8,12 +8,16 @@ from typing import Dict, List, Sequence
 import numpy as np
 import pandas as pd
 
-from core.file_ops import archive_selected, list_root_csvs
+from core.file_ops import _nat_key, archive_selected, list_root_csvs
 from core.loader import (
     DataCube,
+    XLSX_Y_LABEL_OPTIONS,
     build_external_baseline,
+    is_xlsx_map_file,
     load_drr_avg,
     load_pl,
+    load_xlsx_map,
+    resolve_xlsx_y_label,
 )
 from core import processing_run as processing_impl
 from core.processing import (
@@ -109,6 +113,18 @@ def list_csv_files(folder: str) -> List[str]:
     return list_root_csvs(folder)
 
 
+def list_map_input_files(folder: str) -> List[str]:
+    """Return root-level CSV and XLSX map filenames, naturally sorted."""
+    p = Path(folder)
+    if not p.exists() or not p.is_dir():
+        return []
+    try:
+        names = {f.name for f in p.glob("*.csv")} | {f.name for f in p.glob("*.xlsx")}
+    except OSError:
+        return []
+    return sorted(names, key=_nat_key)
+
+
 def list_shg_csv_files(folder: str, files: Sequence[str]) -> List[str]:
     return [file_name for file_name in files if inspect_shg_csv(folder, file_name)]
 
@@ -123,6 +139,11 @@ def move_selected_to_archive(folder: str, file_names: Sequence[str], archive_nam
 
 def load_pl_cube(folder: str, file_name: str, *, log_scale: bool = False, y_axis: str = "auto") -> DataCube:
     return load_pl(folder, file_name, log_scale=log_scale, y_axis=y_axis)
+
+
+def load_drr_map_cube(folder: str, file_name: str, *, y_axis: str = "auto") -> DataCube:
+    """Display a precomputed dR/R XLSX map directly, without ratio processing."""
+    return load_pl(folder, file_name, log_scale=False, y_axis=y_axis)
 
 
 def load_drr_self_cube(
