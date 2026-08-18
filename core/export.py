@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import re
 import textwrap
@@ -23,12 +25,80 @@ from core.processing import background_correct_cube, parse_compare_gate_conditio
 from core.processing_run import save_as_dat
 from core.shg import ShgProcessResult, ShgSettings, ShgSweepData
 from core.shg_fit import ShgAngularFitResult, ShgTwistFitResult
+from app_version import __version__
 
 
 # Match the Streamlit-style export geometry used by the desktop app.
 EXPORT_FIGSIZE = (8.0, 6.2)
 EXPORT_DPI = 150
 DEFAULT_PROCESSED = "Processed Data"
+EXPORT_METADATA_SCHEMA_VERSION = 1
+
+
+def _metadata_jsonable(value):
+    if is_dataclass(value):
+        return {key: _metadata_jsonable(item) for key, item in asdict(value).items()}
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _metadata_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_metadata_jsonable(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _source_descriptor(folder: str, file_name: str, *, role: str = "source") -> dict:
+    raw = str(file_name)
+    path = Path(raw)
+    if not path.is_absolute():
+        path = Path(folder) / path
+    descriptor = {"role": role, "name": raw, "exists": path.is_file()}
+    if not path.is_file():
+        return descriptor
+    descriptor.update({
+        "size_bytes": path.stat().st_size,
+        "modified_utc": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(),
+    })
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    descriptor["sha256"] = digest.hexdigest()
+    return descriptor
+
+
+def write_export_metadata(
+    folder: str,
+    output_paths: Iterable[Path],
+    *,
+    operation: str,
+    input_files: Iterable[tuple[str, str]] = (),
+    processing: dict | None = None,
+    plot: object | None = None,
+    outputs: Iterable[Path] | None = None,
+    extra: dict | None = None,
+) -> Path:
+    paths = [Path(path) for path in output_paths]
+    if not paths:
+        raise ValueError("At least one output path is required for metadata.")
+    output_list = [Path(path) for path in (outputs or paths)]
+    payload = {
+        "schema_version": EXPORT_METADATA_SCHEMA_VERSION,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "app_version": __version__,
+        "operation": operation,
+        "inputs": [_source_descriptor(folder, name, role=role) for role, name in input_files if name],
+        "processing": _metadata_jsonable(processing or {}),
+        "plot": _metadata_jsonable(plot or {}),
+        "outputs": [path.name for path in output_list],
+    }
+    if extra:
+        payload.update(_metadata_jsonable(extra))
+    metadata_path = paths[0].with_suffix(".metadata.json")
+    metadata_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return metadata_path
 
 
 def ensure_processed_dir(folder: str, processed_name: str = DEFAULT_PROCESSED) -> Path:
@@ -421,6 +491,7 @@ def export_pl_pngs_and_dat(
     params_linear: HeatmapParams,
     params_log: HeatmapParams,
     processed_name: str = DEFAULT_PROCESSED,
+    metadata_input_files: Iterable[tuple[str, str]] = (),
 ) -> Dict[str, Path]:
     out_dir = ensure_processed_dir(folder, processed_name)
     safe = Path(file_name).stem
@@ -443,7 +514,17 @@ def export_pl_pngs_and_dat(
             energy_unit="eV",
         )
     )
-    return {"png_linear": png_linear, "png_log": png_log, "dat": dat_path}
+    paths = {"png_linear": png_linear, "png_log": png_log, "dat": dat_path}
+    write_export_metadata(
+        folder,
+        [dat_path],
+        operation="PL",
+        input_files=metadata_input_files or (("measurement", file_name),),
+        processing={"y_axis": cube_linear.gate_label},
+        plot={"linear": params_linear, "log": params_log},
+        outputs=paths.values(),
+    )
+    return paths
 
 
 def _drr_grid_token(sg_mode_label: str) -> str:
@@ -496,6 +577,8 @@ def export_drr_png_and_dat(
     export_base: str,
     processed_name: str = DEFAULT_PROCESSED,
     drr_style: bool = True,
+    metadata_input_files: Iterable[tuple[str, str]] = (),
+    metadata_processing: dict | None = None,
 ) -> Dict[str, Path]:
     """Export one heatmap and its DAT table.
 
@@ -519,7 +602,17 @@ def export_drr_png_and_dat(
             energy_unit="eV",
         )
     )
-    return {"png": png_path, "dat": dat_path}
+    paths = {"png": png_path, "dat": dat_path}
+    write_export_metadata(
+        folder,
+        [dat_path],
+        operation="DR/R" if drr_style else "MCD",
+        input_files=metadata_input_files,
+        processing=metadata_processing or {},
+        plot=params,
+        outputs=paths.values(),
+    )
+    return paths
 
 
 def power_series_export_base(group_key: str, *, y_axis_log: bool) -> str:
@@ -625,6 +718,7 @@ def export_power_series_png_and_dat(
     processed_name: str = DEFAULT_PROCESSED,
 ) -> Dict[str, Path]:
     out_dir = ensure_processed_dir(folder, processed_name)
+    records = tuple(records)
     base = power_series_export_base(group_key, y_axis_log=y_axis_log)
     png_path = _unique_path(out_dir, base, ".png")
     _save_heatmap_png(png_path, cube, params, drr=False)
@@ -644,6 +738,15 @@ def export_power_series_png_and_dat(
             *_split_scale_header_lines(params),
             *_power_record_header_lines(records),
         ],
+    )
+    write_export_metadata(
+        folder,
+        [dat_path],
+        operation="Power Dependent",
+        input_files=[("measurement", str(getattr(record, "file_name", ""))) for record in records],
+        processing={"group_key": group_key, "background_constant": background, "y_axis_log": y_axis_log},
+        plot=params,
+        outputs=(png_path, dat_path),
     )
     return {"png": png_path, "dat": dat_path}
 
@@ -747,9 +850,15 @@ def export_shg_results(
 
     settings_payload = {
         "mode": "SHG Processing",
+        "schema_version": EXPORT_METADATA_SCHEMA_VERSION,
+        "app_version": __version__,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "source_csv": data.source_file,
         "background_csv": result.background_file,
+        "inputs": [
+            _source_descriptor(folder, data.source_file, role="measurement"),
+            *([_source_descriptor(folder, result.background_file, role="background")] if result.background_file else []),
+        ],
         "detected_columns": data.detected_columns,
         "wavelength_range_nm": [
             float(np.nanmin(data.wavelength_nm)),
@@ -917,9 +1026,17 @@ def export_shg_twist_comparison(
 
     settings_payload = {
         "mode": "SHG Compare / Twist Angle",
+        "schema_version": EXPORT_METADATA_SCHEMA_VERSION,
+        "app_version": __version__,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "reference_csv": reference_data.source_file,
         "sample_csv": sample_data.source_file,
+        "inputs": [
+            _source_descriptor(folder, reference_data.source_file, role="reference"),
+            _source_descriptor(folder, sample_data.source_file, role="sample"),
+            *([_source_descriptor(folder, reference_result.background_file, role="reference_background")] if reference_result.background_file else []),
+            *([_source_descriptor(folder, sample_result.background_file, role="sample_background")] if sample_result.background_file else []),
+        ],
         "processing_settings": settings.to_dict(),
         "twist_fit": twist.to_dict(),
     }
@@ -1182,6 +1299,19 @@ def export_compare_panels(
                 *_split_scale_header_lines(params),
             ],
         )
+        write_export_metadata(
+            folder,
+            [dat_path],
+            operation=f"Compare/{key}",
+            input_files=[("source", source_files[key])],
+            processing={
+                "scale": scale_tag,
+                "background_constant": correction_background,
+                "clip_outliers": clip_outliers,
+            },
+            plot=panel_params,
+            outputs=(png_path, dat_path),
+        )
         written.extend([png_path, dat_path])
 
     if export_vp and "KK" in cubes and "KKp" in cubes:
@@ -1225,6 +1355,18 @@ def export_compare_panels(
                 f"xlim={params.xlim}",
                 f"ylim={params.ylim}",
             ],
+        )
+        write_export_metadata(
+            folder,
+            [dat_path],
+            operation="Compare/VP",
+            input_files=[
+                ("source_KK", source_files.get("KK", "")),
+                ("source_KKp", source_files.get("KKp", "")),
+            ],
+            processing={"background_constant": correction_background, "formula": "(KK_corr-KKp_corr)/(KK_corr+KKp_corr)"},
+            plot=vp_params,
+            outputs=(png_path, dat_path),
         )
         written.extend([png_path, dat_path])
     return written

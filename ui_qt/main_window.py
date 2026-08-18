@@ -8731,6 +8731,7 @@ class MainWindow(QMainWindow):
                 cube_log=log_cube,
                 params_linear=options.params_linear,
                 params_log=options.params_log,
+                metadata_input_files=(("measurement", loaded.primary_file),),
             )
             log.emit(f"Exported PNG: {paths['png_linear'].name}, {paths['png_log'].name}")
             log.emit(f"Exported DAT: {paths['dat'].name}")
@@ -8746,7 +8747,27 @@ class MainWindow(QMainWindow):
                 options.drr_sg_polyorder,
                 options.drr_sg_mode_label,
             )
-            paths = export_drr_png_and_dat(folder, cube=options.drr_cube, params=options.params, export_base=base)
+            drr_inputs = [("measurement", name) for name in loaded.selected_files]
+            drr_inputs.extend(("background", name) for name in loaded.baseline_files)
+            paths = export_drr_png_and_dat(
+                folder,
+                cube=options.drr_cube,
+                params=options.params,
+                export_base=base,
+                metadata_input_files=drr_inputs,
+                metadata_processing={
+                    "mode": loaded.drr_mode_label,
+                    "baseline_selection": loaded.drr_baseline_text,
+                    "baseline_which": loaded.drr_baseline_which,
+                    "average_count": len(loaded.selected_files),
+                    "average_method": "per-file dR/R, then nanmean",
+                    "derivative_order": options.drr_derivative_order,
+                    "savgol_window": options.drr_sg_window,
+                    "savgol_polyorder": options.drr_sg_polyorder,
+                    "derivative_grid": options.drr_sg_mode_label,
+                    "y_axis": loaded.y_axis_spec,
+                },
+            )
             log.emit(f"Exported PNG: {paths['png'].name}")
             log.emit(f"Exported DAT: {paths['dat'].name}")
             out_folder = str(paths["png"].parent)
@@ -8765,6 +8786,15 @@ class MainWindow(QMainWindow):
                 params=mcd_export_params,
                 export_base=base,
                 drr_style=False,
+                metadata_input_files=[
+                    ("measurement", name) for name in (loaded.selected_files or [loaded.primary_file])
+                ] + [("background", name) for name in loaded.baseline_files],
+                metadata_processing={
+                    "map": options.mcd_map_name,
+                    "window_center_ev": options.mcd_window_center_ev,
+                    "window_width_mev": options.mcd_window_width_mev,
+                    "window_metric": options.mcd_window_metric,
+                },
             )
             analysis_paths = export_mcd_analysis_bundle(
                 loaded.mcd_result, str(paths["png"].parent), trace_map=options.mcd_map_name,
