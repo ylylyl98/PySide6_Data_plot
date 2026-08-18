@@ -77,6 +77,7 @@ from core.mcd import (
 )
 from core.export import (
     build_drr_export_base,
+    create_unique_package_dir,
     compare_source_title,
     export_compare_panels,
     export_drr_png_and_dat,
@@ -88,7 +89,8 @@ from core.export import (
     vp_compare_export_base,
     vp_compare_title,
 )
-from core.loader import DataCube
+from core.loader import DataCube, resolve_dat_y_axis
+from core.provenance import WorkingCopyRecord, cleanup_working_copy, verify_initial_data_working_file
 from core.plotting import (
     COMPARE_PANEL_ORDER,
     HeatmapParams,
@@ -195,6 +197,7 @@ class LoadedState:
     drr_baseline_text: str = "Self (last frame)"
     drr_baseline_which: str = "last"
     y_axis_spec: str = "auto"
+    provenance_records: tuple[WorkingCopyRecord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -284,7 +287,7 @@ class ExportOptions:
     mcd_show_integral: bool = False
     mcd_fit_near_zero: bool = False
     mcd_fit_window_t: float = 0.2
-    auto_move_sources: bool = False
+    cleanup_verified_sources: bool = False
 
 
 class WorkerSignals(QObject):
@@ -646,7 +649,7 @@ class MainWindow(QMainWindow):
             if not url.isLocalFile():
                 continue
             path = Path(url.toLocalFile())
-            if path.is_dir() or path.suffix.lower() in {".csv", ".xlsx"}:
+            if path.is_dir() or path.suffix.lower() in {".csv", ".xlsx", ".dat"}:
                 return True
         return False
 
@@ -670,7 +673,7 @@ class MainWindow(QMainWindow):
             return
         self._set_drop_highlight(False)
         if event.mimeData().hasUrls():
-            self._status("Drop ignored: only .csv files or folders are supported")
+            self._status("Drop ignored: only .csv, .xlsx, .dat files or folders are supported")
         event.ignore()
 
     def dragMoveEvent(self, event: QDragMoveEvent) -> None:
@@ -696,7 +699,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         if not self._drop_has_csv(event.mimeData()):
-            self._status("Drop ignored: only .csv files or folders are supported")
+            self._status("Drop ignored: only .csv, .xlsx, .dat files or folders are supported")
             event.ignore()
             return
         paths: list[Path] = []
@@ -723,7 +726,7 @@ class MainWindow(QMainWindow):
 
         folders = [path for path in valid_paths if path.is_dir()]
         files = [path for path in valid_paths if path.is_file()]
-        data_files = [path for path in files if path.suffix.lower() in {".csv", ".xlsx"}]
+        data_files = [path for path in files if path.suffix.lower() in {".csv", ".xlsx", ".dat"}]
         ignored_count = len(files) - len(data_files)
 
         if folders and data_files:
@@ -741,7 +744,7 @@ class MainWindow(QMainWindow):
 
         if not data_files:
             if ignored_count > 0:
-                self._status("Drop ignored: only .csv or .xlsx files are supported")
+                self._status("Drop ignored: only .csv, .xlsx, or .dat files are supported")
             else:
                 self._status("Drop ignored: no supported files detected")
             return False
@@ -1195,6 +1198,19 @@ class MainWindow(QMainWindow):
         _pl_yc_h.addWidget(cmap)
         cfg.addRow("Y-axis", _pl_yc_row)
         cfg.addRow("", self.pl_yaxis_advanced_box)
+        self.pl_dat_yaxis_label_edit = QLineEdit()
+        self.pl_dat_yaxis_label_edit.setPlaceholderText("Custom Y-axis label")
+        self.pl_dat_yaxis_unit_edit = QLineEdit()
+        self.pl_dat_yaxis_unit_edit.setPlaceholderText("Optional unit")
+        dat_y_row = QWidget()
+        dat_y_layout = QHBoxLayout(dat_y_row)
+        dat_y_layout.setContentsMargins(0, 0, 0, 0)
+        dat_y_layout.setSpacing(6)
+        dat_y_layout.addWidget(self.pl_dat_yaxis_label_edit)
+        dat_y_layout.addWidget(self.pl_dat_yaxis_unit_edit)
+        cfg.addRow("Imported DAT Y", dat_y_row)
+        self.pl_dat_yaxis_label_edit.setVisible(False)
+        self.pl_dat_yaxis_unit_edit.setVisible(False)
         params_layout.addLayout(cfg)
         for s in spins.values():
             s.setFixedWidth(UI_METRICS["spin_w"])
@@ -1697,6 +1713,10 @@ class MainWindow(QMainWindow):
             return "doping"
         if text == "Efield (V)":
             return "efield"
+        if prefix == "pl" and text in {"Y", "Doping", "Electric field", "Gate voltage", "Custom"}:
+            label = self.pl_dat_yaxis_label_edit.text() if text == "Custom" else ""
+            unit = self.pl_dat_yaxis_unit_edit.text()
+            return f"dat:{text}:{label}:{unit}"
         if text == "Advanced...":
             a = float(getattr(self, f"{prefix}_yaxis_a_spin").value())
             b = float(getattr(self, f"{prefix}_yaxis_b_spin").value())
@@ -1716,7 +1736,11 @@ class MainWindow(QMainWindow):
         combo: QComboBox = getattr(self, f"{prefix}_yaxis_combo", None)
         if combo is None:
             return
-        items = self._xlsx_yaxis_items() if xlsx else self._csv_yaxis_items()
+        file_name = self._selected(self.pl_files)[0] if prefix == "pl" and self._selected(self.pl_files) else ""
+        if prefix == "pl" and Path(file_name).suffix.lower() == ".dat":
+            items = ["Y", "Doping", "Electric field", "Gate voltage", "Custom"]
+        else:
+            items = self._xlsx_yaxis_items() if xlsx else self._csv_yaxis_items()
         current = combo.currentText()
         blocked = combo.blockSignals(True)
         try:
@@ -1726,6 +1750,10 @@ class MainWindow(QMainWindow):
         finally:
             combo.blockSignals(blocked)
         self._update_y_axis_controls(prefix)
+        if prefix == "pl":
+            is_dat = Path(file_name).suffix.lower() == ".dat"
+            self.pl_dat_yaxis_label_edit.setVisible(is_dat and combo.currentText() == "Custom")
+            self.pl_dat_yaxis_unit_edit.setVisible(is_dat)
 
     def _on_pl_selection_changed(self) -> None:
         selected = self._selected(self.pl_files)
@@ -4153,8 +4181,8 @@ class MainWindow(QMainWindow):
         file_layout.setContentsMargins(8, 8, 8, 8)
         file_layout.setSpacing(6)
         file_hint = QLabel(
-            "After export, source CSV files can be moved to an archive folder "
-            "('Initial data after processing') to keep the workspace clean."
+            "After export, source files remain in place. Use 'Move Exported Sources' "
+            "only when you intentionally want to archive them."
         )
         file_hint.setWordWrap(True)
         file_hint.setStyleSheet("QLabel { color: #6e6e73; font-size: 10px; }")
@@ -4276,19 +4304,21 @@ class MainWindow(QMainWindow):
         self.plot_action.setToolTip("Plot/update current state")
         self.save_action = QAction(self.style().standardIcon(QStyle.SP_DialogSaveButton), "Save PNG + DAT", self)
         self.save_action.setToolTip("Export for the active tab")
-        self.auto_move_after_export_chk = QCheckBox("Auto move after save")
-        self.auto_move_after_export_chk.setChecked(False)
-        self.auto_move_after_export_chk.setToolTip("After export, move source CSVs to 'Initial data after processing'.")
         self.move_now_btn = QPushButton("Move Exported Sources")
         self.move_now_btn.setEnabled(False)
         self.move_now_btn.setToolTip("Save first to enable moving exported source files.")
+        self.clean_verified_sources_chk = QCheckBox("Clean verified source copies after successful export")
+        self.clean_verified_sources_chk.setChecked(False)
+        self.clean_verified_sources_chk.setToolTip(
+            "Only verified root-level files matching Initial Data by SHA-256 can be deleted."
+        )
         toolbar.addAction(self.load_action)
         toolbar.addAction(self.plot_action)
         toolbar.addAction(self.save_action)
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         toolbar.addWidget(spacer)
-        toolbar.addWidget(self.auto_move_after_export_chk)
+        toolbar.addWidget(self.clean_verified_sources_chk)
         toolbar.addWidget(self.move_now_btn)
 
     def _wire_actions(self) -> None:
@@ -4339,6 +4369,9 @@ class MainWindow(QMainWindow):
         self.pl_auto_x_btn.clicked.connect(self._auto_pl_xrange)
         self.pl_auto_y_btn.clicked.connect(self._auto_pl_yrange)
         self.pl_yaxis_combo.currentTextChanged.connect(self._on_pl_plot_param_changed)
+        self.pl_yaxis_combo.currentTextChanged.connect(self._on_pl_dat_y_axis_changed)
+        self.pl_dat_yaxis_label_edit.textChanged.connect(lambda _text: self._on_pl_plot_param_changed())
+        self.pl_dat_yaxis_unit_edit.textChanged.connect(lambda _text: self._on_pl_plot_param_changed())
         self.pl_yaxis_a_spin.valueChanged.connect(self._on_pl_plot_param_changed)
         self.pl_yaxis_b_spin.valueChanged.connect(self._on_pl_plot_param_changed)
         self.pl_yaxis_c_spin.valueChanged.connect(self._on_pl_plot_param_changed)
@@ -4618,8 +4651,30 @@ class MainWindow(QMainWindow):
 
     def _on_pl_plot_param_changed(self) -> None:
         self._invalidate_export_move_sources()
+        self._apply_dat_y_axis_selection()
         if self.loaded and self.loaded.mode == "PL":
             self._plot_mode("PL")
+
+    def _apply_dat_y_axis_selection(self) -> None:
+        if not self.loaded or self.loaded.mode != "PL" or not self.loaded.cube:
+            return
+        if Path(self.loaded.primary_file or "").suffix.lower() != ".dat":
+            return
+        label, unit, semantic = resolve_dat_y_axis(
+            self.pl_yaxis_combo.currentText(),
+            custom_label=self.pl_dat_yaxis_label_edit.text(),
+            custom_unit=self.pl_dat_yaxis_unit_edit.text(),
+        )
+        self.loaded.cube.gate_label = label
+        self.loaded.cube.gate_unit = unit
+        self.loaded.cube.y_axis_semantic = semantic
+
+    def _on_pl_dat_y_axis_changed(self, _text: str) -> None:
+        is_dat = Path((self.loaded.primary_file if self.loaded else "") or "").suffix.lower() == ".dat"
+        custom = self.pl_yaxis_combo.currentText() == "Custom"
+        self.pl_dat_yaxis_label_edit.setVisible(is_dat and custom)
+        self.pl_dat_yaxis_unit_edit.setVisible(is_dat)
+        self._on_pl_plot_param_changed()
 
     def _on_mcd_params_changed(self) -> None:
         self._invalidate_export_move_sources()
@@ -4817,7 +4872,7 @@ class MainWindow(QMainWindow):
     def _open_file(self) -> None:
         start = self.current_folder or self._browse_start_folder()
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Open Data File", start, "Data files (*.csv *.xlsx)"
+            self, "Open Data File", start, "Data files (*.csv *.xlsx *.dat)"
         )
         if not file_path:
             return
@@ -5615,12 +5670,39 @@ class MainWindow(QMainWindow):
         worker.signals.finished.connect(self._on_load_finished)
         self.thread_pool.start(worker)
 
+    def _provenance_records_for_load(self, options: LoadOptions) -> tuple[WorkingCopyRecord, ...]:
+        if options.mode not in {"PL", "DRR", "Compare"}:
+            return ()
+        pairs: list[tuple[str, str]] = []
+        if options.mode == "PL":
+            pairs = [("measurement", options.selected_files[0])] if options.selected_files else []
+        elif options.mode == "DRR":
+            pairs = [("measurement", name) for name in options.selected_files]
+            pairs.extend(("background", name) for name in options.baseline_files)
+        else:
+            pairs = [(f"source_{key}", name) for key, name in options.compare_sources.items()]
+        records: list[WorkingCopyRecord] = []
+        for role, name in pairs:
+            path = Path(name)
+            if not path.is_absolute():
+                path = Path(options.folder) / path
+            records.append(
+                verify_initial_data_working_file(
+                    path,
+                    options.folder,
+                    workflow=options.mode,
+                    role=role,
+                )
+            )
+        return tuple(records)
+
     def _load_task(self, options: LoadOptions, *, progress: Signal, log: Signal) -> LoadedState:
         mode = options.mode
         folder = options.folder
         if not options.selected_files:
             raise ValueError("Select required files before loading.")
         log.emit(f"Loading {mode} ...")
+        provenance_records = self._provenance_records_for_load(options)
 
         if mode == "PL":
             cube = data_io.load_pl_cube(
@@ -5633,6 +5715,7 @@ class MainWindow(QMainWindow):
                 selected_files=options.selected_files,
                 cube=cube,
                 y_axis_spec=options.y_axis_spec,
+                provenance_records=provenance_records,
             )
 
         if mode == "DRR":
@@ -5653,6 +5736,7 @@ class MainWindow(QMainWindow):
                     drr_baseline_text="None",
                     drr_baseline_which="last",
                     y_axis_spec=options.y_axis_spec,
+                    provenance_records=provenance_records,
                 )
             baseline = options.drr_baseline_text
             if baseline == "External":
@@ -5689,6 +5773,7 @@ class MainWindow(QMainWindow):
                 drr_baseline_text=baseline,
                 drr_baseline_which=options.drr_baseline_which,
                 y_axis_spec=options.y_axis_spec,
+                provenance_records=provenance_records,
             )
 
         if mode == "MCD":
@@ -5789,6 +5874,7 @@ class MainWindow(QMainWindow):
             compare_cubes=cubes,
             compare_sources=selection.as_pairs(),
             y_axis_spec=options.y_axis_spec,
+            provenance_records=provenance_records,
         )
 
     def _on_loaded(self, loaded: LoadedState) -> None:
@@ -5798,6 +5884,22 @@ class MainWindow(QMainWindow):
         self.last_plotted_mode = None
         self._last_plot_params_key = None
         self._last_plot_cube = None
+        if loaded.mode == "PL" and Path(loaded.primary_file or "").suffix.lower() == ".dat":
+            semantic_to_choice = {
+                "doping": "Doping",
+                "electric_field": "Electric field",
+                "gate_voltage": "Gate voltage",
+                "custom": "Custom",
+            }
+            choice = semantic_to_choice.get(getattr(loaded.cube, "y_axis_semantic", ""), "Y")
+            blocked = self.pl_yaxis_combo.blockSignals(True)
+            self.pl_yaxis_combo.setCurrentText(choice)
+            self.pl_yaxis_combo.blockSignals(blocked)
+            self.pl_dat_yaxis_label_edit.setText(
+                "" if choice != "Custom" else str(getattr(loaded.cube, "gate_label", ""))
+            )
+            self.pl_dat_yaxis_unit_edit.setText(str(getattr(loaded.cube, "gate_unit", "")))
+            self._on_pl_dat_y_axis_changed(choice)
         if loaded.mode == "Power Dependent":
             self._power_refresh_groups()
             idx = self.power_group_combo.findData(loaded.power_group_key)
@@ -6445,10 +6547,13 @@ class MainWindow(QMainWindow):
 
     def _make_params(self, mode: str, cube: DataCube) -> HeatmapParams:
         spins = self._mode_spins(mode)
+        y_label = cube.gate_label
+        if getattr(cube, "gate_unit", ""):
+            y_label = f"{y_label} ({cube.gate_unit})"
         return HeatmapParams(
             title=cube.title,
             xlabel="Photon Energy (eV)",
-            ylabel=cube.gate_label,
+            ylabel=y_label,
             cbar_label=cube.cbar_label,
             vmin=float(spins["vmin"].value()),
             vmax=float(spins["vmax"].value()),
@@ -8629,7 +8734,7 @@ class MainWindow(QMainWindow):
                 params_log=HeatmapParams(
                     **{**params.__dict__, "log_scale": True, "split_scale": log_split}
                 ),
-                auto_move_sources=bool(self.auto_move_after_export_chk.isChecked()),
+                cleanup_verified_sources=bool(self.clean_verified_sources_chk.isChecked()),
             )
         elif mode == "DRR":
             options = ExportOptions(
@@ -8640,7 +8745,7 @@ class MainWindow(QMainWindow):
                 drr_sg_window=drr_used_win,
                 drr_sg_polyorder=drr_poly,
                 drr_sg_mode_label="More correct (regrid)",
-                auto_move_sources=bool(self.auto_move_after_export_chk.isChecked()),
+                cleanup_verified_sources=bool(self.clean_verified_sources_chk.isChecked()),
             )
         elif mode == "Power Dependent":
             options = ExportOptions(
@@ -8660,7 +8765,6 @@ class MainWindow(QMainWindow):
                 power_kkp_records=(power_vp_payload[4] if power_vp_payload else ()),
                 power_pairing_mode=(power_vp_payload[8] if power_vp_payload else self._power_pairing_mode()),
                 power_stage_pairs=(power_vp_payload[9] if power_vp_payload else ()),
-                auto_move_sources=bool(self.auto_move_after_export_chk.isChecked()),
             )
         elif mode == "SHG Processing":
             options = ExportOptions(
@@ -8668,7 +8772,6 @@ class MainWindow(QMainWindow):
                 params=None,
                 shg_settings=self._shg_settings_from_ui(),
                 shg_fit_settings=self._shg_fit_settings_from_ui(),
-                auto_move_sources=bool(self.auto_move_after_export_chk.isChecked()),
             )
         elif mode == "MCD":
             options = ExportOptions(
@@ -8690,7 +8793,6 @@ class MainWindow(QMainWindow):
                 mcd_show_integral=bool(self.mcd_show_integral_chk.isChecked()),
                 mcd_fit_near_zero=bool(self.mcd_fit_zero_chk.isChecked()),
                 mcd_fit_window_t=float(self.mcd_fit_b_window_spin.value()),
-                auto_move_sources=bool(self.auto_move_after_export_chk.isChecked()),
             )
         else:
             compare_background = self._cmp_background_value(
@@ -8706,7 +8808,7 @@ class MainWindow(QMainWindow):
                 compare_gate=float(self.cmp_spins["gate"].value()),
                 compare_background=compare_background,
                 compare_export_vp=True,
-                auto_move_sources=bool(self.auto_move_after_export_chk.isChecked()),
+                cleanup_verified_sources=bool(self.clean_verified_sources_chk.isChecked()),
             )
 
         worker = Worker(self._export_task, self.loaded, options)
@@ -8721,9 +8823,17 @@ class MainWindow(QMainWindow):
         folder = loaded.folder
         out_folder: str | None = None
         files_to_move: list[str] = []
+        metadata_extra = {
+            "provenance": [record.to_dict() for record in loaded.provenance_records]
+        } if mode in {"PL", "DRR", "Compare"} else None
         if mode == "PL" and loaded.primary_file and options.params_linear is not None and options.params_log is not None:
             linear_cube = data_io.load_pl_cube(folder, loaded.primary_file, log_scale=False, y_axis=loaded.y_axis_spec)
             log_cube = data_io.load_pl_cube(folder, loaded.primary_file, log_scale=True, y_axis=loaded.y_axis_spec)
+            if Path(loaded.primary_file).suffix.lower() == ".dat" and loaded.cube is not None:
+                for cube in (linear_cube, log_cube):
+                    cube.gate_label = loaded.cube.gate_label
+                    cube.gate_unit = getattr(loaded.cube, "gate_unit", "")
+                    cube.y_axis_semantic = getattr(loaded.cube, "y_axis_semantic", "")
             paths = export_pl_pngs_and_dat(
                 folder,
                 loaded.primary_file,
@@ -8731,6 +8841,9 @@ class MainWindow(QMainWindow):
                 cube_log=log_cube,
                 params_linear=options.params_linear,
                 params_log=options.params_log,
+                processed_name=str(Path("Processed Data") / "PL"),
+                metadata_input_files=(("measurement", loaded.primary_file),),
+                metadata_extra=metadata_extra,
             )
             log.emit(f"Exported PNG: {paths['png_linear'].name}, {paths['png_log'].name}")
             log.emit(f"Exported DAT: {paths['dat'].name}")
@@ -8746,12 +8859,40 @@ class MainWindow(QMainWindow):
                 options.drr_sg_polyorder,
                 options.drr_sg_mode_label,
             )
-            paths = export_drr_png_and_dat(folder, cube=options.drr_cube, params=options.params, export_base=base)
+            drr_inputs = [("measurement", name) for name in loaded.selected_files]
+            drr_inputs.extend(("background", name) for name in loaded.baseline_files)
+            paths = export_drr_png_and_dat(
+                folder,
+                cube=options.drr_cube,
+                params=options.params,
+                export_base=base,
+                processed_name=str(Path("Processed Data") / "DRR"),
+                metadata_input_files=drr_inputs,
+                metadata_processing={
+                    "mode": loaded.drr_mode_label,
+                    "baseline_selection": loaded.drr_baseline_text,
+                    "baseline_which": loaded.drr_baseline_which,
+                    "average_count": len(loaded.selected_files),
+                    "average_method": "per-file dR/R, then nanmean",
+                    "derivative_order": options.drr_derivative_order,
+                    "savgol_window": options.drr_sg_window,
+                    "savgol_polyorder": options.drr_sg_polyorder,
+                    "derivative_grid": options.drr_sg_mode_label,
+                    "y_axis": loaded.y_axis_spec,
+                },
+                metadata_extra=metadata_extra,
+            )
             log.emit(f"Exported PNG: {paths['png'].name}")
             log.emit(f"Exported DAT: {paths['dat'].name}")
             out_folder = str(paths["png"].parent)
             files_to_move = list(loaded.selected_files) + list(loaded.baseline_files)
         elif mode == "MCD" and options.drr_cube is not None and loaded.mcd_result is not None and loaded.primary_file:
+            package_dir = create_unique_package_dir(
+                Path(folder) / "Processed Data" / "MCD",
+                f"{Path(loaded.primary_file).stem}_MCD_"
+                f"E{options.mcd_window_center_ev:.6f}eV_W{options.mcd_window_width_mev:.6g}meV",
+            )
+            package_subfolder = str(Path("Processed Data") / "MCD" / package_dir.name)
             base = f"{Path(loaded.primary_file).stem}_MCD_{options.mcd_map_name.replace(' ', '_')}"
             # Use the same title and colorbar presentation as a PL export:
             # the source-file stem is the title, while the MCD map identity is
@@ -8764,7 +8905,18 @@ class MainWindow(QMainWindow):
                 cube=options.drr_cube,
                 params=mcd_export_params,
                 export_base=base,
+                processed_name=package_subfolder,
                 drr_style=False,
+                metadata_input_files=[
+                    ("measurement", name) for name in (loaded.selected_files or [loaded.primary_file])
+                ] + [("background", name) for name in loaded.baseline_files],
+                metadata_processing={
+                    "map": options.mcd_map_name,
+                    "window_center_ev": options.mcd_window_center_ev,
+                    "window_width_mev": options.mcd_window_width_mev,
+                    "window_metric": options.mcd_window_metric,
+                },
+                metadata_extra={"package": package_dir.name},
             )
             analysis_paths = export_mcd_analysis_bundle(
                 loaded.mcd_result, str(paths["png"].parent), trace_map=options.mcd_map_name,
@@ -8778,6 +8930,11 @@ class MainWindow(QMainWindow):
                 show_integral=options.mcd_show_integral,
                 fit_near_zero=options.mcd_fit_near_zero,
                 fit_window_t=options.mcd_fit_window_t,
+                package_outputs=(
+                    paths["png"],
+                    paths["dat"],
+                    paths["dat"].with_suffix(".metadata.json"),
+                ),
             )
             log.emit(f"Exported PNG: {paths['png'].name}")
             log.emit(f"Exported DAT: {paths['dat'].name}")
@@ -8790,6 +8947,20 @@ class MainWindow(QMainWindow):
             if options.power_view == "VP":
                 if options.power_kk_cube is None or options.power_kkp_cube is None or options.power_vp_cube is None:
                     raise ValueError("Power VP export requires KK, KKp, and VP cubes.")
+                power_package = create_unique_package_dir(
+                    Path(folder) / "Processed Data" / "Power Dependence",
+                    f"{options.power_kk_group_key}_vs_{options.power_kkp_group_key}_VP",
+                )
+                power_subfolder = str(
+                    Path("Processed Data") / "Power Dependence" / power_package.name
+                )
+                power_metadata = {
+                    "package": power_package.name,
+                    "comparison": {
+                        "KK_group": options.power_kk_group_key,
+                        "KKp_group": options.power_kkp_group_key,
+                    },
+                }
                 paths = export_power_vp_pngs_and_dat(
                     folder,
                     kk_cube=options.power_kk_cube,
@@ -8805,6 +8976,8 @@ class MainWindow(QMainWindow):
                     background=options.power_background,
                     pairing_mode=options.power_pairing_mode,
                     stage_pairs=options.power_stage_pairs,
+                    processed_name=power_subfolder,
+                    metadata_extra=power_metadata,
                 )
                 log.emit(f"Exported {len(paths)} power VP files.")
                 out_folder = str(next(iter(paths.values())).parent) if paths else str(Path(folder))
@@ -8817,6 +8990,20 @@ class MainWindow(QMainWindow):
             elif options.power_view == "Intensity Compare":
                 if options.power_kk_cube is None or options.power_kkp_cube is None:
                     raise ValueError("Power intensity compare export requires KK and KKp cubes.")
+                power_package = create_unique_package_dir(
+                    Path(folder) / "Processed Data" / "Power Dependence",
+                    f"{options.power_kk_group_key}_vs_{options.power_kkp_group_key}_IntensityCompare",
+                )
+                power_subfolder = str(
+                    Path("Processed Data") / "Power Dependence" / power_package.name
+                )
+                power_metadata = {
+                    "package": power_package.name,
+                    "comparison": {
+                        "KK_group": options.power_kk_group_key,
+                        "KKp_group": options.power_kkp_group_key,
+                    },
+                }
                 kk_params = HeatmapParams(**{**options.params.__dict__, "title": options.power_kk_cube.title, "cbar_label": options.power_kk_cube.cbar_label})
                 kkp_params = HeatmapParams(**{**options.params.__dict__, "title": options.power_kkp_cube.title, "cbar_label": options.power_kkp_cube.cbar_label})
                 kk_paths = export_power_series_png_and_dat(
@@ -8827,6 +9014,8 @@ class MainWindow(QMainWindow):
                     group_key=f"KK_{options.power_kk_group_key}",
                     y_axis_log=options.power_axis_log,
                     background=options.power_background,
+                    processed_name=power_subfolder,
+                    metadata_extra=power_metadata,
                 )
                 kkp_paths = export_power_series_png_and_dat(
                     folder,
@@ -8836,6 +9025,8 @@ class MainWindow(QMainWindow):
                     group_key=f"KKp_{options.power_kkp_group_key}",
                     y_axis_log=options.power_axis_log,
                     background=options.power_background,
+                    processed_name=power_subfolder,
+                    metadata_extra=power_metadata,
                 )
                 log.emit(f"Exported PNG: {kk_paths['png'].name}, {kkp_paths['png'].name}")
                 log.emit(f"Exported DAT: {kk_paths['dat'].name}, {kkp_paths['dat'].name}")
@@ -8847,6 +9038,13 @@ class MainWindow(QMainWindow):
                     )
                 )
             else:
+                power_package = create_unique_package_dir(
+                    Path(folder) / "Processed Data" / "Power Dependence",
+                    f"{options.power_group_key}_PowerDep",
+                )
+                power_subfolder = str(
+                    Path("Processed Data") / "Power Dependence" / power_package.name
+                )
                 paths = export_power_series_png_and_dat(
                     folder,
                     cube=options.drr_cube,
@@ -8855,6 +9053,8 @@ class MainWindow(QMainWindow):
                     group_key=loaded.power_group_key,
                     y_axis_log=options.power_axis_log,
                     background=options.power_background,
+                    processed_name=power_subfolder,
+                    metadata_extra={"package": power_package.name},
                 )
                 log.emit(f"Exported PNG: {paths['png'].name}")
                 log.emit(f"Exported DAT: {paths['dat'].name}")
@@ -8866,6 +9066,24 @@ class MainWindow(QMainWindow):
             and loaded.shg_result is not None
             and options.shg_settings is not None
         ):
+            if loaded.shg_compare:
+                package_base = (
+                    f"{Path(loaded.shg_data.source_file).stem}_vs_"
+                    f"{Path(loaded.shg_data_b.source_file).stem}_SHG_twist"
+                    if loaded.shg_data_b is not None
+                    else f"{Path(loaded.shg_data.source_file).stem}_SHG_twist"
+                )
+            else:
+                package_base = (
+                    f"{Path(loaded.shg_data.source_file).stem}_SHG_"
+                    f"{options.shg_settings.peak_center_nm:g}nm"
+                )
+            shg_package_dir = create_unique_package_dir(
+                Path(folder) / "Processed Data" / "SHG", package_base
+            )
+            shg_processed_subfolder = str(
+                Path("Processed Data") / "SHG" / shg_package_dir.name
+            )
             if (
                 loaded.shg_compare
                 and loaded.shg_data_b is not None
@@ -8880,6 +9098,7 @@ class MainWindow(QMainWindow):
                     sample_result=loaded.shg_result_b,
                     settings=options.shg_settings,
                     twist=loaded.shg_twist,
+                    processed_name=shg_processed_subfolder,
                 )
                 log.emit(f"Exported {len(paths)} SHG comparison and twist files.")
                 out_folder = str(paths["combined_csv"].parent)
@@ -8890,6 +9109,7 @@ class MainWindow(QMainWindow):
                     result=loaded.shg_result,
                     settings=options.shg_settings,
                     fit=loaded.shg_fit,
+                    processed_name=shg_processed_subfolder,
                 )
                 sample_paths = export_shg_results(
                     folder,
@@ -8897,6 +9117,7 @@ class MainWindow(QMainWindow):
                     result=loaded.shg_result_b,
                     settings=options.shg_settings,
                     fit=loaded.shg_fit_b,
+                    processed_name=shg_processed_subfolder,
                 )
                 paths = {"reference_csv": reference_paths["csv"], "sample_csv": sample_paths["csv"]}
                 log.emit("Exported both SHG processed CSVs; twist summary unavailable because the fit is disabled or failed.")
@@ -8908,6 +9129,7 @@ class MainWindow(QMainWindow):
                     result=loaded.shg_result,
                     settings=options.shg_settings,
                     fit=loaded.shg_fit,
+                    processed_name=shg_processed_subfolder,
                 )
                 log.emit(f"Exported SHG CSV: {paths['csv'].name}")
                 log.emit(f"Exported SHG settings: {paths['settings'].name}")
@@ -8927,6 +9149,8 @@ class MainWindow(QMainWindow):
                 clip_outliers=options.compare_clip,
                 correction_background=options.compare_background,
                 export_vp=options.compare_export_vp,
+                processed_name=str(Path("Processed Data") / "Compare"),
+                metadata_extra=metadata_extra,
             )
             log.emit(f"Exported {len(paths)} compare files.")
             out_folder = str(Path(paths[0]).parent) if paths else str(Path(folder))
@@ -8934,16 +9158,23 @@ class MainWindow(QMainWindow):
         else:
             raise ValueError("Nothing to export for this mode.")
 
+        # Source files remain in the selected working folder after export.
+        # Explicit manual archival remains available through the toolbar button.
+        cleaned = 0
+        if mode in {"PL", "DRR", "Compare"} and options.cleanup_verified_sources:
+            for record in loaded.provenance_records:
+                if cleanup_working_copy(record, folder):
+                    cleaned += 1
+            if cleaned:
+                log.emit(f"Cleaned {cleaned} verified temporary source copy(s).")
         moved = 0
-        if options.auto_move_sources and files_to_move:
-            moved = int(data_io.move_selected_to_archive(folder, files_to_move))
-            log.emit(f"Moved {moved} source CSV file(s) to 'Initial data after processing'.")
         return {
             "out_folder": out_folder or str(Path(folder)),
             "moved": moved,
             "source_files": list(dict.fromkeys(name for name in files_to_move if name)),
             "folder": folder,
-            "auto_moved": bool(options.auto_move_sources and files_to_move),
+            "auto_moved": False,
+            "cleaned": cleaned,
         }
 
     def _on_export_done(self, result: object) -> None:
@@ -8953,12 +9184,14 @@ class MainWindow(QMainWindow):
             source_files = list(result.get("source_files", []))
             folder = str(result.get("folder", self.current_folder or ""))
             auto_moved = bool(result.get("auto_moved", False))
+            cleaned = int(result.get("cleaned", 0))
         else:
             out_folder = str(result)
             moved = 0
             source_files = []
             folder = self.current_folder or ""
             auto_moved = False
+            cleaned = 0
         if moved > 0:
             self._refresh_file_lists()
         if source_files and not auto_moved:
@@ -8966,7 +9199,8 @@ class MainWindow(QMainWindow):
         else:
             self._invalidate_export_move_sources()
         self._set_stage("Exported")
-        self._status(f"Export completed: {out_folder}")
+        suffix = f"; cleaned {cleaned} verified source copy(s)" if cleaned else ""
+        self._status(f"Export completed: {out_folder}{suffix}")
     def _auto_update_check_enabled(self) -> bool:
         value = self.settings.value(self.SETTINGS_AUTO_UPDATE_CHECK, True)
         if value is None:
