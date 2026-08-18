@@ -11,6 +11,7 @@ retaining a record of the reference used.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
@@ -23,6 +24,7 @@ from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from scipy.signal import find_peaks, peak_widths, savgol_filter
 
+from app_version import __version__
 from core.loader import DataCube
 
 EV_NM = 1239.841984
@@ -1318,6 +1320,7 @@ def export_mcd_analysis_bundle(
     show_integral: bool = False,
     fit_near_zero: bool = False,
     fit_window_t: float = 0.2,
+    package_outputs: tuple[Path, ...] = (),
 ) -> dict[str, Path]:
     """Export the compact, publication-facing MCD analysis set.
 
@@ -1422,7 +1425,21 @@ def export_mcd_analysis_bundle(
         if setting_values.get(key):
             setting_values[key] = Path(str(setting_values[key])).name
     payload = {
+        "schema_version": 1,
+        "app_version": __version__,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
         "source_file": Path(result.source_file).name,
+        "dataset_type": "derived_analysis_1d",
+        "workflow": "MCD",
+        "package": out.name,
+        "sources": [{"role": "measurement", "filename": Path(result.source_file).name}],
+        "outputs": [
+            figure_path.name,
+            csv_path.name,
+            diagnostic_path.name,
+            settings_path.name,
+            *[Path(path).name for path in package_outputs],
+        ],
         "map": trace_map,
         "mcd_b": {
             "center_ev": float(center_ev),

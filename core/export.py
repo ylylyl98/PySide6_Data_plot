@@ -54,18 +54,34 @@ def _source_descriptor(folder: str, file_name: str, *, role: str = "source") -> 
     path = Path(raw)
     if not path.is_absolute():
         path = Path(folder) / path
-    descriptor = {"role": role, "name": raw, "exists": path.is_file()}
-    if not path.is_file():
+    descriptor = {
+        "role": role,
+        "name": raw,
+        "filename": path.name,
+        "path": str(path),
+        "source_path": str(path),
+        "processing_input_path": str(path),
+        "exists": False,
+    }
+    try:
+        descriptor["exists"] = path.is_file()
+    except OSError:
         return descriptor
-    descriptor.update({
-        "size_bytes": path.stat().st_size,
-        "modified_utc": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(),
-    })
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    descriptor["sha256"] = digest.hexdigest()
+    if not descriptor["exists"]:
+        return descriptor
+    try:
+        stat = path.stat()
+        descriptor.update({
+            "size_bytes": stat.st_size,
+            "modified_utc": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+        })
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        descriptor["sha256"] = digest.hexdigest()
+    except OSError:
+        descriptor["sha256"] = None
     return descriptor
 
 
@@ -79,6 +95,8 @@ def write_export_metadata(
     plot: object | None = None,
     outputs: Iterable[Path] | None = None,
     extra: dict | None = None,
+    dataset_type: str = "processed_2d",
+    output_manifest: Iterable[tuple[str, Path]] | None = None,
 ) -> Path:
     paths = [Path(path) for path in output_paths]
     if not paths:
@@ -89,11 +107,19 @@ def write_export_metadata(
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "app_version": __version__,
         "operation": operation,
-        "inputs": [_source_descriptor(folder, name, role=role) for role, name in input_files if name],
+        "workflow": operation,
+        "dataset_type": dataset_type,
+        "sources": [_source_descriptor(folder, name, role=role) for role, name in input_files if name],
         "processing": _metadata_jsonable(processing or {}),
         "plot": _metadata_jsonable(plot or {}),
         "outputs": [path.name for path in output_list],
     }
+    if output_manifest is not None:
+        payload["output_manifest"] = [
+            {"role": role, "filename": Path(path).name}
+            for role, path in output_manifest
+        ]
+    payload["inputs"] = list(payload["sources"])
     if extra:
         payload.update(_metadata_jsonable(extra))
     metadata_path = paths[0].with_suffix(".metadata.json")
@@ -228,6 +254,32 @@ def _unique_path(out_dir: Path, base: str, ext: str = ".png") -> Path:
         if not p2.exists():
             return p2
     return p
+
+
+def _unique_result_stem(out_dir: Path, base: str, suffixes: Iterable[str]) -> str:
+    """Return one collision-safe stem for a group of related output files."""
+    suffixes = tuple(str(suffix) for suffix in suffixes)
+    for idx in range(1000):
+        stem = base if idx == 0 else f"{base}_{idx:02d}"
+        if not any((out_dir / f"{stem}{suffix}").exists() for suffix in suffixes):
+            return stem
+    raise FileExistsError(f"Could not allocate a collision-safe output stem for {base!r}.")
+
+
+def create_unique_package_dir(root: str | Path, base: str) -> Path:
+    """Create one collision-safe directory for a logical analysis package."""
+    package_root = Path(root)
+    package_root.mkdir(parents=True, exist_ok=True)
+    safe_base = safe_stem(base, max_len=110).rstrip(" ._") or "analysis"
+    for idx in range(1000):
+        name = safe_base if idx == 0 else f"{safe_base}_{idx:02d}"
+        candidate = package_root / name
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            continue
+        return candidate
+    raise FileExistsError(f"Could not allocate an analysis package for {base!r}.")
 
 
 def _save_heatmap_png(path: Path, cube: DataCube, params: HeatmapParams, *, drr: bool) -> Path:
@@ -492,12 +544,17 @@ def export_pl_pngs_and_dat(
     params_log: HeatmapParams,
     processed_name: str = DEFAULT_PROCESSED,
     metadata_input_files: Iterable[tuple[str, str]] = (),
+    metadata_extra: dict | None = None,
 ) -> Dict[str, Path]:
     out_dir = ensure_processed_dir(folder, processed_name)
-    safe = Path(file_name).stem
+    safe = _unique_result_stem(
+        out_dir,
+        f"{Path(file_name).stem}_PL",
+        ("_linear.dat", "_linear.metadata.json", "_linear.png", "_log.png"),
+    )
 
-    png_linear = out_dir / f"{safe}_PL_linear.png"
-    png_log = out_dir / f"{safe}_PL_log.png"
+    png_linear = out_dir / f"{safe}_linear.png"
+    png_log = out_dir / f"{safe}_log.png"
     _save_heatmap_png(png_linear, cube_linear, params_linear, drr=False)
     _save_heatmap_png(png_log, cube_log, params_log, drr=False)
 
@@ -508,7 +565,7 @@ def export_pl_pngs_and_dat(
             cube_linear.Z,
             user_folder=folder,
             subfolder=processed_name,
-            basename_override=f"{safe}_PL",
+            basename_override=f"{safe}_linear",
             name_suffix="",
             energy_label="Photon energy",
             energy_unit="eV",
@@ -520,9 +577,20 @@ def export_pl_pngs_and_dat(
         [dat_path],
         operation="PL",
         input_files=metadata_input_files or (("measurement", file_name),),
-        processing={"y_axis": cube_linear.gate_label},
+        processing={
+            "y_axis": cube_linear.gate_label,
+            "y_axis_label": cube_linear.gate_label,
+            "y_axis_unit": getattr(cube_linear, "gate_unit", ""),
+            "y_axis_semantic": getattr(cube_linear, "y_axis_semantic", ""),
+        },
         plot={"linear": params_linear, "log": params_log},
         outputs=paths.values(),
+        extra=metadata_extra,
+        output_manifest=(
+            ("data", dat_path),
+            ("figure_linear", png_linear),
+            ("figure_log", png_log),
+        ),
     )
     return paths
 
@@ -579,6 +647,7 @@ def export_drr_png_and_dat(
     drr_style: bool = True,
     metadata_input_files: Iterable[tuple[str, str]] = (),
     metadata_processing: dict | None = None,
+    metadata_extra: dict | None = None,
 ) -> Dict[str, Path]:
     """Export one heatmap and its DAT table.
 
@@ -607,10 +676,18 @@ def export_drr_png_and_dat(
         folder,
         [dat_path],
         operation="DR/R" if drr_style else "MCD",
+        dataset_type="processed_2d" if drr_style else "derived_analysis_2d",
         input_files=metadata_input_files,
-        processing=metadata_processing or {},
+        processing={
+            **(metadata_processing or {}),
+            "y_axis_label": getattr(cube, "gate_label", ""),
+            "y_axis_unit": getattr(cube, "gate_unit", ""),
+            "y_axis_semantic": getattr(cube, "y_axis_semantic", ""),
+        },
         plot=params,
         outputs=paths.values(),
+        extra=metadata_extra,
+        output_manifest=(("data", dat_path), ("figure", png_path)),
     )
     return paths
 
@@ -716,6 +793,7 @@ def export_power_series_png_and_dat(
     y_axis_log: bool,
     background: float = 0.0,
     processed_name: str = DEFAULT_PROCESSED,
+    metadata_extra: dict | None = None,
 ) -> Dict[str, Path]:
     out_dir = ensure_processed_dir(folder, processed_name)
     records = tuple(records)
@@ -744,9 +822,16 @@ def export_power_series_png_and_dat(
         [dat_path],
         operation="Power Dependent",
         input_files=[("measurement", str(getattr(record, "file_name", ""))) for record in records],
-        processing={"group_key": group_key, "background_constant": background, "y_axis_log": y_axis_log},
+        processing={
+            "group_key": group_key,
+            "background_constant": background,
+            "y_axis_log": y_axis_log,
+            "power_values_uW": [getattr(record, "power_uW", None) for record in records],
+        },
         plot=params,
         outputs=(png_path, dat_path),
+        output_manifest=(("figure", png_path), ("data", dat_path)),
+        extra=metadata_extra,
     )
     return {"png": png_path, "dat": dat_path}
 
@@ -851,6 +936,9 @@ def export_shg_results(
     settings_payload = {
         "mode": "SHG Processing",
         "schema_version": EXPORT_METADATA_SCHEMA_VERSION,
+        "workflow": "SHG",
+        "dataset_type": "derived_analysis_1d",
+        "package": out_dir.name,
         "app_version": __version__,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "source_csv": data.source_file,
@@ -871,6 +959,11 @@ def export_shg_results(
         "cosmic_affected_rows": int(np.count_nonzero(result.cosmic_pixels_removed)),
         "settings": settings.to_dict(),
         "angular_fit": fit.to_dict() if fit is not None else None,
+        "outputs": [csv_path.name, settings_path.name],
+        "output_manifest": [
+            {"role": "data", "filename": csv_path.name},
+            {"role": "settings", "filename": settings_path.name},
+        ],
     }
     settings_path.write_text(json.dumps(settings_payload, indent=2), encoding="utf-8")
     return {"csv": csv_path, "settings": settings_path}
@@ -1027,6 +1120,9 @@ def export_shg_twist_comparison(
     settings_payload = {
         "mode": "SHG Compare / Twist Angle",
         "schema_version": EXPORT_METADATA_SCHEMA_VERSION,
+        "workflow": "SHG",
+        "dataset_type": "derived_analysis_1d",
+        "package": out_dir.name,
         "app_version": __version__,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "reference_csv": reference_data.source_file,
@@ -1039,6 +1135,26 @@ def export_shg_twist_comparison(
         ],
         "processing_settings": settings.to_dict(),
         "twist_fit": twist.to_dict(),
+        "outputs": [
+            reference_paths["csv"].name,
+            reference_paths["settings"].name,
+            sample_paths["csv"].name,
+            sample_paths["settings"].name,
+            combined_path.name,
+            fit_summary_path.name,
+            twist_summary_path.name,
+            settings_path.name,
+        ],
+        "output_manifest": [
+            {"role": "reference_data", "filename": reference_paths["csv"].name},
+            {"role": "reference_settings", "filename": reference_paths["settings"].name},
+            {"role": "sample_data", "filename": sample_paths["csv"].name},
+            {"role": "sample_settings", "filename": sample_paths["settings"].name},
+            {"role": "combined", "filename": combined_path.name},
+            {"role": "fit_summary", "filename": fit_summary_path.name},
+            {"role": "twist_summary", "filename": twist_summary_path.name},
+            {"role": "settings", "filename": settings_path.name},
+        ],
     }
     settings_path.write_text(json.dumps(settings_payload, indent=2), encoding="utf-8")
     return {
@@ -1070,9 +1186,13 @@ def export_power_vp_pngs_and_dat(
     pairing_mode: str = "stage",
     stage_pairs: Iterable[object] = (),
     processed_name: str = DEFAULT_PROCESSED,
+    metadata_extra: dict | None = None,
 ) -> Dict[str, Path]:
     out_dir = ensure_processed_dir(folder, processed_name)
     written: Dict[str, Path] = {}
+    kk_records = tuple(kk_records)
+    kkp_records = tuple(kkp_records)
+    stage_pairs = tuple(stage_pairs)
 
     kk_base = f"KK_{power_series_export_base(kk_group_key, y_axis_log=y_axis_log)}"
     kkp_base = f"KKp_{power_series_export_base(kkp_group_key, y_axis_log=y_axis_log)}"
@@ -1138,6 +1258,29 @@ def export_power_vp_pngs_and_dat(
                 *_power_record_header_lines(records),
             ],
         )
+        write_export_metadata(
+            folder,
+            [dat_path],
+            operation="Power Dependent",
+            dataset_type="processed_2d",
+            input_files=[
+                ("KK" if label == "KK" else "KKp", str(getattr(record, "file_name", "")))
+                for record in records
+            ],
+            processing={
+                "panel": label,
+                "group_key": group_key,
+                "background_constant": background,
+                "y_axis_log": y_axis_log,
+                "pairing_mode": pairing_mode,
+                "alignment": "stage_pair_average_power" if pairing_mode == "stage" else "power_interpolation_overlap",
+                "power_values_uW": [getattr(record, "power_uW", None) for record in records],
+            },
+            plot=panel_params,
+            outputs=(png_path, dat_path),
+            output_manifest=(("figure", png_path), ("data", dat_path)),
+            extra=metadata_extra,
+        )
         written[f"{label}_png"] = png_path
         written[f"{label}_dat"] = dat_path
 
@@ -1192,6 +1335,34 @@ def export_power_vp_pngs_and_dat(
     )
     written["VP_png"] = png_path
     written["VP_dat"] = dat_path
+    write_export_metadata(
+        folder,
+        [dat_path],
+        operation="Power Dependent VP",
+        dataset_type="derived_analysis_2d",
+        input_files=[
+            ("KK", str(getattr(record, "file_name", ""))) for record in kk_records
+        ] + [
+            ("KKp", str(getattr(record, "file_name", ""))) for record in kkp_records
+        ],
+        processing={
+            "kk_group_key": kk_group_key,
+            "kkp_group_key": kkp_group_key,
+            "background_constant": background,
+            "pairing_mode": pairing_mode,
+            "alignment": "stage_pair_average_power" if pairing_mode == "stage" else "power_interpolation_overlap",
+            "formula": "(KK_corr-KKp_corr)/(KK_corr+KKp_corr)",
+            "power_values_uW": {
+                "KK": [getattr(record, "power_uW", None) for record in kk_records],
+                "KKp": [getattr(record, "power_uW", None) for record in kkp_records],
+            },
+            "stage_pairs": list(stage_pairs),
+        },
+        plot=vp_params,
+        outputs=(png_path, dat_path),
+        output_manifest=(("figure", png_path), ("data", dat_path)),
+        extra=metadata_extra,
+    )
     return written
 
 
@@ -1237,6 +1408,7 @@ def export_compare_panels(
     correction_background: float = 0.0,
     export_vp: bool = True,
     processed_name: str = DEFAULT_PROCESSED,
+    metadata_extra: dict | None = None,
 ) -> list[Path]:
     out_dir = ensure_processed_dir(folder, processed_name)
     written: list[Path] = []
@@ -1303,6 +1475,7 @@ def export_compare_panels(
             folder,
             [dat_path],
             operation=f"Compare/{key}",
+            dataset_type="processed_2d",
             input_files=[("source", source_files[key])],
             processing={
                 "scale": scale_tag,
@@ -1310,7 +1483,9 @@ def export_compare_panels(
                 "clip_outliers": clip_outliers,
             },
             plot=panel_params,
-            outputs=(png_path, dat_path),
+        outputs=(png_path, dat_path),
+        extra=metadata_extra,
+        output_manifest=(("figure", png_path), ("data", dat_path)),
         )
         written.extend([png_path, dat_path])
 
@@ -1360,6 +1535,7 @@ def export_compare_panels(
             folder,
             [dat_path],
             operation="Compare/VP",
+            dataset_type="derived_analysis_2d",
             input_files=[
                 ("source_KK", source_files.get("KK", "")),
                 ("source_KKp", source_files.get("KKp", "")),
@@ -1367,6 +1543,8 @@ def export_compare_panels(
             processing={"background_constant": correction_background, "formula": "(KK_corr-KKp_corr)/(KK_corr+KKp_corr)"},
             plot=vp_params,
             outputs=(png_path, dat_path),
+            extra=metadata_extra,
+            output_manifest=(("figure", png_path), ("data", dat_path)),
         )
         written.extend([png_path, dat_path])
     return written

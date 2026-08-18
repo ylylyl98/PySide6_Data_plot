@@ -63,6 +63,26 @@ and taskbar pinning. To create a Desktop shortcut instead, run:
 powershell -ExecutionPolicy Bypass -File scripts\create_windows_shortcut.ps1 -Desktop
 ```
 
+On macOS, install Python 3 and double-click `Data_Plot_App.command`. The
+launcher uses a project-local `.venv`, installs the declared requirements when
+needed, and starts the same `run_qt.py` entry point. Finder may require
+right-clicking the file and choosing **Open** the first time; the file must be
+executable in a checkout (`chmod +x Data_Plot_App.command`).
+
+To build an unsigned macOS application on a Mac, install the build requirements
+and run:
+
+```bash
+python -m pip install -r requirements.txt -r requirements-build.txt
+python -m PyInstaller packaging/PySide6_Data_Plot_macos.spec
+```
+
+This produces `dist/DPTK Desktop.app`. It must be built on macOS for the target
+CPU architecture. Unsigned or unnotarized builds may trigger Gatekeeper; use
+right-click **Open** for a local build. Developer ID signing and notarization
+are future distribution work. The existing Windows BAT launcher and Windows
+PyInstaller spec remain unchanged.
+
 ## Build and Release
 
 For a local Windows build, install the build dependency and run:
@@ -107,16 +127,109 @@ Generated `build/` and `dist/` content stays local and is not committed.
 - `run_qt.py`: PySide6 entrypoint.
 
 ## Expected Folder Structure
-When you choose a data folder, CSV files must be in the folder root (not subfolders):
+Choose the experiment folder, such as `YZ327`, as the app's data folder. Canonical
+acquisition files belong in `Initial Data`. The app writes new processed results
+under workflow-specific directories without moving historical results.
 
 ```text
-<user-folder>/
-  sample_001.csv
-  sample_002.csv
-  ...
-  Processed Data/                    # created by app
-  Initial data after processing/     # created by app
+YZ327/
+├── Initial Data/                         # canonical acquisition/raw files
+│   ├── raw_001.csv
+│   └── raw_002.csv
+├── Processed Data/                       # generated results
+│   ├── PL/
+│   ├── DRR/
+│   ├── Compare/
+│   ├── MCD/<analysis package>/
+│   ├── SHG/<analysis package>/
+│   └── Power Dependence/<group or comparison package>/
+├── temporary working CSV copies/          # normally directly under YZ327
+└── Initial data after processing/         # manual archive only
 ```
+
+For normal CSV processing, selected working files remain directly under the
+experiment folder because the file browser is more convenient for selecting
+many raw files. Existing historical files directly under `Processed Data/`
+remain valid; the application does not migrate or reorganize them.
+
+### Raw-data lifecycle and cleanup
+
+For PL, DRR, and Compare:
+
+1. The acquisition application writes canonical files into `Initial Data/`.
+2. Use Windows Explorer or macOS Finder to copy only the files needed for the
+   analysis into the experiment folder.
+3. Load and process those root-level working copies in the app.
+4. Results are written to `Processed Data/<workflow>/`.
+5. If **Clean verified source copies after successful export** is enabled, the
+   app may remove a root-level duplicate only after its matching
+   `Initial Data/<filename>` file exists and the SHA-256 hashes match.
+
+Cleanup never deletes canonical files. A missing canonical file, invalid path
+relationship, hash mismatch, failed export, disabled option, or unverified/manual
+source leaves the working file in place. A file selected directly from
+`Initial Data/` is never treated as a disposable temporary copy.
+
+The **Move Exported Sources** button is separate and manual. It moves explicitly
+selected source files to the legacy `Initial data after processing/` archive.
+That folder is not canonical raw storage, automatic cleanup storage, or normal
+processed-result storage.
+
+### Export locations and contents
+
+| Workflow | New export location | Typical contents |
+|---|---|---|
+| PL | `Processed Data/PL/` | DAT, metadata sidecar, linear/log PNG figures |
+| DRR | `Processed Data/DRR/` | averaged or derivative DAT, metadata, PNG |
+| Compare | `Processed Data/Compare/` | channel DAT/PNG/metadata and VP results |
+| MCD | `Processed Data/MCD/<analysis package>/` | map DAT/PNG/metadata, MCD(B) CSV/PNG, diagnostics, settings |
+| SHG | `Processed Data/SHG/<analysis package>/` | area-vs-angle CSV, settings, fit/twist summaries |
+| Power Dependence | `Processed Data/Power Dependence/<package>/` | KK/KKp/VP DAT, PNG, metadata |
+
+MCD package names use a readable source, energy, and window identity such as
+`<source>_MCD_E1.650000eV_W5meV`. SHG single analyses use
+`<source>_SHG_<center>nm`; twist analyses use
+`<reference>_vs_<sample>_SHG_twist`. Power packages use one of:
+`<group>_PowerDep`, `<KK-group>_vs_<KKp-group>_IntensityCompare`, or
+`<KK-group>_vs_<KKp-group>_VP`. Package names are sanitized for Windows and
+macOS. Related numerical files, metadata, figures, and diagnostics stay
+together.
+
+### Metadata and collision handling
+
+Metadata sidecars use the DAT file's own directory and are optional for reading
+the numerical data. Where emitted, the shared metadata core records schema and
+app versions, workflow, dataset type, creation time, sources/provenance,
+processing, plot settings, outputs, and an output manifest. Workflow-specific
+fields record details such as DRR backgrounds, MCD windows, SHG fits, or Power
+pairing and alignment.
+
+Repeated exports do not silently overwrite earlier results. Simple result stems
+use collision-safe suffixes such as `_01`; complex MCD, SHG, and Power analyses
+use collision-safe package directories. Associated DAT, PNG, and JSON files
+retain the same logical stem or package.
+
+### DAT re-import and Origin use
+
+Exported DAT files remain tab-delimited, Origin-friendly numerical matrices and
+can be opened without JSON. The app can load DAT files from old root-level
+`Processed Data`, the new workflow folders, or other supported user-selected
+locations. Sidecar metadata is searched beside the DAT file, so moving a DAT
+does not require the experiment root to be known. When present, metadata can
+restore labels, units, plot context, and processing information.
+
+For imported DAT colormaps, the PL Y-axis selector supports `Y`, `Doping`,
+`Electric field`, `Gate voltage`, and `Custom` labels, with an optional unit.
+Without metadata, neutral generic labels are used.
+
+The same layout works with Windows Explorer and macOS Finder. Documentation
+uses portable folder names and the application uses cross-platform path
+handling.
+
+Compatibility note: the active PySide GUI routes new exports to the workflow
+locations above. Some lower-level legacy Python helper functions retain their
+old configurable/default `Processed Data` destination for existing scripts;
+calling those helpers directly is separate from the normal GUI workflow.
 
 ## Usage Notes
 - `PL`: one-file plotting workflow for heatmap + spectrum.
@@ -167,6 +280,10 @@ When you choose a data folder, CSV files must be in the folder root (not subfold
   available as optional diagnostics, while the CSV retains all metric columns.
 - `Compare`: 2-4 selected files rendered in a compare grid.
 - `Save PNG` exports with fixed Streamlit-style geometry (`8.0 x 6.2 in @ 150 DPI`) independent of window size.
+- Exported `.dat` files remain tab-delimited numeric matrices for Origin. The
+  app can re-open them from the PL tab and optionally restores labels and plot
+  metadata from the adjacent `.metadata.json` sidecar (or
+  `<file>.plotmeta.json`). Without a sidecar, safe generic labels are used.
 
 ## Smoke Check (No Test Framework Required)
 Run:
