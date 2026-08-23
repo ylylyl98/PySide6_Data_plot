@@ -623,14 +623,15 @@ def _resolve_axis_choice(
     }
 
 def _require_csv_in_root(user_folder: Path, origin_name: str) -> Path:
-    """Load ONLY from the root folder; do not search subfolders."""
-    fname = Path(origin_name).name
-    p = user_folder / fname
-    if p.exists():
+    """Resolve a CSV from the experiment root, Initial Data, or an explicit path."""
+    requested = Path(origin_name)
+    p = requested if requested.is_absolute() else user_folder / requested
+    p = p.resolve()
+    if p.exists() and p.is_file() and p.suffix.lower() == ".csv":
         return p
-    have = sorted([f.name for f in user_folder.glob("*.csv")])
+    have = sorted(path.name for path in user_folder.glob("*.csv"))
     raise FileNotFoundError(
-        f"CSV not found in root:\n  {p}\nRoot CSVs:\n  - " + "\n  - ".join(have)
+        f"CSV not found:\n  {p}\nRoot CSVs:\n  - " + "\n  - ".join(have)
     )
 
 def _sci_fmt(x, pos):
@@ -1936,6 +1937,24 @@ def process_ref_avg(
                     raise ValueError(
                         f"External baseline energy shape {e_ext.shape} != baseline shape {I0_ext.shape}."
                     )
+                measurement_wavelength = 1240.0 / np.asarray(energy0, float)
+                baseline_wavelength = 1240.0 / e_ext
+                measurement_center_nm = 0.5 * (
+                    float(np.nanmin(measurement_wavelength)) + float(np.nanmax(measurement_wavelength))
+                )
+                baseline_center_nm = 0.5 * (
+                    float(np.nanmin(baseline_wavelength)) + float(np.nanmax(baseline_wavelength))
+                )
+                if (
+                    np.isfinite(measurement_center_nm)
+                    and np.isfinite(baseline_center_nm)
+                    and abs(measurement_center_nm - baseline_center_nm) > 1.0
+                ):
+                    raise ValueError(
+                        "External background wavelength center must match the measurement: "
+                        f"measurement≈{measurement_center_nm:.3g} nm, "
+                        f"background≈{baseline_center_nm:.3g} nm."
+                    )
                 if (e_ext.shape != energy0.shape) or (not np.allclose(e_ext, energy0, rtol=1e-6, atol=1e-9)):
                     finite = np.isfinite(e_ext) & np.isfinite(I0_ext)
                     if np.count_nonzero(finite) < 2:
@@ -1954,6 +1973,15 @@ def process_ref_avg(
             raise ValueError("bg_mode='external' but no external baseline provided.")
         if I0_ext.shape != (eN,):
             raise ValueError(f"External baseline length {I0_ext.shape} != energy length {eN}.")
+        overlap_count = int(np.count_nonzero(np.isfinite(I0_ext)))
+        minimum_overlap = max(2, int(np.ceil(0.5 * eN)))
+        if overlap_count < minimum_overlap:
+            overlap_percent = 100.0 * overlap_count / max(1, eN)
+            raise ValueError(
+                "External baseline is not compatible with this measurement: "
+                f"only {overlap_percent:.1f}% of the measurement energy grid overlaps. "
+                "Choose a background from a matching wavelength/energy configuration."
+            )
     mode_map = {"self_first": "first", "self_last": "last", "external": "external"}
     dmode = mode_map[bg_mode]
     stack = [ _drr_from_Z(Z0, dmode, I0_ext) ]
@@ -2138,6 +2166,12 @@ def build_external_baseline_avg(
 
     I0_list_1d: list[np.ndarray] = []
 
+    def _wavelength_center_nm(energy: np.ndarray) -> float:
+        wavelength = 1240.0 / np.asarray(energy, float)
+        return 0.5 * (float(np.nanmin(wavelength)) + float(np.nanmax(wavelength)))
+
+    baseline_center0 = _wavelength_center_nm(energy0)
+
     def _pick_I0_from_Z(Z: np.ndarray) -> np.ndarray:
         Zf = Z.astype(float, copy=False)
         if which == "first":
@@ -2175,6 +2209,17 @@ def build_external_baseline_avg(
     for f in files_zero[1:]:
         d = _load_canonical(user_folder, f)
         energy_i = np.asarray(d["energy"]).ravel()
+
+        center_i = _wavelength_center_nm(energy_i)
+        if (
+            np.isfinite(baseline_center0)
+            and np.isfinite(center_i)
+            and abs(baseline_center0 - center_i) > 1.0
+        ):
+            raise ValueError(
+                "Selected background files use different wavelength centers: "
+                f"first≈{baseline_center0:.3g} nm, {Path(f).name}≈{center_i:.3g} nm."
+            )
 
         Z = np.asarray(d["Z"])
         I0_i = _pick_I0_from_Z(Z)

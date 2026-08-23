@@ -195,6 +195,185 @@ class ExportMetadataTests(unittest.TestCase):
             self.assertIn(paths["dat"].name, payload["outputs"])
             self.assertIn(paths["png"].name, payload["outputs"])
 
+    def test_repeated_identical_drr_export_reuses_the_existing_result(self) -> None:
+        def render(path, *_args, **_kwargs):
+            Path(path).write_bytes(b"png")
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "core.export._save_heatmap_png", side_effect=render
+        ):
+            source = Path(tmp) / "sample.csv"
+            source.write_text("raw", encoding="utf-8")
+            cube = DataCube(
+                energy=np.asarray([1.0, 2.0]), gate=np.asarray([0.0]),
+                Z=np.asarray([[0.1, 0.2]]), gate_label="Gate", title="DR/R", cbar_label="DR/R",
+            )
+            params = HeatmapParams(
+                title="DR/R", xlabel="Energy", ylabel="Gate", cbar_label="DR/R",
+                vmin=-1.0, vmax=1.0, xlim=(1.0, 2.0), ylim=(0.0, 1.0),
+            )
+            output_folder = str(Path("Processed Data") / "DRR")
+
+            first = export_drr_png_and_dat(
+                tmp, cube=cube, params=params, export_base="sample", processed_name=output_folder,
+                metadata_input_files=(("measurement", source.name),),
+                metadata_processing={"mode": "Self"},
+            )
+            second = export_drr_png_and_dat(
+                tmp, cube=cube, params=params, export_base="sample", processed_name=output_folder,
+                metadata_input_files=(("measurement", source.name),),
+                metadata_processing={"mode": "Self"},
+            )
+
+            self.assertEqual(first["dat"].parent, Path(tmp) / "Processed Data" / "DRR")
+            self.assertEqual(first["dat"].stem, "sample")
+            self.assertEqual(second["dat"], first["dat"])
+            self.assertEqual(second["png"], first["png"])
+            self.assertEqual(second.save_status, "reused")
+            self.assertEqual(len(list(first["dat"].parent.glob("*.dat"))), 1)
+            self.assertEqual(len(list(first["dat"].parent.glob("*.png"))), 1)
+
+    def test_drr_plot_change_updates_png_without_duplicate_dat(self) -> None:
+        def render(path, *_args, **_kwargs):
+            Path(path).write_bytes(b"png")
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "core.export._save_heatmap_png", side_effect=render
+        ):
+            source = Path(tmp) / "sample.csv"
+            source.write_text("raw", encoding="utf-8")
+            cube = DataCube(
+                energy=np.asarray([1.0, 2.0]), gate=np.asarray([0.0]),
+                Z=np.asarray([[0.1, 0.2]]), gate_label="Gate", title="DR/R", cbar_label="DR/R",
+            )
+            first_params = HeatmapParams(
+                title="DR/R", xlabel="Energy", ylabel="Gate", cbar_label="DR/R",
+                vmin=-1.0, vmax=1.0, xlim=(1.0, 2.0), ylim=(0.0, 1.0),
+            )
+            changed_params = HeatmapParams(
+                **{**first_params.__dict__, "vmin": -0.5, "vmax": 0.5}
+            )
+            kwargs = {
+                "cube": cube,
+                "export_base": "sample",
+                "metadata_input_files": (("measurement", source.name),),
+                "metadata_processing": {"mode": "Self"},
+            }
+
+            first = export_drr_png_and_dat(tmp, params=first_params, **kwargs)
+            second = export_drr_png_and_dat(tmp, params=changed_params, **kwargs)
+
+            self.assertEqual(second.save_status, "updated")
+            self.assertEqual(second["dat"], first["dat"])
+            self.assertEqual(len(list(second["dat"].parent.glob("*.dat"))), 1)
+            payload = json.loads(second["dat"].with_suffix(".metadata.json").read_text())
+            self.assertEqual(payload["plot"]["vmin"], -0.5)
+            self.assertEqual(payload["plot"]["vmax"], 0.5)
+
+    def test_drr_repeat_recognizes_metadata_written_before_fingerprints(self) -> None:
+        def render(path, *_args, **_kwargs):
+            Path(path).write_bytes(b"png")
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "core.export._save_heatmap_png", side_effect=render
+        ):
+            source = Path(tmp) / "sample.csv"
+            source.write_text("raw", encoding="utf-8")
+            cube = DataCube(
+                energy=np.asarray([1.0, 2.0]), gate=np.asarray([0.0]),
+                Z=np.asarray([[0.1, 0.2]]), gate_label="Gate", title="DR/R", cbar_label="DR/R",
+            )
+            params = HeatmapParams(
+                title="DR/R", xlabel="Energy", ylabel="Gate", cbar_label="DR/R",
+                vmin=-1.0, vmax=1.0, xlim=(1.0, 2.0), ylim=(0.0, 1.0),
+            )
+            kwargs = {
+                "cube": cube,
+                "params": params,
+                "export_base": "sample",
+                "metadata_input_files": (("measurement", source.name),),
+                "metadata_processing": {"mode": "Self"},
+            }
+            first = export_drr_png_and_dat(tmp, **kwargs)
+            metadata_path = first["dat"].with_suffix(".metadata.json")
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            payload.pop("analysis_fingerprint")
+            payload.pop("plot_fingerprint")
+            metadata_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            second = export_drr_png_and_dat(tmp, **kwargs)
+
+            self.assertEqual(second.save_status, "reused")
+            self.assertEqual(second["dat"], first["dat"])
+
+    def test_changed_drr_processing_creates_a_distinct_result(self) -> None:
+        def render(path, *_args, **_kwargs):
+            Path(path).write_bytes(b"png")
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "core.export._save_heatmap_png", side_effect=render
+        ):
+            source = Path(tmp) / "sample.csv"
+            source.write_text("raw", encoding="utf-8")
+            cube = DataCube(
+                energy=np.asarray([1.0, 2.0]), gate=np.asarray([0.0]),
+                Z=np.asarray([[0.1, 0.2]]), gate_label="Gate", title="DR/R", cbar_label="DR/R",
+            )
+            params = HeatmapParams(
+                title="DR/R", xlabel="Energy", ylabel="Gate", cbar_label="DR/R",
+                vmin=-1.0, vmax=1.0, xlim=(1.0, 2.0), ylim=(0.0, 1.0),
+            )
+            common = {
+                "cube": cube,
+                "params": params,
+                "export_base": "sample",
+                "metadata_input_files": (("measurement", source.name),),
+            }
+
+            first = export_drr_png_and_dat(
+                tmp, metadata_processing={"mode": "Self", "derivative_order": None}, **common
+            )
+            second = export_drr_png_and_dat(
+                tmp, metadata_processing={"mode": "Self", "derivative_order": 1}, **common
+            )
+
+            self.assertEqual(first["dat"].stem, "sample")
+            self.assertEqual(second["dat"].stem, "sample_01")
+            self.assertEqual(second.save_status, "created")
+
+    def test_changed_drr_source_contents_create_a_distinct_result(self) -> None:
+        def render(path, *_args, **_kwargs):
+            Path(path).write_bytes(b"png")
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "core.export._save_heatmap_png", side_effect=render
+        ):
+            source = Path(tmp) / "sample.csv"
+            source.write_text("first acquisition", encoding="utf-8")
+            cube = DataCube(
+                energy=np.asarray([1.0, 2.0]), gate=np.asarray([0.0]),
+                Z=np.asarray([[0.1, 0.2]]), gate_label="Gate", title="DR/R", cbar_label="DR/R",
+            )
+            params = HeatmapParams(
+                title="DR/R", xlabel="Energy", ylabel="Gate", cbar_label="DR/R",
+                vmin=-1.0, vmax=1.0, xlim=(1.0, 2.0), ylim=(0.0, 1.0),
+            )
+            kwargs = {
+                "cube": cube,
+                "params": params,
+                "export_base": "sample",
+                "metadata_input_files": (("measurement", source.name),),
+                "metadata_processing": {"mode": "Self"},
+            }
+
+            first = export_drr_png_and_dat(tmp, **kwargs)
+            source.write_text("second acquisition", encoding="utf-8")
+            second = export_drr_png_and_dat(tmp, **kwargs)
+
+            self.assertEqual(first["dat"].stem, "sample")
+            self.assertEqual(second["dat"].stem, "sample_01")
+            self.assertEqual(second.save_status, "created")
+
 
 if __name__ == "__main__":
     unittest.main()

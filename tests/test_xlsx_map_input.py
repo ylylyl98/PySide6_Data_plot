@@ -174,12 +174,17 @@ class XlsxMapInputTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             loader.load_xlsx_map(str(folder), "missing.xlsx")
 
-    def test_load_xlsx_map_rejects_nested_name(self) -> None:
+    def test_load_xlsx_map_supports_nested_and_absolute_sources(self) -> None:
         folder = self._make_folder()
-        with self.assertRaises(ValueError):
-            loader.load_xlsx_map(str(folder), "sub/dR_R.xlsx")
-        with self.assertRaises(ValueError):
-            loader.load_xlsx_map(str(folder), str(folder / "dR_R.xlsx"))
+        nested = folder / "Initial Data" / "old session"
+        nested.mkdir(parents=True)
+        path = nested / "dR_R.xlsx"
+        _write_map_xlsx(path, ["0", -1.0, 1.0], [[1.7, 2.0, 3.0]])
+
+        relative = loader.load_xlsx_map(str(folder), "Initial Data/old session/dR_R.xlsx")
+        absolute = loader.load_xlsx_map(str(folder), str(path))
+
+        self.assertTrue(np.array_equal(relative.Z, absolute.Z))
 
     def test_load_xlsx_map_rejects_non_xlsx_suffix(self) -> None:
         folder = self._make_folder()

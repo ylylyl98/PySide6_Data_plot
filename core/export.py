@@ -9,6 +9,7 @@ import re
 import textwrap
 from pathlib import Path
 from typing import Dict, Iterable
+from uuid import uuid4
 
 import numpy as np
 import matplotlib
@@ -33,6 +34,14 @@ EXPORT_FIGSIZE = (8.0, 6.2)
 EXPORT_DPI = 150
 DEFAULT_PROCESSED = "Processed Data"
 EXPORT_METADATA_SCHEMA_VERSION = 1
+
+
+class ExportPathResult(dict[str, Path]):
+    """Path mapping with non-breaking status information for the caller."""
+
+    def __init__(self, *args, save_status: str = "created", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.save_status = save_status
 
 
 def _metadata_jsonable(value):
@@ -123,7 +132,17 @@ def write_export_metadata(
     if extra:
         payload.update(_metadata_jsonable(extra))
     metadata_path = paths[0].with_suffix(".metadata.json")
-    metadata_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary_path = metadata_path.with_name(
+        f".{metadata_path.name}.{uuid4().hex}.tmp"
+    )
+    try:
+        temporary_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary_path.replace(metadata_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
     return metadata_path
 
 
@@ -637,6 +656,119 @@ def build_drr_export_base(
     return f"{safe}_{suffix}{deriv_tag}"
 
 
+def _fingerprint_json(value: object) -> str:
+    encoded = json.dumps(
+        _metadata_jsonable(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _drr_source_identity(descriptor: dict) -> dict:
+    raw_path = (
+        descriptor.get("source_path")
+        or descriptor.get("path")
+        or descriptor.get("name")
+        or ""
+    )
+    try:
+        normalized_path = str(Path(str(raw_path)).resolve()).casefold()
+    except OSError:
+        normalized_path = str(raw_path).casefold()
+    identity = {
+        "role": str(descriptor.get("role", "source")),
+        "path": normalized_path,
+        "sha256": descriptor.get("sha256"),
+        "size_bytes": descriptor.get("size_bytes"),
+    }
+    if not identity["sha256"]:
+        identity["modified_utc"] = descriptor.get("modified_utc")
+    return identity
+
+
+def _drr_analysis_fingerprint(sources: Iterable[dict], processing: dict) -> str:
+    return _fingerprint_json(
+        {
+            "operation": "DR/R",
+            "sources": [_drr_source_identity(item) for item in sources],
+            "processing": processing,
+        }
+    )
+
+
+def _existing_drr_result(
+    out_dir: Path,
+    *,
+    analysis_fingerprint: str,
+) -> tuple[str, dict] | None:
+    """Find a prior DRR result, including metadata written before fingerprints existed."""
+    for metadata_path in sorted(out_dir.glob("*.metadata.json")):
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if payload.get("operation") != "DR/R":
+            continue
+        existing_fingerprint = payload.get("analysis_fingerprint")
+        if not existing_fingerprint:
+            sources = payload.get("sources", payload.get("inputs", []))
+            processing = payload.get("processing", {})
+            if isinstance(sources, list) and isinstance(processing, dict):
+                existing_fingerprint = _drr_analysis_fingerprint(sources, processing)
+        if existing_fingerprint != analysis_fingerprint:
+            continue
+        suffix = ".metadata.json"
+        return metadata_path.name[: -len(suffix)], payload
+    return None
+
+
+def _save_heatmap_png_atomic(
+    path: Path,
+    cube: DataCube,
+    params: HeatmapParams,
+    *,
+    drr: bool,
+) -> None:
+    temporary = path.with_name(f".{path.stem}.{uuid4().hex}.tmp{path.suffix}")
+    try:
+        _save_heatmap_png(temporary, cube, params, drr=drr)
+        # Unit tests may replace the renderer with a no-op. Production renders
+        # the temporary file and atomically promotes it here.
+        if temporary.exists():
+            temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _save_drr_dat_atomic(
+    path: Path,
+    cube: DataCube,
+    *,
+    folder: str,
+    processed_name: str,
+) -> None:
+    temporary_stem = f".{path.stem}.{uuid4().hex}.tmp"
+    temporary = Path(
+        save_as_dat(
+            cube.gate,
+            cube.energy,
+            cube.Z,
+            user_folder=folder,
+            subfolder=processed_name,
+            basename_override=temporary_stem,
+            name_suffix="",
+            energy_label="Photon energy",
+            energy_unit="eV",
+        )
+    )
+    try:
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def export_drr_png_and_dat(
     folder: str,
     *,
@@ -656,37 +788,71 @@ def export_drr_png_and_dat(
     ``False`` while still sharing the same data-export path.
     """
     out_dir = ensure_processed_dir(folder, processed_name)
-    png_path = out_dir / f"{export_base}.png"
-    _save_heatmap_png(png_path, cube, params, drr=drr_style)
-    dat_path = Path(
-        save_as_dat(
-            cube.gate,
-            cube.energy,
-            cube.Z,
-            user_folder=folder,
-            subfolder=processed_name,
-            basename_override=export_base,
-            name_suffix="",
-            energy_label="Photon energy",
-            energy_unit="eV",
-        )
+    input_files = tuple(metadata_input_files)
+    processing = {
+        **(metadata_processing or {}),
+        "y_axis_label": getattr(cube, "gate_label", ""),
+        "y_axis_unit": getattr(cube, "gate_unit", ""),
+        "y_axis_semantic": getattr(cube, "y_axis_semantic", ""),
+    }
+    sources = [
+        _source_descriptor(folder, name, role=role)
+        for role, name in input_files
+        if name
+    ]
+    analysis_fingerprint = _drr_analysis_fingerprint(sources, processing)
+    plot_fingerprint = _fingerprint_json(params)
+    prior = (
+        _existing_drr_result(out_dir, analysis_fingerprint=analysis_fingerprint)
+        if drr_style
+        else None
     )
-    paths = {"png": png_path, "dat": dat_path}
+    if prior is None:
+        safe = _unique_result_stem(
+            out_dir,
+            export_base,
+            (".png", ".dat", ".metadata.json"),
+        )
+        prior_payload: dict = {}
+        save_status = "created"
+    else:
+        safe, prior_payload = prior
+        save_status = "reused"
+    png_path = out_dir / f"{safe}.png"
+    dat_path = out_dir / f"{safe}.dat"
+    plot_matches = prior_payload.get("plot_fingerprint") == plot_fingerprint
+    if prior and not prior_payload.get("plot_fingerprint"):
+        plot_matches = _fingerprint_json(prior_payload.get("plot", {})) == plot_fingerprint
+    needs_dat = not dat_path.is_file()
+    needs_png = not png_path.is_file() or not plot_matches
+    if needs_dat:
+        _save_drr_dat_atomic(
+            dat_path,
+            cube,
+            folder=folder,
+            processed_name=processed_name,
+        )
+    if needs_png:
+        _save_heatmap_png_atomic(png_path, cube, params, drr=drr_style)
+    if prior and (needs_dat or needs_png):
+        save_status = "updated"
+    paths = ExportPathResult({"png": png_path, "dat": dat_path}, save_status=save_status)
+    if save_status == "reused":
+        return paths
     write_export_metadata(
         folder,
         [dat_path],
         operation="DR/R" if drr_style else "MCD",
         dataset_type="processed_2d" if drr_style else "derived_analysis_2d",
-        input_files=metadata_input_files,
-        processing={
-            **(metadata_processing or {}),
-            "y_axis_label": getattr(cube, "gate_label", ""),
-            "y_axis_unit": getattr(cube, "gate_unit", ""),
-            "y_axis_semantic": getattr(cube, "y_axis_semantic", ""),
-        },
+        input_files=input_files,
+        processing=processing,
         plot=params,
         outputs=paths.values(),
-        extra=metadata_extra,
+        extra={
+            **(metadata_extra or {}),
+            "analysis_fingerprint": analysis_fingerprint,
+            "plot_fingerprint": plot_fingerprint,
+        },
         output_manifest=(("data", dat_path), ("figure", png_path)),
     )
     return paths

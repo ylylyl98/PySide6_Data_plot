@@ -63,6 +63,18 @@ from scipy.signal import find_peaks
 
 from app_version import __version__
 from core import data_io
+from core.drr_sources import (
+    DrrSource,
+    assess_background_gate_files,
+    discover_drr_sources,
+    extract_wavelength_center_nm,
+    find_saved_drr_recipe,
+    guess_drr_background,
+    group_drr_sources,
+    inspect_csv_wavelength_center,
+    resolve_source_path,
+    wavelength_centers_match,
+)
 from core.colormaps import CUSTOM_COLORMAPS, STANDARD_COLORMAPS, register_colormaps, resolve_cmap
 from core.update_checker import (
     CheckResult,
@@ -405,6 +417,7 @@ class MainWindow(QMainWindow):
         self.recent_folders: List[str] = self._load_recent_folders()
         self.available_files: List[str] = []
         self.available_map_files: List[str] = []
+        self.drr_available_sources: List[DrrSource] = []
         self.drr_selected_files: List[str] = []
         self.drr_baseline_files_manual: List[str] = []
         self.drr_baseline_files_found: List[str] = []
@@ -467,6 +480,9 @@ class MainWindow(QMainWindow):
         self._drr_heatmap_fit_artist = None
         self._folder_placeholder_text = ""
         self._load_in_progress = False
+        self._export_in_progress = False
+        self._active_export_request_key = ""
+        self._last_export_request_key = ""
         self._active_load_mode: str | None = None
         self._active_load_succeeded = False
         self._mcd_reapply_pending = False
@@ -580,8 +596,14 @@ class MainWindow(QMainWindow):
         if not path.exists() or not path.is_dir():
             self._show_error(f"Folder does not exist: {folder}")
             return False
-        if str(path).lower() != self.current_folder.lower():
+        folder_changed = str(path).lower() != self.current_folder.lower()
+        if folder_changed:
             self._invalidate_export_move_sources()
+            self._reset_workflow_state_for_folder_change()
+            if hasattr(self, "drr_pin_baseline_chk"):
+                self.drr_baseline_files_manual = []
+                self.drr_baseline_files_found = []
+                self.drr_pin_baseline_chk.setChecked(False)
         self.current_folder = str(path)
         self.folder_edit.setText(self.current_folder)
         self._watch_current_folder()
@@ -603,12 +625,34 @@ class MainWindow(QMainWindow):
         path = Path(self.current_folder)
         if not path.exists() or not path.is_dir():
             return
-        if self.folder_watcher.addPath(str(path)):
+        watch_paths = [path]
+        initial_data = path / "Initial Data"
+        if initial_data.is_dir():
+            watch_paths.append(initial_data)
+            try:
+                watch_paths.extend(
+                    child for child in initial_data.rglob("*") if child.is_dir()
+                )
+            except OSError:
+                pass
+        self.folder_watcher.addPaths([str(item) for item in watch_paths[:256]])
+        if str(path) in self.folder_watcher.directories():
             self._watched_folder = str(path)
 
     def _on_watched_folder_changed(self, folder: str) -> None:
-        if self.current_folder and str(Path(folder)) == str(Path(self.current_folder)):
+        if not self.current_folder:
+            return
+        changed = Path(folder).resolve()
+        root = Path(self.current_folder).resolve()
+        initial_data = (root / "Initial Data").resolve()
+        if changed == root:
             self.folder_refresh_timer.start()
+            return
+        try:
+            changed.relative_to(initial_data)
+        except ValueError:
+            return
+        self.folder_refresh_timer.start()
 
     def _refresh_watched_folder(self) -> None:
         if not self.current_folder:
@@ -622,8 +666,7 @@ class MainWindow(QMainWindow):
             self.folder_refresh_timer.start()
             return
         self._refresh_file_lists(auto=True)
-        if self.current_folder and self.current_folder not in self.folder_watcher.directories():
-            self._watch_current_folder()
+        self._watch_current_folder()
 
     def _restore_last_folder(self) -> None:
         self._populate_recent_folder_combo()
@@ -1421,7 +1464,10 @@ class MainWindow(QMainWindow):
         self.drr_edit_baselines_btn = QPushButton("Select...")
         self.drr_edit_baselines_btn.setFixedHeight(30)
         self.drr_edit_baselines_btn.setMaximumWidth(92)
-        self.drr_baseline_autofind_btn = QPushButton("Auto Find...")
+        self.drr_baseline_autofind_btn = QPushButton("Clear")
+        self.drr_baseline_autofind_btn.setToolTip(
+            "Clear the selected external background files."
+        )
         self.drr_baseline_autofind_btn.setFixedHeight(30)
         self.drr_baseline_autofind_btn.setMaximumWidth(104)
         base_grid.addWidget(self.drr_baseline_summary, 0, 0, 1, 3)
@@ -1433,16 +1479,23 @@ class MainWindow(QMainWindow):
         self.drr_baseline_combine_combo = QComboBox()
         self.drr_baseline_combine_combo.addItems(
             [
-                "Last frame of each baseline file",
-                "First frame of each baseline file",
-                "Average all baseline files",
+                "Last frame from each file, then average",
+                "First frame from each file, then average",
+                "Average all frames in each file, then average files",
             ]
         )
         self.drr_baseline_combine_combo.setMaximumWidth(320)
         self._style_combo_popup(self.drr_baseline_combine_combo)
         files_layout.addWidget(self.drr_baseline_combine_combo)
+        self.drr_pin_baseline_chk = QCheckBox("Pin background when measurement changes")
+        self.drr_pin_baseline_chk.setToolTip(
+            "Keep this manually selected background for another measurement group. "
+            "The wavelength center and spectral grid are still validated."
+        )
+        files_layout.addWidget(self.drr_pin_baseline_chk)
         self.drr_external_baseline_row.setVisible(False)
         self.drr_baseline_combine_combo.setVisible(False)
+        self.drr_pin_baseline_chk.setVisible(False)
         layout.addWidget(self._make_expander("Data", files, expanded=True))
 
         params = QGroupBox("Plot Options")
@@ -2784,10 +2837,6 @@ class MainWindow(QMainWindow):
             ):
                 index = combo.findData(previous)
                 combo.setCurrentIndex(index if index >= 0 else 0)
-            if old_compare[0] not in self.available_files and self.available_files:
-                self.shg_compare_reference_combo.setCurrentIndex(1)
-            if old_compare[1] not in self.available_files and len(self.available_files) > 1:
-                self.shg_compare_sample_combo.setCurrentIndex(2)
         finally:
             self.shg_files.blockSignals(source_blocked)
             self.shg_background_combo.blockSignals(background_blocked)
@@ -3597,7 +3646,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "power_group_combo"):
             return ""
         data = self.power_group_combo.currentData()
-        return str(data) if data else str(self.power_group_combo.currentText()).strip()
+        return str(data or "")
 
     def _power_role_group_key(self, role: str) -> str:
         combo = self.power_kk_group_combo if role == "KK" else self.power_kkp_group_combo
@@ -3623,6 +3672,7 @@ class MainWindow(QMainWindow):
             ]
         try:
             self.power_group_combo.clear()
+            self.power_group_combo.addItem("— Select power sweep —", "")
             if hasattr(self, "power_kk_group_combo"):
                 self.power_kk_group_combo.clear()
                 self.power_kkp_group_combo.clear()
@@ -3673,12 +3723,11 @@ class MainWindow(QMainWindow):
         sources = self._power_current_sources()
         key = self._power_selected_group_key()
         source = sources.get(key)
-        if source is None and sources:
-            source = next(iter(sources.values()))
-            key = source.key
         if source is None:
             self.power_group_summary.setPlainText(
-                "No power sweeps found. Expected a Power_uW table or filenames containing values such as 37.96uW."
+                "Select a detected power sweep."
+                if sources
+                else "No power sweeps found. Expected a Power_uW table or filenames containing values such as 37.96uW."
             )
             return
         if source.source_format == "table":
@@ -4113,6 +4162,10 @@ class MainWindow(QMainWindow):
             out_kp_angle=out_kp,
             tolerance=tolerance,
         )
+        # Never turn a duplicate classification into a silent channel choice.
+        # Leave ambiguous channels empty so the user can resolve them explicitly.
+        for key in duplicates:
+            found.pop(key, None)
         for key, combo in self.cmp_channel_combos.items():
             old = combo.blockSignals(True)
             try:
@@ -4587,7 +4640,8 @@ class MainWindow(QMainWindow):
         self.drr_edit_measurements_btn.clicked.connect(self._edit_drr_measurements)
         self.drr_clear_measurements_btn.clicked.connect(self._clear_drr_measurements)
         self.drr_edit_baselines_btn.clicked.connect(self._edit_drr_baselines_dialog)
-        self.drr_baseline_autofind_btn.clicked.connect(self._auto_find_back_baselines)
+        self.drr_baseline_autofind_btn.clicked.connect(self._clear_drr_baselines)
+        self.drr_pin_baseline_chk.toggled.connect(self._on_drr_pin_baseline_toggled)
         self.drr_baseline_combine_combo.currentTextChanged.connect(self._on_drr_baseline_mode_changed)
         self.drr_auto_v_btn.clicked.connect(self._auto_drr_vrange)
         self.drr_auto_x_btn.clicked.connect(self._auto_drr_xrange)
@@ -4736,6 +4790,8 @@ class MainWindow(QMainWindow):
     def _toolbar_load(self) -> None:
         mode = self._active_mode()
         if mode:
+            if mode == "DRR":
+                self._refresh_file_lists(auto=True)
             self._start_load(mode)
 
     def _toolbar_plot(self) -> None:
@@ -4763,6 +4819,12 @@ class MainWindow(QMainWindow):
         external_baseline = self.drr_baseline_combo.currentText() == "External"
         self.drr_external_baseline_row.setVisible(external_baseline)
         self.drr_baseline_combine_combo.setVisible(external_baseline)
+        self.drr_pin_baseline_chk.setVisible(external_baseline)
+        if external_baseline and not self.drr_baseline_files_manual:
+            self._invalidate_drr_for_background_selection(
+                "Select an external background before processing."
+            )
+            return
         if self.loaded and self.loaded.mode == "DRR" and not self._suspend_drr_autoplot:
             sender = self.sender()
             if sender in (
@@ -4998,6 +5060,17 @@ class MainWindow(QMainWindow):
         self._update_action_states()
         self._update_plot_view_bar_visibility()
         self._update_results_dock_page()
+        if (
+            self._active_mode() == "DRR"
+            and self.drr_selected_files
+            and (
+                self.drr_baseline_combo.currentText() != "External"
+                or bool(self.drr_baseline_files_manual)
+            )
+            and not self._load_in_progress
+            and (not self.loaded or self.loaded.mode != "DRR")
+        ):
+            QTimer.singleShot(0, lambda: self._start_load("DRR"))
 
     def _on_cmp_plot_param_changed(self) -> None:
         self._invalidate_export_move_sources()
@@ -5071,6 +5144,16 @@ class MainWindow(QMainWindow):
 
     def _refresh_file_lists(self, *, auto: bool = False) -> None:
         old_files = set(self.available_files)
+        old_drr_files = {source.source for source in self.drr_available_sources}
+        old_source_files = old_files | old_drr_files
+        old_drr_groups = group_drr_sources(self.drr_available_sources)
+        selected_before = set(self.drr_selected_files)
+        selected_complete_group_keys = {
+            group.key
+            for group in old_drr_groups
+            if group.files
+            and {source.source for source in group.files}.issubset(selected_before)
+        }
         pl_selected = self._selected(self.pl_files)
         self.pl_files.clear()
         if not self.current_folder:
@@ -5079,20 +5162,39 @@ class MainWindow(QMainWindow):
             return
         self.available_files = data_io.list_csv_files(self.current_folder)
         self.available_map_files = data_io.list_map_input_files(self.current_folder)
+        self.drr_available_sources = discover_drr_sources(self.current_folder)
         self.pl_files.addItems(self.available_map_files)
         self._restore_list_selection(self.pl_files, [f for f in pl_selected if f in self.available_map_files])
         self._cmp_set_channel_combo_items()
         self._power_refresh_groups()
         self._mcd_refresh_sources()
         self._shg_refresh_sources()
-        self.drr_selected_files = [f for f in self.drr_selected_files if f in self.available_map_files]
-        self.drr_baseline_files_manual = [f for f in self.drr_baseline_files_manual if f in self.available_files]
-        self.drr_baseline_files_found = [f for f in self.drr_baseline_files_found if f in self.available_files]
+        drr_candidates = {source.source for source in self.drr_available_sources}
+        self.drr_selected_files = [
+            f for f in self.drr_selected_files
+            if f in drr_candidates or (Path(f).is_absolute() and Path(f).is_file())
+        ]
+        if selected_complete_group_keys:
+            selected_now = set(self.drr_selected_files)
+            for group in group_drr_sources(self.drr_available_sources):
+                if group.key not in selected_complete_group_keys:
+                    continue
+                for source in group.files:
+                    if source.source not in selected_now:
+                        self.drr_selected_files.append(source.source)
+                        selected_now.add(source.source)
+        self.drr_baseline_files_manual = [
+            f for f in self.drr_baseline_files_manual
+            if f in drr_candidates or (Path(f).is_absolute() and Path(f).is_file())
+        ]
+        self.drr_baseline_files_found = [f for f in self.drr_baseline_files_found if f in drr_candidates]
         self._cmp_auto_assign_channels()
         self._update_drr_selection_labels()
         new_files = set(self.available_files)
-        added = len(new_files - old_files)
-        removed = len(old_files - new_files)
+        new_drr_files = {source.source for source in self.drr_available_sources}
+        new_source_files = new_files | new_drr_files
+        added = len(new_source_files - old_source_files)
+        removed = len(old_source_files - new_source_files)
         if added or removed:
             self._invalidate_export_move_sources()
         if auto and (added or removed):
@@ -5101,9 +5203,12 @@ class MainWindow(QMainWindow):
                 parts.append(f"{added} new")
             if removed:
                 parts.append(f"{removed} removed")
-            self._status(f"Data source updated: {', '.join(parts)} ({len(self.available_files)} CSV files).")
+            self._status(
+                f"Data source updated: {', '.join(parts)} "
+                f"({len(new_source_files)} source files)."
+            )
         elif not auto:
-            self._status(f"Loaded file list: {len(self.available_files)}")
+            self._status(f"Loaded file list: {len(new_source_files)} source files")
 
     def _update_drr_selection_labels(self) -> None:
         def _brief(names: List[str]) -> str:
@@ -5111,13 +5216,13 @@ class MainWindow(QMainWindow):
                 return "none"
             # Zero-width break opportunities preserve the complete first name
             # while allowing underscore-heavy measurement names to wrap.
-            first = names[0].replace("_", "_\u200b").replace("-", "-\u200b")
+            first = Path(names[0]).name.replace("_", "_\u200b").replace("-", "-\u200b")
             return first if len(names) == 1 else f"{first} (+{len(names) - 1} more)"
 
         mode_map = {
-            "Last frame of each baseline file": "last",
-            "First frame of each baseline file": "first",
-            "Average all baseline files": "avg",
+            "Last frame from each file, then average": "last",
+            "First frame from each file, then average": "first",
+            "Average all frames in each file, then average files": "all frames",
         }
         mode_short = mode_map.get(self.drr_baseline_combine_combo.currentText(), "last")
         self.drr_measurement_summary.setText(f"Measurement: {len(self.drr_selected_files)} files ({_brief(self.drr_selected_files)})")
@@ -5145,34 +5250,575 @@ class MainWindow(QMainWindow):
         if len(xlsx) != 1 or len(selected) != 1:
             raise ValueError("Select exactly one XLSX map for direct DR/R display (XLSX maps cannot be mixed with CSV measurements).")
 
+    def _drr_source_center(self, source_name: str) -> float | None:
+        for source in self.drr_available_sources:
+            if source.source == source_name and source.wavelength_center_nm is not None:
+                return float(source.wavelength_center_nm)
+        named = extract_wavelength_center_nm(source_name)
+        if named is not None:
+            return float(named)
+        path = resolve_source_path(self.current_folder, source_name)
+        if path.suffix.lower() == ".csv" and path.is_file():
+            return inspect_csv_wavelength_center(path)
+        return None
+
+    def _restore_saved_drr_recipe(self) -> bool:
+        recipe = find_saved_drr_recipe(self.current_folder, self.drr_selected_files)
+        if recipe is None:
+            return False
+        missing = [
+            source
+            for source in recipe.baseline_files
+            if not resolve_source_path(self.current_folder, source).is_file()
+        ]
+        if missing:
+            self._status(
+                "Saved DRR background is unavailable; select a background manually."
+            )
+            return False
+
+        measurement_center = self._drr_selected_wavelength_center()
+        baseline_centers = [
+            center
+            for source in recipe.baseline_files
+            if (center := self._drr_source_center(source)) is not None
+        ]
+        compatible = (
+            all(
+                wavelength_centers_match(baseline_centers[0], center)
+                for center in baseline_centers[1:]
+            )
+            if baseline_centers
+            else True
+        )
+        if (
+            not compatible
+            or measurement_center is not None
+            and baseline_centers
+            and not wavelength_centers_match(measurement_center, baseline_centers[0])
+        ):
+            self._status(
+                "Saved DRR background has an incompatible wavelength center; "
+                "select a background manually."
+            )
+            return False
+
+        mode = recipe.baseline_selection
+        if recipe.baseline_files or mode == "External":
+            mode = "External"
+        elif "first" in mode.casefold():
+            mode = "Self (first frame)"
+        else:
+            mode = "Self (last frame)"
+        combine_text = {
+            "first": "First frame from each file, then average",
+            "last": "Last frame from each file, then average",
+            "all": "Average all frames in each file, then average files",
+        }.get(recipe.baseline_which, "Last frame from each file, then average")
+
+        blocked = self.drr_baseline_combo.blockSignals(True)
+        self.drr_baseline_combo.setCurrentText(mode)
+        self.drr_baseline_combo.blockSignals(blocked)
+        blocked = self.drr_baseline_combine_combo.blockSignals(True)
+        self.drr_baseline_combine_combo.setCurrentText(combine_text)
+        self.drr_baseline_combine_combo.blockSignals(blocked)
+        self.drr_baseline_files_manual = list(recipe.baseline_files)
+        self.drr_baseline_files_found = list(recipe.baseline_files)
+        external = mode == "External"
+        self.drr_external_baseline_row.setVisible(external)
+        self.drr_baseline_combine_combo.setVisible(external)
+        self.drr_pin_baseline_chk.setVisible(external)
+        self._status(
+            f"Restored saved DRR recipe: {len(recipe.baseline_files)} background "
+            f"file{'s' if len(recipe.baseline_files) != 1 else ''}, mode={recipe.baseline_which}."
+        )
+        return True
+
+    def _reset_workflow_state_for_folder_change(self) -> None:
+        """Prevent selections and plots from one experiment leaking into another."""
+        self.loaded = None
+        self.last_plotted_mode = None
+        self._last_plot_cube = None
+        self._last_plot_params_key = None
+        self.drr_selected_files = []
+        self.drr_baseline_files_manual = []
+        self.drr_baseline_files_found = []
+        for name in ("pl_files", "mcd_files", "shg_files"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                blocked = widget.blockSignals(True)
+                widget.clearSelection()
+                widget.blockSignals(blocked)
+        for name in (
+            "shg_background_combo",
+            "shg_compare_reference_combo",
+            "shg_compare_sample_combo",
+            "shg_compare_background_a_combo",
+            "shg_compare_background_b_combo",
+            "mcd_dark_pos_combo",
+            "mcd_dark_neg_combo",
+        ):
+            combo = getattr(self, name, None)
+            if combo is not None and combo.count():
+                blocked = combo.blockSignals(True)
+                combo.setCurrentIndex(0)
+                combo.blockSignals(blocked)
+        self._active_export_request_key = ""
+        self._last_export_request_key = ""
+        if hasattr(self, "figure"):
+            self.figure.clear()
+            self.canvas.draw_idle()
+        self._update_action_states()
+
+    def _apply_drr_background_gate_default(self) -> bool:
+        if not self.drr_baseline_files_manual:
+            return True
+        assessment = assess_background_gate_files(
+            self.current_folder,
+            self.drr_baseline_files_manual,
+        )
+        if not assessment.all_constant:
+            return True
+        if len(assessment.profiles) > 1 and not assessment.same_constant_values:
+            self._invalidate_drr_for_background_selection(
+                "Selected backgrounds have different constant gate values. "
+                "Choose files from one gate condition."
+            )
+            return False
+        blocked = self.drr_baseline_combine_combo.blockSignals(True)
+        self.drr_baseline_combine_combo.setCurrentText(
+            "Average all frames in each file, then average files"
+        )
+        self.drr_baseline_combine_combo.blockSignals(blocked)
+        self._status(
+            "Constant-gate background detected: averaging all frames per file"
+            + (" and then averaging files." if len(assessment.profiles) > 1 else ".")
+        )
+        return True
+
+    def _guess_drr_background_for_selection(self) -> bool:
+        guess = guess_drr_background(
+            self.current_folder,
+            self.drr_available_sources,
+            self.drr_selected_files,
+        )
+        if guess is None:
+            return False
+        combine_text = {
+            "first": "First frame from each file, then average",
+            "last": "Last frame from each file, then average",
+            "all": "Average all frames in each file, then average files",
+        }[guess.baseline_which]
+        blocked = self.drr_baseline_combo.blockSignals(True)
+        self.drr_baseline_combo.setCurrentText("External")
+        self.drr_baseline_combo.blockSignals(blocked)
+        blocked = self.drr_baseline_combine_combo.blockSignals(True)
+        self.drr_baseline_combine_combo.setCurrentText(combine_text)
+        self.drr_baseline_combine_combo.blockSignals(blocked)
+        self.drr_baseline_files_manual = list(guess.baseline_files)
+        self.drr_baseline_files_found = list(guess.baseline_files)
+        self.drr_external_baseline_row.setVisible(True)
+        self.drr_baseline_combine_combo.setVisible(True)
+        self.drr_pin_baseline_chk.setVisible(True)
+        gap_minutes = guess.time_gap_seconds / 60.0
+        message = (
+            f"Guessed {len(guess.baseline_files)} earlier background file"
+            f"{'s' if len(guess.baseline_files) != 1 else ''} "
+            f"({gap_minutes:.1f} min earlier): {guess.reason}."
+        )
+        self._status(message)
+        self._append_log(message)
+        return True
+
     def _edit_drr_measurements(self) -> None:
-        selected = self._open_dual_list_dialog(
-            title="Measurement Files",
+        previous = list(self.drr_selected_files)
+        selected = self._open_drr_source_dialog(
+            title="Choose DRR Measurement Group",
             selected=self.drr_selected_files,
-            enable_group_auto=True,
-            enable_back_auto=False,
-            candidates=self.available_map_files,
+            baseline_mode=False,
         )
         self._reject_mixed_xlsx_selection(selected)
         self.drr_selected_files = selected
+        measurement_changed = selected != previous
+        if measurement_changed and not self.drr_pin_baseline_chk.isChecked():
+            self.drr_baseline_files_manual = []
+            self.drr_baseline_files_found = []
+            if not self._restore_saved_drr_recipe():
+                self._guess_drr_background_for_selection()
         self._update_drr_selection_labels()
-        if self.loaded and self.loaded.mode == "DRR":
+        if measurement_changed:
+            self._clear_loaded_drr_view()
+        if (
+            measurement_changed
+            and self.drr_baseline_combo.currentText() == "External"
+            and not self.drr_baseline_files_manual
+        ):
+            self._invalidate_drr_for_background_selection(
+                "Measurement changed. Select an external background."
+            )
+            return
+        if self.drr_selected_files:
             self._start_load("DRR")
 
     def _clear_drr_measurements(self) -> None:
         self.drr_selected_files = []
+        if not self.drr_pin_baseline_chk.isChecked():
+            self.drr_baseline_files_manual = []
         self._update_drr_selection_labels()
+        self._clear_loaded_drr_view()
+        self._set_stage("No DRR measurement")
+        self._update_action_states()
 
     def _edit_drr_baselines_dialog(self) -> None:
-        self.drr_baseline_files_manual = self._open_dual_list_dialog(
-            title="Baseline Files",
+        self.drr_baseline_files_manual = self._open_drr_source_dialog(
+            title="Choose Historical or External Baseline",
             selected=self.drr_baseline_files_manual,
-            enable_group_auto=False,
-            enable_back_auto=True,
+            baseline_mode=True,
         )
+        if self.drr_baseline_files_manual:
+            blocked = self.drr_baseline_combo.blockSignals(True)
+            self.drr_baseline_combo.setCurrentText("External")
+            self.drr_baseline_combo.blockSignals(blocked)
+            self.drr_external_baseline_row.setVisible(True)
+            self.drr_baseline_combine_combo.setVisible(True)
+            self.drr_pin_baseline_chk.setVisible(True)
         self._update_drr_selection_labels()
-        if self.loaded and self.loaded.mode == "DRR":
+        if not self._apply_drr_background_gate_default():
+            return
+        if self.drr_selected_files:
             self._start_load("DRR")
+
+    def _clear_loaded_drr_view(self) -> None:
+        self._invalidate_export_move_sources()
+        if self.loaded and self.loaded.mode == "DRR":
+            self.loaded = None
+        if self.last_plotted_mode == "DRR":
+            self.last_plotted_mode = None
+            self.figure.clear()
+            self.canvas.draw_idle()
+        self._last_plot_cube = None
+        self._last_plot_params_key = None
+
+    def _invalidate_drr_for_background_selection(self, message: str) -> None:
+        self._clear_loaded_drr_view()
+        self._set_stage("Background required")
+        self._status(message)
+        self._update_action_states()
+
+    def _clear_drr_baselines(self) -> None:
+        self.drr_baseline_files_manual = []
+        self.drr_baseline_files_found = []
+        self.drr_pin_baseline_chk.setChecked(False)
+        self._update_drr_selection_labels()
+        if self.drr_baseline_combo.currentText() == "External":
+            self._invalidate_drr_for_background_selection(
+                "External background cleared. Select a background before processing."
+            )
+
+    def _on_drr_pin_baseline_toggled(self, checked: bool) -> None:
+        if checked and not self.drr_baseline_files_manual:
+            blocked = self.drr_pin_baseline_chk.blockSignals(True)
+            self.drr_pin_baseline_chk.setChecked(False)
+            self.drr_pin_baseline_chk.blockSignals(blocked)
+            self._status("Select an external background before pinning it.")
+            return
+        self._status("External background pinned." if checked else "External background follows measurement selection.")
+
+    def _drr_selected_wavelength_center(self) -> float | None:
+        catalog_centers = {
+            source.source: source.wavelength_center_nm for source in self.drr_available_sources
+        }
+        centers = [
+            center
+            for name in self.drr_selected_files
+            if (
+                center := catalog_centers.get(name)
+                if catalog_centers.get(name) is not None
+                else extract_wavelength_center_nm(name)
+            ) is not None
+        ]
+        if not centers:
+            return None
+        first = float(centers[0])
+        return first if all(wavelength_centers_match(first, center) for center in centers[1:]) else None
+
+    def _open_drr_source_dialog(
+        self,
+        *,
+        title: str,
+        selected: List[str],
+        baseline_mode: bool,
+    ) -> List[str]:
+        """Browse recent DRR groups without flattening the complete device history."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        if not self.windowIcon().isNull():
+            dlg.setWindowIcon(self.windowIcon())
+        dlg.setMinimumSize(920, 560)
+        dlg.resize(1120, 680)
+        layout = QVBoxLayout(dlg)
+
+        hint = QLabel(
+            "Background history includes earlier measurement groups; select any compatible file or group."
+            if baseline_mode
+            else "The newest unprocessed measurement group is shown first. Search to reach older sessions."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        filter_row = QHBoxLayout()
+        filter_edit = QLineEdit()
+        filter_edit.setPlaceholderText("Search group, date, or filename...")
+        show_all = QCheckBox("Show all history")
+        show_incompatible = QCheckBox("Show other wavelengths")
+        show_incompatible.setVisible(baseline_mode)
+        show_incompatible.setToolTip(
+            "Show background candidates whose filename wavelength center does not match the measurement."
+        )
+        unprocessed_only = QCheckBox("Unprocessed only")
+        unprocessed_only.setChecked(not baseline_mode)
+        unprocessed_only.setVisible(not baseline_mode)
+        include_backgrounds = QCheckBox("Include background candidates")
+        include_backgrounds.setVisible(not baseline_mode)
+        include_backgrounds.setToolTip(
+            "Show files classified as backgrounds so an unusual constant-gate measurement can be restored manually."
+        )
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.setToolTip("Scan Initial Data and its measurement folders for new files.")
+        filter_row.addWidget(QLabel("Find"))
+        filter_row.addWidget(filter_edit, 1)
+        filter_row.addWidget(unprocessed_only)
+        filter_row.addWidget(include_backgrounds)
+        filter_row.addWidget(show_incompatible)
+        filter_row.addWidget(show_all)
+        filter_row.addWidget(refresh_btn)
+        layout.addLayout(filter_row)
+
+        panes = QSplitter(Qt.Horizontal)
+        group_list = QListWidget()
+        file_list = QListWidget()
+        selected_list = QListWidget()
+        for widget in (group_list, file_list, selected_list):
+            widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            widget.setWordWrap(True)
+            widget.setTextElideMode(Qt.ElideNone)
+            widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            widget.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+            widget.setUniformItemSizes(False)
+            widget.setResizeMode(QListView.Adjust)
+            widget.setSpacing(3)
+            widget.setItemDelegate(WrappedFilenameDelegate(widget))
+
+        def _panel(label: str, widget: QListWidget) -> QWidget:
+            panel = QWidget()
+            panel_layout = QVBoxLayout(panel)
+            panel_layout.setContentsMargins(0, 0, 0, 0)
+            panel_layout.addWidget(QLabel(label))
+            panel_layout.addWidget(widget, 1)
+            return panel
+
+        panes.addWidget(_panel("Data history" if baseline_mode else "Measurement sessions", group_list))
+        panes.addWidget(_panel("Files in selected session", file_list))
+        panes.addWidget(_panel("Chosen files", selected_list))
+        panes.setStretchFactor(0, 4)
+        panes.setStretchFactor(1, 3)
+        panes.setStretchFactor(2, 3)
+        panes.setSizes([440, 330, 330])
+        layout.addWidget(panes, 1)
+
+        action_row = QHBoxLayout()
+        add_group_btn = QPushButton("Add Entire Group")
+        add_files_btn = QPushButton("Add Selected Files")
+        remove_btn = QPushButton("Remove")
+        clear_btn = QPushButton("Clear")
+        browse_btn = QPushButton("Browse File Anywhere...")
+        browse_btn.setVisible(baseline_mode)
+        action_row.addWidget(add_group_btn)
+        action_row.addWidget(add_files_btn)
+        action_row.addWidget(browse_btn)
+        action_row.addStretch(1)
+        action_row.addWidget(remove_btn)
+        action_row.addWidget(clear_btn)
+        layout.addLayout(action_row)
+
+        def _catalog_groups():
+            catalog_sources = (
+                [
+                    source
+                    for source in self.drr_available_sources
+                    if Path(source.source).suffix.lower() == ".csv"
+                ]
+                if baseline_mode
+                else self.drr_available_sources
+            )
+            result = group_drr_sources(catalog_sources)
+            if baseline_mode:
+                result = sorted(
+                    result,
+                    key=lambda group: (0 if group.is_background else 1, -group.modified_time),
+                )
+            return result
+
+        groups = _catalog_groups()
+        groups_by_key = {group.key: group for group in groups}
+        measurement_center = self._drr_selected_wavelength_center()
+
+        def _add_chosen(source: str) -> None:
+            existing = {
+                str(selected_list.item(index).data(Qt.UserRole) or selected_list.item(index).text())
+                for index in range(selected_list.count())
+            }
+            if source in existing:
+                return
+            item = QListWidgetItem(Path(source).name)
+            item.setData(Qt.UserRole, source)
+            item.setToolTip(source)
+            selected_list.addItem(item)
+
+        for source in selected:
+            _add_chosen(source)
+
+        def _selected_group():
+            item = group_list.currentItem()
+            return groups_by_key.get(str(item.data(Qt.UserRole))) if item is not None else None
+
+        def _populate_files() -> None:
+            file_list.clear()
+            group = _selected_group()
+            if group is None:
+                return
+            for source in group.files:
+                detail = (
+                    f"\n{source.classification_reason}"
+                    if source.classification != "measurement"
+                    else ""
+                )
+                item = QListWidgetItem(f"{source.filename}{detail}")
+                item.setData(Qt.UserRole, source.source)
+                item.setToolTip(f"{source.source}\n{source.classification_reason}")
+                file_list.addItem(item)
+
+        def _refresh_groups() -> None:
+            needle = filter_edit.text().strip().casefold()
+            all_history = show_all.isChecked() or bool(needle)
+            group_list.clear()
+            visible = []
+            for group in groups:
+                if not baseline_mode and group.is_background and not include_backgrounds.isChecked():
+                    continue
+                if (
+                    baseline_mode
+                    and measurement_center is not None
+                    and group.wavelength_centers_nm
+                    and not show_incompatible.isChecked()
+                    and not all(
+                        wavelength_centers_match(measurement_center, center)
+                        for center in group.wavelength_centers_nm
+                    )
+                ):
+                    continue
+                if unprocessed_only.isVisible() and unprocessed_only.isChecked() and group.processed:
+                    continue
+                searchable = " ".join(
+                    [group.title, group.session_date, *(source.filename for source in group.files)]
+                ).casefold()
+                if needle and needle not in searchable:
+                    continue
+                visible.append(group)
+            if not all_history:
+                visible = visible[:25]
+            for group in visible:
+                kind = {
+                    "background": "background",
+                    "likely_background": "likely background",
+                    "review": "constant gate · review",
+                }.get(group.classification, "measurement")
+                done = " · processed" if group.processed and not baseline_mode else ""
+                center_text = (
+                    " · " + "/".join(f"{center:g}" for center in group.wavelength_centers_nm) + " nm"
+                    if group.wavelength_centers_nm
+                    else " · wavelength unknown"
+                )
+                summary = (
+                    f"{group.session_date} · {len(group.files)} file"
+                    f"{'s' if len(group.files) != 1 else ''} · {kind}{done}{center_text}"
+                )
+                item = QListWidgetItem(
+                    f"{summary}\n{group.title}"
+                )
+                item.setData(Qt.UserRole, group.key)
+                item.setToolTip(
+                    f"{group.title}\n{summary}\n\n"
+                    + "\n".join(
+                        f"{source.source} — {source.classification_reason}"
+                        for source in group.files
+                    )
+                )
+                group_list.addItem(item)
+            if group_list.count():
+                group_list.setCurrentRow(0)
+            else:
+                file_list.clear()
+
+        def _reload_catalog() -> None:
+            nonlocal groups, groups_by_key, measurement_center
+            self.drr_available_sources = discover_drr_sources(self.current_folder)
+            groups = _catalog_groups()
+            groups_by_key = {group.key: group for group in groups}
+            measurement_center = self._drr_selected_wavelength_center()
+            _refresh_groups()
+            self._status(f"DRR catalog refreshed: {len(self.drr_available_sources)} files.")
+
+        def _add_group() -> None:
+            group = _selected_group()
+            if group is not None:
+                for source in group.files:
+                    _add_chosen(source.source)
+
+        def _add_files() -> None:
+            for item in file_list.selectedItems():
+                _add_chosen(str(item.data(Qt.UserRole)))
+
+        def _remove() -> None:
+            for item in selected_list.selectedItems():
+                selected_list.takeItem(selected_list.row(item))
+
+        def _browse_external() -> None:
+            paths, _selected_filter = QFileDialog.getOpenFileNames(
+                dlg,
+                "Choose External DRR Baseline",
+                self.current_folder or self._browse_start_folder(),
+                "DRR baseline files (*.csv)",
+            )
+            for path in paths:
+                _add_chosen(str(Path(path).resolve()))
+
+        group_list.currentRowChanged.connect(lambda _row: _populate_files())
+        group_list.itemDoubleClicked.connect(lambda _item: _add_group())
+        file_list.itemDoubleClicked.connect(lambda _item: _add_files())
+        filter_edit.textChanged.connect(lambda _text: _refresh_groups())
+        show_all.toggled.connect(lambda _checked: _refresh_groups())
+        unprocessed_only.toggled.connect(lambda _checked: _refresh_groups())
+        include_backgrounds.toggled.connect(lambda _checked: _refresh_groups())
+        show_incompatible.toggled.connect(lambda _checked: _refresh_groups())
+        add_group_btn.clicked.connect(_add_group)
+        add_files_btn.clicked.connect(_add_files)
+        remove_btn.clicked.connect(_remove)
+        clear_btn.clicked.connect(selected_list.clear)
+        browse_btn.clicked.connect(_browse_external)
+        refresh_btn.clicked.connect(_reload_catalog)
+        _refresh_groups()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        if dlg.exec() != QDialog.Accepted:
+            return selected
+        return [
+            str(selected_list.item(index).data(Qt.UserRole) or selected_list.item(index).text())
+            for index in range(selected_list.count())
+        ]
 
     def _open_dual_list_dialog(
         self,
@@ -5349,23 +5995,17 @@ class MainWindow(QMainWindow):
         if self.loaded and self.loaded.mode == "DRR" and not self._suspend_drr_autoplot:
             self._plot_mode("DRR")
 
-    def _auto_find_back_baselines(self) -> None:
-        matches = [f for f in self.available_files if "back" in f.lower()]
-        self.drr_baseline_files_manual = matches
-        if matches:
-            self.drr_baseline_combo.setCurrentText("External")
-        self._update_drr_selection_labels()
-        self._status(f"State: Auto-found {len(matches)} baseline files containing 'back'.")
-        if self.loaded and self.loaded.mode == "DRR":
-            self._start_load("DRR")
-
     def _update_action_states(self) -> None:
         active_mode = self._active_mode()
         loaded_mode = self.loaded.mode if self.loaded else None
         plotted_mode = self.last_plotted_mode
         self.load_action.setEnabled(active_mode is not None)
         self.plot_action.setEnabled(active_mode is not None and loaded_mode == active_mode)
-        self.save_action.setEnabled(active_mode is not None and plotted_mode == active_mode)
+        self.save_action.setEnabled(
+            active_mode is not None
+            and plotted_mode == active_mode
+            and not self._export_in_progress
+        )
         self._update_move_exported_sources_state()
         pl_loaded = loaded_mode == "PL"
         drr_loaded = loaded_mode == "DRR"
@@ -5728,13 +6368,18 @@ class MainWindow(QMainWindow):
             cmp_log = False
             drr_baseline = self.drr_baseline_combo.currentText()
             which_map = {
-                "Last frame of each baseline file": "last",
-                "First frame of each baseline file": "first",
-                "Average all baseline files": "all",
+                "Last frame from each file, then average": "last",
+                "First frame from each file, then average": "first",
+                "Average all frames in each file, then average files": "all",
             }
             drr_baseline_which = which_map.get(self.drr_baseline_combine_combo.currentText(), "last")
             y_axis_spec = self._selected_y_axis_spec("drr")
             power_group_key = ""
+            if drr_baseline == "External" and not baselines:
+                self._invalidate_drr_for_background_selection(
+                    "Select an external background before processing."
+                )
+                return
         elif mode == "Compare":
             selection = self._cmp_selection_from_ui()
             selected = list(selection.as_pairs().values())
@@ -5807,7 +6452,16 @@ class MainWindow(QMainWindow):
             drr_baseline = "Self (last frame)"
             drr_baseline_which = "last"
             y_axis_spec = "auto"
-            power_group_key = self._power_selected_group_key()
+            if self._power_view() == "VP":
+                if not self._power_has_distinct_role_groups():
+                    self._show_error("Assign distinct KK and KKp power sweeps before loading VP.")
+                    return
+                power_group_key = self._power_role_group_key("KK")
+            else:
+                power_group_key = self._power_selected_group_key()
+                if not power_group_key:
+                    self._show_error("Select a power sweep before loading.")
+                    return
         if mode == "PL":
             power_group_key = ""
         if mode != "Compare":
@@ -5842,6 +6496,18 @@ class MainWindow(QMainWindow):
         worker.signals.finished.connect(self._on_load_finished)
         self.thread_pool.start(worker)
 
+    def _drr_provenance_records(
+        self, folder: str, selected: Sequence[str], baselines: Sequence[str]
+    ) -> tuple[WorkingCopyRecord, ...]:
+        records: list[WorkingCopyRecord] = []
+        pairs = [("measurement", name) for name in selected]
+        pairs.extend(("background", name) for name in baselines)
+        for role, name in pairs:
+            records.append(
+                verify_initial_data_working_file(name, folder, workflow="DRR", role=role)
+            )
+        return tuple(records)
+
     def _provenance_records_for_load(self, options: LoadOptions) -> tuple[WorkingCopyRecord, ...]:
         if options.mode not in {"PL", "DRR", "Compare"}:
             return ()
@@ -5849,8 +6515,9 @@ class MainWindow(QMainWindow):
         if options.mode == "PL":
             pairs = [("measurement", options.selected_files[0])] if options.selected_files else []
         elif options.mode == "DRR":
-            pairs = [("measurement", name) for name in options.selected_files]
-            pairs.extend(("background", name) for name in options.baseline_files)
+            return self._drr_provenance_records(
+                options.folder, options.selected_files, options.baseline_files
+            )
         else:
             pairs = [(f"source_{key}", name) for key, name in options.compare_sources.items()]
         records: list[WorkingCopyRecord] = []
@@ -6253,7 +6920,18 @@ class MainWindow(QMainWindow):
                 refresh_split=True,
                 center_split=True,
             )
-        self._on_split_scale_param_changed(prefix)
+        else:
+            self._refresh_automatic_ranges(
+                self._split_prefix_mode(prefix), refresh_split=False
+            )
+        if prefix == "pl":
+            self._on_pl_plot_param_changed()
+        elif prefix == "drr":
+            self._on_drr_plot_param_changed()
+        elif prefix == "cmp":
+            self._on_cmp_plot_param_changed()
+        else:
+            self._on_power_plot_param_changed()
         self._update_action_states()
 
     def _on_split_scale_param_changed(self, prefix: str) -> None:
@@ -8673,9 +9351,9 @@ class MainWindow(QMainWindow):
         baseline_text = p["baseline_mode"]
         y_axis_spec = str(p["y_axis_spec"])
         which_map = {
-            "Last frame of each baseline file": "last",
-            "First frame of each baseline file": "first",
-            "Average all baseline files": "all",
+            "Last frame from each file, then average": "last",
+            "First frame from each file, then average": "first",
+            "Average all frames in each file, then average files": "all",
         }
         baseline_which = which_map.get(str(p["baseline_which"]), "last")
         needs_reload = (
@@ -8724,6 +9402,9 @@ class MainWindow(QMainWindow):
                 drr_baseline_text=baseline_text,
                 drr_baseline_which=baseline_which,
                 y_axis_spec=y_axis_spec,
+                provenance_records=self._drr_provenance_records(
+                    self.current_folder, selected, baselines
+                ),
             )
             self._last_plot_cube = None
             self._last_plot_params_key = None
@@ -8962,6 +9643,9 @@ class MainWindow(QMainWindow):
         self._update_pl_spectrum_and_gate_line(self._pl_last_plot_cube)
 
     def _start_export(self, mode: str) -> None:
+        if self._export_in_progress:
+            self._status("Save already in progress.")
+            return
         if not self.loaded or self.loaded.mode != mode:
             self._show_error("Load and plot data before exporting.")
             return
@@ -9152,10 +9836,38 @@ class MainWindow(QMainWindow):
                 cleanup_verified_sources=bool(self.clean_verified_sources_chk.isChecked()),
             )
 
+        source_state: list[tuple[str, int | None, int | None]] = []
+        source_names = [*self.loaded.selected_files, *self.loaded.baseline_files]
+        source_names.extend((self.loaded.compare_sources or {}).values())
+        for source_name in dict.fromkeys(source_names):
+            path = resolve_source_path(self.loaded.folder, source_name)
+            try:
+                stat = path.stat()
+                source_state.append((str(path).casefold(), stat.st_size, stat.st_mtime_ns))
+            except OSError:
+                source_state.append((str(path).casefold(), None, None))
+        request_key = repr(
+            (
+                mode,
+                self.loaded.folder,
+                tuple(self.loaded.selected_files),
+                tuple(self.loaded.baseline_files),
+                self.loaded.primary_file,
+                tuple(source_state),
+                options,
+            )
+        )
+        if request_key == self._last_export_request_key:
+            self._status("This unchanged result is already saved; no duplicate created.")
+            return
+
         worker = Worker(self._export_task, self.loaded, options)
         worker.signals.log.connect(self._append_log)
         worker.signals.result.connect(self._on_export_done)
-        worker.signals.error.connect(self._show_error)
+        worker.signals.error.connect(self._on_export_error)
+        self._export_in_progress = True
+        self._active_export_request_key = request_key
+        self._update_action_states()
         self._set_stage("Exporting...")
         self.thread_pool.start(worker)
 
@@ -9163,6 +9875,7 @@ class MainWindow(QMainWindow):
         mode = options.mode
         folder = loaded.folder
         out_folder: str | None = None
+        save_status = "created"
         files_to_move: list[str] = []
         metadata_extra = {
             "provenance": [record.to_dict() for record in loaded.provenance_records]
@@ -9223,10 +9936,23 @@ class MainWindow(QMainWindow):
                 },
                 metadata_extra=metadata_extra,
             )
-            log.emit(f"Exported PNG: {paths['png'].name}")
-            log.emit(f"Exported DAT: {paths['dat'].name}")
+            save_status = getattr(paths, "save_status", "created")
+            if save_status == "reused":
+                log.emit(f"Already saved; reused {paths['dat'].name} and {paths['png'].name}")
+            elif save_status == "updated":
+                log.emit(f"Updated existing DRR result: {paths['dat'].name}, {paths['png'].name}")
+            else:
+                log.emit(f"Exported PNG: {paths['png'].name}")
+                log.emit(f"Exported DAT: {paths['dat'].name}")
             out_folder = str(paths["png"].parent)
-            files_to_move = list(loaded.selected_files) + list(loaded.baseline_files)
+            # Canonical Initial Data and historical background files are never
+            # offered for archival. Only verified legacy root working copies are.
+            files_to_move = [
+                Path(record.working_copy_path).name
+                for record in loaded.provenance_records
+                if record.temporary_working_copy
+                and Path(record.working_copy_path).parent.resolve() == Path(folder).resolve()
+            ]
         elif mode == "MCD" and options.drr_cube is not None and loaded.mcd_result is not None and loaded.primary_file:
             package_dir = create_unique_package_dir(
                 Path(folder) / "Processed Data" / "MCD",
@@ -9516,9 +10242,22 @@ class MainWindow(QMainWindow):
             "folder": folder,
             "auto_moved": False,
             "cleaned": cleaned,
+            "mode": mode,
+            "save_status": save_status,
         }
 
+    def _on_export_error(self, message: str) -> None:
+        self._export_in_progress = False
+        self._active_export_request_key = ""
+        self._update_action_states()
+        self._set_stage("Export failed")
+        self._show_error(message)
+
     def _on_export_done(self, result: object) -> None:
+        self._export_in_progress = False
+        self._last_export_request_key = self._active_export_request_key
+        self._active_export_request_key = ""
+        self._update_action_states()
         if isinstance(result, dict):
             out_folder = str(result.get("out_folder", self.current_folder or ""))
             moved = int(result.get("moved", 0))
@@ -9526,6 +10265,8 @@ class MainWindow(QMainWindow):
             folder = str(result.get("folder", self.current_folder or ""))
             auto_moved = bool(result.get("auto_moved", False))
             cleaned = int(result.get("cleaned", 0))
+            exported_mode = str(result.get("mode", ""))
+            save_status = str(result.get("save_status", "created"))
         else:
             out_folder = str(result)
             moved = 0
@@ -9533,15 +10274,24 @@ class MainWindow(QMainWindow):
             folder = self.current_folder or ""
             auto_moved = False
             cleaned = 0
+            exported_mode = ""
+            save_status = "created"
         if moved > 0:
             self._refresh_file_lists()
         if source_files and not auto_moved:
             self._set_export_move_sources(folder, source_files)
         else:
             self._invalidate_export_move_sources()
-        self._set_stage("Exported")
+        self._set_stage("Already saved" if save_status == "reused" else "Exported")
+        if exported_mode == "DRR" and self.current_folder:
+            self._refresh_file_lists(auto=True)
         suffix = f"; cleaned {cleaned} verified source copy(s)" if cleaned else ""
-        self._status(f"Export completed: {out_folder}{suffix}")
+        if save_status == "reused":
+            self._status(f"Already saved—no duplicate created: {out_folder}{suffix}")
+        elif save_status == "updated":
+            self._status(f"Existing DRR result updated: {out_folder}{suffix}")
+        else:
+            self._status(f"Export completed: {out_folder}{suffix}")
     def _auto_update_check_enabled(self) -> bool:
         value = self.settings.value(self.SETTINGS_AUTO_UPDATE_CHECK, True)
         if value is None:
