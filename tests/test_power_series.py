@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from unittest.mock import patch
 from pathlib import Path
 
@@ -54,6 +55,31 @@ class PowerSeriesParserTests(unittest.TestCase):
 
 
 class PowerSeriesLoaderExportTests(unittest.TestCase):
+    def test_power_series_can_export_into_group_package(self) -> None:
+        cube = DataCube(
+            np.asarray([1.0, 2.0]), np.asarray([10.0, 20.0]),
+            np.asarray([[1.0, 2.0], [3.0, 4.0]]),
+            "Power (uW)", "KK", "PL",
+        )
+        params = HeatmapParams(
+            title="KK", xlabel="Energy", ylabel="Power", cbar_label="PL",
+            vmin=0.0, vmax=4.0, xlim=(1.0, 2.0), ylim=(10.0, 20.0),
+        )
+        records = (PowerSeriesFile("a.csv", 10.0, 1.0, "rot2145", "KK"),)
+        with tempfile.TemporaryDirectory() as tmp, patch("core.export._save_heatmap_png"):
+            paths = export_power_series_png_and_dat(
+                tmp, cube=cube, params=params, records=records,
+                group_key="rot2145", y_axis_log=False,
+                processed_name="Processed Data/Power Dependence/rot2145_PowerDep",
+                metadata_extra={"package": "rot2145_PowerDep"},
+            )
+            expected = Path(tmp) / "Processed Data" / "Power Dependence" / "rot2145_PowerDep"
+            self.assertEqual(paths["dat"].parent, expected)
+            metadata = json.loads(paths["dat"].with_suffix(".metadata.json").read_text())
+            self.assertEqual(metadata["package"], "rot2145_PowerDep")
+            self.assertEqual(metadata["processing"]["group_key"], "rot2145")
+            self.assertEqual(metadata["processing"]["power_values_uW"], [10.0])
+
     def test_legacy_power_group_uses_one_filename_derived_gate_axis(self) -> None:
         files = [
             "device_1uW_Rot220p5deg_Stage0_TG-0.8BG=0.csv",
@@ -331,6 +357,12 @@ class PowerSeriesLoaderExportTests(unittest.TestCase):
                 self.assertTrue(lines[0].startswith("# mode=Power Dependent"))
                 self.assertIn("Photon energy\t10\t20", lines)
             self.assertIn("1\t0.33\t0.33", paths["VP_dat"].read_text())
+            metadata = json.loads(paths["VP_dat"].with_suffix(".metadata.json").read_text())
+            self.assertEqual(metadata["workflow"], "Power Dependent VP")
+            self.assertEqual(metadata["dataset_type"], "derived_analysis_2d")
+            self.assertEqual(metadata["processing"]["kk_group_key"], "rot2145")
+            self.assertEqual(metadata["processing"]["kkp_group_key"], "rot295")
+            self.assertEqual(metadata["output_manifest"][1]["filename"], paths["VP_dat"].name)
 
 
 if __name__ == "__main__":

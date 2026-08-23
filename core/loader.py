@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import json
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
@@ -13,6 +14,7 @@ from core import processing_run as P
 XLSX_Y_LABEL_DOPING = "Doping (V)"
 XLSX_Y_LABEL_EFIELD = "Efield (V)"
 XLSX_Y_LABEL_OPTIONS = (XLSX_Y_LABEL_DOPING, XLSX_Y_LABEL_EFIELD)
+DAT_Y_AXIS_OPTIONS = ("Y", "Doping", "Electric field", "Gate voltage", "Custom")
 
 
 def is_xlsx_map_file(file_name: str) -> bool:
@@ -36,6 +38,107 @@ class DataCube:
     gate_label: str
     title: str
     cbar_label: str
+    gate_unit: str = ""
+    y_axis_semantic: str = ""
+
+
+def _dat_sidecar_candidates(path: Path) -> tuple[Path, ...]:
+    return (
+        path.with_suffix(".metadata.json"),
+        Path(f"{path}.plotmeta.json"),
+    )
+
+
+def _load_dat_sidecar(path: Path) -> dict:
+    for sidecar in _dat_sidecar_candidates(path):
+        if not sidecar.is_file():
+            continue
+        try:
+            value = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+    return {}
+
+
+def resolve_dat_y_axis(choice: str, *, custom_label: str = "", custom_unit: str = "") -> tuple[str, str, str]:
+    """Map a user-facing DAT Y-axis choice to label, unit, and semantic id."""
+    selected = str(choice or "Y").strip()
+    if selected == "Doping":
+        return "Doping", str(custom_unit).strip(), "doping"
+    if selected == "Electric field":
+        return "Electric field", str(custom_unit).strip(), "electric_field"
+    if selected == "Gate voltage":
+        return "Gate voltage", str(custom_unit).strip(), "gate_voltage"
+    if selected == "Custom":
+        label = str(custom_label).strip() or "Y"
+        return label, str(custom_unit).strip(), "custom"
+    return "Y", "", "y"
+
+
+def load_dat(path: str | Path) -> DataCube:
+    """Load an Origin-friendly exported DAT matrix into the normal DataCube model."""
+    dat_path = Path(path)
+    if not dat_path.is_file():
+        raise FileNotFoundError(f"DAT file not found: {dat_path}")
+    try:
+        lines = dat_path.read_text(encoding="utf-8-sig").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"Could not read DAT file {dat_path}: {exc}") from exc
+    content = [line for line in lines if line.strip() and not line.lstrip().startswith("#")]
+    if not content:
+        raise ValueError(f"DAT file {dat_path.name!r} contains no numeric table.")
+    header = content[0].split("\t")
+    if len(header) < 2:
+        raise ValueError(f"DAT file {dat_path.name!r} must contain an X column and at least one Y column.")
+    try:
+        gate = np.asarray([float(value.strip()) for value in header[1:]], dtype=float)
+    except ValueError as exc:
+        raise ValueError(f"DAT file {dat_path.name!r} has non-numeric Y/gate headers.") from exc
+    rows: list[list[float]] = []
+    for row_number, line in enumerate(content[1:], start=2):
+        fields = line.split("\t")
+        if len(fields) != len(header):
+            raise ValueError(
+                f"DAT file {dat_path.name!r} row {row_number} has {len(fields)} columns; expected {len(header)}."
+            )
+        try:
+            rows.append([float(value.strip()) for value in fields])
+        except ValueError as exc:
+            raise ValueError(f"DAT file {dat_path.name!r} has non-numeric data on row {row_number}.") from exc
+    if not rows:
+        raise ValueError(f"DAT file {dat_path.name!r} contains no data rows.")
+    table = np.asarray(rows, dtype=float)
+    energy = table[:, 0]
+    z = table[:, 1:].T.copy()
+    metadata = _load_dat_sidecar(dat_path)
+    plot = metadata.get("plot", {}) if isinstance(metadata.get("plot", {}), dict) else {}
+    if isinstance(plot.get("linear"), dict):
+        plot = plot["linear"]
+    processing = metadata.get("processing", {}) if isinstance(metadata.get("processing", {}), dict) else {}
+    mode = str(metadata.get("operation", processing.get("mode", "")))
+    sidecar_label = metadata.get("y_axis_label", processing.get("y_axis_label", plot.get("ylabel", "Y")))
+    sidecar_unit = metadata.get("y_axis_unit", processing.get("y_axis_unit", plot.get("y_unit", "")))
+    sidecar_semantic = metadata.get("y_axis_semantic", processing.get("y_axis_semantic", ""))
+    if not sidecar_semantic:
+        sidecar_semantic = {
+            "doping": "doping",
+            "electric field": "electric_field",
+            "gate voltage": "gate_voltage",
+        }.get(str(sidecar_label).strip().lower(), "" if str(sidecar_label).strip() in {"", "Y"} else "custom")
+    cube = DataCube(
+        energy=energy,
+        gate=gate,
+        Z=z,
+        gate_label=str(sidecar_label or "Y"),
+        title=str(plot.get("title", dat_path.stem)),
+        cbar_label=str(plot.get("cbar_label", mode or "Imported DAT")),
+        gate_unit=str(sidecar_unit or ""),
+        y_axis_semantic=str(sidecar_semantic or ""),
+    )
+    cube.plot_metadata = plot
+    cube.import_metadata = metadata
+    return cube
 
 
 def _validate_cube_arrays(energy: np.ndarray, gate: np.ndarray, Z: np.ndarray, *, context: str) -> None:
