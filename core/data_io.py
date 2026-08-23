@@ -15,6 +15,7 @@ from core.loader import (
     build_external_baseline,
     is_xlsx_map_file,
     load_drr_avg,
+    load_dat,
     load_pl,
     load_xlsx_map,
     resolve_xlsx_y_label,
@@ -114,12 +115,14 @@ def list_csv_files(folder: str) -> List[str]:
 
 
 def list_map_input_files(folder: str) -> List[str]:
-    """Return root-level CSV and XLSX map filenames, naturally sorted."""
+    """Return root-level CSV, XLSX, and exported DAT filenames, naturally sorted."""
     p = Path(folder)
     if not p.exists() or not p.is_dir():
         return []
     try:
-        names = {f.name for f in p.glob("*.csv")} | {f.name for f in p.glob("*.xlsx")}
+        names = ({f.name for f in p.glob("*.csv")} |
+                 {f.name for f in p.glob("*.xlsx")} |
+                 {f.name for f in p.glob("*.dat")})
     except OSError:
         return []
     return sorted(names, key=_nat_key)
@@ -138,6 +141,8 @@ def move_selected_to_archive(folder: str, file_names: Sequence[str], archive_nam
 
 
 def load_pl_cube(folder: str, file_name: str, *, log_scale: bool = False, y_axis: str = "auto") -> DataCube:
+    if Path(file_name).suffix.lower() == ".dat":
+        return load_dat(Path(folder) / Path(file_name).name)
     return load_pl(folder, file_name, log_scale=log_scale, y_axis=y_axis)
 
 
