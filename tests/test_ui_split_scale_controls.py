@@ -82,21 +82,72 @@ class SplitScaleControlTests(unittest.TestCase):
         self.assertTrue(self.window.drr_measurement_summary.wordWrap())
         self.assertIn(full_name, self.window.drr_measurement_summary.toolTip())
 
-    def test_tall_tab_pages_scroll_without_horizontal_clipping(self) -> None:
+    def test_compact_sidebar_avoids_default_scrolling_and_horizontal_clipping(self) -> None:
         self.window.tabs.setCurrentWidget(self.window.drr_tab_scroll)
         self.window.resize(1180, 700)
         self.app.processEvents()
 
         scroll = self.window.drr_tab_scroll
         self.assertIsInstance(scroll, QScrollArea)
-        self.assertGreater(scroll.verticalScrollBar().maximum(), 0)
+        self.assertEqual(scroll.verticalScrollBar().maximum(), 0)
         self.assertEqual(
             scroll.horizontalScrollBarPolicy(), Qt.ScrollBarAlwaysOff
         )
 
-        scroll.ensureWidgetVisible(self.window.drr_analysis_text)
+    def test_workflow_navigation_is_above_the_collapsible_sidebar(self) -> None:
+        self.assertFalse(self.window.tabs.tabBar().isVisible())
+        self.assertEqual(self.window.workflow_tabs.count(), self.window.tabs.count())
+        self.window.workflow_tabs.setCurrentIndex(1)
+        self.assertEqual(self.window._active_mode(), "DRR")
+
+        self.window.sidebar_toggle_btn.setChecked(False)
         self.app.processEvents()
-        self.assertGreater(scroll.verticalScrollBar().value(), 0)
+        self.assertFalse(self.window.left_panel.isVisible())
+        self.window.sidebar_toggle_btn.setChecked(True)
+        self.app.processEvents()
+        self.assertTrue(self.window.left_panel.isVisible())
+
+    def test_enabling_drr_split_centers_boundary_and_scales_both_regions(self) -> None:
+        cube = DataCube(
+            energy=np.array([0.0, 1.0, 2.0, 3.0]),
+            gate=np.array([0.0, 1.0]),
+            Z=np.array([[1.0, 2.0, 100.0, 200.0], [3.0, 4.0, 300.0, 400.0]]),
+            gate_label="Gate",
+            title="DRR split",
+            cbar_label="DR/R",
+        )
+        self.window.loaded = LoadedState(mode="DRR", folder="", cube=cube)
+        for key, value in (("xmin", 0.0), ("xmax", 3.0), ("ymin", 0.0), ("ymax", 1.0)):
+            self.window._set_spin_value_silent(self.window.drr_spins[key], value)
+        self.window.drr_split_spins["x0"].setValue(0.25)
+
+        with patch.object(self.window, "_on_drr_plot_param_changed"):
+            self.window.drr_split_scale_chk.setChecked(True)
+
+        self.assertAlmostEqual(self.window.drr_split_spins["x0"].value(), 1.5)
+        self.assertLess(self.window.drr_split_spins["left_vmax"].value(), 5.0)
+        self.assertGreater(self.window.drr_split_spins["right_vmin"].value(), 90.0)
+
+    def test_drr_derivative_refreshes_unfixed_color_limits(self) -> None:
+        energy = np.linspace(0.0, 4.0, 21)
+        cube = DataCube(
+            energy=energy,
+            gate=np.array([0.0, 1.0]),
+            Z=np.vstack((energy**2, 2.0 * energy**2)),
+            gate_label="Gate",
+            title="DRR derivative",
+            cbar_label="DR/R",
+        )
+        self.window.loaded = LoadedState(mode="DRR", folder="", cube=cube)
+        for key, value in (("xmin", 0.0), ("xmax", 4.0), ("ymin", 0.0), ("ymax", 1.0)):
+            self.window._set_spin_value_silent(self.window.drr_spins[key], value)
+        self.window._refresh_automatic_ranges("DRR")
+        original_vmax = self.window.drr_spins["vmax"].value()
+
+        with patch.object(self.window, "_plot_mode"):
+            self.window.drr_derivative_combo.setCurrentText("dE")
+
+        self.assertNotAlmostEqual(self.window.drr_spins["vmax"].value(), original_vmax)
 
     def test_auto_region_preserves_each_fixed_bound(self) -> None:
         cube = DataCube(
