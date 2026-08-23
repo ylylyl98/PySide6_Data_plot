@@ -45,7 +45,9 @@ from PySide6.QtWidgets import (
     QStyleOptionViewItem,
     QSizePolicy,
     QSplitter,
+    QStackedWidget,
     QStatusBar,
+    QTabBar,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -132,7 +134,7 @@ from core.shg_fit import (
 )
 
 UI_METRICS = {
-    "left_width": 540,
+    "left_width": 480,
     "main_margin": 8,
     "group_margin": 6,
     "row_spacing": 6,
@@ -446,6 +448,7 @@ class MainWindow(QMainWindow):
         self._gate_motion_cid: int | None = None
         self._gate_click_cid: int | None = None
         self._suspend_drr_autoplot = False
+        self._automatic_range_update = False
         self._pl_peak_gate: float | None = None
         self._pl_peak_indices: np.ndarray | None = None
         self._pl_fit_gate: float | None = None
@@ -795,6 +798,8 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         left = self._build_left_panel()
         right = self._build_plot_panel()
+        self.left_panel = left
+        self.workspace_splitter = splitter
         left.setFixedWidth(UI_METRICS["left_width"])
         splitter.addWidget(left)
         splitter.addWidget(right)
@@ -810,6 +815,34 @@ class MainWindow(QMainWindow):
             UI_METRICS["main_margin"],
             UI_METRICS["main_margin"],
         )
+        navigation = QFrame()
+        navigation.setObjectName("workflowNavigation")
+        navigation.setStyleSheet(
+            "QFrame#workflowNavigation { background: #f7f7f9; border: 1px solid #e2e2e7; border-radius: 7px; }"
+            "QTabBar::tab { min-width: 76px; padding: 7px 13px; border: none; color: #515154; }"
+            "QTabBar::tab:selected { color: #0071e3; font-weight: 600; border-bottom: 2px solid #0071e3; }"
+            "QTabBar::tab:hover { color: #0071e3; }"
+        )
+        navigation_layout = QHBoxLayout(navigation)
+        navigation_layout.setContentsMargins(6, 2, 6, 2)
+        navigation_layout.setSpacing(4)
+        self.sidebar_toggle_btn = QToolButton()
+        self.sidebar_toggle_btn.setText("☰ Controls")
+        self.sidebar_toggle_btn.setCheckable(True)
+        self.sidebar_toggle_btn.setChecked(True)
+        self.sidebar_toggle_btn.setToolTip("Show or hide the contextual controls sidebar (Ctrl+B)")
+        navigation_layout.addWidget(self.sidebar_toggle_btn)
+        self.workflow_tabs = QTabBar()
+        self.workflow_tabs.setExpanding(True)
+        self.workflow_tabs.setUsesScrollButtons(False)
+        for index in range(self.tabs.count()):
+            tab_index = self.workflow_tabs.addTab(self.tabs.tabText(index))
+            self.workflow_tabs.setTabToolTip(tab_index, self.tabs.tabToolTip(index))
+        navigation_layout.addWidget(self.workflow_tabs, 1)
+        self.workflow_tabs.currentChanged.connect(self.tabs.setCurrentIndex)
+        self.tabs.currentChanged.connect(self.workflow_tabs.setCurrentIndex)
+        self.sidebar_toggle_btn.toggled.connect(self._set_sidebar_visible)
+        layout.addWidget(navigation)
         layout.addWidget(splitter)
 
         sb = QStatusBar()
@@ -831,7 +864,19 @@ class MainWindow(QMainWindow):
         self._update_status_button.clicked.connect(self._on_update_status_clicked)
         self.statusBar().addPermanentWidget(self._update_status_button)
         self._build_log_dock()
+        self._build_results_dock()
         self._build_menu_and_toolbar()
+
+    def _set_sidebar_visible(self, visible: bool) -> None:
+        """Show or hide the contextual inspector without changing the active workflow."""
+        if not hasattr(self, "left_panel"):
+            return
+        self.left_panel.setVisible(bool(visible))
+        if hasattr(self, "sidebar_toggle_btn"):
+            blocked = self.sidebar_toggle_btn.blockSignals(True)
+            self.sidebar_toggle_btn.setChecked(bool(visible))
+            self.sidebar_toggle_btn.blockSignals(blocked)
+            self.sidebar_toggle_btn.setText("☰ Controls" if visible else "☰ Show controls")
 
     def _build_left_panel(self) -> QWidget:
         box = QWidget()
@@ -875,7 +920,7 @@ class MainWindow(QMainWindow):
         folder_grid.addWidget(self.refresh_btn, 1, 2)
         folder_grid.addWidget(QLabel("Recent"), 2, 0)
         folder_grid.addWidget(self.recent_folder_combo, 2, 1, 1, 2)
-        layout.addWidget(self._make_expander("Data Source", folder_box, expanded=True))
+        layout.addWidget(self._make_expander("Data Source", folder_box, expanded=False))
 
         self.tabs = QTabWidget()
         self.tabs.tabBar().setExpanding(True)
@@ -892,6 +937,10 @@ class MainWindow(QMainWindow):
         ):
             index = self.tabs.addTab(self._make_scrollable_tab(page, key), label)
             self.tabs.setTabToolTip(index, tooltip)
+        # Workflow navigation is rendered above the entire workspace.  This
+        # QTabWidget remains the page stack so existing tab-specific code and
+        # keyboard behavior continue to work.
+        self.tabs.tabBar().hide()
         layout.addWidget(self.tabs, 1)
         return box
 
@@ -1044,12 +1093,16 @@ class MainWindow(QMainWindow):
         split_spins["right_vmax"].setToolTip("Color maximum from x0 to xmax.")
 
         split_fix_checks = {
+            "x0": QCheckBox("Fix"),
             "left_vmin": QCheckBox("Fix"),
             "left_vmax": QCheckBox("Fix"),
             "right_vmin": QCheckBox("Fix"),
             "right_vmax": QCheckBox("Fix"),
         }
         for key, check in split_fix_checks.items():
+            if key == "x0":
+                check.setToolTip("Keep the split boundary when data or visible x limits change.")
+                continue
             region = "left" if key.startswith("left") else "right"
             bound = "minimum" if key.endswith("vmin") else "maximum"
             check.setToolTip(
@@ -1074,7 +1127,8 @@ class MainWindow(QMainWindow):
         # the sidebar's minimum width instead of clipping its right edge.
         grid.addWidget(QLabel("Split position (x0)"), 0, 0, 1, 2)
         grid.addWidget(split_spins["x0"], 0, 2, 1, 2)
-        grid.addWidget(show_boundary, 0, 4, 1, 2)
+        grid.addWidget(split_fix_checks["x0"], 0, 4)
+        grid.addWidget(show_boundary, 0, 5)
 
         left_title = QLabel("Region 1: xmin → x0")
         left_title.setStyleSheet("font-weight: 600;")
@@ -1251,7 +1305,7 @@ class MainWindow(QMainWindow):
         basic_form.addRow("Scale / Clip", flags)
         self._set_form_label_width(basic_form, UI_METRICS["label_col_width"])
 
-        params_layout.addWidget(basic)
+        params_layout.addWidget(self._make_expander("Manual plot ranges", basic, expanded=False))
 
         analysis = QGroupBox("Spectrum Analysis Controls")
         analysis_form = QFormLayout(analysis)
@@ -1357,6 +1411,7 @@ class MainWindow(QMainWindow):
         files_layout.addWidget(meas_row)
 
         base_row = QWidget()
+        self.drr_external_baseline_row = base_row
         base_grid = QGridLayout(base_row)
         base_grid.setContentsMargins(0, 0, 0, 0)
         base_grid.setHorizontalSpacing(6)
@@ -1386,7 +1441,9 @@ class MainWindow(QMainWindow):
         self.drr_baseline_combine_combo.setMaximumWidth(320)
         self._style_combo_popup(self.drr_baseline_combine_combo)
         files_layout.addWidget(self.drr_baseline_combine_combo)
-        layout.addWidget(self._make_expander("Measurement + Baseline Files", files, expanded=True))
+        self.drr_external_baseline_row.setVisible(False)
+        self.drr_baseline_combine_combo.setVisible(False)
+        layout.addWidget(self._make_expander("Data", files, expanded=True))
 
         params = QGroupBox("Plot Options")
         params_layout = QVBoxLayout(params)
@@ -1432,6 +1489,8 @@ class MainWindow(QMainWindow):
         self.drr_sg_poly_spin.setToolTip("Savitzky-Golay polynomial order.")
         self.drr_sg_poly_spin.setFixedWidth(UI_METRICS["spin_w"])
         self.drr_sg_poly_spin.setFixedHeight(UI_METRICS["input_h"])
+        self.drr_sg_window_spin.setVisible(False)
+        self.drr_sg_poly_spin.setVisible(False)
 
         deriv_row = QWidget()
         deriv_h = QHBoxLayout(deriv_row)
@@ -1591,7 +1650,7 @@ class MainWindow(QMainWindow):
         self.drr_analysis_text.setPlaceholderText("Peak/fit results will appear here after detection.")
         analysis_form.addRow("", self.drr_analysis_text)
         self.drr_fit_status.setStyleSheet("QLabel { color: #0071e3; font-size: 10px; }")
-        params_layout.addWidget(basic)
+        params_layout.addWidget(self._make_expander("Manual plot ranges", basic, expanded=False))
         layout.addWidget(self._make_expander("Parameters", params, expanded=True))
         layout.addWidget(self._make_expander("Spectrum Analysis", analysis_box, expanded=False))
         layout.addStretch(1)
@@ -2005,7 +2064,7 @@ class MainWindow(QMainWindow):
         flags_h.addStretch(1)
         basic_form.addRow("Scale / Clip", flags)
         self._set_form_label_width(basic_form, UI_METRICS["label_col_width"])
-        params_layout.addWidget(self._make_expander("Plot", basic, expanded=True))
+        params_layout.addWidget(self._make_expander("Manual plot ranges", basic, expanded=False))
         layout.addWidget(self._make_expander("Parameters", params, expanded=True))
         layout.addStretch(1)
         return tab
@@ -2194,7 +2253,7 @@ class MainWindow(QMainWindow):
         advanced_form.addRow("Dark sigma+", self.mcd_dark_pos_combo)
         advanced_form.addRow("Dark sigma-", self.mcd_dark_neg_combo)
         correction_layout.addWidget(self._make_expander("Advanced", advanced_correction, expanded=False))
-        layout.addWidget(self._make_expander("Correction", correction, expanded=True))
+        layout.addWidget(self._make_expander("Correction", correction, expanded=False))
 
         diagnostics = QGroupBox("Pair diagnostics")
         diagnostics_layout = QVBoxLayout(diagnostics)
@@ -2207,7 +2266,8 @@ class MainWindow(QMainWindow):
             "the applied gain range, and background RMS before/after fitting. The full table is exported with MCD results."
         )
         diagnostics_layout.addWidget(self.mcd_diagnostics_text)
-        layout.addWidget(self._make_expander("Diagnostics", diagnostics, expanded=False))
+        self.mcd_diagnostics_expander = self._make_expander("Diagnostics", diagnostics, expanded=False)
+        layout.addWidget(self.mcd_diagnostics_expander)
 
         display = QGroupBox("Display and MCD(B)")
         display_form = QFormLayout(display)
@@ -2638,7 +2698,7 @@ class MainWindow(QMainWindow):
         flags_h.addStretch(1)
         basic_form.addRow("Color / Clip", flags)
         self._set_form_label_width(basic_form, UI_METRICS["label_col_width"])
-        params_layout.addWidget(self._make_expander("Axis Ranges", basic, expanded=True))
+        params_layout.addWidget(self._make_expander("Manual plot ranges", basic, expanded=False))
 
         layout.addWidget(self._make_expander("Parameters", params, expanded=True))
         layout.addStretch(1)
@@ -4281,11 +4341,61 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.BottomDockWidgetArea, self.log_dock)
         self.log_dock.hide()
 
+    def _build_results_dock(self) -> None:
+        """Host read-only analysis output outside the contextual controls."""
+        self.results_dock = QDockWidget("Analysis Results", self)
+        self.results_dock.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.RightDockWidgetArea)
+        self.results_stack = QStackedWidget()
+        self._results_page_indices: dict[str, int] = {}
+
+        for mode, title, widget in (
+            ("PL", "PL peak and fit results", self.pl_analysis_text),
+            ("DRR", "DRR peak and fit results", self.drr_analysis_text),
+            ("MCD", "MCD pair diagnostics", self.mcd_diagnostics_text),
+        ):
+            page = QWidget()
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(8, 6, 8, 6)
+            label = QLabel(title)
+            label.setStyleSheet("QLabel { font-weight: 600; color: #3a3a3c; }")
+            page_layout.addWidget(label)
+            widget.setMaximumHeight(16777215)
+            page_layout.addWidget(widget, 1)
+            self._results_page_indices[mode] = self.results_stack.addWidget(page)
+
+        empty_page = QLabel("This workflow has no separate text results. Use the plot and export controls.")
+        empty_page.setAlignment(Qt.AlignCenter)
+        empty_page.setWordWrap(True)
+        self._results_empty_index = self.results_stack.addWidget(empty_page)
+        self.results_dock.setWidget(self.results_stack)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self.results_dock)
+        self.resizeDocks([self.results_dock], [190], Qt.Vertical)
+        self.results_dock.hide()
+        self.mcd_diagnostics_expander.hide()
+        self._update_results_dock_page()
+
+    def _update_results_dock_page(self) -> None:
+        if not hasattr(self, "results_stack"):
+            return
+        mode = self._active_mode()
+        index = self._results_page_indices.get(mode or "", self._results_empty_index)
+        self.results_stack.setCurrentIndex(index)
+
     def _build_menu_and_toolbar(self) -> None:
         menu = self.menuBar().addMenu("View")
         self.show_log_action = self.log_dock.toggleViewAction()
         self.show_log_action.setText("Show Log")
         menu.addAction(self.show_log_action)
+        self.show_results_action = self.results_dock.toggleViewAction()
+        self.show_results_action.setText("Show Analysis Results")
+        menu.addAction(self.show_results_action)
+        self.show_sidebar_action = QAction("Show Controls Sidebar", self)
+        self.show_sidebar_action.setCheckable(True)
+        self.show_sidebar_action.setChecked(True)
+        self.show_sidebar_action.setShortcut("Ctrl+B")
+        self.show_sidebar_action.toggled.connect(self._set_sidebar_visible)
+        self.sidebar_toggle_btn.toggled.connect(self.show_sidebar_action.setChecked)
+        menu.addAction(self.show_sidebar_action)
 
         help_menu = self.menuBar().addMenu("Help")
         self.check_updates_action = QAction("Check for Updates...", self)
@@ -4640,19 +4750,47 @@ class MainWindow(QMainWindow):
 
     def _on_drr_derivative_changed(self) -> None:
         self._invalidate_export_move_sources()
+        derivative_active = self._drr_derivative_value() is not None
+        self.drr_sg_window_spin.setVisible(derivative_active)
+        self.drr_sg_poly_spin.setVisible(derivative_active)
         self._enforce_drr_sg_constraints(show_status=True)
         if self.loaded and self.loaded.mode == "DRR" and not self._suspend_drr_autoplot:
+            self._refresh_automatic_ranges("DRR", refresh_split=True)
             self._plot_mode("DRR")
 
     def _on_drr_plot_param_changed(self) -> None:
         self._invalidate_export_move_sources()
+        external_baseline = self.drr_baseline_combo.currentText() == "External"
+        self.drr_external_baseline_row.setVisible(external_baseline)
+        self.drr_baseline_combine_combo.setVisible(external_baseline)
         if self.loaded and self.loaded.mode == "DRR" and not self._suspend_drr_autoplot:
+            sender = self.sender()
+            if sender in (
+                self.drr_spins["xmin"], self.drr_spins["xmax"],
+                self.drr_spins["ymin"], self.drr_spins["ymax"],
+                self.drr_log_chk, self.drr_center_zero_chk,
+            ):
+                self._refresh_automatic_ranges(
+                    "DRR",
+                    refresh_split=True,
+                    center_split=sender in (self.drr_spins["xmin"], self.drr_spins["xmax"]),
+                )
             self._plot_mode("DRR")
 
     def _on_pl_plot_param_changed(self) -> None:
         self._invalidate_export_move_sources()
         self._apply_dat_y_axis_selection()
         if self.loaded and self.loaded.mode == "PL":
+            sender = self.sender()
+            if sender in (
+                self.pl_spins["xmin"], self.pl_spins["xmax"],
+                self.pl_spins["ymin"], self.pl_spins["ymax"], self.pl_log_chk,
+            ):
+                self._refresh_automatic_ranges(
+                    "PL",
+                    refresh_split=True,
+                    center_split=sender in (self.pl_spins["xmin"], self.pl_spins["xmax"]),
+                )
             self._plot_mode("PL")
 
     def _apply_dat_y_axis_selection(self) -> None:
@@ -4737,6 +4875,8 @@ class MainWindow(QMainWindow):
     def _on_mcd_plot_changed(self) -> None:
         self._invalidate_export_move_sources()
         if self.loaded and self.loaded.mode == "MCD":
+            if self.sender() in (self.mcd_map_combo, self.mcd_center_zero_chk):
+                self._refresh_automatic_ranges("MCD", refresh_split=False)
             self._plot_mode("MCD")
 
     def _select_mcd_pair_at_b(self, requested_b: float, *, clicked: bool = False) -> None:
@@ -4783,6 +4923,18 @@ class MainWindow(QMainWindow):
         self._invalidate_export_move_sources()
         self._power_update_group_summary()
         if self.loaded and self.loaded.mode == "Power Dependent":
+            sender = self.sender()
+            if sender in (
+                self.power_spins["xmin"], self.power_spins["xmax"],
+                self.power_spins["ymin"], self.power_spins["ymax"],
+                self.power_log_chk, self.power_background_spin,
+                self.power_background_auto_chk,
+            ):
+                self._refresh_automatic_ranges(
+                    "Power Dependent",
+                    refresh_split=True,
+                    center_split=sender in (self.power_spins["xmin"], self.power_spins["xmax"]),
+                )
             self._plot_mode("Power Dependent")
 
     def _on_power_source_assignment_changed(self) -> None:
@@ -4790,6 +4942,7 @@ class MainWindow(QMainWindow):
         self._power_update_group_summary()
         self._power_update_vp_availability()
         if self.loaded and self.loaded.mode == "Power Dependent":
+            self._refresh_automatic_ranges("Power Dependent", refresh_split=True)
             self._plot_mode("Power Dependent")
 
     def _on_cmp_auto_assign_requested(self) -> None:
@@ -4807,6 +4960,8 @@ class MainWindow(QMainWindow):
         self._invalidate_export_move_sources()
         self._cmp_apply_display_preset()
         self._cmp_update_assignment_summary()
+        if self.loaded and self.loaded.mode == "Compare":
+            self._refresh_automatic_ranges("Compare", refresh_split=True)
         self._on_cmp_plot_param_changed()
 
     def _on_cmp_plot_view_button_clicked(self, mode: str) -> None:
@@ -4818,6 +4973,8 @@ class MainWindow(QMainWindow):
         self._power_selected_row_index = None
         self._power_set_view_mode(mode)
         self._update_action_states()
+        if self.loaded and self.loaded.mode == "Power Dependent" and mode == "Intensity":
+            self._refresh_automatic_ranges("Power Dependent", refresh_split=True)
         self._on_power_plot_param_changed()
 
     def _on_cmp_view_changed(self) -> None:
@@ -4825,6 +4982,8 @@ class MainWindow(QMainWindow):
         self._cmp_update_view_mode()
         self._cmp_update_assignment_summary()
         self._update_action_states()
+        if self.loaded and self.loaded.mode == "Compare" and not self._cmp_is_vp_view():
+            self._refresh_automatic_ranges("Compare", refresh_split=True)
         self._on_cmp_plot_param_changed()
 
     def _on_cmp_background_mode_changed(self, _checked: bool) -> None:
@@ -4838,11 +4997,24 @@ class MainWindow(QMainWindow):
         self._invalidate_export_move_sources()
         self._update_action_states()
         self._update_plot_view_bar_visibility()
+        self._update_results_dock_page()
 
     def _on_cmp_plot_param_changed(self) -> None:
         self._invalidate_export_move_sources()
         self._cmp_update_assignment_summary()
         if self.loaded and self.loaded.mode == "Compare":
+            sender = self.sender()
+            if sender in (
+                self.cmp_spins["xmin"], self.cmp_spins["xmax"],
+                self.cmp_spins["ymin"], self.cmp_spins["ymax"],
+                self.cmp_log_chk, self.cmp_vp_background_spin,
+                self.cmp_vp_auto_background_chk,
+            ) or sender in tuple(self.cmp_channel_combos.values()) or sender in tuple(self.cmp_show_checks.values()):
+                self._refresh_automatic_ranges(
+                    "Compare",
+                    refresh_split=True,
+                    center_split=sender in (self.cmp_spins["xmin"], self.cmp_spins["xmax"]),
+                )
             self._plot_mode("Compare")
 
     def _show_error(self, message: str) -> None:
@@ -6076,6 +6248,11 @@ class MainWindow(QMainWindow):
                     spin.setValue(value)
                 finally:
                     spin.blockSignals(blocked)
+            self._refresh_automatic_ranges(
+                self._split_prefix_mode(prefix),
+                refresh_split=True,
+                center_split=True,
+            )
         self._on_split_scale_param_changed(prefix)
         self._update_action_states()
 
@@ -6083,6 +6260,9 @@ class MainWindow(QMainWindow):
         toggle: QCheckBox = getattr(self, f"{prefix}_split_scale_chk")
         if not toggle.isChecked():
             return
+        self._refresh_automatic_ranges(
+            self._split_prefix_mode(prefix), refresh_split=True
+        )
         if prefix == "pl":
             self._on_pl_plot_param_changed()
         elif prefix == "drr":
@@ -6177,6 +6357,153 @@ class MainWindow(QMainWindow):
                 ]
             return [self._power_corrected_cube(self.loaded.cube)]
         return []
+
+    @staticmethod
+    def _set_spin_value_silent(spin: QDoubleSpinBox, value: float) -> None:
+        blocked = spin.blockSignals(True)
+        try:
+            spin.setValue(float(value))
+        finally:
+            spin.blockSignals(blocked)
+
+    def _automatic_cubes_for_mode(self, mode: str) -> list[DataCube]:
+        if mode == "MCD" and self.loaded and self.loaded.mode == "MCD" and self.loaded.mcd_result is not None:
+            return [self.loaded.mcd_result.cube(self.mcd_map_combo.currentText())]
+        return self._split_auto_cubes(mode)
+
+    def _color_bounds_for_cubes(
+        self,
+        mode: str,
+        cubes: Sequence[DataCube],
+        *,
+        side: str | None = None,
+        split_x: float | None = None,
+    ) -> tuple[float, float] | None:
+        """Calculate robust limits from the data currently visible to the user."""
+        spins = self._mode_spins(mode)
+        xmin, xmax = sorted((float(spins["xmin"].value()), float(spins["xmax"].value())))
+        ymin, ymax = sorted((float(spins["ymin"].value()), float(spins["ymax"].value())))
+        values: list[np.ndarray] = []
+        for cube in cubes:
+            x = np.asarray(cube.energy, float).ravel()
+            y = np.asarray(cube.gate, float).ravel()
+            z = np.asarray(cube.Z, float)
+            xmask = (x >= xmin) & (x <= xmax)
+            if side is not None:
+                if split_x is None:
+                    continue
+                try:
+                    split_index, _boundary = resolve_split_boundary(x, split_x)
+                except ValueError:
+                    continue
+                columns = np.arange(x.size)
+                xmask &= columns < split_index if side == "left" else columns >= split_index
+            ymask = (y >= ymin) & (y <= ymax)
+            if not np.any(xmask) or not np.any(ymask):
+                continue
+            finite = z[np.ix_(ymask, xmask)]
+            finite = finite[np.isfinite(finite)]
+            if self._mode_log(mode):
+                finite = finite[finite > 0.0]
+            if finite.size:
+                values.append(finite)
+        if not values:
+            return None
+        combined = np.concatenate(values)
+        vmin, vmax = (float(value) for value in np.nanpercentile(combined, [0.01, 99.99]))
+        center_zero = (
+            mode == "DRR" and bool(self.drr_center_zero_chk.isChecked())
+        ) or (
+            mode == "MCD" and bool(self.mcd_center_zero_chk.isChecked())
+        )
+        if center_zero and not self._mode_log(mode):
+            bound = max(abs(vmin), abs(vmax), 1e-12)
+            return -bound, bound
+        if vmax <= vmin:
+            pad = max(1e-12, abs(vmin) * 0.01)
+            vmin -= pad
+            vmax += pad
+        if self._mode_log(mode):
+            vmin = max(vmin, 1e-12)
+            vmax = max(vmax, vmin * 1.01)
+        return vmin, vmax
+
+    def _refresh_automatic_ranges(
+        self,
+        mode: str,
+        *,
+        refresh_axes: bool = False,
+        refresh_split: bool = True,
+        center_split: bool = False,
+    ) -> bool:
+        """Refresh all unlocked ranges as one UI transaction.
+
+        Numeric fields remain editable, but an unchecked Fix box means the
+        value follows the displayed data whenever that data or its ROI changes.
+        """
+        if self._automatic_range_update:
+            return False
+        cubes = self._automatic_cubes_for_mode(mode)
+        if not cubes:
+            return False
+        self._automatic_range_update = True
+        changed = False
+        try:
+            spins = self._mode_spins(mode)
+            if refresh_axes:
+                axis_values = {
+                    "xmin": min(float(np.nanmin(cube.energy)) for cube in cubes),
+                    "xmax": max(float(np.nanmax(cube.energy)) for cube in cubes),
+                    "ymin": min(float(np.nanmin(cube.gate)) for cube in cubes),
+                    "ymax": max(float(np.nanmax(cube.gate)) for cube in cubes),
+                }
+                for key, value in axis_values.items():
+                    if not self._mode_fix_value(mode, key):
+                        self._set_spin_value_silent(spins[key], value)
+                        changed = True
+
+            bounds = self._color_bounds_for_cubes(mode, cubes)
+            if bounds is not None:
+                for key, value in zip(("vmin", "vmax"), bounds):
+                    if not self._mode_fix_value(mode, key):
+                        self._set_spin_value_silent(spins[key], value)
+                        changed = True
+
+            if mode == "MCD" or not refresh_split:
+                return changed
+            prefix = "pl" if mode == "PL" else "drr" if mode == "DRR" else "power" if mode == "Power Dependent" else "cmp"
+            if not bool(getattr(self, f"{prefix}_split_scale_chk").isChecked()):
+                return changed
+            split_spins: Dict[str, QDoubleSpinBox] = getattr(self, f"{prefix}_split_spins")
+            split_fixes: Dict[str, QCheckBox] = getattr(self, f"{prefix}_split_fix_checks")
+            xmin, xmax = sorted((float(spins["xmin"].value()), float(spins["xmax"].value())))
+            x0 = float(split_spins["x0"].value())
+            if (center_split and not split_fixes["x0"].isChecked()) or not xmin < x0 < xmax:
+                requested = 0.5 * (xmin + xmax)
+                try:
+                    _index, x0 = resolve_split_boundary(np.asarray(cubes[0].energy, float), requested)
+                except ValueError:
+                    x0 = requested
+                self._set_spin_value_silent(split_spins["x0"], x0)
+                changed = True
+
+            for side in ("left", "right"):
+                side_bounds = self._color_bounds_for_cubes(mode, cubes, side=side, split_x=x0)
+                if side_bounds is None:
+                    continue
+                vmin_key, vmax_key = f"{side}_vmin", f"{side}_vmax"
+                candidate_min = float(split_spins[vmin_key].value()) if split_fixes[vmin_key].isChecked() else side_bounds[0]
+                candidate_max = float(split_spins[vmax_key].value()) if split_fixes[vmax_key].isChecked() else side_bounds[1]
+                if candidate_max <= candidate_min or (self._mode_log(mode) and candidate_min <= 0.0):
+                    self._status(f"Automatic {side} color range conflicts with a fixed limit.")
+                    continue
+                for key, value in ((vmin_key, candidate_min), (vmax_key, candidate_max)):
+                    if not split_fixes[key].isChecked():
+                        self._set_spin_value_silent(split_spins[key], value)
+                        changed = True
+            return changed
+        finally:
+            self._automatic_range_update = False
 
     def _auto_split_vrange(self, prefix: str, side: str) -> None:
         mode = self._split_prefix_mode(prefix)
@@ -6489,28 +6816,29 @@ class MainWindow(QMainWindow):
         limits = compute_auto_limits(cube, log_scale=self._mode_log(mode))
         spins = self._mode_spins(mode)
         if not self._mode_fix_value(mode, "vmin"):
-            spins["vmin"].setValue(limits.vmin)
+            self._set_spin_value_silent(spins["vmin"], limits.vmin)
         if not self._mode_fix_value(mode, "vmax"):
-            spins["vmax"].setValue(limits.vmax)
+            self._set_spin_value_silent(spins["vmax"], limits.vmax)
         if not self._mode_fix_value(mode, "xmin"):
-            spins["xmin"].setValue(limits.xmin)
+            self._set_spin_value_silent(spins["xmin"], limits.xmin)
         if not self._mode_fix_value(mode, "xmax"):
-            spins["xmax"].setValue(limits.xmax)
+            self._set_spin_value_silent(spins["xmax"], limits.xmax)
         if not self._mode_fix_value(mode, "ymin"):
-            spins["ymin"].setValue(limits.ymin)
+            self._set_spin_value_silent(spins["ymin"], limits.ymin)
         if not self._mode_fix_value(mode, "ymax"):
-            spins["ymax"].setValue(limits.ymax)
+            self._set_spin_value_silent(spins["ymax"], limits.ymax)
         if mode == "Power Dependent" and self._power_axis_log():
             positive = np.asarray(cube.gate, float)
             positive = positive[np.isfinite(positive) & (positive > 0)]
             if positive.size:
                 if not self._mode_fix_value(mode, "ymin"):
-                    spins["ymin"].setValue(float(np.nanmin(positive)))
+                    self._set_spin_value_silent(spins["ymin"], float(np.nanmin(positive)))
                 if not self._mode_fix_value(mode, "ymax"):
-                    spins["ymax"].setValue(float(np.nanmax(positive)))
+                    self._set_spin_value_silent(spins["ymax"], float(np.nanmax(positive)))
         if mode == "MCD":
             # MCD cursor selection is tied to the selected raw measurement
             # pair.  Do not overwrite it with the binned-colormap median.
+            self._refresh_automatic_ranges(mode, refresh_split=False)
             return
         prefix = "pl" if mode == "PL" else "drr" if mode == "DRR" else "power" if mode == "Power Dependent" else "cmp"
         if bool(getattr(self, f"{prefix}_split_scale_chk").isChecked()):
@@ -6543,7 +6871,12 @@ class MainWindow(QMainWindow):
                         split_spins[key].setValue(value)
                     finally:
                         split_spins[key].blockSignals(blocked)
-        spins["gate"].setValue(float(np.nanmedian(cube.gate)))
+        self._refresh_automatic_ranges(
+            mode,
+            refresh_split=True,
+            center_split=True,
+        )
+        self._set_spin_value_silent(spins["gate"], float(np.nanmedian(cube.gate)))
 
     def _make_params(self, mode: str, cube: DataCube) -> HeatmapParams:
         spins = self._mode_spins(mode)
@@ -6880,6 +7213,8 @@ class MainWindow(QMainWindow):
                 )
 
     def _on_drr_find_peaks(self) -> None:
+        self.results_dock.show()
+        self._update_results_dock_page()
         if self.last_plotted_mode != "DRR" or self._last_plot_cube is None:
             return
         gate_used, x, y = self._current_drr_spectrum(self._last_plot_cube)
@@ -6900,6 +7235,8 @@ class MainWindow(QMainWindow):
         self._update_drr_spectrum_and_gate_line(self._last_plot_cube)
 
     def _on_drr_fit_lorentz(self) -> None:
+        self.results_dock.show()
+        self._update_results_dock_page()
         if self.last_plotted_mode != "DRR" or self._last_plot_cube is None:
             return
         gate_used, x, y = self._current_drr_spectrum(self._last_plot_cube)
@@ -7141,6 +7478,8 @@ class MainWindow(QMainWindow):
         self.canvas.draw_idle()
 
     def _on_pl_find_peaks(self) -> None:
+        self.results_dock.show()
+        self._update_results_dock_page()
         if self.last_plotted_mode != "PL" or self._pl_last_plot_cube is None:
             return
         gate_used, x, y = self._current_pl_spectrum(self._pl_last_plot_cube)
@@ -7161,6 +7500,8 @@ class MainWindow(QMainWindow):
         self._update_pl_spectrum_with_analysis(self._pl_last_plot_cube)
 
     def _on_pl_fit_lorentz(self) -> None:
+        self.results_dock.show()
+        self._update_results_dock_page()
         if self.last_plotted_mode != "PL" or self._pl_last_plot_cube is None:
             return
         gate_used, x, y = self._current_pl_spectrum(self._pl_last_plot_cube)
