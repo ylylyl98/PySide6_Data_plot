@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from core.file_ops import _nat_key, archive_selected, list_root_csvs
+from core.drr_sources import validate_named_wavelength_centers
 from core.loader import (
     DataCube,
     XLSX_Y_LABEL_OPTIONS,
@@ -178,6 +179,7 @@ def load_drr_external_cube(
     y_axis: str = "auto",
     derivative: int | None = None,
 ) -> DataCube:
+    validate_named_wavelength_centers(files, baseline_files)
     baseline = build_external_baseline(folder, baseline_files, which=baseline_which)
     return load_drr_avg(
         folder,

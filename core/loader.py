@@ -156,15 +156,20 @@ def _validate_cube_arrays(energy: np.ndarray, gate: np.ndarray, Z: np.ndarray, *
         )
 
 
+def _source_path(user_folder: str, file_name: str) -> Path:
+    requested = Path(file_name)
+    return requested.resolve() if requested.is_absolute() else (Path(user_folder) / requested).resolve()
+
+
 def _csv_signature(user_folder: str, file_name: str) -> Tuple[int, int]:
-    """Return cache key pieces from the root CSV mtime and size."""
+    """Return cache key pieces from a CSV mtime and size."""
     folder = Path(user_folder)
     if not folder.exists() or not folder.is_dir():
         raise FileNotFoundError(f"Folder does not exist: {user_folder}")
 
-    csv_path = folder / Path(file_name).name
+    csv_path = _source_path(user_folder, file_name)
     if not csv_path.exists() or not csv_path.is_file():
-        raise FileNotFoundError(f"CSV not found in folder root: {csv_path}")
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
 
     stt = csv_path.stat()
     return int(stt.st_mtime_ns), int(stt.st_size)
@@ -234,14 +239,14 @@ def load_pl(user_folder: str, file_name: str, *, log_scale: bool = False, y_axis
 
 
 def _xlsx_signature(user_folder: str, file_name: str) -> Tuple[int, int]:
-    """Return cache key pieces from the root XLSX mtime and size."""
+    """Return cache key pieces from an XLSX mtime and size."""
     folder = Path(user_folder)
     if not folder.exists() or not folder.is_dir():
         raise FileNotFoundError(f"Folder does not exist: {user_folder}")
 
-    xlsx_path = folder / Path(file_name).name
+    xlsx_path = _source_path(user_folder, file_name)
     if not xlsx_path.exists() or not xlsx_path.is_file():
-        raise FileNotFoundError(f"XLSX not found in folder root: {xlsx_path}")
+        raise FileNotFoundError(f"XLSX not found: {xlsx_path}")
 
     stat = xlsx_path.stat()
     return int(stat.st_mtime_ns), int(stat.st_size)
@@ -271,7 +276,7 @@ def _load_xlsx_map_cached(
 
     from openpyxl import load_workbook
 
-    path = Path(user_folder) / Path(file_name).name
+    path = _source_path(user_folder, file_name)
     workbook = load_workbook(path, read_only=True, data_only=False)
     try:
         sheet_names = workbook.sheetnames
@@ -346,14 +351,10 @@ def load_xlsx_map(
 ) -> DataCube:
     """Load a precomputed dR/R XLSX map into the standard DataCube contract."""
     raw_name = str(file_name)
-    if Path(raw_name).name != raw_name:
-        raise ValueError(
-            f"XLSX map must reference a root-level file name, got {raw_name!r}"
-        )
     if not is_xlsx_map_file(raw_name):
         raise ValueError(f"XLSX map must reference a .xlsx file, got {raw_name!r}")
     signature = _xlsx_signature(user_folder, file_name)
-    energy, gate, z, title = _load_xlsx_map_cached(user_folder, Path(file_name).name, signature)
+    energy, gate, z, title = _load_xlsx_map_cached(user_folder, raw_name, signature)
     _validate_cube_arrays(energy, gate, z, context="XLSX map load")
     return DataCube(
         energy=np.asarray(energy, dtype=float).copy(),

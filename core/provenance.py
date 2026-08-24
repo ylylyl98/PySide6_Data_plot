@@ -87,17 +87,40 @@ def verify_initial_data_working_file(
     workflow: str,
     role: str,
 ) -> WorkingCopyRecord:
-    """Verify a manually copied root-level file against its Initial Data source."""
-    working = Path(working_path).resolve()
+    """Describe a direct source or verify a root copy against Initial Data."""
+    raw_working = Path(working_path)
     root = Path(experiment_folder).resolve()
-    canonical = root / "Initial Data" / working.name
+    working = raw_working.resolve() if raw_working.is_absolute() else (root / raw_working).resolve()
+    initial_root = (root / "Initial Data").resolve()
+    try:
+        working.relative_to(initial_root)
+        is_canonical_file = True
+    except ValueError:
+        is_canonical_file = False
+
+    if is_canonical_file or working.parent != root:
+        digest = sha256_file(working)
+        return WorkingCopyRecord(
+            canonical_source_path=str(working),
+            working_copy_path=str(working),
+            canonical_sha256=digest,
+            working_sha256_at_creation=digest,
+            workflow=str(workflow),
+            role=str(role),
+            app_managed=False,
+            # A canonical source is not a verified temporary copy. Its hash is
+            # still recorded for reproducibility, but it must never be cleaned.
+            provenance_verified=False,
+            temporary_working_copy=False,
+            verification_method="direct_initial_data" if is_canonical_file else "direct_external_source",
+        )
+
+    canonical = initial_root / working.name
     working_hash = sha256_file(working)
     canonical_hash = sha256_file(canonical)
     is_root_file = working.parent == root
-    is_canonical_file = working.parent == (root / "Initial Data").resolve()
     verified = (
         is_root_file
-        and not is_canonical_file
         and working.is_file()
         and canonical.is_file()
         and canonical.name == working.name
