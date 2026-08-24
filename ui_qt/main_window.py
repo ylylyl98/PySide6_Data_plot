@@ -135,7 +135,6 @@ from core.processing import (
     parse_compare_rotation_angles,
     valley_polarization_cube,
 )
-from ui_qt.presentation_widget import PresentationBuilderWidget
 from core.shg import ShgProcessResult, ShgSettings, ShgSweepData, process_shg_sweep
 from core.shg_fit import (
     ShgAngularFitResult,
@@ -852,13 +851,6 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
 
-        self.presentation_widget = PresentationBuilderWidget()
-        self.presentation_widget.status_message.connect(self._status)
-        self.presentation_widget.log_message.connect(self._append_log)
-        self.workspace_stack = QStackedWidget()
-        self.workspace_stack.addWidget(splitter)
-        self.workspace_stack.addWidget(self.presentation_widget)
-
         layout = QVBoxLayout(root)
         layout.setContentsMargins(
             UI_METRICS["main_margin"],
@@ -894,7 +886,7 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self.workflow_tabs.setCurrentIndex)
         self.sidebar_toggle_btn.toggled.connect(self._set_sidebar_visible)
         layout.addWidget(navigation)
-        layout.addWidget(self.workspace_stack, 1)
+        layout.addWidget(splitter)
 
         sb = QStatusBar()
         self._status_progress = QProgressBar()
@@ -921,8 +913,6 @@ class MainWindow(QMainWindow):
     def _set_sidebar_visible(self, visible: bool) -> None:
         """Show or hide the contextual inspector without changing the active workflow."""
         if not hasattr(self, "left_panel"):
-            return
-        if hasattr(self, "tabs") and self.tabs.tabText(self.tabs.currentIndex()) == "Slides":
             return
         self.left_panel.setVisible(bool(visible))
         if hasattr(self, "sidebar_toggle_btn"):
@@ -986,7 +976,6 @@ class MainWindow(QMainWindow):
             ("power", "Power", "Power Dependent", self._build_power_tab()),
             ("mcd", "MCD", "Magnetic circular dichroism", self._build_mcd_tab()),
             ("shg", "SHG", "SHG Processing", self._build_shg_tab()),
-            ("slides", "Slides", "Build a PowerPoint from processed plot PNGs", QWidget()),
             ("tools", "Tools", "Log / Tools", self._build_tools_tab()),
         ):
             index = self.tabs.addTab(self._make_scrollable_tab(page, key), label)
@@ -5068,17 +5057,6 @@ class MainWindow(QMainWindow):
 
     def _on_tab_changed(self, _index: int) -> None:
         self._invalidate_export_move_sources()
-        slides_active = self.tabs.tabText(self.tabs.currentIndex()) == "Slides"
-        if hasattr(self, "workspace_stack"):
-            self.workspace_stack.setCurrentIndex(1 if slides_active else 0)
-        if hasattr(self, "sidebar_toggle_btn"):
-            self.sidebar_toggle_btn.setEnabled(not slides_active)
-        if hasattr(self, "show_sidebar_action"):
-            self.show_sidebar_action.setEnabled(not slides_active)
-        if slides_active:
-            self.presentation_widget.set_experiment_folder(self.current_folder or None)
-        elif hasattr(self, "left_panel"):
-            self.left_panel.setVisible(self.sidebar_toggle_btn.isChecked())
         self._update_action_states()
         self._update_plot_view_bar_visibility()
         self._update_results_dock_page()
