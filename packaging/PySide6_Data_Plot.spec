@@ -1,15 +1,17 @@
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 
 project_root = Path(SPECPATH).parent
 icon_path = project_root / "assets" / "icons" / "app_icon.ico"
+pptx_datas = collect_data_files("pptx")
 
 analysis = Analysis(
     [str(project_root / "run_qt.py")],
     pathex=[str(project_root)],
     binaries=[],
-    datas=[(str(project_root / "assets" / "icons"), "assets/icons")],
-    hiddenimports=[],
+    datas=[(str(project_root / "assets" / "icons"), "assets/icons"), *pptx_datas],
+    hiddenimports=collect_submodules("pptx"),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
