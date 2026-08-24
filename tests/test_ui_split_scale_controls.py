@@ -57,7 +57,7 @@ class SplitScaleControlTests(unittest.TestCase):
         self.assertEqual(tab_bar.elideMode(), Qt.ElideNone)
         self.assertEqual(
             [self.window.tabs.tabText(i) for i in range(self.window.tabs.count())],
-            ["PL", "DRR", "Compare", "Power", "MCD", "SHG", "Tools"],
+            ["PL", "DRR", "Compare", "Power", "MCD", "SHG", "Slides", "Tools"],
         )
         expected_modes = [
             "PL",
@@ -282,6 +282,26 @@ class SplitScaleControlTests(unittest.TestCase):
         self.window.sidebar_toggle_btn.setChecked(True)
         self.app.processEvents()
         self.assertTrue(self.window.left_panel.isVisible())
+
+    def test_slides_workspace_is_full_width_and_owns_its_build_controls(self) -> None:
+        slides_index = next(
+            index
+            for index in range(self.window.tabs.count())
+            if self.window.tabs.tabText(index) == "Slides"
+        )
+        self.window.workflow_tabs.setCurrentIndex(slides_index)
+        QApplication.processEvents()
+        self.assertIs(self.window.workspace_stack.currentWidget(), self.window.presentation_widget)
+        self.assertFalse(self.window.sidebar_toggle_btn.isEnabled())
+        self.assertFalse(self.window.load_action.isEnabled())
+        self.assertFalse(self.window.plot_action.isEnabled())
+        self.assertFalse(self.window.save_action.isEnabled())
+        counts = [
+            self.window.presentation_widget.images_per_slide_combo.itemData(index)
+            for index in range(self.window.presentation_widget.images_per_slide_combo.count())
+        ]
+        self.assertEqual(counts, list(range(1, 13)))
+        self.assertIn("never alter the PNG", self.window.presentation_widget.caption_combo.toolTip())
 
     def test_enabling_drr_split_centers_boundary_and_scales_both_regions(self) -> None:
         cube = DataCube(

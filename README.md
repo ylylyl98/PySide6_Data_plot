@@ -55,6 +55,22 @@ pip install -r requirements.txt
 python run_qt.py
 ```
 
+## Building PowerPoint slides
+
+Open the **Slides** workflow to assemble processed PNG plots into a PowerPoint
+presentation. Choose an existing `.pptx` to keep its slides and theme, or leave
+the source empty to start a new presentation. DPTK always writes a separate
+output copy.
+
+- Search PNGs recursively below the experiment's `Processed Data` folder.
+- Drag plots into the desired order and preview each planned slide.
+- Choose any layout from 1 through 12 images per slide, including 2×4, 3×3,
+  and 3×4 layouts for 8, 9, and 12 images.
+- Add optional short captions and A/B/C panel labels as editable PowerPoint
+  text. The source PNG files are never changed or cropped.
+- Build again safely: a sidecar manifest records image hashes and prevents the
+  same plot from being appended twice.
+
 On Windows, run `Data_Plot_App.bat` once. It creates `DPTK Desktop.lnk` beside
 the launcher with the application icon; use that shortcut for normal launches
 and taskbar pinning. To create a Desktop shortcut instead, run:
