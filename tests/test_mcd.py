@@ -871,7 +871,12 @@ class McdProcessingTests(unittest.TestCase):
                 )
                 loaded = window._load_task(options, progress=Sink(), log=Sink())
                 self.assertEqual(loaded.primary_file, "mcd/sweep.csv")
-                self.assertEqual(Path(loaded.mcd_result.source_file), mcd_folder / "sweep.csv")
+                self.assertTrue(
+                    os.path.samefile(
+                        loaded.mcd_result.source_file,
+                        mcd_folder / "sweep.csv",
+                    )
+                )
             finally:
                 window.close()
 
