@@ -6,6 +6,8 @@ on:
     branches:
       - main
   push:
+    branches:
+      - main
     tags:
       - "v*"
 
@@ -117,6 +119,7 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Test-Path -LiteralPath "dist\PySide6_Data_Plot\PySide6_Data_Plot.exe" -PathType Leaf)) { throw "Expected executable was not produced" }
+          if (-not (Test-Path -LiteralPath "dist\PySide6_Data_Plot\_internal\matplotlib\mpl-data\matplotlibrc" -PathType Leaf)) { throw "Matplotlib data file was not bundled" }
       - name: Package portable application
         shell: pwsh
         run: Compress-Archive -Path "dist\PySide6_Data_Plot" -DestinationPath "${{ env.ZIP_NAME }}" -Force
