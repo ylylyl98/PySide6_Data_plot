@@ -41,6 +41,19 @@ class McdProcessingTests(unittest.TestCase):
         self.assertEqual(settings.correction_mode, "pair_spectral")
         self.assertEqual(settings.spectral_order, 2)
 
+    def test_metric_signal_invalidates_center_candidates(self) -> None:
+        window = MainWindow()
+        try:
+            window._mcd_center_candidates = (
+                McdCenterCandidate(1.64, 8.0, 9.0, 0.9, 0.04, 1),
+            )
+            current = window.mcd_window_metric_combo.currentIndex()
+            window.mcd_window_metric_combo.setCurrentIndex(0 if current != 0 else 1)
+            self.app.processEvents()
+            self.assertEqual(window._mcd_center_candidates, ())
+        finally:
+            window.close()
+
     def test_current_acquisition_format_uses_mid_field_and_rotation_angle(self) -> None:
         with tempfile.TemporaryDirectory() as folder_text:
             path = Path(folder_text) / "current_format.csv"
@@ -856,7 +869,12 @@ class McdProcessingTests(unittest.TestCase):
                 self.assertEqual(window._selected(window.mcd_files), ["mcd/sweep.csv"])
                 self.assertIn("Selected:", window.mcd_selection_summary.text())
                 self.assertIn("● NEW", window.mcd_selection_summary.text())
-                self.assertIn(str(mcd_folder.resolve()), window.folder_watcher.directories())
+                self.assertTrue(
+                    any(
+                        os.path.samefile(watched, mcd_folder)
+                        for watched in window.folder_watcher.directories()
+                    )
+                )
 
                 options = LoadOptions(
                     mode="MCD", folder=str(folder), selected_files=["mcd/sweep.csv"],
@@ -866,7 +884,12 @@ class McdProcessingTests(unittest.TestCase):
                 )
                 loaded = window._load_task(options, progress=Sink(), log=Sink())
                 self.assertEqual(loaded.primary_file, "mcd/sweep.csv")
-                self.assertEqual(Path(loaded.mcd_result.source_file), mcd_folder / "sweep.csv")
+                self.assertTrue(
+                    os.path.samefile(
+                        loaded.mcd_result.source_file,
+                        mcd_folder / "sweep.csv",
+                    )
+                )
             finally:
                 window.close()
 

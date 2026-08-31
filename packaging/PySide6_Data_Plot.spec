@@ -8,6 +8,11 @@ from PyInstaller.utils.hooks import (
 
 project_root = Path(SPECPATH).parent
 icon_path = project_root / "assets" / "icons" / "app_icon.ico"
+# Matplotlib reads mpl-data/matplotlibrc during import.  Do not rely only on
+# the version-specific PyInstaller hook to discover this directory: a GitHub
+# build with a different hook version can otherwise produce an EXE that starts
+# and then fails before the Qt window is created.
+matplotlib_datas = collect_data_files("matplotlib", includes=["mpl-data/**"])
 pptx_datas = collect_data_files("pptx")
 pywin32_binaries = [
     (get_pywin32_module_file_attribute("pythoncom"), "pywin32_system32"),
@@ -18,7 +23,11 @@ analysis = Analysis(
     [str(project_root / "run_qt.py")],
     pathex=[str(project_root)],
     binaries=pywin32_binaries,
-    datas=[(str(project_root / "assets" / "icons"), "assets/icons"), *pptx_datas],
+    datas=[
+        (str(project_root / "assets" / "icons"), "assets/icons"),
+        *matplotlib_datas,
+        *pptx_datas,
+    ],
     hiddenimports=[
         "run_mcd_organizer",
         "ui_qt.mcd_organizer_window",

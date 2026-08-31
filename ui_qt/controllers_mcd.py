@@ -89,7 +89,7 @@ class McdController:
         self.mcd_zero_spin.setEnabled(self.mcd_reference_mode_combo.currentIndex() == 1)
         self._on_mcd_params_changed()
 
-    def _on_mcd_plot_changed(self, source=None) -> None:
+    def _on_mcd_plot_changed(self, _signal_value=None, *, source=None) -> None:
         self._invalidate_export_move_sources()
         sender = source if source is not None else self._owner.sender()
         if self._mcd_center_candidates:

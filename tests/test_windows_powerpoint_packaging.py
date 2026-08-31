@@ -14,6 +14,12 @@ class WindowsPowerPointPackagingTests(unittest.TestCase):
         self.assertIn('"win32com.client"', spec)
         self.assertIn("--check-powerpoint-integration", build_script)
 
+    def test_windows_build_explicitly_bundles_matplotlib_data(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        spec = (root / "packaging" / "PySide6_Data_Plot.spec").read_text(encoding="utf-8")
+        self.assertIn('collect_data_files("matplotlib", includes=["mpl-data/**"])', spec)
+        self.assertIn("*matplotlib_datas", spec)
+
     def test_source_launcher_repairs_missing_powerpoint_bridge(self) -> None:
         root = Path(__file__).resolve().parents[1]
         launcher = (root / "Data_Plot_App.bat").read_text(encoding="utf-8")
