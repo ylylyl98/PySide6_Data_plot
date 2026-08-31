@@ -42,7 +42,9 @@ class SplitScaleControlTests(unittest.TestCase):
 
     def _wait_for_drr_catalog(self) -> None:
         self._wait_for_file_catalog()
-        for _ in range(100):
+        # File discovery is intentionally asynchronous and GitHub's Windows
+        # runners can be busy while the full Qt suite is running.
+        for _ in range(500):
             self.app.processEvents()
             if not self.window._drr_refresh_running:
                 return

@@ -440,6 +440,12 @@ class McdOrganizerWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
         self._closing = True
+        # The scan worker may still own the SQLite catalog briefly after its
+        # result callback runs.  Wait for it before a temporary experiment
+        # directory is removed; Windows otherwise reports the database as
+        # locked during test cleanup and occasionally during normal teardown.
+        if self._scan_workers:
+            self._thread_pool.waitForDone(3000)
         super().closeEvent(event)
 
     def _apply_versions(self) -> None:
