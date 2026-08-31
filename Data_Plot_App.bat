@@ -103,9 +103,11 @@ if not exist "%PYEXE%" (
 
 )
 
-"%PYEXE%" -c "import PySide6" >nul 2>nul
+rem Check every capability needed at runtime. An older .venv can already have
+rem PySide6 while still missing a newly added dependency such as pywin32.
+"%PYEXE%" -c "import PySide6, pythoncom, win32com.client" >nul 2>nul
 if errorlevel 1 (
-    echo PySide6 not found in .venv. Installing requirements...
+    echo One or more app requirements are missing in .venv. Installing requirements...
     "%PYEXE%" -m pip install --upgrade pip
     if errorlevel 1 (
         echo ERROR: Failed to upgrade pip in .venv.
@@ -120,9 +122,9 @@ if errorlevel 1 (
         exit /b 1
     )
 
-    "%PYEXE%" -c "import PySide6" >nul 2>nul
+    "%PYEXE%" -c "import PySide6, pythoncom, win32com.client" >nul 2>nul
     if errorlevel 1 (
-        echo ERROR: PySide6 is still unavailable after installation.
+        echo ERROR: Required app or PowerPoint integration packages are still unavailable after installation.
         pause
         exit /b 1
     )

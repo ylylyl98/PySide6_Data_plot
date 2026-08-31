@@ -24,7 +24,9 @@ class WrappedFilenameDelegateTests(unittest.TestCase):
         file_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         file_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         file_list.setUniformItemSizes(False)
-        file_list.setResizeMode(QListView.Adjust)
+        # DRR dialogs use Fixed to avoid a full relayout on every resize; the
+        # delegate must still size wrapped rows correctly in that mode.
+        file_list.setResizeMode(QListView.Fixed)
         file_list.setItemDelegate(WrappedFilenameDelegate(file_list))
         full_name = (
             "YZ364_0Tpa_3.6KREF_620nmc_0p1sx10_"
@@ -43,6 +45,12 @@ class WrappedFilenameDelegateTests(unittest.TestCase):
         self.assertGreater(row_rect.height(), single_line_height * 2)
         self.assertEqual(row_rect.width(), file_list.viewport().width())
         self.assertEqual(file_list.horizontalScrollBar().maximum(), 0)
+
+        file_list.resize(240, 220)
+        self.app.processEvents()
+        resized_rect = file_list.visualItemRect(item)
+        self.assertGreater(resized_rect.height(), row_rect.height())
+        self.assertEqual(resized_rect.width(), file_list.viewport().width())
         file_list.close()
 
 

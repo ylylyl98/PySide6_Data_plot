@@ -6,9 +6,12 @@ import csv
 import json
 import math
 from pathlib import Path
+import random
 import re
 import statistics
 from typing import Iterable, Sequence
+
+import numpy as np
 
 from core.processing import split_group_and_sort_key
 
@@ -56,6 +59,52 @@ class DrrSourceGroup:
     wavelength_centers_nm: tuple[float, ...] = ()
 
 
+class DrrSourceCache:
+    """Incremental cache for the per-file work used by catalog discovery.
+
+    File classification still runs on every discovery because the relative
+    size/frame thresholds can change when files are added or removed.  The
+    expensive file reads (gate profile and spectral-axis inspection) are
+    reused while a file's size and modification timestamp are unchanged.
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[str, tuple[int, int, dict[str, object]]] = {}
+
+    def get(self, identity: str, *, modified_ns: int, size_bytes: int) -> dict[str, object] | None:
+        entry = self._entries.get(identity)
+        if entry is None or entry[:2] != (modified_ns, size_bytes):
+            return None
+        return dict(entry[2])
+
+    def put(
+        self,
+        identity: str,
+        *,
+        modified_ns: int,
+        size_bytes: int,
+        metadata: dict[str, object],
+    ) -> None:
+        self._entries[identity] = (modified_ns, size_bytes, dict(metadata))
+
+    def retain(self, identities: set[str]) -> None:
+        for identity in tuple(self._entries):
+            if identity not in identities:
+                self._entries.pop(identity, None)
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+    def clone(self) -> "DrrSourceCache":
+        """Return an independent snapshot suitable for a background scan."""
+        clone = DrrSourceCache()
+        clone._entries = {
+            identity: (modified_ns, size_bytes, dict(metadata))
+            for identity, (modified_ns, size_bytes, metadata) in self._entries.items()
+        }
+        return clone
+
+
 @dataclass(frozen=True)
 class DrrSavedRecipe:
     measurement_files: tuple[str, ...]
@@ -86,6 +135,11 @@ class DrrBackgroundGuess:
     baseline_which: str
     reason: str
     time_gap_seconds: float
+    intensity_difference_percent: float | None = None
+    shape_correlation: float | None = None
+    points_within_tolerance_percent: float | None = None
+    confidence: str = "unknown"
+    candidate_group_count: int = 0
 
 
 def resolve_source_path(root: str | Path, source: str | Path) -> Path:
@@ -283,7 +337,13 @@ def guess_drr_background(
     catalog: Sequence[DrrSource],
     measurement_files: Sequence[str],
 ) -> DrrBackgroundGuess | None:
-    """Guess the closest earlier wavelength-compatible background group."""
+    """Choose the unmodified background group that best overlaps the raw data.
+
+    Automatic selection is deliberately conservative: measurement and
+    background spectra must use the same sampled photon-energy grid.  No
+    rescaling, offset correction, fitting, or interpolation is performed.
+    Time proximity is used only after the raw-intensity comparison.
+    """
     selected = set(measurement_files)
     measurements = [source for source in catalog if source.source in selected]
     if not measurements or {source.source for source in measurements} != selected:
@@ -298,42 +358,250 @@ def guess_drr_background(
         for center in centers[1:]
     ):
         return None
-    measurement_start = min(source.modified_time for source in measurements)
-    compatible = [
-        source
-        for source in catalog
-        if source.is_background
-        and source.modified_time <= measurement_start
-        and source.wavelength_center_nm is not None
-        and wavelength_centers_match(centers[0], source.wavelength_center_nm)
-    ]
-    groups = group_drr_sources(compatible)
-    if not groups:
+    measurement_time = min(source.modified_time for source in measurements)
+    measurement_sessions = {source.session_date for source in measurements}
+    measurement_folders = {str(Path(source.source).parent).casefold() for source in measurements}
+    try:
+        measurement_energy, measurement_spectra = _measurement_spectral_sample(
+            root, measurement_files
+        )
+    except (OSError, ValueError):
         return None
-    closest = max(groups, key=lambda group: group.modified_time)
-    files = [source.source for source in closest.files]
-    gate = assess_background_gate_files(root, files)
-    if gate.all_constant and gate.same_constant_values:
-        chosen = tuple(files)
-        which = "all"
-        gate_reason = "constant matching gates; averaging all frames and files"
-    elif gate.all_constant:
-        latest = max(closest.files, key=lambda source: source.modified_time)
-        chosen = (latest.source,)
-        which = "all"
-        gate_reason = "different constant gates; using only the closest file"
-    else:
-        chosen = tuple(files)
-        which = "last"
-        gate_reason = "gate varies; using the last frame from each file"
-    gap = max(0.0, measurement_start - closest.modified_time)
+
+    compatible = []
+    for source in catalog:
+        if not source.is_background or Path(source.source).suffix.lower() != ".csv":
+            continue
+        if (
+            source.wavelength_center_nm is not None
+            and not wavelength_centers_match(centers[0], source.wavelength_center_nm)
+        ):
+            continue
+        compatible.append(source)
+
+    scored: list[tuple[tuple[float, float, int, int, float], DrrSourceGroup, tuple[str, ...], str, str, tuple[float, float, float]]] = []
+    for group in group_drr_sources(compatible):
+        files = [source.source for source in group.files]
+        gate = assess_background_gate_files(root, files)
+        if gate.all_constant and gate.same_constant_values:
+            chosen = tuple(files)
+            which = "all"
+            gate_reason = "constant matching gates; averaging all frames and files"
+        elif gate.all_constant:
+            latest = max(group.files, key=lambda source: source.modified_time)
+            chosen = (latest.source,)
+            which = "all"
+            gate_reason = "different constant gates; using only the closest file"
+        else:
+            chosen = tuple(files)
+            which = "last"
+            gate_reason = "gate varies; using the last frame from each file"
+        try:
+            background_energy, background = _background_group_spectrum(
+                root, chosen, which
+            )
+        except (OSError, ValueError):
+            continue
+        if not _same_spectral_grid(measurement_energy, background_energy):
+            continue
+        metrics = _raw_spectrum_overlap_metrics(measurement_spectra, background)
+        if metrics is None:
+            continue
+        difference_percent, correlation, within_percent = metrics
+        time_gap = abs(measurement_time - group.modified_time)
+        same_session_penalty = 0 if group.session_date in measurement_sessions else 1
+        same_folder_penalty = 0 if any(
+            str(Path(source.source).parent).casefold() in measurement_folders
+            for source in group.files
+        ) else 1
+        # Intensity overlap is primary. Session/folder and time only break close calls.
+        rank = (
+            difference_percent,
+            -correlation,
+            same_session_penalty,
+            same_folder_penalty,
+            time_gap,
+        )
+        scored.append((rank, group, chosen, which, gate_reason, metrics))
+
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0])
+    _rank, best_group, chosen, which, gate_reason, metrics = scored[0]
+    difference_percent, correlation, within_percent = metrics
+    gap = abs(measurement_time - best_group.modified_time)
+    confidence = (
+        "high" if difference_percent <= 5.0 and correlation >= 0.98
+        else "medium" if difference_percent <= 15.0 and correlation >= 0.90
+        else "low"
+    )
     return DrrBackgroundGuess(
         baseline_files=chosen,
         baseline_which=which,
         reason=(
-            f"closest earlier background at {centers[0]:g} nm; {gate_reason}"
+            f"best raw-spectrum overlap among {len(scored)} exact-grid background "
+            f"group{'s' if len(scored) != 1 else ''} at {centers[0]:g} nm; "
+            f"median intensity difference {difference_percent:.2f}%, "
+            f"shape correlation {correlation:.4f}; {gate_reason}"
         ),
         time_gap_seconds=gap,
+        intensity_difference_percent=difference_percent,
+        shape_correlation=correlation,
+        points_within_tolerance_percent=within_percent,
+        confidence=confidence,
+        candidate_group_count=len(scored),
+    )
+
+
+def _same_spectral_grid(first: np.ndarray, second: np.ndarray) -> bool:
+    first = np.asarray(first, dtype=float).ravel()
+    second = np.asarray(second, dtype=float).ravel()
+    return (
+        first.shape == second.shape
+        and first.size >= 2
+        and np.all(np.isfinite(first))
+        and np.all(np.isfinite(second))
+        and np.allclose(first, second, rtol=1e-7, atol=1e-10)
+    )
+
+
+def _read_csv_spectral_sample(
+    path: str | Path, *, max_frames: int | None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Read an original spectral grid and a deterministic sample of raw frames."""
+    source = Path(path)
+    with source.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+        first_line = next((line for line in handle if line.strip()), "")
+        if not first_line:
+            raise ValueError(f"Empty DRR file: {source.name}")
+        delimiter = max((",", "\t", ";"), key=first_line.count)
+        first_row = next(csv.reader([first_line], delimiter=delimiter), [])
+        header_is_text = any(_as_float(token) is None for token in first_row)
+        if header_is_text:
+            spectral_indices = [
+                index for index, token in enumerate(first_row)
+                if _as_float(token) is not None
+            ]
+            spectral_axis = np.asarray(
+                [float(_as_float(first_row[index])) for index in spectral_indices], float
+            )
+            rows = csv.reader(handle, delimiter=delimiter)
+        else:
+            numeric_header = np.asarray(
+                [np.nan if _as_float(token) is None else float(_as_float(token)) for token in first_row],
+                float,
+            )
+            starts = np.flatnonzero(np.isfinite(numeric_header) & (numeric_header > 50.0))
+            start = int(starts[0]) if starts.size else 4
+            spectral_indices = list(range(start, len(first_row)))
+            spectral_axis = numeric_header[start:]
+            rows = csv.reader(handle, delimiter=delimiter)
+        if spectral_axis.size < 2:
+            raise ValueError(f"No usable spectral grid in {source.name}")
+
+        sampled: list[np.ndarray] = []
+        seen = 0
+        rng = random.Random(0)
+        for row in rows:
+            values = [
+                _as_float(row[index]) if index < len(row) else None
+                for index in spectral_indices
+            ]
+            frame = np.asarray(
+                [np.nan if value is None else float(value) for value in values], float
+            )
+            if frame.size != spectral_axis.size or np.count_nonzero(np.isfinite(frame)) < 2:
+                continue
+            seen += 1
+            if max_frames is None or len(sampled) < max_frames:
+                sampled.append(frame)
+            else:
+                replacement = rng.randrange(seen)
+                if replacement < max_frames:
+                    sampled[replacement] = frame
+        if not sampled:
+            raise ValueError(f"No usable spectra in {source.name}")
+
+    energy = 1240.0 / spectral_axis if float(np.nanmedian(spectral_axis)) > 20.0 else spectral_axis.copy()
+    order = np.argsort(energy)
+    return np.asarray(energy[order], float), np.asarray(sampled, float)[:, order]
+
+
+def _measurement_spectral_sample(
+    root: str | Path, sources: Sequence[str]
+) -> tuple[np.ndarray, np.ndarray]:
+    energy0: np.ndarray | None = None
+    samples: list[np.ndarray] = []
+    per_file_limit = max(8, 64 // max(1, len(sources)))
+    for source in sources:
+        energy, spectra = _read_csv_spectral_sample(
+            resolve_source_path(root, source), max_frames=per_file_limit
+        )
+        if energy0 is None:
+            energy0 = energy
+        elif not _same_spectral_grid(energy0, energy):
+            raise ValueError("Selected measurements do not use one exact spectral grid.")
+        samples.append(spectra)
+    if energy0 is None or not samples:
+        raise ValueError("No measurement spectra available.")
+    return energy0, np.concatenate(samples, axis=0)
+
+
+def _background_group_spectrum(
+    root: str | Path, sources: Sequence[str], which: str
+) -> tuple[np.ndarray, np.ndarray]:
+    energy0: np.ndarray | None = None
+    per_file: list[np.ndarray] = []
+    for source in sources:
+        energy, spectra = _read_csv_spectral_sample(
+            resolve_source_path(root, source), max_frames=None
+        )
+        if energy0 is None:
+            energy0 = energy
+        elif not _same_spectral_grid(energy0, energy):
+            raise ValueError("Background group does not use one exact spectral grid.")
+        if which == "first":
+            per_file.append(spectra[0])
+        elif which == "last":
+            per_file.append(spectra[-1])
+        else:
+            per_file.append(np.nanmean(spectra, axis=0))
+    if energy0 is None or not per_file:
+        raise ValueError("No background spectra available.")
+    return energy0, np.nanmean(np.stack(per_file, axis=0), axis=0)
+
+
+def _raw_spectrum_overlap_metrics(
+    measurement_spectra: np.ndarray, background: np.ndarray
+) -> tuple[float, float, float] | None:
+    differences: list[float] = []
+    correlations: list[float] = []
+    within: list[float] = []
+    background = np.asarray(background, float).ravel()
+    for spectrum in np.asarray(measurement_spectra, float):
+        valid = np.isfinite(spectrum) & np.isfinite(background)
+        if np.count_nonzero(valid) < 3:
+            continue
+        measured = np.asarray(spectrum[valid], float)
+        baseline = background[valid]
+        intensity_scale = float(np.nanmedian(np.abs(measured)))
+        if not np.isfinite(intensity_scale) or intensity_scale <= 1e-12:
+            continue
+        residual = np.abs(measured - baseline)
+        differences.append(100.0 * float(np.nanmedian(residual)) / intensity_scale)
+        tolerance = np.maximum(0.05 * np.abs(measured), 0.005 * intensity_scale)
+        within.append(100.0 * float(np.mean(residual <= tolerance)))
+        if np.nanstd(measured) <= 1e-12 or np.nanstd(baseline) <= 1e-12:
+            correlations.append(1.0 if np.allclose(measured, baseline) else 0.0)
+        else:
+            correlation = float(np.corrcoef(measured, baseline)[0, 1])
+            correlations.append(correlation if np.isfinite(correlation) else -1.0)
+    if not differences:
+        return None
+    return (
+        float(np.nanmedian(differences)),
+        float(np.nanmedian(correlations)),
+        float(np.nanmedian(within)),
     )
 
 
@@ -451,9 +719,16 @@ def _processed_measurement_paths(root: Path) -> set[str]:
     return processed
 
 
-def discover_drr_sources(root: str | Path) -> list[DrrSource]:
+def discover_drr_sources(
+    root: str | Path,
+    *,
+    cache: DrrSourceCache | None = None,
+) -> list[DrrSource]:
+    """Discover DRR files, reusing unchanged per-file inspections when possible."""
     experiment_root = Path(root).resolve()
     if not experiment_root.is_dir():
+        if cache is not None:
+            cache.clear()
         return []
     processed_paths = _processed_measurement_paths(experiment_root)
     candidates: list[Path] = []
@@ -481,30 +756,55 @@ def discover_drr_sources(root: str | Path) -> list[DrrSource]:
             stat = path.stat()
             modified = float(stat.st_mtime)
             size_bytes = int(stat.st_size)
+            modified_ns = int(getattr(stat, "st_mtime_ns", round(modified * 1e9)))
         except OSError:
             modified = 0.0
             size_bytes = 0
-        gate_varies, frame_count = (
-            inspect_csv_gate(path) if path.suffix.lower() == ".csv" else (None, None)
-        )
-        named_center = extract_wavelength_center_nm(path.name)
-        spectral_center = (
-            inspect_csv_wavelength_center(path)
-            if path.suffix.lower() == ".csv" and named_center is None
+            modified_ns = 0
+        cached = (
+            cache.get(identity, modified_ns=modified_ns, size_bytes=size_bytes)
+            if cache is not None
             else None
         )
+        if cached is None:
+            gate_varies, frame_count = (
+                inspect_csv_gate(path) if path.suffix.lower() == ".csv" else (None, None)
+            )
+            named_center = extract_wavelength_center_nm(path.name)
+            spectral_center = (
+                inspect_csv_wavelength_center(path)
+                if path.suffix.lower() == ".csv" and named_center is None
+                else None
+            )
+            cached = {
+                "gate_varies": gate_varies,
+                "frame_count": frame_count,
+                "wavelength_center_nm": named_center if named_center is not None else spectral_center,
+                "wavelength_center_source": (
+                    "filename" if named_center is not None
+                    else "spectral axis" if spectral_center is not None
+                    else ""
+                ),
+            }
+            if cache is not None:
+                cache.put(
+                    identity,
+                    modified_ns=modified_ns,
+                    size_bytes=size_bytes,
+                    metadata=cached,
+                )
         inspected.append(
             {
                 "path": path,
                 "identity": identity,
                 "modified": modified,
                 "size_bytes": size_bytes,
-                "gate_varies": gate_varies,
-                "frame_count": frame_count,
-                "wavelength_center_nm": named_center if named_center is not None else spectral_center,
-                "wavelength_center_source": "filename" if named_center is not None else "spectral axis" if spectral_center is not None else "",
+                **cached,
             }
         )
+
+    if cache is not None:
+        cache.retain(seen)
 
     csv_sizes = [item["size_bytes"] for item in inspected if item["path"].suffix.lower() == ".csv" and item["size_bytes"] > 0]
     frame_counts = [item["frame_count"] for item in inspected if item["frame_count"] is not None and item["frame_count"] > 0]

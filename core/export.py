@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import textwrap
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable
 from uuid import uuid4
@@ -58,6 +59,22 @@ def _metadata_jsonable(value):
     return value
 
 
+@lru_cache(maxsize=128)
+def _cached_file_sha256(
+    resolved_path: str,
+    size_bytes: int,
+    modified_ns: int,
+    changed_ns: int,
+) -> str:
+    """Hash one unchanged source once per app session."""
+    del size_bytes, modified_ns, changed_ns  # These values intentionally form the cache key.
+    digest = hashlib.sha256()
+    with Path(resolved_path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _source_descriptor(folder: str, file_name: str, *, role: str = "source") -> dict:
     raw = str(file_name)
     path = Path(raw)
@@ -84,11 +101,12 @@ def _source_descriptor(folder: str, file_name: str, *, role: str = "source") -> 
             "size_bytes": stat.st_size,
             "modified_utc": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
         })
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        descriptor["sha256"] = digest.hexdigest()
+        descriptor["sha256"] = _cached_file_sha256(
+            str(path.resolve()),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+            int(stat.st_ctime_ns),
+        )
     except OSError:
         descriptor["sha256"] = None
     return descriptor
@@ -106,6 +124,7 @@ def write_export_metadata(
     extra: dict | None = None,
     dataset_type: str = "processed_2d",
     output_manifest: Iterable[tuple[str, Path]] | None = None,
+    source_descriptors: Iterable[dict] | None = None,
 ) -> Path:
     paths = [Path(path) for path in output_paths]
     if not paths:
@@ -118,7 +137,11 @@ def write_export_metadata(
         "operation": operation,
         "workflow": operation,
         "dataset_type": dataset_type,
-        "sources": [_source_descriptor(folder, name, role=role) for role, name in input_files if name],
+        "sources": (
+            list(source_descriptors)
+            if source_descriptors is not None
+            else [_source_descriptor(folder, name, role=role) for role, name in input_files if name]
+        ),
         "processing": _metadata_jsonable(processing or {}),
         "plot": _metadata_jsonable(plot or {}),
         "outputs": [path.name for path in output_list],
@@ -688,10 +711,15 @@ def _drr_source_identity(descriptor: dict) -> dict:
     return identity
 
 
-def _drr_analysis_fingerprint(sources: Iterable[dict], processing: dict) -> str:
+def _drr_analysis_fingerprint(
+    sources: Iterable[dict],
+    processing: dict,
+    *,
+    operation: str = "DR/R",
+) -> str:
     return _fingerprint_json(
         {
-            "operation": "DR/R",
+            "operation": operation,
             "sources": [_drr_source_identity(item) for item in sources],
             "processing": processing,
         }
@@ -702,6 +730,7 @@ def _existing_drr_result(
     out_dir: Path,
     *,
     analysis_fingerprint: str,
+    operation: str = "DR/R",
 ) -> tuple[str, dict] | None:
     """Find a prior DRR result, including metadata written before fingerprints existed."""
     for metadata_path in sorted(out_dir.glob("*.metadata.json")):
@@ -709,14 +738,16 @@ def _existing_drr_result(
             payload = json.loads(metadata_path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
             continue
-        if payload.get("operation") != "DR/R":
+        if payload.get("operation") != operation:
             continue
         existing_fingerprint = payload.get("analysis_fingerprint")
         if not existing_fingerprint:
             sources = payload.get("sources", payload.get("inputs", []))
             processing = payload.get("processing", {})
             if isinstance(sources, list) and isinstance(processing, dict):
-                existing_fingerprint = _drr_analysis_fingerprint(sources, processing)
+                existing_fingerprint = _drr_analysis_fingerprint(
+                    sources, processing, operation=operation
+                )
         if existing_fingerprint != analysis_fingerprint:
             continue
         suffix = ".metadata.json"
@@ -780,6 +811,7 @@ def export_drr_png_and_dat(
     metadata_input_files: Iterable[tuple[str, str]] = (),
     metadata_processing: dict | None = None,
     metadata_extra: dict | None = None,
+    reuse_existing_analysis: bool = False,
 ) -> Dict[str, Path]:
     """Export one heatmap and its DAT table.
 
@@ -800,11 +832,18 @@ def export_drr_png_and_dat(
         for role, name in input_files
         if name
     ]
-    analysis_fingerprint = _drr_analysis_fingerprint(sources, processing)
+    operation = "DR/R" if drr_style else "MCD"
+    analysis_fingerprint = _drr_analysis_fingerprint(
+        sources, processing, operation=operation
+    )
     plot_fingerprint = _fingerprint_json(params)
     prior = (
-        _existing_drr_result(out_dir, analysis_fingerprint=analysis_fingerprint)
-        if drr_style
+        _existing_drr_result(
+            out_dir,
+            analysis_fingerprint=analysis_fingerprint,
+            operation=operation,
+        )
+        if drr_style or reuse_existing_analysis
         else None
     )
     if prior is None:
@@ -842,7 +881,7 @@ def export_drr_png_and_dat(
     write_export_metadata(
         folder,
         [dat_path],
-        operation="DR/R" if drr_style else "MCD",
+        operation=operation,
         dataset_type="processed_2d" if drr_style else "derived_analysis_2d",
         input_files=input_files,
         processing=processing,
@@ -854,6 +893,7 @@ def export_drr_png_and_dat(
             "plot_fingerprint": plot_fingerprint,
         },
         output_manifest=(("data", dat_path), ("figure", png_path)),
+        source_descriptors=sources,
     )
     return paths
 
