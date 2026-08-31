@@ -11,6 +11,7 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 from core.presentation import (
+    _add_live_plot_slide,
     PresentationImage,
     build_presentation,
     compact_caption,
@@ -109,6 +110,84 @@ class PresentationTests(unittest.TestCase):
             self.assertEqual(Path(plans[0].images[1].path), paths[2])
             self.assertEqual(Path(plans[0].images[2].path), paths[3])
             self.assertEqual(planned_slide_title(plans[0]), "Doping = 6.3 V")
+
+    def test_exported_panel_labels_restart_after_automatic_grouping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = [
+                self._png(root, "MCD/run_D1_F0/run_D1_F0_MCD_vs_B_E1p57eV_W5meV.png", color=(10, 20, 30)),
+                self._png(root, "MCD/run_D2_F0/run_D2_F0_MCD_vs_B_E1p60eV_W5meV.png", color=(40, 50, 60)),
+                self._png(root, "MCD/run_D1_F20/run_D1_F20_MCD_vs_B_E1p64eV_W5meV.png", color=(70, 80, 90)),
+            ]
+            output = root / "grouped.pptx"
+            build_presentation(
+                [PresentationImage(path) for path in paths],
+                output,
+                images_per_slide=12,
+                group_by="doping",
+                show_panel_labels=True,
+            )
+
+            manifest = json.loads(manifest_path_for(output).read_text(encoding="utf-8"))
+            self.assertEqual(
+                [item["panel_label"] for item in manifest["images"]],
+                ["A", "B", "A"],
+            )
+
+    def test_live_insert_names_picture_for_closed_deck_duplicate_detection(self) -> None:
+        class Tags:
+            def Add(self, _name, _value) -> None:
+                pass
+
+        class Picture:
+            def __init__(self) -> None:
+                self.Name = "Picture 1"
+                self.Tags = Tags()
+
+        class Shapes:
+            def __init__(self) -> None:
+                self.picture = Picture()
+
+            def AddPicture(self, *_args):
+                return self.picture
+
+        class Slide:
+            def __init__(self) -> None:
+                self.Shapes = Shapes()
+                self.Tags = Tags()
+
+        class Slides:
+            Count = 0
+
+            def __init__(self) -> None:
+                self.slide = Slide()
+
+            def Add(self, *_args):
+                return self.slide
+
+        class PageSetup:
+            SlideWidth = 960.0
+            SlideHeight = 540.0
+
+        class PresentationStub:
+            def __init__(self) -> None:
+                self.Slides = Slides()
+                self.PageSetup = PageSetup()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image = self._png(Path(tmp), "plot.png")
+            presentation = PresentationStub()
+            _add_live_plot_slide(
+                presentation,
+                [(PresentationImage(image), "digest", "logical-id")],
+                "",
+                show_captions=False,
+                show_panel_labels=False,
+            )
+            self.assertEqual(
+                presentation.Slides.slide.Shapes.picture.Name,
+                "DPTK_RESULT_logical-id",
+            )
 
     def test_logical_identity_normalizes_mcd_energy_precision(self) -> None:
         first = Path("run_D1") / "sample_MCD_vs_B_E1.640000eV_W5meV.png"

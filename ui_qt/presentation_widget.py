@@ -42,7 +42,6 @@ from core.presentation import (
     grid_for_count,
     plan_presentation_slides,
     planned_slide_title,
-    panel_label,
     build_presentation,
     insert_plots_into_open_powerpoint,
     powerpoint_integration_available,
@@ -1074,9 +1073,8 @@ class PresentationBuilderWidget(QWidget):
 
     def _presentation_images(self) -> list[PresentationImage]:
         mode = str(self.caption_combo.currentData())
-        per_slide = self._images_per_slide()
         result = []
-        for index, path in enumerate(self._queued_paths()):
+        for path in self._queued_paths():
             caption = ""
             if mode == "minimal":
                 caption = compact_caption(path)
@@ -1086,7 +1084,7 @@ class PresentationBuilderWidget(QWidget):
                 PresentationImage(
                     path=path,
                     caption=caption,
-                    panel_label=panel_label(index % per_slide) if self.panel_labels_chk.isChecked() else "",
+                    panel_label="",
                 )
             )
         return result

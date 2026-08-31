@@ -333,6 +333,19 @@ def panel_label(index: int) -> str:
         value -= 1
 
 
+def _label_slide_images(
+    images: Sequence[PresentationImage], show_panel_labels: bool
+) -> list[PresentationImage]:
+    """Assign exported panel labels from each image's final slide position."""
+
+    if not show_panel_labels:
+        return list(images)
+    return [
+        PresentationImage(image.path, image.caption, panel_label(index), image.logical_id)
+        for index, image in enumerate(images)
+    ]
+
+
 def file_sha256(path: str | Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -592,7 +605,7 @@ def build_presentation(
     digest_by_id = {result_id: digest for _item, digest, result_id in accepted}
     added_records: list[dict] = []
     for plan in plans:
-        group = list(plan.images)
+        group = _label_slide_images(plan.images, show_panel_labels)
         title = planned_slide_title(plan, title_prefix)
         _add_plot_slide(
             prs,
@@ -810,6 +823,11 @@ def _add_live_plot_slide(
             str(image.path), 0, -1, picture_left, picture_top,
             float(fitted_width), float(fitted_height),
         )
+        try:
+            picture.Name = f"DPTK_RESULT_{result_id}"
+        except Exception:
+            # COM tags still prevent duplicates while the deck remains open.
+            pass
         picture.Tags.Add("DPTK_SHA256", digest)
         picture.Tags.Add("DPTK_RESULT_ID", result_id)
         if show_panel_labels and image.panel_label:
@@ -903,15 +921,18 @@ def insert_plots_into_open_powerpoint(
             [item for item, _digest, _result_id in accepted], images_per_slide, group_by
         )
         accepted_by_id = {
-            result_id: (item, digest, result_id)
-            for item, digest, result_id in accepted
+            result_id: (digest, result_id)
+            for _item, digest, result_id in accepted
         }
         starting_slide_count = int(presentation.Slides.Count)
         added_records: list[dict] = []
         for plan in plans:
-            group = list(plan.images)
+            group = _label_slide_images(plan.images, show_panel_labels)
             title = planned_slide_title(plan, title_prefix)
-            tagged_group = [accepted_by_id[item.logical_id] for item in group]
+            tagged_group = [
+                (item, *accepted_by_id[item.logical_id])
+                for item in group
+            ]
             slide, layout = _add_live_plot_slide(
                 presentation, tagged_group, title,
                 group_key=plan.group_key,

@@ -41,6 +41,19 @@ class McdProcessingTests(unittest.TestCase):
         self.assertEqual(settings.correction_mode, "pair_spectral")
         self.assertEqual(settings.spectral_order, 2)
 
+    def test_metric_signal_invalidates_center_candidates(self) -> None:
+        window = MainWindow()
+        try:
+            window._mcd_center_candidates = (
+                McdCenterCandidate(1.64, 8.0, 9.0, 0.9, 0.04, 1),
+            )
+            current = window.mcd_window_metric_combo.currentIndex()
+            window.mcd_window_metric_combo.setCurrentIndex(0 if current != 0 else 1)
+            self.app.processEvents()
+            self.assertEqual(window._mcd_center_candidates, ())
+        finally:
+            window.close()
+
     def test_current_acquisition_format_uses_mid_field_and_rotation_angle(self) -> None:
         with tempfile.TemporaryDirectory() as folder_text:
             path = Path(folder_text) / "current_format.csv"
