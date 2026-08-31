@@ -5,9 +5,11 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from core.drr_sources import (
     assess_background_gate_files,
+    DrrSourceCache,
     discover_drr_sources,
     extract_wavelength_center_nm,
     find_saved_drr_recipe,
@@ -24,6 +26,37 @@ from core.provenance import verify_initial_data_working_file
 
 
 class DrrSourceCatalogTests(unittest.TestCase):
+    def test_discovery_cache_reuses_unchanged_file_inspections(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initial = root / "Initial Data"
+            initial.mkdir()
+            path = initial / "sample_laser.csv"
+            path.write_text(
+                "Vbg,Vtg,740,760,780\n0,0,1,2,3\n1,0,2,3,4\n",
+                encoding="utf-8",
+            )
+            cache = DrrSourceCache()
+            with (
+                patch("core.drr_sources.inspect_csv_gate", wraps=inspect_csv_gate) as gate,
+                patch(
+                    "core.drr_sources.inspect_csv_wavelength_center",
+                    wraps=inspect_csv_wavelength_center,
+                ) as center,
+            ):
+                discover_drr_sources(root, cache=cache)
+                discover_drr_sources(root, cache=cache)
+                self.assertEqual(gate.call_count, 1)
+                self.assertEqual(center.call_count, 1)
+
+                path.write_text(
+                    path.read_text(encoding="utf-8") + "2,0,3,4,5\n",
+                    encoding="utf-8",
+                )
+                discover_drr_sources(root, cache=cache)
+                self.assertEqual(gate.call_count, 2)
+                self.assertEqual(center.call_count, 2)
+
     def test_discovers_root_and_nested_initial_data_without_processed_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -179,7 +212,7 @@ class DrrSourceCatalogTests(unittest.TestCase):
                 find_saved_drr_recipe(root, ["Initial Data/unprocessed.csv"])
             )
 
-    def test_guesses_closest_earlier_compatible_background_group(self) -> None:
+    def test_guesses_best_exact_grid_raw_overlap_background_group(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             initial = root / "Initial Data"
@@ -214,7 +247,91 @@ class DrrSourceCatalogTests(unittest.TestCase):
                 {f"Initial Data/{name}" for name in background_names},
             )
             self.assertEqual(guess.baseline_which, "all")
-            self.assertIn("closest earlier background", guess.reason)
+            self.assertIn("best raw-spectrum overlap", guess.reason)
+            self.assertEqual(guess.candidate_group_count, 1)
+
+    def test_raw_overlap_can_choose_older_multi_file_background_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initial = root / "Initial Data"
+            initial.mkdir()
+            measurement = initial / "sample_760nmc_data_rep1_1.csv"
+            measurement.write_text(
+                "Vbg,Vtg,740,760,780\n0,0,100,200,300\n1,0,102,202,302\n",
+                encoding="utf-8",
+            )
+            os.utime(measurement, (1_700_001_000, 1_700_001_000))
+
+            older_names = [
+                "older_760nmc_back_rep1_1.csv",
+                "older_760nmc_back_rep1_2.csv",
+            ]
+            for index, name in enumerate(older_names):
+                path = initial / name
+                path.write_text(
+                    "Vbg,Vtg,740,760,780\n0,0,100,200,300\n0,0,102,202,302\n",
+                    encoding="utf-8",
+                )
+                os.utime(path, (1_699_900_000 + index, 1_699_900_000 + index))
+
+            recent = initial / "recent_760nmc_back_rep1_1.csv"
+            recent.write_text(
+                "Vbg,Vtg,740,760,780\n0,0,150,250,350\n0,0,150,250,350\n",
+                encoding="utf-8",
+            )
+            os.utime(recent, (1_700_000_990, 1_700_000_990))
+
+            guess = guess_drr_background(
+                root,
+                discover_drr_sources(root),
+                [f"Initial Data/{measurement.name}"],
+            )
+
+            self.assertIsNotNone(guess)
+            self.assertEqual(
+                set(guess.baseline_files),
+                {f"Initial Data/{name}" for name in older_names},
+            )
+            self.assertEqual(guess.baseline_which, "all")
+            self.assertEqual(guess.candidate_group_count, 2)
+            self.assertLess(guess.intensity_difference_percent, 1.0)
+
+    def test_auto_guess_skips_background_group_with_different_spectral_grid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initial = root / "Initial Data"
+            initial.mkdir()
+            measurement = initial / "sample_760nmc_data_rep1_1.csv"
+            measurement.write_text(
+                "Vbg,Vtg,740,760,780\n0,0,10,20,30\n1,0,11,21,31\n",
+                encoding="utf-8",
+            )
+            exact = initial / "exact_760nmc_back_rep1_1.csv"
+            exact.write_text(
+                "Vbg,Vtg,740,760,780\n0,0,10,20,30\n0,0,11,21,31\n",
+                encoding="utf-8",
+            )
+            mismatched = initial / "mismatch_760nmc_back_rep1_1.csv"
+            mismatched.write_text(
+                "Vbg,Vtg,740,760,781\n0,0,10,20,30\n0,0,11,21,31\n",
+                encoding="utf-8",
+            )
+            os.utime(exact, (1_700_000_000, 1_700_000_000))
+            os.utime(mismatched, (1_700_000_100, 1_700_000_100))
+            os.utime(measurement, (1_700_000_200, 1_700_000_200))
+
+            guess = guess_drr_background(
+                root,
+                discover_drr_sources(root),
+                [f"Initial Data/{measurement.name}"],
+            )
+
+            self.assertIsNotNone(guess)
+            self.assertEqual(
+                guess.baseline_files,
+                (f"Initial Data/{exact.name}",),
+            )
+            self.assertEqual(guess.candidate_group_count, 1)
 
     def test_small_constant_gate_file_is_likely_background(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

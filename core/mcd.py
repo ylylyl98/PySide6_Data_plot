@@ -1,7 +1,9 @@
 """Magnetic circular dichroism (MCD) B-sweep processing.
 
-The input format is a single CSV whose first two columns are B field (T) and
-waveplate/analyser angle (deg), followed by wavelength columns (nm).  The
+The input format is a single CSV containing B field and waveplate/analyser
+angle columns plus numeric wavelength columns (nm). Legacy files may place
+field and angle first; current acquisition files use ``Bmid_T`` and
+``rotation_angle_deg`` after their timestamp and sweep metadata. The
 normalisation is deliberately explicit: each angle is dark-subtracted and
 normalised by its own near-zero-field spectrum before the two angles are
 compared.  This removes wavelength-dependent waveplate throughput while
@@ -12,13 +14,15 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+import csv
 import json
 from pathlib import Path
 import re
-from typing import Literal
+from typing import Literal, Sequence
 
 import numpy as np
 import pandas as pd
+from matplotlib import patheffects
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
@@ -93,6 +97,7 @@ class McdResult:
     dark_neg: np.ndarray
     maps: dict[str, DataCube]
     summary: dict[str, object]
+    acquisition_conditions: dict[str, tuple[float, float]]
 
     def cube(self, name: str) -> DataCube:
         try:
@@ -171,31 +176,247 @@ def _load_reference_file(path: str, wavelength_nm: np.ndarray) -> np.ndarray:
     return values_sorted[np.argsort(target_order)]
 
 
-def load_b_sweep_csv(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    frame = pd.read_csv(path)
+def _coalesce_angle_readback(angle: np.ndarray, *, tolerance_deg: float = 0.01) -> np.ndarray:
+    """Group sub-hundredth-degree readback jitter into commanded angles."""
+    values = np.asarray(angle, float)
+    if values.size < 2:
+        return values.copy()
+    order = np.argsort(values, kind="stable")
+    groups: list[list[int]] = []
+    for index in order:
+        if not groups:
+            groups.append([int(index)])
+            continue
+        center = float(np.median(values[groups[-1]]))
+        if abs(float(values[index]) - center) <= tolerance_deg:
+            groups[-1].append(int(index))
+        else:
+            groups.append([int(index)])
+    grouped = values.copy()
+    for indices in groups:
+        grouped[indices] = float(np.median(values[indices]))
+    return grouped
+
+
+def _parse_b_sweep_frame(
+    frame: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Parse an already-loaded MCD table without performing more file I/O."""
     if frame.shape[1] < 4:
         raise ValueError("MCD CSV must contain B_T, angle_deg, and at least two wavelength columns.")
+
+    column_lookup = {str(column).strip().casefold(): column for column in frame.columns}
+    field_column = next(
+        (column_lookup[name] for name in ("bmid_t", "b_t") if name in column_lookup),
+        None,
+    )
+    angle_column = next(
+        (
+            column_lookup[name]
+            for name in ("rotation_angle_deg", "angle_deg")
+            if name in column_lookup
+        ),
+        None,
+    )
+    if (field_column is None) != (angle_column is None):
+        missing = "Bmid_T/B_T" if field_column is None else "rotation_angle_deg/angle_deg"
+        raise ValueError(f"MCD CSV is missing the required {missing} column.")
+
     try:
-        b = pd.to_numeric(frame.iloc[:, 0], errors="raise").to_numpy(float)
-        angle = pd.to_numeric(frame.iloc[:, 1], errors="raise").to_numpy(float)
+        if field_column is not None and angle_column is not None:
+            b = pd.to_numeric(frame[field_column], errors="raise").to_numpy(float)
+            angle = pd.to_numeric(frame[angle_column], errors="raise").to_numpy(float)
+        else:
+            b = pd.to_numeric(frame.iloc[:, 0], errors="raise").to_numpy(float)
+            angle = pd.to_numeric(frame.iloc[:, 1], errors="raise").to_numpy(float)
     except (TypeError, ValueError) as exc:
-        raise ValueError("The first two MCD CSV columns must be numeric B field and angle.") from exc
-    columns = list(frame.columns[2:])
+        if field_column is not None:
+            raise ValueError("MCD field and angle columns must contain numeric values.") from exc
+        raise ValueError(
+            "MCD CSV needs named Bmid_T and rotation_angle_deg columns, or legacy numeric field and angle columns first."
+        ) from exc
+
+    columns = _numeric_spectrum_columns(frame)
+    if len(columns) < 2:
+        raise ValueError("MCD CSV needs at least two numeric wavelength columns (nm).")
+    wavelength = np.asarray([float(column) for column in columns], float)
+    # Acquisition CSV spectral columns are already inferred as numeric by the
+    # parser. Avoid calling pandas once per wavelength column (often >1,000
+    # calls); retain the permissive legacy fallback for mixed/object columns.
     try:
-        wavelength = np.asarray([float(column) for column in columns], float)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("MCD wavelength column headers must be numeric nm values.") from exc
-    spectra = frame.iloc[:, 2:].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+        spectra = frame[columns].to_numpy(dtype=float, na_value=np.nan)
+    except (TypeError, ValueError):
+        spectra = frame[columns].apply(pd.to_numeric, errors="coerce").to_numpy(float)
     if not np.all(np.isfinite(b)) or not np.all(np.isfinite(angle)):
         raise ValueError("MCD B field and angle columns cannot contain missing values.")
+    angle = _coalesce_angle_readback(angle)
     if np.unique(wavelength).size != wavelength.size:
         raise ValueError("MCD wavelength columns must be unique.")
     return b, angle, wavelength, spectra
 
 
+def load_b_sweep_csv(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    return _parse_b_sweep_frame(pd.read_csv(path))
+
+
+_MCD_CONDITION_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("Vtg_V", "Vtg", "V"),
+    ("Vbg_V", "Vbg", "V"),
+    ("Vbias_V", "Vbias", "V"),
+    ("Doping_V", "Doping", "V"),
+    ("Efield_V", "E-field", "V"),
+    ("sample_Tmid_K", "T", "K"),
+)
+
+
+def _extract_mcd_acquisition_conditions_frame(
+    frame: pd.DataFrame,
+) -> dict[str, tuple[float, float]]:
+    column_lookup = {str(column).strip().casefold(): column for column in frame.columns}
+    conditions: dict[str, tuple[float, float]] = {}
+    for column_name, label, _unit in _MCD_CONDITION_COLUMNS:
+        column = column_lookup.get(column_name.casefold())
+        if column is None:
+            continue
+        values = pd.to_numeric(frame[column], errors="coerce").to_numpy(float)
+        finite = values[np.isfinite(values)]
+        if finite.size:
+            conditions[label] = (float(np.nanmin(finite)), float(np.nanmax(finite)))
+    return conditions
+
+
+def extract_mcd_acquisition_conditions(path: str) -> dict[str, tuple[float, float]]:
+    """Read finite named acquisition conditions as stable values or ranges."""
+    header = pd.read_csv(path, nrows=0)
+    lookup = {str(column).strip().casefold(): column for column in header.columns}
+    selected = [
+        lookup[column_name.casefold()]
+        for column_name, _label, _unit in _MCD_CONDITION_COLUMNS
+        if column_name.casefold() in lookup
+    ]
+    if not selected:
+        return {}
+    return _extract_mcd_acquisition_conditions_frame(
+        pd.read_csv(path, usecols=selected)
+    )
+
+
+def _trim_decimal(value: float, *, decimals: int = 6, signed: bool = False) -> str:
+    text = f"{float(value):+.{decimals}f}" if signed else f"{float(value):.{decimals}f}"
+    text = text.rstrip("0").rstrip(".")
+    return "0" if text in {"-0", "+0"} else text
+
+
+def format_mcd_energy(value_ev: float) -> str:
+    """Format energy compactly while retaining up to six useful decimals."""
+    return _trim_decimal(value_ev, decimals=6)
+
+
+def format_mcd_acquisition_conditions(
+    conditions: dict[str, tuple[float, float]],
+    *,
+    include_bias: bool = True,
+) -> str:
+    """Build the shared plot/export condition subtitle."""
+    units = {label: unit for _column, label, unit in _MCD_CONDITION_COLUMNS}
+    parts: list[str] = []
+    for _column, label, _unit in _MCD_CONDITION_COLUMNS:
+        if label == "Vbias" and not include_bias:
+            continue
+        bounds = conditions.get(label)
+        if bounds is None:
+            continue
+        low, high = (float(bounds[0]), float(bounds[1]))
+        unit = units[label]
+        tolerance = max(1e-9, 1e-6 * max(abs(low), abs(high), 1.0))
+        show_plus = label in {"Vtg", "Vbg", "Vbias"}
+        if abs(high - low) <= tolerance:
+            value = 0.5 * (low + high)
+            parts.append(f"{label} = {_trim_decimal(value, signed=show_plus)} {unit}")
+        else:
+            parts.append(
+                f"{label} = {_trim_decimal(low, signed=show_plus)} to "
+                f"{_trim_decimal(high, signed=show_plus)} {unit}"
+            )
+    return " | ".join(parts)
+
+
 def detect_angles(path: str) -> tuple[float, ...]:
-    _b, angles, _wavelength, _spectra = load_b_sweep_csv(path)
+    # Source selection only needs one column. Reading every spectrum column on
+    # the UI thread caused a visible pause before background loading began.
+    with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+        header_line = handle.readline()
+        columns = next(csv.reader([header_line])) if header_line else []
+        lookup = {str(column).strip().casefold(): index for index, column in enumerate(columns)}
+        angle_index = next(
+            (lookup[name] for name in ("rotation_angle_deg", "angle_deg") if name in lookup),
+            1 if len(columns) >= 2 else None,
+        )
+        if angle_index is None:
+            raise ValueError("MCD CSV does not contain an angle column.")
+        angle_values: list[float] = []
+        for line in handle:
+            # Angle is an early metadata field in both current and legacy MCD
+            # files. Stop splitting after it instead of tokenizing >1,000
+            # wavelength fields merely to populate two angle choices.
+            parts = line.rstrip("\r\n").split(",", maxsplit=angle_index + 1)
+            if len(parts) <= angle_index:
+                continue
+            text = parts[angle_index].strip().strip('"')
+            if not text:
+                raise ValueError("MCD angle column cannot contain missing values.")
+            try:
+                angle_values.append(float(text))
+            except ValueError as exc:
+                raise ValueError("MCD angle column must contain numeric values.") from exc
+    if not angle_values:
+        raise ValueError("MCD CSV does not contain an angle column.")
+    angles = np.asarray(angle_values, float)
+    if not np.all(np.isfinite(angles)):
+        raise ValueError("MCD angle column cannot contain missing values.")
+    angles = _coalesce_angle_readback(angles)
     return tuple(float(value) for value in sorted(np.unique(angles)))
+
+
+def discover_mcd_processing_status(
+    experiment_root: str | Path,
+    sources: list[str] | tuple[str, ...],
+) -> dict[str, str]:
+    """Map raw MCD sources to the newest matching saved-analysis timestamp."""
+    root = Path(experiment_root)
+    metadata_root = root / "Processed Data" / "MCD"
+    if not metadata_root.is_dir():
+        return {}
+    by_filename: dict[str, list[str]] = {}
+    for source in sources:
+        by_filename.setdefault(Path(source).name.casefold(), []).append(str(source))
+    status: dict[str, str] = {}
+    try:
+        settings_files = metadata_root.rglob("*_MCD_settings*.json")
+        for settings_path in settings_files:
+            try:
+                payload = json.loads(settings_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if str(payload.get("workflow", "")).casefold() != "mcd":
+                continue
+            filename = Path(str(payload.get("source_file", ""))).name.casefold()
+            if not filename or filename not in by_filename:
+                continue
+            created = str(payload.get("created_utc", "")).strip()
+            if not created:
+                try:
+                    created = datetime.fromtimestamp(
+                        settings_path.stat().st_mtime, timezone.utc
+                    ).isoformat()
+                except OSError:
+                    created = "processed"
+            for source in by_filename[filename]:
+                if created > status.get(source, ""):
+                    status[source] = created
+    except OSError:
+        return status
+    return status
 
 
 def _pair_angles(
@@ -958,7 +1179,9 @@ def _odd_map(cube: DataCube, name: str, tolerance: float) -> DataCube | None:
 
 def process_mcd(path: str, settings: McdSettings | None = None) -> McdResult:
     settings = settings or McdSettings()
-    b, angle, wavelength, spectra = load_b_sweep_csv(path)
+    frame = pd.read_csv(path)
+    b, angle, wavelength, spectra = _parse_b_sweep_frame(frame)
+    acquisition_conditions = _extract_mcd_acquisition_conditions_frame(frame)
     pair_b, pair_b_pos, pair_b_neg, pair_gap, pair_pos_index, pair_neg_index, i_pos, i_neg = _pair_angles(b, angle, spectra, settings)
     pair_interpolated_pos = np.zeros(pair_b.size, dtype=bool)
     pair_interpolated_neg = np.zeros(pair_b.size, dtype=bool)
@@ -1047,10 +1270,186 @@ def process_mcd(path: str, settings: McdSettings | None = None) -> McdResult:
         reference_b=reference_b, gain=gain,
         reference_pos=ref_pos, reference_neg=ref_neg, dark_pos=dark_pos, dark_neg=dark_neg, maps=maps,
         summary={"pairs": int(pair_b.size), "reference_mode": settings.reference_mode, "reference_b_t": reference_b, "zero_pairs": int(np.count_nonzero(np.abs(pair_b) <= settings.zero_window_t)), "gain_mode": settings.gain_mode, "correction_mode": settings.correction_mode, "spectral_order": settings.spectral_order, "pair_b_alignment": settings.pair_b_alignment, "background_ranges_ev": settings.background_ranges_ev, "background_selection": settings.background_selection, "max_delta_b_t": settings.max_delta_b, "bin_decimals": settings.bin_decimals, "odd_tolerance_t": tolerance},
+        acquisition_conditions=acquisition_conditions,
     )
 
 
 WindowMetric = Literal["mean", "absolute_mean", "field_signed_absolute_mean", "integral"]
+
+
+@dataclass(frozen=True)
+class McdCenterCandidate:
+    center_ev: float
+    score: float
+    snr: float
+    branch_agreement: float
+    window_signal: float
+    score_rank: int
+
+
+def suggest_mcd_window_centers(
+    result: McdResult,
+    width_mev: float,
+    *,
+    metric: WindowMetric = "mean",
+    energy_range: tuple[float, float] | None = None,
+    max_candidates: int = 5,
+) -> tuple[McdCenterCandidate, ...]:
+    """Rank distinct fixed-width centers using robust field-odd MCD signal.
+
+    Suggestions are deliberately advisory.  The score rewards high-field
+    field-odd signal and sweep-branch agreement, while its noise estimate
+    includes high-field scatter, near-zero-field residuals, and disagreement
+    between the two acquired sweep branches.
+    """
+    energy = EV_NM / np.asarray(result.wavelength_nm, float)
+    order = np.argsort(energy)
+    energy = energy[order]
+    spectra = np.asarray(result.pair_mcd_corrected, float)[:, order]
+    fields = np.asarray(result.pair_b, float)
+    labels = np.asarray(result.pair_labels, dtype=str)
+    finite_fields = np.isfinite(fields)
+    if energy.size < 2 or spectra.shape != (fields.size, energy.size) or not np.any(finite_fields):
+        return ()
+    max_field = float(np.nanmax(np.abs(fields[finite_fields])))
+    if not np.isfinite(max_field) or max_field <= 0:
+        return ()
+    high_mask = finite_fields & (np.abs(fields) >= max(0.45 * max_field, 1e-12))
+    if np.count_nonzero(high_mask) < 2:
+        return ()
+
+    signed_high = np.sign(fields[high_mask])[:, None] * spectra[high_mask]
+    signal = np.nanmedian(signed_high, axis=0)
+    high_scatter = 1.4826 * np.nanmedian(np.abs(signed_high - signal[None, :]), axis=0)
+
+    zero_mask = finite_fields & (np.abs(fields) <= max(0.12 * max_field, 1e-12))
+    if np.any(zero_mask):
+        zero_noise = 1.4826 * np.nanmedian(
+            np.abs(spectra[zero_mask] - np.nanmedian(spectra[zero_mask], axis=0)[None, :]),
+            axis=0,
+        )
+        zero_noise = np.maximum(zero_noise, np.nanmedian(np.abs(spectra[zero_mask]), axis=0))
+    else:
+        zero_noise = np.zeros_like(signal)
+
+    branch_signals: list[np.ndarray] = []
+    for branch in ("B increasing", "B decreasing"):
+        mask = high_mask & (labels == branch)
+        if np.any(mask):
+            branch_signals.append(
+                np.nanmedian(np.sign(fields[mask])[:, None] * spectra[mask], axis=0)
+            )
+    if len(branch_signals) >= 2:
+        branch_difference = 0.5 * np.abs(branch_signals[0] - branch_signals[1])
+    else:
+        branch_difference = np.zeros_like(signal)
+
+    point_noise = np.sqrt(high_scatter**2 + zero_noise**2 + branch_difference**2)
+    finite_noise = point_noise[np.isfinite(point_noise) & (point_noise > 0)]
+    noise_floor = float(np.nanpercentile(finite_noise, 25)) if finite_noise.size else 1e-12
+    noise_floor = max(noise_floor, 1e-12)
+
+    if energy_range is None:
+        search_low, search_high = float(energy[0]), float(energy[-1])
+    else:
+        search_low, search_high = sorted((float(energy_range[0]), float(energy_range[1])))
+        search_low = max(search_low, float(energy[0]))
+        search_high = min(search_high, float(energy[-1]))
+    half_width = max(float(width_mev), 0.0) * 5e-4
+    centers_mask = (energy >= search_low + half_width) & (energy <= search_high - half_width)
+    center_indices = np.flatnonzero(centers_mask)
+    if center_indices.size == 0:
+        return ()
+
+    scores = np.full(energy.size, np.nan, float)
+    snrs = np.full(energy.size, np.nan, float)
+    agreements = np.full(energy.size, np.nan, float)
+    strengths = np.full(energy.size, np.nan, float)
+    magnitude_metric = metric in {"absolute_mean", "field_signed_absolute_mean"}
+    left_edges = np.searchsorted(
+        energy, energy[center_indices] - half_width, side="left"
+    )
+    right_edges = np.searchsorted(
+        energy, energy[center_indices] + half_width, side="right"
+    )
+    right_edges = np.maximum(right_edges, left_edges + 1)
+
+    def rolling_mean(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        finite = np.isfinite(values)
+        sums = np.concatenate(([0.0], np.cumsum(np.where(finite, values, 0.0))))
+        counts = np.concatenate(([0], np.cumsum(finite.astype(np.int64))))
+        window_counts = counts[right_edges] - counts[left_edges]
+        means = np.divide(
+            sums[right_edges] - sums[left_edges],
+            window_counts,
+            out=np.full(center_indices.size, np.nan, float),
+            where=window_counts > 0,
+        )
+        return means, window_counts
+
+    if metric == "integral":
+        strength_values = np.full(center_indices.size, np.nan, float)
+        for output_index, (left, right) in enumerate(zip(left_edges, right_edges)):
+            if right - left >= 2:
+                strength_values[output_index] = abs(float(np.trapezoid(
+                    signal[left:right], x=energy[left:right]
+                ))) / max(2.0 * half_width, 1e-12)
+            else:
+                strength_values[output_index] = abs(float(signal[left]))
+    else:
+        signal_values = np.abs(signal) if magnitude_metric else signal
+        signal_means, _signal_counts = rolling_mean(signal_values)
+        strength_values = signal_means if magnitude_metric else np.abs(signal_means)
+    noise_square_means, noise_counts = rolling_mean(point_noise**2)
+    safe_counts = np.maximum(noise_counts, 1)
+    window_noise = np.sqrt(noise_square_means) / np.sqrt(safe_counts)
+    window_noise = np.maximum(window_noise, noise_floor / np.sqrt(safe_counts))
+    window_noise = np.maximum(window_noise, 1e-12)
+    # A rolling mean is intentionally used here instead of invoking nanmedian
+    # once per possible center. The branch-difference trace is already formed
+    # from robust branch medians, so this retains robustness while removing
+    # thousands of tiny Python/NumPy calls during every automatic search.
+    disagreement_values, _disagreement_counts = rolling_mean(branch_difference)
+    agreement_values = 1.0 / (
+        1.0 + disagreement_values / np.maximum(strength_values, noise_floor)
+    )
+    snr_values = strength_values / window_noise
+    scores[center_indices] = snr_values * agreement_values
+    snrs[center_indices] = snr_values
+    agreements[center_indices] = agreement_values
+    strengths[center_indices] = strength_values
+
+    valid_indices = center_indices[np.isfinite(scores[center_indices])]
+    if valid_indices.size == 0:
+        return ()
+    spacing = float(np.nanmedian(np.diff(energy)))
+    minimum_separation = max(2.0 * half_width, spacing)
+    distance_points = max(1, int(np.ceil(minimum_separation / max(spacing, 1e-12))))
+    peak_input = np.where(np.isfinite(scores), scores, -np.inf)
+    peak_indices, _properties = find_peaks(peak_input, distance=distance_points)
+    peak_indices = peak_indices[np.isin(peak_indices, valid_indices)]
+    global_best = int(valid_indices[np.nanargmax(scores[valid_indices])])
+    ranked_pool = np.unique(np.append(peak_indices, global_best))
+    ranked = ranked_pool[np.argsort(scores[ranked_pool])[::-1]]
+    selected: list[int] = []
+    for index in ranked:
+        if any(abs(float(energy[index] - energy[other])) < minimum_separation for other in selected):
+            continue
+        selected.append(int(index))
+        if len(selected) >= max(1, int(max_candidates)):
+            break
+    ranked_candidates = [
+        McdCenterCandidate(
+            center_ev=float(energy[index]),
+            score=float(scores[index]),
+            snr=float(snrs[index]),
+            branch_agreement=float(agreements[index]),
+            window_signal=float(strengths[index]),
+            score_rank=rank,
+        )
+        for rank, index in enumerate(selected, start=1)
+    ]
+    return tuple(sorted(ranked_candidates, key=lambda candidate: candidate.center_ev))
 
 
 def _window_trace_from_cube(
@@ -1139,6 +1538,9 @@ def pair_window_trace_by_branch(
     result: McdResult,
     center_ev: float,
     width_mev: float,
+    *,
+    metrics: Sequence[WindowMetric] | None = None,
+    include_raw: bool = True,
 ) -> dict[str, dict[str, tuple[np.ndarray, np.ndarray]]]:
     """Return raw/corrected MCD(B) values for each acquired B-sweep branch.
 
@@ -1146,12 +1548,49 @@ def pair_window_trace_by_branch(
     binned map.  Therefore repeated B values on increasing and decreasing
     sweeps remain independent values for plotting and Origin export.
     """
+    requested = tuple(dict.fromkeys(
+        ("mean", "field_signed_absolute_mean", "absolute_mean", "integral")
+        if metrics is None else metrics
+    ))
+    unsupported = set(requested) - {
+        "mean", "field_signed_absolute_mean", "absolute_mean", "integral",
+    }
+    if unsupported:
+        raise ValueError(f"Unsupported MCD window metric(s): {sorted(unsupported)}")
+
+    # Sorting the spectrum and finding the energy window used to happen once
+    # per source and metric (up to eight times for one redraw).  Do it once,
+    # then derive every requested reduction from the same selected arrays.
+    energy = EV_NM / np.asarray(result.wavelength_nm, float)
+    order = np.argsort(energy)
+    energy = energy[order]
+    half = float(width_mev) * 5e-4
+    mask = np.abs(energy - float(center_ev)) <= half
+    if not np.any(mask):
+        mask[int(np.argmin(np.abs(energy - float(center_ev))))] = True
+    selected_energy = energy[mask]
+
     all_values: dict[str, np.ndarray] = {}
-    for source, spectra in (("raw", result.pair_mcd_raw), ("corrected", result.pair_mcd_corrected)):
-        for metric in ("mean", "field_signed_absolute_mean", "absolute_mean", "integral"):
-            all_values[f"{source}_{metric}"] = _pair_window_metric(
-                result, spectra, center_ev=center_ev, width_mev=width_mev, metric=metric
-            )
+    sources = [("corrected", result.pair_mcd_corrected)]
+    if include_raw:
+        sources.insert(0, ("raw", result.pair_mcd_raw))
+    pair_sign = np.sign(np.asarray(result.pair_b, float))
+    for source, spectra in sources:
+        selected = np.asarray(spectra, float)[:, order][:, mask]
+        mean_values: np.ndarray | None = None
+        absolute_values: np.ndarray | None = None
+        for metric in requested:
+            if metric == "integral":
+                values = np.trapezoid(selected, x=selected_energy, axis=1)
+            elif metric in {"absolute_mean", "field_signed_absolute_mean"}:
+                if absolute_values is None:
+                    absolute_values = np.nanmean(np.abs(selected), axis=1)
+                values = absolute_values if metric == "absolute_mean" else pair_sign * absolute_values
+            else:
+                if mean_values is None:
+                    mean_values = np.nanmean(selected, axis=1)
+                values = mean_values
+            all_values[f"{source}_{metric}"] = np.asarray(values, float)
     labels = np.asarray(result.pair_labels, dtype=str)
     branches: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
     for branch in ("B increasing", "B decreasing"):
@@ -1164,6 +1603,30 @@ def pair_window_trace_by_branch(
             )
         branches[branch] = branch_values
     return branches
+
+
+def low_field_mcd_branch_fits(
+    traces: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]],
+    fit_window_t: float,
+) -> dict[str, tuple[float, float]]:
+    """Fit corrected signed-mean data near zero for each sweep branch."""
+
+    fits: dict[str, tuple[float, float]] = {}
+    window = abs(float(fit_window_t))
+    for branch in ("B increasing", "B decreasing"):
+        branch_traces = traces.get(branch, {})
+        if "corrected_mean" not in branch_traces:
+            continue
+        b_values, values = branch_traces["corrected_mean"]
+        b_values = np.asarray(b_values, float)
+        values = np.asarray(values, float)
+        mask = np.isfinite(b_values) & np.isfinite(values) & (np.abs(b_values) <= window)
+        if np.count_nonzero(mask) < 2 or np.ptp(b_values[mask]) <= 0:
+            continue
+        slope, intercept = np.polyfit(b_values[mask], values[mask], 1)
+        if np.isfinite(slope) and np.isfinite(intercept):
+            fits[branch] = (float(slope), float(intercept))
+    return fits
 
 
 def export_mcd_tables(result: McdResult, output_dir: str, *, trace_map: str, center_ev: float, width_mev: float, metric: WindowMetric = "mean") -> dict[str, Path]:
@@ -1224,9 +1687,12 @@ def _mcd_trace_comparison_table(
     trace_map: str,
     center_ev: float,
     width_mev: float,
+    *,
+    traces: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] | None = None,
 ) -> pd.DataFrame:
     del trace_map  # MCD(B) deliberately uses unbinned acquired pairs.
-    traces = pair_window_trace_by_branch(result, center_ev, width_mev)
+    if traces is None:
+        traces = pair_window_trace_by_branch(result, center_ev, width_mev)
     # Two X/Y blocks make direct Origin plotting possible without filtering a
     # mixed branch column.  Pandas pads the shorter branch with blank cells.
     table = pd.DataFrame()
@@ -1304,6 +1770,112 @@ def _json_safe(value: object) -> object:
     return value
 
 
+_MCD_CONDITION_CORNERS: tuple[str, ...] = (
+    "upper left", "upper right", "lower left", "lower right",
+)
+
+
+def _mcd_corner_occupancy(
+    *axes: object,
+    width_fraction: float,
+    height_fraction: float,
+) -> dict[str, int]:
+    """Count rendered line samples in a corner-sized annotation footprint."""
+    occupancy = {corner: 0 for corner in _MCD_CONDITION_CORNERS}
+    for axis in axes:
+        xmin, xmax = (float(value) for value in axis.get_xlim())
+        ymin, ymax = (float(value) for value in axis.get_ylim())
+        if xmax == xmin or ymax == ymin:
+            continue
+        for line in axis.lines:
+            xdata = np.asarray(line.get_xdata(), float).ravel()
+            ydata = np.asarray(line.get_ydata(), float).ravel()
+            if xdata.size == 0 or xdata.size != ydata.size:
+                continue
+            finite = np.isfinite(xdata) & np.isfinite(ydata)
+            if not np.any(finite):
+                continue
+            xfinite = xdata[finite]
+            yfinite = ydata[finite]
+            # Two-point fit lines still cross a large part of the graph. Sample
+            # their rendered segment so they carry the same placement weight
+            # as measured curves with many markers.
+            if xfinite.size == 2:
+                xfinite = np.linspace(xfinite[0], xfinite[1], 80)
+                yfinite = np.linspace(yfinite[0], yfinite[1], 80)
+            xnorm = (xfinite - xmin) / (xmax - xmin)
+            ynorm = (yfinite - ymin) / (ymax - ymin)
+            left = xnorm <= width_fraction
+            right = xnorm >= 1.0 - width_fraction
+            lower = ynorm <= height_fraction
+            upper = ynorm >= 1.0 - height_fraction
+            occupancy["upper left"] += int(np.count_nonzero(left & upper))
+            occupancy["upper right"] += int(np.count_nonzero(right & upper))
+            occupancy["lower left"] += int(np.count_nonzero(left & lower))
+            occupancy["lower right"] += int(np.count_nonzero(right & lower))
+    return occupancy
+
+
+def mcd_annotation_layout(
+    *axes: object,
+    show_conditions: bool,
+    show_slopes: bool,
+    show_metric_legend: bool,
+) -> dict[str, str]:
+    """Jointly place MCD information boxes and legends in quiet corners.
+
+    Each role uses a footprint approximating its real rendered size at the
+    configured fonts. Exhaustively evaluating the four corners prevents two
+    boxes from selecting the same locally quiet location.
+    """
+    roles: list[tuple[str, float, float, int]] = []
+    if show_conditions:
+        roles.append(("conditions", 0.50, 0.48, 5))
+    if show_slopes:
+        roles.append(("slopes", 0.50, 0.25, 5))
+    roles.append(("branch_legend", 0.31, 0.21, 2))
+    if show_metric_legend:
+        roles.append(("metric_legend", 0.31, 0.18, 1))
+
+    occupancies = {
+        name: _mcd_corner_occupancy(
+            *axes, width_fraction=width, height_fraction=height
+        )
+        for name, width, height, _weight in roles
+    }
+    role_names = [role[0] for role in roles]
+    weights = {name: weight for name, _width, _height, weight in roles}
+    from itertools import permutations
+
+    best: tuple[float, tuple[str, ...]] | None = None
+    for corners in permutations(_MCD_CONDITION_CORNERS, len(role_names)):
+        score = float(sum(
+            weights[name] * occupancies[name][corner]
+            for name, corner in zip(role_names, corners)
+        ))
+        candidate = (score, corners)
+        if best is None or candidate < best:
+            best = candidate
+    assert best is not None
+    return dict(zip(role_names, best[1]))
+
+
+def _mcd_quiet_condition_corner(*axes: object) -> str:
+    """Backward-compatible condition-only corner selection."""
+    return mcd_annotation_layout(
+        *axes, show_conditions=True, show_slopes=False, show_metric_legend=False
+    )["conditions"]
+
+
+def _mcd_corner_anchor(corner: str) -> tuple[float, float, str, str]:
+    return {
+        "upper left": (0.02, 0.98, "left", "top"),
+        "upper right": (0.98, 0.98, "right", "top"),
+        "lower left": (0.02, 0.02, "left", "bottom"),
+        "lower right": (0.98, 0.02, "right", "bottom"),
+    }[corner]
+
+
 def export_mcd_analysis_bundle(
     result: McdResult,
     output_dir: str,
@@ -1333,7 +1905,25 @@ def export_mcd_analysis_bundle(
     stem = Path(result.source_file).stem
     tag = _mcd_window_export_tag(center_ev, width_mev)
     trace_base = f"{stem}_MCD_vs_B_{tag}"
-    table = _mcd_trace_comparison_table(result, trace_map, center_ev, width_mev)
+    # Window metrics are the only numerically center-dependent part of this
+    # export. Calculate them once and share the result between CSV and figure.
+    traces = pair_window_trace_by_branch(result, center_ev, width_mev)
+    branch_fits = low_field_mcd_branch_fits(traces, fit_window_t) if fit_near_zero else {}
+    increasing_slope = branch_fits.get("B increasing", (float("nan"), float("nan")))[0]
+    decreasing_slope = branch_fits.get("B decreasing", (float("nan"), float("nan")))[0]
+    table = _mcd_trace_comparison_table(
+        result,
+        trace_map,
+        center_ev,
+        width_mev,
+        traces=traces,
+    )
+    table["low_field_mcd_slope_increasing_per_T"] = increasing_slope
+    table["low_field_mcd_slope_decreasing_per_T"] = decreasing_slope
+    table["low_field_fit_half_range_T"] = (
+        float(fit_window_t) if fit_near_zero else float("nan")
+    )
+    table["low_field_fit_range_mode"] = "fixed" if fit_near_zero else "disabled"
     csv_path = out / f"{trace_base}.csv"
     table.to_csv(csv_path, index=False)
 
@@ -1341,19 +1931,37 @@ def export_mcd_analysis_bundle(
     # Match the fixed PL/DRR export canvas.  The plot rectangle is likewise
     # fixed whether or not the integral/right axis is enabled, so PNGs from
     # different trace selections align exactly in size and inner plot area.
-    fig = Figure(figsize=(8.0, 6.2), dpi=150, facecolor="white")
+    figure_width = 9.0 if show_integral else 8.0
+    figure_height = 6.2
+    fig = Figure(figsize=(figure_width, figure_height), dpi=150, facecolor="white")
     FigureCanvasAgg(fig)
-    fig.text(0.08, 0.985, _mcd_export_metadata(result.source_file), ha="left", va="top", fontsize=8.2, fontweight="bold", color="#242424")
+    title_x = 0.64 / figure_width
+    fig.text(title_x, 0.985, _mcd_export_metadata(result.source_file), ha="left", va="top", fontsize=8.2, fontweight="bold", color="#242424")
     fig.text(
-        0.08, 0.945,
-        f"MCD(B): E = {float(center_ev):.6f} eV, window = {float(width_mev):.6g} meV",
+        title_x, 0.945,
+        f"MCD(B): E = {format_mcd_energy(center_ev)} eV, window = {float(width_mev):.6g} meV",
         ha="left", va="top", fontsize=16, fontweight="bold",
     )
+    condition_text = format_mcd_acquisition_conditions(result.acquisition_conditions)
+    condition_display = ""
+    if condition_text:
+        condition_parts = condition_text.split(" | ")
+        split_at = (len(condition_parts) + 1) // 2
+        condition_lines = [
+            " | ".join(condition_parts[:split_at]),
+            " | ".join(condition_parts[split_at:]),
+        ]
+        condition_display = "\n".join(line for line in condition_lines if line)
+        condition_inside_display = "\n".join(condition_parts)
+    else:
+        condition_inside_display = ""
     # The 16 pt MCD y-label needs more room than a heatmap's short axis
     # label.  This fixed rectangle is shared by every MCD(B) PNG.
-    axis = fig.add_axes([0.16, 0.12, 0.70, 0.76])
+    # Keep the grid at exactly 6.2 x 4.712 inches. Integral-enabled figures
+    # receive a wider outer canvas for their right-axis text, without changing
+    # the physical grid dimensions used by ordinary MCD(B) exports.
+    axis = fig.add_axes([1.28 / figure_width, 0.12, 6.2 / figure_width, 0.76])
 
-    traces = pair_window_trace_by_branch(result, center_ev, width_mev)
     trace_specs = (
         ("mean", "Signed mean", "#1666b0", show_signed_mean),
         ("field_signed_absolute_mean", "Field-signed |MCD|", "#c94c00", show_field_signed_absolute_mean),
@@ -1361,6 +1969,8 @@ def export_mcd_analysis_bundle(
         ("integral", "Signed integral", "#6a3d9a", show_integral),
     )
     integral_axis = axis.twinx()
+    primary_data_values: list[np.ndarray] = []
+    integral_data_values: list[np.ndarray] = []
     for metric_name, label, color, visible in trace_specs:
         if not visible:
             continue
@@ -1370,18 +1980,57 @@ def export_mcd_analysis_bundle(
                 if source == "raw" and not show_raw:
                     continue
                 b_values, values = traces[branch][f"{source}_{metric_name}"]
+                finite_values = np.asarray(values, float)
+                if metric_name == "integral":
+                    integral_data_values.append(finite_values[np.isfinite(finite_values)])
+                else:
+                    primary_data_values.append(finite_values[np.isfinite(finite_values)])
                 target.plot(
                     b_values, values, f"o{branch_style}", ms=3.1, lw=1.25,
                     color=color, alpha=alpha, markerfacecolor=marker_fill,
                     markeredgecolor=color, markeredgewidth=0.9, label="_nolegend_",
                 )
-        if fit_near_zero and metric_name == "mean":
-            for branch, branch_style in (("B increasing", "-"), ("B decreasing", "--")):
-                b_values, values = traces[branch]["corrected_mean"]
-                mask = np.isfinite(b_values) & np.isfinite(values) & (np.abs(b_values) <= float(fit_window_t))
-                if np.count_nonzero(mask) >= 2:
-                    slope, intercept = np.polyfit(b_values[mask], values[mask], 1)
-                    axis.plot(b_values, slope * b_values + intercept, ":", color=color, lw=1.1, label="_nolegend_")
+        if fit_near_zero and metric_name == "mean" and branch_fits:
+            fit_fields = np.concatenate([
+                np.asarray(traces[branch]["corrected_mean"][0], float)
+                for branch in ("B increasing", "B decreasing")
+            ])
+            fit_mask = np.isfinite(fit_fields) & (np.abs(fit_fields) <= float(fit_window_t))
+            if np.count_nonzero(fit_mask) >= 2:
+                finite_fields = fit_fields[np.isfinite(fit_fields)]
+                fit_x = np.array([
+                    float(np.min(finite_fields)),
+                    float(np.max(finite_fields)),
+                ])
+                fit_styles = {
+                    "B increasing": ("#d55e00", "-"),
+                    "B decreasing": ("#7a3db8", "--"),
+                }
+                for branch, (slope, intercept) in branch_fits.items():
+                    color, line_style = fit_styles[branch]
+                    fit_line, = axis.plot(
+                        fit_x, slope * fit_x + intercept,
+                        line_style, color=color, lw=2.2, zorder=26,
+                        label="_nolegend_",
+                    )
+                    fit_line.set_path_effects([
+                        patheffects.Stroke(linewidth=3.5, foreground="white", alpha=0.95),
+                        patheffects.Normal(),
+                    ])
+
+    def set_data_ylim(target_axis, arrays: list[np.ndarray]) -> None:
+        finite = [array for array in arrays if array.size]
+        if not finite:
+            return
+        values = np.concatenate(finite)
+        low, high = float(np.min(values)), float(np.max(values))
+        span = high - low
+        padding = 0.05 * (span if span > 0 else max(abs(low), abs(high), 1.0))
+        target_axis.set_ylim(low - padding, high + padding)
+
+    set_data_ylim(axis, primary_data_values)
+    if show_integral:
+        set_data_ylim(integral_axis, integral_data_values)
 
     axis.axhline(0.0, color="#555", lw=0.7)
     axis.set_xlabel("B field (T)", fontsize=16)
@@ -1397,13 +2046,53 @@ def export_mcd_analysis_bundle(
         integral_axis.set_yticks([])
         integral_axis.set_ylabel("")
         integral_axis.spines["right"].set_visible(False)
+    visible_metric_count = sum(1 for _name, _label, _color, visible in trace_specs if visible)
+    show_slope_box = bool(fit_near_zero and branch_fits)
+    annotation_layout = mcd_annotation_layout(
+        axis, integral_axis,
+        show_conditions=bool(condition_text),
+        show_slopes=show_slope_box,
+        show_metric_legend=visible_metric_count > 1,
+    )
+    condition_corner = annotation_layout.get("conditions")
+    if condition_text and condition_corner is not None:
+        anchor = _mcd_corner_anchor(condition_corner)
+        axis.text(
+            anchor[0], anchor[1], condition_inside_display,
+            transform=axis.transAxes, ha=anchor[2], va=anchor[3],
+            fontsize=16, fontweight="semibold", color="#303030",
+            linespacing=1.12, zorder=30,
+            bbox={
+                "boxstyle": "round,pad=0.32", "facecolor": "white",
+                "edgecolor": "#9a9a9a", "linewidth": 0.7, "alpha": 0.90,
+            },
+        )
+    if show_slope_box:
+        slope_lines = []
+        if np.isfinite(increasing_slope):
+            slope_lines.append(f"Increasing slope = {increasing_slope:.6g} T⁻¹")
+        if np.isfinite(decreasing_slope):
+            slope_lines.append(f"Decreasing slope = {decreasing_slope:.6g} T⁻¹")
+        slope_corner = annotation_layout["slopes"]
+        anchor = _mcd_corner_anchor(slope_corner)
+        axis.text(
+            anchor[0], anchor[1], "\n".join(slope_lines),
+            transform=axis.transAxes, ha=anchor[2], va=anchor[3],
+            fontsize=16, fontweight="semibold", color="#303030",
+            linespacing=1.12, zorder=31,
+            bbox={
+                "boxstyle": "round,pad=0.32", "facecolor": "white",
+                "edgecolor": "#9a9a9a", "linewidth": 0.7, "alpha": 0.90,
+            },
+        )
+    branch_legend_location = annotation_layout["branch_legend"]
     branch_legend = axis.legend(
         [
             Line2D([0], [0], color="#333", marker="o", markerfacecolor="#333", lw=1.25),
             Line2D([0], [0], color="#333", marker="o", markerfacecolor="white", lw=1.25, ls="--"),
         ],
         ["B increasing", "B decreasing"],
-        fontsize=7.2, frameon=True, framealpha=0.82, loc="upper left", borderpad=0.35, labelspacing=0.28, handlelength=2.4,
+        fontsize=7.2, frameon=True, framealpha=0.82, loc=branch_legend_location, borderpad=0.35, labelspacing=0.28, handlelength=2.4,
     )
     axis.add_artist(branch_legend)
     metric_handles: list[Line2D] = []
@@ -1413,13 +2102,15 @@ def export_mcd_analysis_bundle(
             continue
         metric_handles.append(Line2D([0], [0], color=color, lw=1.6))
         metric_labels.append(f"{label} (right axis)" if metric_name == "integral" else label)
-    if metric_handles:
-        axis.legend(metric_handles, metric_labels, fontsize=7.2, frameon=True, framealpha=0.82, loc="lower right", borderpad=0.35, labelspacing=0.28, handlelength=2.4)
+    if len(metric_handles) > 1:
+        axis.legend(metric_handles, metric_labels, fontsize=7.2, frameon=True, framealpha=0.82, loc=annotation_layout["metric_legend"], borderpad=0.35, labelspacing=0.28, handlelength=2.4)
     fig.savefig(figure_path, dpi=fig.dpi, facecolor="white", edgecolor="none", pad_inches=0)
 
+    # Pairing diagnostics depend on the loaded/pairing analysis, not the
+    # integration center. Keep one stable file instead of one copy per center.
     diagnostic_path = out / f"{stem}_MCD_pair_diagnostics.csv"
     _mcd_pair_diagnostic_table(result).to_csv(diagnostic_path, index=False)
-    settings_path = out / f"{stem}_MCD_settings.json"
+    settings_path = out / f"{stem}_MCD_settings_{tag}.json"
     setting_values = asdict(settings) if settings is not None else {}
     for key in ("dark_pos_file", "dark_neg_file"):
         if setting_values.get(key):
@@ -1452,17 +2143,82 @@ def export_mcd_analysis_bundle(
             "show_integral": bool(show_integral),
             "fit_near_zero": bool(fit_near_zero),
             "fit_window_t": float(fit_window_t),
+            "fit_range_mode": "fixed" if fit_near_zero else "disabled",
+            "low_field_mcd_slope_increasing_per_T": (
+                float(increasing_slope) if np.isfinite(increasing_slope) else None
+            ),
+            "low_field_mcd_slope_decreasing_per_T": (
+                float(decreasing_slope) if np.isfinite(decreasing_slope) else None
+            ),
+            "center_selection": _json_safe(
+                result.summary.get("window_center_selection", {"method": "manual"})
+            ),
         },
         "sigma_plus_angle_deg": float(result.pos_angle),
         "sigma_minus_angle_deg": float(result.neg_angle),
         "reference_b_t": float(result.reference_b),
+        "acquisition_conditions": _json_safe(result.acquisition_conditions),
+        "acquisition_conditions_display": condition_text,
+        "acquisition_conditions_placement": condition_corner or "none",
         "processing": _json_safe(setting_values),
         "processing_summary": _json_safe(result.summary),
     }
     settings_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    # Keep the processed-data organizer current without rescanning the MCD
+    # output tree. Catalog failure must never invalidate a successful export;
+    # the organizer's explicit Rebuild action can reconcile it later.
+    try:
+        from core.mcd_extract import index_processed_mcd_settings
+
+        index_processed_mcd_settings(settings_path, payload=payload)
+    except (OSError, ValueError):
+        pass
     return {
         "mcd_vs_b_png": figure_path,
         "mcd_vs_b_csv": csv_path,
         "pair_diagnostics": diagnostic_path,
         "settings": settings_path,
     }
+
+
+def ensure_mcd_package_dir(experiment_root: str | Path, source_file: str | Path) -> Path:
+    """Return one stable package per raw CSV and merge legacy window packages."""
+    stem = Path(source_file).stem
+    parent = Path(experiment_root) / "Processed Data" / "MCD"
+    package = parent / f"{stem}_MCD"
+    package.mkdir(parents=True, exist_ok=True)
+    legacy_prefix = f"{stem}_MCD_E".casefold()
+    try:
+        legacy_packages = [
+            child
+            for child in parent.iterdir()
+            if child.is_dir()
+            and child != package
+            and child.name.casefold().startswith(legacy_prefix)
+        ]
+    except OSError:
+        legacy_packages = []
+    for legacy in legacy_packages:
+        try:
+            children = list(legacy.iterdir())
+        except OSError:
+            continue
+        for item in children:
+            target = package / item.name
+            if target.exists():
+                index = 1
+                while True:
+                    candidate = package / f"{item.stem}_legacy{index:02d}{item.suffix}"
+                    if not candidate.exists():
+                        target = candidate
+                        break
+                    index += 1
+            try:
+                item.replace(target)
+            except OSError:
+                continue
+        try:
+            legacy.rmdir()
+        except OSError:
+            pass
+    return package

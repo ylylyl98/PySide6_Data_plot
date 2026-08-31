@@ -55,6 +55,28 @@ pip install -r requirements.txt
 python run_qt.py
 ```
 
+## Building PowerPoint slides
+
+Open the **Slides** workflow to assemble processed PNG plots into a PowerPoint
+presentation. Choose the existing `.pptx` you want to edit. **Insert live**
+updates that exact deck while it is open in desktop PowerPoint without saving;
+**Insert and save** updates the same file whether it is open or closed. A
+separate copy remains available as an optional action.
+
+- Search PNGs recursively below the experiment's `Processed Data` folder;
+  filenames wrap in full and can be sorted by modified time or name.
+- Filter MCD Combo maps and MCD(B) traces separately, or add the newest matching
+  same-subfolder pair in one click. Folder badges and a queue warning make
+  mixed MCD folders visible before insertion.
+- Select plots in the desired order, drag the queue to refine it, and preview
+  each planned slide.
+- Choose any layout from 1 through 12 images per slide, including 2×4, 3×3,
+  and 3×4 layouts for 8, 9, and 12 images.
+- Add optional short captions as editable PowerPoint text. A/B/C panel labels
+  are available but off by default. Source PNG files are never changed or cropped.
+- Insert again safely: a recovery backup and sidecar manifest protect the deck
+  and prevent the same saved plot from being appended twice.
+
 On Windows, run `Data_Plot_App.bat` once. It creates `DPTK Desktop.lnk` beside
 the launcher with the application icon; use that shortcut for normal launches
 and taskbar pinning. To create a Desktop shortcut instead, run:
@@ -95,7 +117,8 @@ python -m pip install -r requirements.txt -r requirements-build.txt
 The portable application is created at
 `dist\PySide6_Data_Plot\PySide6_Data_Plot.exe`. PyInstaller uses an `onedir`
 layout, so distribute the entire `PySide6_Data_Plot` directory rather than the
-EXE alone.
+EXE alone. The build stops automatically if the Windows PowerPoint bridge was
+not included; installed users do not need to install Python packages.
 
 To build the installer locally, install NSIS and run:
 
@@ -141,6 +164,7 @@ YZ327/
 │   ├── DRR/
 │   ├── Compare/
 │   ├── MCD/<analysis package>/
+│   ├── MCD Extracts/                       # Origin XLSX, comparison PNG, settings JSON
 │   ├── SHG/<analysis package>/
 │   └── Power Dependence/<group or comparison package>/
 ├── temporary working CSV copies/          # normally directly under YZ327
@@ -278,6 +302,20 @@ calling those helpers directly is separate from the normal GUI workflow.
   baseline. MCD(B) displays only signed mean initially, and signed mean is also
   the primary PNG/settings export metric; magnitude and integral traces remain
   available as optional diagnostics, while the CSV retains all metric columns.
+  **Open processed MCD Extract / Compare** catalogs saved MCD(B) results without
+  reprocessing raw files. It supports tolerance-based doping and E-field filters,
+  integration-energy ranges, integration-width filters, nearby-energy grouping,
+  and individual include/exclude choices. Increasing-field traces remain solid
+  with filled markers; decreasing-field traces remain dashed with open markers.
+  Preview and PNG export place the two branches on separate axes with shared
+  scaling, while the result/color legend stays outside the data panels.
+  Choose automatic or explicit ordering, ascending/descending direction, and a
+  color palette. Extraction writes one descriptively named Origin-ready XLSX
+  with separate Increasing, Decreasing, and Slope Summary sheets; a matching PNG;
+  and a compact settings JSON. The branch sheets contain X/Y trace pairs, fitted
+  curves, slopes, intercepts, point counts, and R². Optional branch CSV copies are
+  off by default. Missing temperature is resolved from measurement JSON or the
+  original CSV before filename fallback, and its provenance is recorded.
 - `Compare`: 2-4 selected files rendered in a compare grid.
 - `Save PNG` exports with fixed Streamlit-style geometry (`8.0 x 6.2 in @ 150 DPI`) independent of window size.
 - Exported `.dat` files remain tab-delimited numeric matrices for Origin. The

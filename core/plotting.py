@@ -51,6 +51,30 @@ class HeatmapRender:
         return self.secondary is not None and self.split_x is not None
 
 
+def downsample_cube_for_display(cube: DataCube, *, max_points: int = 250_000) -> DataCube:
+    """Return a bounded display view while leaving the source cube untouched.
+
+    The selected axis samples always include both endpoints.  Analysis and
+    export continue to use the original :class:`DataCube`; this helper is only
+    for expensive interactive heatmap rendering.
+    """
+    energy = np.asarray(cube.energy).ravel()
+    gate = np.asarray(cube.gate).ravel()
+    z = np.asarray(cube.Z)
+    if energy.size * gate.size <= int(max_points):
+        return cube
+    target = max(2, int(np.sqrt(max_points)))
+    n_energy = min(energy.size, target)
+    n_gate = min(gate.size, max(2, int(max_points / max(1, n_energy))))
+    e_idx = np.unique(np.linspace(0, energy.size - 1, n_energy, dtype=int))
+    g_idx = np.unique(np.linspace(0, gate.size - 1, n_gate, dtype=int))
+    return DataCube(
+        energy=energy[e_idx], gate=gate[g_idx], Z=z[np.ix_(g_idx, e_idx)],
+        gate_label=cube.gate_label, title=cube.title, cbar_label=cube.cbar_label,
+        gate_unit=cube.gate_unit, y_axis_semantic=cube.y_axis_semantic,
+    )
+
+
 def _norm_from_params(z: np.ndarray, params: HeatmapParams):
     if params.log_scale:
         vmin = max(float(params.vmin), 1e-12)

@@ -7,7 +7,6 @@ from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import QApplication
 
 from app_version import __version__
-from ui_qt.main_window import MainWindow
 
 APP_USER_MODEL_ID = "com.ylylyl98.dptk_desktop.data_plot"
 APP_ICON_PATH = Path("assets") / "icons" / "app_icon.ico"
@@ -275,6 +274,19 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
 
 
 def main() -> int:
+    if "--mcd-organizer" in sys.argv:
+        index = sys.argv.index("--mcd-organizer")
+        experiment = sys.argv[index + 1] if index + 1 < len(sys.argv) else str(Path.cwd())
+        from run_mcd_organizer import main as organizer_main
+
+        return organizer_main([experiment])
+
+    if "--check-powerpoint-integration" in sys.argv:
+        from core.presentation import powerpoint_integration_available
+
+        available, _message = powerpoint_integration_available()
+        return 0 if available else 2
+
     set_windows_app_user_model_id()
 
     app = QApplication(sys.argv)
@@ -287,6 +299,8 @@ def main() -> int:
     app_icon = load_app_icon()
     if not app_icon.isNull():
         app.setWindowIcon(app_icon)
+
+    from ui_qt.main_window import MainWindow
 
     window = MainWindow()
     if not app_icon.isNull():

@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
+import core.export as export_module
 from core.export import export_drr_png_and_dat, export_pl_pngs_and_dat, write_export_metadata
 from core.loader import DataCube
 from core.plotting import HeatmapParams
@@ -15,6 +16,52 @@ from core.provenance import verify_initial_data_working_file
 
 
 class ExportMetadataTests(unittest.TestCase):
+    def test_mcd_center_change_reuses_map_and_hashes_source_once_per_save(self) -> None:
+        def render(path, *_args, **_kwargs):
+            Path(path).write_bytes(b"png")
+
+        export_module._cached_file_sha256.cache_clear()
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "core.export._save_heatmap_png", side_effect=render
+        ), patch(
+            "core.export._source_descriptor",
+            wraps=export_module._source_descriptor,
+        ) as describe_source:
+            source = Path(tmp) / "mcd" / "sample.csv"
+            source.parent.mkdir()
+            source.write_text("raw MCD", encoding="utf-8")
+            cube = DataCube(
+                energy=np.asarray([1.6, 1.7]), gate=np.asarray([-1.0, 1.0]),
+                Z=np.asarray([[-0.1, 0.1], [0.1, -0.1]]),
+                gate_label="B field", title="MCD", cbar_label="MCD",
+            )
+            params = HeatmapParams(
+                title="MCD", xlabel="Energy", ylabel="B field", cbar_label="MCD",
+                vmin=-0.1, vmax=0.1, xlim=(1.6, 1.7), ylim=(-1.0, 1.0),
+            )
+            common = dict(
+                cube=cube,
+                params=params,
+                export_base="sample_MCD_Combo",
+                processed_name=str(Path("Processed Data") / "MCD" / "sample_MCD"),
+                drr_style=False,
+                metadata_input_files=(("measurement", str(source)),),
+                metadata_processing={"map": "Combo", "mcd_settings": {"correction": "pair"}},
+                reuse_existing_analysis=True,
+            )
+            first = export_drr_png_and_dat(tmp, **common)
+            second = export_drr_png_and_dat(tmp, **common)
+
+            self.assertEqual(first["png"], second["png"])
+            self.assertEqual(first["dat"], second["dat"])
+            self.assertEqual(second.save_status, "reused")
+            self.assertEqual(len(list(first["dat"].parent.glob("*.dat"))), 1)
+            self.assertEqual(len(list(first["png"].parent.glob("*.png"))), 1)
+            self.assertEqual(describe_source.call_count, 2)
+            cache = export_module._cached_file_sha256.cache_info()
+            self.assertEqual(cache.misses, 1)
+            self.assertGreaterEqual(cache.hits, 1)
+
     def test_pl_logical_outputs_share_collision_safe_stem(self) -> None:
         cube = DataCube(
             energy=np.asarray([0.0, 1.0]), gate=np.asarray([0.0]),

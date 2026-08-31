@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,7 @@ import pandas as pd
 from core.export import create_unique_package_dir, export_drr_png_and_dat
 from core.loader import DataCube
 from core.mcd import McdSettings, export_mcd_analysis_bundle, process_mcd
+from core.mcd_extract import mcd_catalog_database_path
 from core.plotting import HeatmapParams
 from core.shg import ShgSettings, ShgSweepData, process_shg_sweep
 from core.export import export_shg_results
@@ -63,7 +65,7 @@ class Phase3PackageTests(unittest.TestCase):
             root = Path(tmp)
             source = root / "branch.csv"
             rows = []
-            for field in (-1.0, 0.0, 1.0):
+            for field in (-1.0, 0.0, 1.0, 1.0, 0.0, -1.0):
                 for angle, scale in ((10.0, 1.0), (50.0, 2.0)):
                     rows.append({"B_T": field, "angle_deg": angle, "700": scale * (10 + field), "710": scale * (8 + field)})
             pd.DataFrame(rows).to_csv(source, index=False)
@@ -83,6 +85,16 @@ class Phase3PackageTests(unittest.TestCase):
             self.assertTrue(all(path.parent == package for path in bundle.values()))
             payload = json.loads(bundle["settings"].read_text(encoding="utf-8"))
             self.assertEqual(payload["package"], package.name)
+            catalog_path = mcd_catalog_database_path(root)
+            self.assertTrue(catalog_path.is_file())
+            connection = sqlite3.connect(catalog_path)
+            try:
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM processed_mcd").fetchone()[0],
+                    1,
+                )
+            finally:
+                connection.close()
 
     def test_shg_single_result_and_settings_stay_in_package(self) -> None:
         data = _synthetic_data()

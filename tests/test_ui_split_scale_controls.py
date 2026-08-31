@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -12,10 +13,13 @@ import numpy as np
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QScrollArea, QSplitter, QWidget
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QDialog, QLineEdit, QListWidget, QScrollArea, QSplitter, QWidget
 
 from core.loader import DataCube
+from core.drr_sources import DrrSource
 from ui_qt.main_window import LoadedState, MainWindow, UI_METRICS
+from tests.ui_test_helpers import wait_for_file_catalog
 
 
 class SplitScaleControlTests(unittest.TestCase):
@@ -33,6 +37,20 @@ class SplitScaleControlTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.window.close()
+        self.window.deleteLater()
+        self.app.processEvents()
+
+    def _wait_for_drr_catalog(self) -> None:
+        self._wait_for_file_catalog()
+        for _ in range(100):
+            self.app.processEvents()
+            if not self.window._drr_refresh_running:
+                return
+            QTest.qWait(10)
+        self.fail("Timed out waiting for the DRR catalog refresh")
+
+    def _wait_for_file_catalog(self) -> None:
+        wait_for_file_catalog(self.window)
 
     def test_split_controls_fit_at_minimum_sidebar_width(self) -> None:
         splitter = self.window.findChild(QSplitter)
@@ -57,7 +75,7 @@ class SplitScaleControlTests(unittest.TestCase):
         self.assertEqual(tab_bar.elideMode(), Qt.ElideNone)
         self.assertEqual(
             [self.window.tabs.tabText(i) for i in range(self.window.tabs.count())],
-            ["PL", "DRR", "Compare", "Power", "MCD", "SHG", "Tools"],
+            ["PL", "DRR", "Compare", "Power", "MCD", "SHG", "Slides", "Tools"],
         )
         expected_modes = [
             "PL",
@@ -71,6 +89,15 @@ class SplitScaleControlTests(unittest.TestCase):
         for index, expected in enumerate(expected_modes):
             self.window.tabs.setCurrentIndex(index)
             self.assertEqual(self.window._active_mode(), expected)
+
+    def test_mcd_organizer_launcher_lives_on_tools_page(self) -> None:
+        labels = [
+            self.window.tabs.tabText(index) for index in range(self.window.tabs.count())
+        ]
+        mcd_page = self.window.tabs.widget(labels.index("MCD"))
+        tools_page = self.window.tabs.widget(labels.index("Tools"))
+        self.assertFalse(mcd_page.isAncestorOf(self.window.mcd_extract_btn))
+        self.assertTrue(tools_page.isAncestorOf(self.window.mcd_extract_btn))
 
     def test_drr_summary_wraps_the_complete_first_filename(self) -> None:
         full_name = (
@@ -101,6 +128,7 @@ class SplitScaleControlTests(unittest.TestCase):
             self._write_drr_measurement(first)
 
             self.window._set_current_folder(tmp, remember=False)
+            self._wait_for_drr_catalog()
             self.assertEqual(self.window.drr_selected_files, [])
             self.window.drr_selected_files = [
                 "Initial Data/sample_760nmc_rep1_1.csv"
@@ -108,6 +136,7 @@ class SplitScaleControlTests(unittest.TestCase):
 
             self._write_drr_measurement(second)
             self.window._refresh_file_lists(auto=True)
+            self._wait_for_drr_catalog()
 
             self.assertEqual(
                 set(self.window.drr_selected_files),
@@ -116,6 +145,76 @@ class SplitScaleControlTests(unittest.TestCase):
                     "Initial Data/sample_760nmc_rep1_2.csv",
                 },
             )
+
+    def test_drr_source_search_is_debounced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            initial = Path(tmp) / "Initial Data"
+            initial.mkdir()
+            self._write_drr_measurement(initial / "sample_760nmc_rep1.csv")
+            self.window._set_current_folder(tmp, remember=False)
+            self._wait_for_drr_catalog()
+
+            observed: dict[str, int] = {}
+
+            def fake_exec(dialog: QDialog) -> int:
+                filter_edit = dialog.findChild(QLineEdit)
+                group_list = next(
+                    widget for widget in dialog.findChildren(QListWidget) if widget.count()
+                )
+                self.assertIsNotNone(filter_edit)
+                self.assertGreater(group_list.count(), 0)
+                filter_edit.setText("query-that-does-not-match")
+                self.app.processEvents()
+                observed["before"] = group_list.count()
+                QTest.qWait(230)
+                self.app.processEvents()
+                observed["after"] = group_list.count()
+                return QDialog.Rejected
+
+            with patch.object(QDialog, "exec", fake_exec):
+                self.window._open_drr_source_dialog(
+                    title="Choose DRR files", selected=[], baseline_mode=False
+                )
+
+            self.assertGreater(observed["before"], 0)
+            self.assertEqual(observed["after"], 0)
+
+    def test_drr_catalog_discovery_runs_off_the_gui_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entered = threading.Event()
+            release = threading.Event()
+            source = DrrSource(
+                source="Initial Data/async_760nmc.csv",
+                filename="async_760nmc.csv",
+                group_key="async_760nmc",
+                session_date="2026-08-26",
+                modified_time=1.0,
+                is_background=False,
+            )
+
+            def delayed_discovery(_folder, *, cache=None):
+                entered.set()
+                release.wait(2.0)
+                return [source]
+
+            self.window.current_folder = str(root)
+            with patch(
+                "ui_qt.main_window.discover_drr_sources",
+                side_effect=delayed_discovery,
+            ):
+                self.window._refresh_file_lists()
+                self._wait_for_file_catalog()
+                self.assertTrue(entered.wait(1.0))
+                # The worker is intentionally blocked; reaching this point
+                # proves the refresh call itself did not perform discovery.
+                self.assertFalse(release.is_set())
+                self.assertTrue(self.window._drr_refresh_running)
+
+                release.set()
+                self._wait_for_drr_catalog()
+
+            self.assertEqual(self.window.drr_available_sources, [source])
 
     def test_drr_refresh_preserves_a_deliberately_selected_subset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -128,11 +227,13 @@ class SplitScaleControlTests(unittest.TestCase):
             self._write_drr_measurement(second)
 
             self.window._set_current_folder(tmp, remember=False)
+            self._wait_for_drr_catalog()
             chosen = "Initial Data/sample_760nmc_rep1_1.csv"
             self.window.drr_selected_files = [chosen]
             self._write_drr_measurement(third)
 
             self.window._refresh_file_lists(auto=True)
+            self._wait_for_drr_catalog()
 
             self.assertEqual(self.window.drr_selected_files, [chosen])
 
@@ -166,6 +267,7 @@ class SplitScaleControlTests(unittest.TestCase):
                     encoding="utf-8",
                 )
             self.window._set_current_folder(first_tmp, remember=False)
+            self._wait_for_file_catalog()
             self.window._restore_list_selection(self.window.pl_files, ["same_name.csv"])
             self.window._restore_list_selection(self.window.shg_files, ["same_name.csv"])
             self.window.drr_selected_files = ["same_name.csv"]
@@ -173,6 +275,7 @@ class SplitScaleControlTests(unittest.TestCase):
             self.window.last_plotted_mode = "PL"
 
             self.window._set_current_folder(second_tmp, remember=False)
+            self._wait_for_file_catalog()
 
             self.assertEqual(self.window._selected(self.window.pl_files), [])
             self.assertEqual(self.window._selected(self.window.mcd_files), [])
@@ -282,6 +385,26 @@ class SplitScaleControlTests(unittest.TestCase):
         self.window.sidebar_toggle_btn.setChecked(True)
         self.app.processEvents()
         self.assertTrue(self.window.left_panel.isVisible())
+
+    def test_slides_workspace_is_full_width_and_owns_its_build_controls(self) -> None:
+        slides_index = next(
+            index
+            for index in range(self.window.tabs.count())
+            if self.window.tabs.tabText(index) == "Slides"
+        )
+        self.window.workflow_tabs.setCurrentIndex(slides_index)
+        QApplication.processEvents()
+        self.assertIs(self.window.workspace_stack.currentWidget(), self.window.presentation_widget)
+        self.assertFalse(self.window.sidebar_toggle_btn.isEnabled())
+        self.assertFalse(self.window.load_action.isEnabled())
+        self.assertFalse(self.window.plot_action.isEnabled())
+        self.assertFalse(self.window.save_action.isEnabled())
+        counts = [
+            self.window.presentation_widget.images_per_slide_combo.itemData(index)
+            for index in range(self.window.presentation_widget.images_per_slide_combo.count())
+        ]
+        self.assertEqual(counts, [0, *range(1, 13)])
+        self.assertIn("never alter the PNG", self.window.presentation_widget.caption_combo.toolTip())
 
     def test_enabling_drr_split_centers_boundary_and_scales_both_regions(self) -> None:
         cube = DataCube(
@@ -429,6 +552,8 @@ class SplitScaleControlTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.window._set_current_folder(tmp, remember=False)
+            self._wait_for_file_catalog()
+            self._wait_for_drr_catalog()
             selected = "Initial Data/sample_760nmc_rep1.csv"
 
             with patch.object(
@@ -461,6 +586,7 @@ class SplitScaleControlTests(unittest.TestCase):
                     encoding="utf-8",
                 )
             self.window._set_current_folder(tmp, remember=False)
+            self._wait_for_file_catalog()
             self.window.drr_baseline_files_manual = [first.name, second.name]
             self.window.drr_baseline_combine_combo.setCurrentText(
                 "Last frame from each file, then average"
