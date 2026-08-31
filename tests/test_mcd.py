@@ -856,7 +856,12 @@ class McdProcessingTests(unittest.TestCase):
                 self.assertEqual(window._selected(window.mcd_files), ["mcd/sweep.csv"])
                 self.assertIn("Selected:", window.mcd_selection_summary.text())
                 self.assertIn("● NEW", window.mcd_selection_summary.text())
-                self.assertIn(str(mcd_folder.resolve()), window.folder_watcher.directories())
+                self.assertTrue(
+                    any(
+                        os.path.samefile(watched, mcd_folder)
+                        for watched in window.folder_watcher.directories()
+                    )
+                )
 
                 options = LoadOptions(
                     mode="MCD", folder=str(folder), selected_files=["mcd/sweep.csv"],
