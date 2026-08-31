@@ -39,6 +39,7 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt -r requirements-build.txt
       - name: Install NSIS
+        if: github.event_name != 'pull_request'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -93,6 +94,7 @@ jobs:
           "MAKENSIS_PATH=$makensis" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "MAKENSIS_PATH=$makensis"
       - name: Resolve and validate version
+        if: github.event_name != 'pull_request'
         shell: pwsh
         run: |
           $version = python scripts/validate_release_version.py --print-version
@@ -114,19 +116,24 @@ jobs:
       - name: Run smoke check
         run: python scripts/smoke_check.py
       - name: Build Windows application
+        if: github.event_name != 'pull_request'
         run: .\build_windows.bat
       - name: Verify executable
+        if: github.event_name != 'pull_request'
         shell: pwsh
         run: |
           if (-not (Test-Path -LiteralPath "dist\PySide6_Data_Plot\PySide6_Data_Plot.exe" -PathType Leaf)) { throw "Expected executable was not produced" }
           if (-not (Test-Path -LiteralPath "dist\PySide6_Data_Plot\_internal\matplotlib\mpl-data\matplotlibrc" -PathType Leaf)) { throw "Matplotlib data file was not bundled" }
       - name: Package portable application
+        if: github.event_name != 'pull_request'
         shell: pwsh
         run: Compress-Archive -Path "dist\PySide6_Data_Plot" -DestinationPath "${{ env.ZIP_NAME }}" -Force
       - name: Build installer
+        if: github.event_name != 'pull_request'
         shell: pwsh
         run: .\scripts\build_installer.ps1 -Version "${{ env.APP_VERSION }}" -OutputFile "${{ env.SETUP_NAME }}" -MakensisPath "${{ env.MAKENSIS_PATH }}"
       - name: Generate checksums
+        if: github.event_name != 'pull_request'
         shell: pwsh
         run: |
           $files = @("${{ env.ZIP_NAME }}", "${{ env.SETUP_NAME }}")
@@ -136,6 +143,7 @@ jobs:
           }
           $lines | Set-Content -LiteralPath SHA256SUMS.txt -Encoding ascii
       - name: Upload Windows artifacts
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: DPTK-Windows-x64
