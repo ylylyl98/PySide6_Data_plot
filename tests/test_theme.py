@@ -102,6 +102,26 @@ class ThemeLayerTests(unittest.TestCase):
         self.assertNotIn("QSpinBox:read-only::", rendered)
         self.assertNotIn("QDoubleSpinBox:read-only::", rendered)
 
+    def test_read_only_spinbox_subcontrols_override_interactive_states(self) -> None:
+        repository = _repository()
+        with tempfile.TemporaryDirectory() as asset_dir:
+            rendered = render_qss_file(
+                _QSS_TEMPLATE,
+                repository.resolve("dark", shell_profile="fluent-workbench"),
+                asset_directory=asset_dir,
+            )
+        for widget in ("QSpinBox", "QDoubleSpinBox"):
+            for direction in ("up", "down"):
+                for state in ("hover", "pressed", "focus"):
+                    self.assertIn(
+                        f'{widget}[readOnly="true"]::{direction}-button:{state}',
+                        rendered,
+                    )
+                self.assertIn(
+                    f'{widget}[readOnly="true"]::{direction}-arrow:hover',
+                    rendered,
+                )
+
     def test_approved_shell_icons_are_current_color_svg_assets(self) -> None:
         icon_root = _QSS_TEMPLATE.parent / "icons"
         for filename in (

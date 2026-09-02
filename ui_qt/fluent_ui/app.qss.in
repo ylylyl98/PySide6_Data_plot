@@ -360,6 +360,29 @@ QSpinBox[readOnly="true"]::down-arrow, QDoubleSpinBox[readOnly="true"]::down-arr
     image: url("@{spin_down_icon_disabled}");
 }
 
+QSpinBox[readOnly="true"]::up-button:hover, QDoubleSpinBox[readOnly="true"]::up-button:hover,
+QSpinBox[readOnly="true"]::down-button:hover, QDoubleSpinBox[readOnly="true"]::down-button:hover {
+    background-color: transparent;
+}
+
+QSpinBox[readOnly="true"]::up-button:pressed, QDoubleSpinBox[readOnly="true"]::up-button:pressed,
+QSpinBox[readOnly="true"]::down-button:pressed, QDoubleSpinBox[readOnly="true"]::down-button:pressed {
+    background-color: transparent;
+}
+
+QSpinBox[readOnly="true"]::up-button:focus, QDoubleSpinBox[readOnly="true"]::up-button:focus,
+QSpinBox[readOnly="true"]::down-button:focus, QDoubleSpinBox[readOnly="true"]::down-button:focus {
+    background-color: transparent;
+}
+
+QSpinBox[readOnly="true"]::up-arrow:hover, QDoubleSpinBox[readOnly="true"]::up-arrow:hover {
+    image: url("@{spin_up_icon_disabled}");
+}
+
+QSpinBox[readOnly="true"]::down-arrow:hover, QDoubleSpinBox[readOnly="true"]::down-arrow:hover {
+    image: url("@{spin_down_icon_disabled}");
+}
+
 QSpinBox[fluentInvalid="true"]::up-button, QDoubleSpinBox[fluentInvalid="true"]::up-button,
 QSpinBox[fluentInvalid="true"]::down-button, QDoubleSpinBox[fluentInvalid="true"]::down-button {
     background-color: transparent;
