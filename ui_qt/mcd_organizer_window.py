@@ -47,6 +47,8 @@ from core.mcd_extract import (
     record_order_value,
 )
 from ui_qt.mcd_async import McdScanWorker
+from ui_qt.fluent_ui.style import set_fluent_property
+from ui_qt.theme import alias as theme_alias
 
 
 def _number(value: float | None) -> str:
@@ -158,14 +160,14 @@ class McdOrganizerWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 4, 0)
         title = QLabel("Processed condition series")
-        title.setStyleSheet("font-size: 14px; font-weight: 600;")
+        set_fluent_property(title, "appRole", "pageHeading")
         layout.addWidget(title)
         hint = QLabel(
             "Check the series to export. Click a series to preview it. "
             "Every result keeps its own processed energy."
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: #666;")
+        set_fluent_property(hint, "appRole", "hintText")
         layout.addWidget(hint)
         compare_row = QHBoxLayout()
         compare_row.addWidget(QLabel("Compare different:"))
@@ -242,7 +244,7 @@ class McdOrganizerWindow(QMainWindow):
         layout.setContentsMargins(4, 0, 0, 0)
         header = QHBoxLayout()
         self.preview_title = QLabel("Select a series to preview")
-        self.preview_title.setStyleSheet("font-size: 14px; font-weight: 600;")
+        set_fluent_property(self.preview_title, "appRole", "pageHeading")
         self.increasing_chk = QCheckBox("Increasing")
         self.decreasing_chk = QCheckBox("Decreasing")
         self.increasing_chk.setChecked(True)
@@ -293,7 +295,7 @@ class McdOrganizerWindow(QMainWindow):
         layout.addLayout(condition_row)
         layout.addWidget(self.condition_list)
         self.condition_summary = QLabel("0 of 0 conditions included")
-        self.condition_summary.setStyleSheet("color: #666; font-size: 11px;")
+        set_fluent_property(self.condition_summary, "appRole", "hintText")
         layout.addWidget(self.condition_summary)
 
         self.figure = None
@@ -440,6 +442,12 @@ class McdOrganizerWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
         self._closing = True
+        # The scan worker may still own the SQLite catalog briefly after its
+        # result callback runs.  Wait for it before a temporary experiment
+        # directory is removed; Windows otherwise reports the database as
+        # locked during test cleanup and occasionally during normal teardown.
+        if self._scan_workers:
+            self._thread_pool.waitForDone(3000)
         super().closeEvent(event)
 
     def _apply_versions(self) -> None:
@@ -638,7 +646,9 @@ class McdOrganizerWindow(QMainWindow):
             item.setForeground(QColor(colors[record.record_id]))
             item.setData(Qt.UserRole + 1, colors[record.record_id])
             item.setBackground(
-                QColor("#e7f1ff") if record.record_id in selected else QColor("#f0f0f0")
+                QColor(theme_alias("selection_subtle_background"))
+                if record.record_id in selected
+                else QColor(theme_alias("surface_secondary"))
             )
             self.condition_list.addItem(item)
         self._list_refreshing = False
@@ -786,10 +796,14 @@ class McdOrganizerWindow(QMainWindow):
             series = self._current_series()
             included_ids = self._selected_record_ids.get(series.series_id, set()) if series else set()
             checked = str(item.data(Qt.UserRole)) in included_ids
-            item.setBackground(QColor("#e7f1ff") if checked else QColor("#f0f0f0"))
+            item.setBackground(
+                QColor(theme_alias("selection_subtle_background"))
+                if checked
+                else QColor(theme_alias("surface_secondary"))
+            )
             item.setForeground(
                 QColor(item.data(Qt.UserRole + 1)) if checked
-                else QColor("#888888")
+                else QColor(theme_alias("text_tertiary"))
             )
             font = item.font()
             font.setBold(checked)

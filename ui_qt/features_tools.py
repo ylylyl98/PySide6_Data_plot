@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QGroupBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
+from ui_qt.fluent_ui.style import set_fluent_property
+
 
 class ToolsPageMixin:
     def _build_tools_tab(self) -> QWidget:
@@ -22,7 +24,7 @@ class ToolsPageMixin:
         log_layout.setSpacing(6)
         hint = QLabel("The log panel records all load, plot, and export events.")
         hint.setWordWrap(True)
-        hint.setStyleSheet("QLabel { color: #6e6e73; font-size: 10px; }")
+        set_fluent_property(hint, "appRole", "hintText")
         log_layout.addWidget(hint)
         log_btn_row = QHBoxLayout()
         log_btn_row.setSpacing(8)
@@ -44,7 +46,7 @@ class ToolsPageMixin:
             "only when you intentionally want to archive them."
         )
         file_hint.setWordWrap(True)
-        file_hint.setStyleSheet("QLabel { color: #6e6e73; font-size: 10px; }")
+        set_fluent_property(file_hint, "appRole", "hintText")
         file_layout.addWidget(file_hint)
         layout.addWidget(file_box)
 
@@ -57,7 +59,7 @@ class ToolsPageMixin:
             "temperature, doping, or gate-voltage comparison series."
         )
         data_hint.setWordWrap(True)
-        data_hint.setStyleSheet("QLabel { color: #6e6e73; font-size: 10px; }")
+        set_fluent_property(data_hint, "appRole", "hintText")
         data_layout.addWidget(data_hint)
         self.mcd_extract_btn = QPushButton("Open standalone MCD Organizer…")
         self.mcd_extract_btn.setToolTip(

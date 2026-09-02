@@ -7,7 +7,38 @@ refactoring stage.
 
 from __future__ import annotations
 
-from ui_qt.main_window import *
+import csv
+from typing import Dict
+
+import numpy as np
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QCheckBox,
+    QFileDialog,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QPlainTextEdit,
+    QPushButton,
+    QSizePolicy,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from core.mcd_peak_shift import analyze_peak_shift, valley_quantities
+from core.plotting import COMPARE_PANEL_ORDER
+from ui_qt.common import UI_METRICS, QComboBox, QDoubleSpinBox, QSpinBox
+from ui_qt.fluent_ui.style import set_fluent_property
+from ui_qt.status_badge import StatusBadge
 
 
 class FeatureTabsMixin:
@@ -29,8 +60,7 @@ class FeatureTabsMixin:
         source_grid.setContentsMargins(0, 0, 0, 0)
         source_grid.setHorizontalSpacing(6)
         source_grid.setVerticalSpacing(4)
-        self.pl_selection_summary = QLabel("No PL file selected.")
-        self.pl_selection_summary.setWordWrap(True)
+        self.pl_selection_summary = StatusBadge("No PL file selected.", app_role=None)
         self.pl_selection_summary.setMinimumWidth(0)
         self.pl_selection_summary.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.pl_select_source_btn = QPushButton("Select...")
@@ -193,7 +223,7 @@ class FeatureTabsMixin:
         row3h.addStretch(1)
         analysis_form.addRow("", row3)
         self.pl_fit_status = QLabel("")
-        self.pl_fit_status.setStyleSheet("QLabel { color: #0071e3; font-size: 10px; }")
+        set_fluent_property(self.pl_fit_status, "appRole", "fitStatus")
         analysis_form.addRow("", self.pl_fit_status)
         self.pl_analysis_text = QPlainTextEdit()
         self.pl_analysis_text.setReadOnly(True)
@@ -485,7 +515,7 @@ class FeatureTabsMixin:
         self.drr_analysis_text.setMaximumHeight(100)
         self.drr_analysis_text.setPlaceholderText("Peak/fit results will appear here after detection.")
         analysis_form.addRow("", self.drr_analysis_text)
-        self.drr_fit_status.setStyleSheet("QLabel { color: #0071e3; font-size: 10px; }")
+        set_fluent_property(self.drr_fit_status, "appRole", "fitStatus")
         params_layout.addWidget(self._make_expander("Manual plot ranges", basic, expanded=False))
         layout.addWidget(self._make_expander("Parameters", params, expanded=True))
         layout.addWidget(self._make_expander("Spectrum Analysis", analysis_box, expanded=False))
@@ -720,8 +750,7 @@ class FeatureTabsMixin:
         source_grid.setContentsMargins(0, 0, 0, 0)
         source_grid.setHorizontalSpacing(6)
         source_grid.setVerticalSpacing(4)
-        self.mcd_selection_summary = QLabel("No MCD CSV selected.")
-        self.mcd_selection_summary.setWordWrap(True)
+        self.mcd_selection_summary = StatusBadge("No MCD CSV selected.", app_role=None)
         self.mcd_selection_summary.setMinimumWidth(0)
         # Keep the action row anchored when the status changes between NEW,
         # PROCESSED, and long-filename states.  The status text is allowed to
@@ -1007,6 +1036,198 @@ class FeatureTabsMixin:
         layout.addStretch(1)
         return tab
 
+    def _build_mcd_peak_shift_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        source = QGroupBox("Reflection peak source")
+        form = QFormLayout(source)
+        self.mcd_peak_source_summary = QLabel("No MCD result loaded. Load an MCD sweep to begin.")
+        self.mcd_peak_source_summary.setWordWrap(True)
+        self.mcd_peak_source_combo = QComboBox()
+        self.mcd_peak_source_combo.addItems(["Corrected average", "Corrected pos", "Corrected neg", "Raw average", "Raw pos", "Raw neg"])
+        self.mcd_peak_source_combo.setToolTip("Reflection spectrum used for peak detection; this is not the raw K-K' intensity difference.")
+        self.mcd_peak_display_combo = QComboBox()
+        self.mcd_peak_display_combo.addItems(["Delta E", "Absolute E"])
+        self.mcd_peak_display_combo.setToolTip("Choose zero-field-referenced energy shift or absolute peak energy.")
+        form.addRow("Loaded MCD", self.mcd_peak_source_summary)
+        form.addRow("Spectrum", self.mcd_peak_source_combo)
+        form.addRow("Display", self.mcd_peak_display_combo)
+        layout.addWidget(source)
+        controls = QGroupBox("Detection and tracking")
+        cform = QFormLayout(controls)
+        self.mcd_peak_prom_spin = QDoubleSpinBox(); self.mcd_peak_prom_spin.setRange(0.0, 1.0); self.mcd_peak_prom_spin.setDecimals(3); self.mcd_peak_prom_spin.setValue(0.03)
+        self.mcd_peak_dist_spin = QSpinBox(); self.mcd_peak_dist_spin.setRange(1, 500); self.mcd_peak_dist_spin.setValue(5)
+        self.mcd_peak_smooth_spin = QSpinBox(); self.mcd_peak_smooth_spin.setRange(3, 101); self.mcd_peak_smooth_spin.setSingleStep(2); self.mcd_peak_smooth_spin.setValue(7)
+        self.mcd_peak_jump_spin = QDoubleSpinBox(); self.mcd_peak_jump_spin.setRange(0.0001, 2.0); self.mcd_peak_jump_spin.setDecimals(4); self.mcd_peak_jump_spin.setValue(0.04); self.mcd_peak_jump_spin.setSuffix(" eV")
+        self.mcd_peak_max_spin = QSpinBox(); self.mcd_peak_max_spin.setRange(1, 12); self.mcd_peak_max_spin.setValue(6)
+        cform.addRow("Prominence fraction", self.mcd_peak_prom_spin)
+        cform.addRow("Minimum separation", self.mcd_peak_dist_spin)
+        cform.addRow("Smoothing points", self.mcd_peak_smooth_spin)
+        cform.addRow("Maximum jump", self.mcd_peak_jump_spin)
+        cform.addRow("Maximum peaks", self.mcd_peak_max_spin)
+        row = QHBoxLayout()
+        self.mcd_peak_analyze_btn = QPushButton("Analyze")
+        self.mcd_peak_analyze_btn.setAccessibleName("Analyze MCD reflection peak shifts")
+        self.mcd_peak_analyze_btn.setToolTip("Detect multiple reflection peaks and track them through each sweep branch.")
+        self.mcd_peak_export_btn = QPushButton("Export CSV")
+        self.mcd_peak_export_btn.setAccessibleName("Export MCD peak shift CSV")
+        self.mcd_peak_export_btn.setEnabled(False)
+        row.addWidget(self.mcd_peak_analyze_btn); row.addWidget(self.mcd_peak_export_btn); row.addStretch(1)
+        cform.addRow(row)
+        layout.addWidget(controls)
+        self.mcd_peak_status = QLabel("Ready when an MCD result is loaded.")
+        self.mcd_peak_status.setWordWrap(True)
+        layout.addWidget(self.mcd_peak_status)
+        self.mcd_peak_table = QTableWidget(0, 7)
+        self.mcd_peak_table.setHorizontalHeaderLabels(["Peak", "B (T)", "Branch", "E (eV)", "Delta E (eV)", "Status", "Reference"])
+        self.mcd_peak_table.setAlternatingRowColors(True)
+        self.mcd_peak_table.setToolTip("Tracked reflection peak energies. Missing and ambiguous points are retained explicitly.")
+        self.mcd_peak_table.setAccessibleName("MCD peak shift results")
+        layout.addWidget(self.mcd_peak_table, 1)
+        self.mcd_valley_table = QTableWidget(0, 11)
+        self.mcd_valley_table.setHorizontalHeaderLabels([
+            "B (T)", "Branch", "E_K", "E_Kp", "Delta E_K", "Delta E_Kp",
+            "Delta E_Kp-K", "Average E", "Odd average", "Even average", "Status",
+        ])
+        self.mcd_valley_table.setToolTip("K/K' labels use the documented energy-order convention, not waveplate-angle calibration.")
+        self.mcd_valley_table.setAccessibleName("MCD valley quantities")
+        layout.addWidget(self.mcd_valley_table, 1)
+        pair_row = QWidget(); pair_form = QHBoxLayout(pair_row); pair_form.setContentsMargins(0, 0, 0, 0)
+        pair_form.addWidget(QLabel("Valley pair"))
+        self.mcd_peak_k_combo = QComboBox(); self.mcd_peak_kp_combo = QComboBox()
+        for combo in (self.mcd_peak_k_combo, self.mcd_peak_kp_combo):
+            combo.setToolTip("Select two tracked optical peak IDs for derived K/K' quantities; labels use energy ordering, not waveplate angles.")
+            pair_form.addWidget(combo)
+        pair_form.addStretch(1); cform.addRow(pair_row)
+        self.mcd_peak_result = None
+        self.mcd_peak_analyze_btn.setEnabled(False)
+        self.mcd_peak_analyze_btn.clicked.connect(self._analyze_mcd_peak_shift)
+        self.mcd_peak_export_btn.clicked.connect(self._export_mcd_peak_shift)
+        self.mcd_peak_display_combo.currentTextChanged.connect(self._refresh_mcd_peak_plot)
+        self.mcd_peak_k_combo.currentIndexChanged.connect(self._on_mcd_valley_pair_changed)
+        self.mcd_peak_kp_combo.currentIndexChanged.connect(self._on_mcd_valley_pair_changed)
+        return tab
+
+    def _update_mcd_peak_shift_source(self, result) -> None:
+        if not hasattr(self, "mcd_peak_source_summary"):
+            return
+        if result is None:
+            self.mcd_peak_source_summary.setText("No MCD result loaded. Load an MCD sweep to begin.")
+            self.mcd_peak_analyze_btn.setEnabled(False)
+            self.mcd_peak_export_btn.setEnabled(False)
+            self.mcd_peak_status.setText("Empty: load an MCD result first.")
+            return
+        n = int(np.asarray(result.pair_b).size)
+        self.mcd_peak_source_summary.setText(f"{n} paired spectra; {result.source_file}. K/K' labels follow energy ordering: lower branch is K for B > 0; labels are not waveplate-angle calibration.")
+        self.mcd_peak_analyze_btn.setEnabled(True)
+        self.mcd_peak_status.setText("Loaded. Choose a reflection source and analyze.")
+        self.mcd_peak_result = None
+        self.mcd_peak_export_btn.setEnabled(False)
+        self.mcd_peak_table.setRowCount(0)
+        self.mcd_valley_table.setRowCount(0)
+
+    def _analyze_mcd_peak_shift(self) -> None:
+        if not self.loaded or self.loaded.mode != "MCD" or self.loaded.mcd_result is None:
+            self.mcd_peak_status.setText("Error: no MCD result is loaded."); return
+        self.mcd_peak_analyze_btn.setEnabled(False); self.mcd_peak_status.setText("Analyzing reflection peaks…")
+        try:
+            self.mcd_peak_result = analyze_peak_shift(self.loaded.mcd_result, source=self.mcd_peak_source_combo.currentText().casefold(), prominence_fraction=self.mcd_peak_prom_spin.value(), min_distance_points=self.mcd_peak_dist_spin.value(), smoothing_points=self.mcd_peak_smooth_spin.value(), max_jump_ev=self.mcd_peak_jump_spin.value(), max_peaks=self.mcd_peak_max_spin.value())
+            self._populate_mcd_peak_table()
+            self._refresh_mcd_peak_plot()
+            self.mcd_peak_export_btn.setEnabled(bool(self.mcd_peak_result.tracks))
+            refs = ", ".join(dict.fromkeys(t.reference_method for t in self.mcd_peak_result.tracks)) or "none"
+            self.mcd_peak_status.setText(f"Complete: {len(self.mcd_peak_result.tracks)} branch-local peak track(s). Valley pair IDs: {self.mcd_peak_k_combo.currentText()} / {self.mcd_peak_kp_combo.currentText()}. Zero-field reference: {refs}. Missing/ambiguous points are retained.")
+        except Exception as exc:
+            self.mcd_peak_result = None; self.mcd_peak_export_btn.setEnabled(False); self.mcd_peak_status.setText(f"Error: {exc}")
+        finally:
+            self.mcd_peak_analyze_btn.setEnabled(True)
+
+    def _populate_mcd_peak_table(self) -> None:
+        result = self.mcd_peak_result
+        self.mcd_peak_table.setRowCount(0)
+        self.mcd_valley_table.setRowCount(0)
+        if result is None: return
+        ids = sorted({track.peak_id for track in result.tracks})
+        for combo in (self.mcd_peak_k_combo, self.mcd_peak_kp_combo):
+            previous = combo.currentData(); combo.blockSignals(True); combo.clear()
+            for value in ids: combo.addItem(f"Peak {value}", value)
+            if previous in ids:
+                combo.setCurrentIndex(ids.index(previous))
+            elif len(ids) >= 2:
+                combo.setCurrentIndex(0 if combo is self.mcd_peak_k_combo else 1)
+            combo.blockSignals(False)
+        for track in result.tracks:
+            for point in track.points:
+                row = self.mcd_peak_table.rowCount(); self.mcd_peak_table.insertRow(row)
+                reference = track.reference_method
+                if track.reference_energy_ev is not None:
+                    reference += f": {track.reference_energy_ev:.8g} eV"
+                if track.reference_field_t is not None:
+                    reference += f" at {track.reference_field_t:.6g} T"
+                values = [
+                    track.peak_id, f"{point.field_t:.6g}", point.branch,
+                    "" if point.energy_ev is None else f"{point.energy_ev:.8g}",
+                    "" if point.delta_energy_ev is None else f"{point.delta_energy_ev:.8g}",
+                    point.status, reference,
+                ]
+                for col, value in enumerate(values): self.mcd_peak_table.setItem(row, col, QTableWidgetItem(str(value)))
+        self.mcd_peak_table.resizeColumnsToContents()
+        for value in valley_quantities(result, (self.mcd_peak_k_combo.currentData(), self.mcd_peak_kp_combo.currentData())):
+            row = self.mcd_valley_table.rowCount(); self.mcd_valley_table.insertRow(row)
+            b = float(value["B_T"])
+            fields = [
+                f"{b:.6g}",
+                "B > 0: lower=K" if b > 0 else "B < 0: upper=K" if b < 0 else "B = 0: ambiguous",
+                value.get("E_K"), value.get("E_Kp"),
+                value.get("delta_E_K"), value.get("delta_E_Kp"),
+                value.get("splitting_E_Kp_minus_E_K"), value.get("average_E"),
+                value.get("odd_average_E"), value.get("even_average_E"), value.get("status"),
+            ]
+            for col, item in enumerate(fields):
+                text = "" if item is None else f"{float(item):.8g}" if isinstance(item, (float, np.floating)) else str(item)
+                self.mcd_valley_table.setItem(row, col, QTableWidgetItem(text))
+        self.mcd_valley_table.resizeColumnsToContents()
+
+    def _refresh_mcd_peak_plot(self) -> None:
+        self._plot_mode("MCD Peak Shift")
+
+    def _on_mcd_valley_pair_changed(self) -> None:
+        if self.mcd_peak_result is not None:
+            self._populate_mcd_peak_table()
+            self._refresh_mcd_peak_plot()
+
+    def _export_mcd_peak_shift(self) -> None:
+        if self.mcd_peak_result is None: return
+        path, _ = QFileDialog.getSaveFileName(self, "Export MCD peak shifts", "mcd_peak_shift.csv", "CSV files (*.csv)")
+        if not path: return
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle); writer.writerow([
+                "peak_id", "B_T", "branch", "E_peak_eV", "delta_E_eV", "status",
+                "reference_method", "reference_field_T", "selected_K_peak_id",
+                "selected_Kp_peak_id", "E_K_eV", "E_Kp_eV", "delta_E_K_eV",
+                "delta_E_Kp_eV", "delta_E_Kp_minus_K_eV", "average_E_eV",
+                "odd_average_E_eV", "even_average_E_eV", "odd_splitting_eV",
+                "even_splitting_eV",
+            ])
+            valleys = {(round(float(value["B_T"]), 9), str(value["branch"])): value for value in valley_quantities(self.mcd_peak_result, (self.mcd_peak_k_combo.currentData(), self.mcd_peak_kp_combo.currentData()))}
+            for track in self.mcd_peak_result.tracks:
+                for point in track.points:
+                    valley = valleys.get((round(point.field_t, 9), point.branch), {})
+                    writer.writerow([
+                        track.peak_id, point.field_t, point.branch, point.energy_ev,
+                        point.delta_energy_ev, point.status, track.reference_method,
+                        track.reference_field_t, self.mcd_peak_k_combo.currentData(),
+                        self.mcd_peak_kp_combo.currentData(), valley.get("E_K"),
+                        valley.get("E_Kp"), valley.get("delta_E_K"),
+                        valley.get("delta_E_Kp"), valley.get("splitting_E_Kp_minus_E_K"),
+                        valley.get("average_E"), valley.get("odd_average_E"),
+                        valley.get("even_average_E"), valley.get("odd_splitting"),
+                        valley.get("even_splitting"),
+                    ])
+        self.mcd_peak_status.setText(f"Exported {path}")
+
     def _build_shg_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -1230,6 +1451,6 @@ class FeatureTabsMixin:
         fit_form.addRow(self.shg_fit_summary)
         self._set_form_label_width(fit_form, UI_METRICS["label_col_width"])
         layout.addWidget(self._make_expander("Angular Fit", fit_box, expanded=True))
-        self._shg_update_cosmic_controls()
+        self.shg_controller._shg_update_cosmic_controls()
         layout.addStretch(1)
         return tab

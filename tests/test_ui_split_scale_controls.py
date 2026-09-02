@@ -42,7 +42,9 @@ class SplitScaleControlTests(unittest.TestCase):
 
     def _wait_for_drr_catalog(self) -> None:
         self._wait_for_file_catalog()
-        for _ in range(100):
+        # File discovery is intentionally asynchronous and GitHub's Windows
+        # runners can be busy while the full Qt suite is running.
+        for _ in range(500):
             self.app.processEvents()
             if not self.window._drr_refresh_running:
                 return
@@ -57,9 +59,11 @@ class SplitScaleControlTests(unittest.TestCase):
         self.assertIsNotNone(splitter)
         left_panel = splitter.widget(0)
         self.assertEqual(left_panel.width(), UI_METRICS["left_width"])
-        splitter.setSizes([400, 1200])
+        self.assertGreaterEqual(left_panel.minimumWidth(), 300)
+        self.assertGreater(left_panel.maximumWidth(), left_panel.minimumWidth())
+        splitter.setSizes([UI_METRICS["sidebar_min_width"] - 80, 1200])
         self.app.processEvents()
-        self.assertEqual(left_panel.width(), UI_METRICS["left_width"])
+        self.assertGreaterEqual(left_panel.width(), UI_METRICS["sidebar_min_width"])
 
         panel = self.window.pl_split_scale_panel
         visible_children = panel.findChildren(
@@ -69,13 +73,63 @@ class SplitScaleControlTests(unittest.TestCase):
         right_edge = max(child.geometry().right() for child in visible_children)
         self.assertLessEqual(right_edge, panel.contentsRect().right())
 
-    def test_fixed_sidebar_uses_complete_compact_tab_labels(self) -> None:
+    def test_empty_canvas_guidance_is_passive_and_tracks_scientific_axes(self) -> None:
+        overlay = self.window.empty_canvas_overlay
+        self.assertTrue(overlay.isVisible())
+        self.assertTrue(overlay.testAttribute(Qt.WA_TransparentForMouseEvents))
+        self.assertTrue(overlay.accessibleName())
+        self.assertIn("Load", overlay.text())
+        self.assertIn("Plot", overlay.text())
+
+        self.window.figure.add_subplot(111)
+        self.window.canvas.draw()
+        self.app.processEvents()
+        self.assertFalse(overlay.isVisible())
+
+        self.window.figure.clear()
+        self.window.canvas.draw()
+        self.app.processEvents()
+        self.assertTrue(overlay.isVisible())
+
+    def test_data_source_spacing_is_tight_at_default_sidebar_width(self) -> None:
+        self.window.workspace_splitter.setSizes([UI_METRICS["left_width"], 900])
+        self.app.processEvents()
+        margins = self.window.data_source_context.layout().contentsMargins()
+        self.assertEqual((margins.left(), margins.top(), margins.right(), margins.bottom()), (8, 4, 8, 6))
+        self.assertEqual(self.window.data_source_context.layout().horizontalSpacing(), 6)
+        self.assertEqual(self.window.data_source_context.layout().verticalSpacing(), 6)
+
+    def test_sidebar_can_resize_within_bounds_and_canvas_remains_dominant(self) -> None:
+        splitter = self.window.workspace_splitter
+        splitter.setSizes([UI_METRICS["left_width"] + 80, 900])
+        self.app.processEvents()
+        self.assertEqual(splitter.sizes()[0], UI_METRICS["left_width"] + 80)
+        self.assertGreater(splitter.sizes()[1], splitter.sizes()[0])
+
+        splitter.setSizes([UI_METRICS["sidebar_max_width"] + 200, 900])
+        self.app.processEvents()
+        self.assertLessEqual(self.window.left_panel.width(), UI_METRICS["sidebar_max_width"])
+
+    def test_sidebar_collapse_restore_remembers_last_expanded_width(self) -> None:
+        splitter = self.window.workspace_splitter
+        expanded_width = UI_METRICS["left_width"] + 60
+        splitter.setSizes([expanded_width, 900])
+        self.app.processEvents()
+        remembered = splitter.sizes()[0]
+        self.window.sidebar_toggle_btn.setChecked(False)
+        self.app.processEvents()
+        self.assertFalse(self.window.left_panel.isVisible())
+        self.window.sidebar_toggle_btn.setChecked(True)
+        self.app.processEvents()
+        self.assertEqual(splitter.sizes()[0], remembered)
+
+    def test_resizable_sidebar_uses_complete_compact_tab_labels(self) -> None:
         tab_bar = self.window.tabs.tabBar()
         self.assertFalse(tab_bar.usesScrollButtons())
         self.assertEqual(tab_bar.elideMode(), Qt.ElideNone)
         self.assertEqual(
             [self.window.tabs.tabText(i) for i in range(self.window.tabs.count())],
-            ["PL", "DRR", "Compare", "Power", "MCD", "SHG", "Slides", "Tools"],
+            ["PL", "DRR", "Compare", "Power", "MCD", "MCD Peak Shift", "SHG", "Slides", "Tools"],
         )
         expected_modes = [
             "PL",
@@ -83,8 +137,10 @@ class SplitScaleControlTests(unittest.TestCase):
             "Compare",
             "Power Dependent",
             "MCD",
+            None,  # MCD Peak Shift
             "SHG Processing",
-            None,
+            None,  # Slides
+            None,  # Tools
         ]
         for index, expected in enumerate(expected_modes):
             self.window.tabs.setCurrentIndex(index)
@@ -105,7 +161,7 @@ class SplitScaleControlTests(unittest.TestCase):
             "TG-1.05BG=0_extra_long_measurement_name.csv"
         )
         self.window.drr_selected_files = [full_name, "second.csv"]
-        self.window._update_drr_selection_labels()
+        self.window.drr_controller._update_drr_selection_labels()
 
         displayed = self.window.drr_measurement_summary.text().replace("\u200b", "")
         self.assertIn(full_name, displayed)
@@ -172,7 +228,7 @@ class SplitScaleControlTests(unittest.TestCase):
                 return QDialog.Rejected
 
             with patch.object(QDialog, "exec", fake_exec):
-                self.window._open_drr_source_dialog(
+                self.window.drr_controller._open_drr_source_dialog(
                     title="Choose DRR files", selected=[], baseline_mode=False
                 )
 
@@ -295,15 +351,15 @@ class SplitScaleControlTests(unittest.TestCase):
 
             self.window._set_current_folder(tmp, remember=False)
 
-            self.assertEqual(self.window._power_selected_group_key(), "")
-            self.assertEqual(self.window._shg_selected_file(), "")
-            self.assertEqual(self.window._shg_compare_files(), ("", ""))
+            self.assertEqual(self.window.power_controller._power_selected_group_key(), "")
+            self.assertEqual(self.window.shg_controller._shg_selected_file(), "")
+            self.assertEqual(self.window.shg_controller._shg_compare_files(), ("", ""))
 
     def test_compare_auto_assignment_leaves_duplicate_channel_unassigned(self) -> None:
         with (
-            patch.object(self.window, "_cmp_assign_candidate_files", return_value=[]),
+            patch.object(type(self.window.compare_controller), "_cmp_assign_candidate_files", return_value=[]),
             patch(
-                "ui_qt.main_window.coherent_compare_auto_assignment",
+                "ui_qt.controllers_compare.coherent_compare_auto_assignment",
                 return_value=(
                     {"KK": "ambiguous.csv"},
                     {"KK": ["first.csv", "second.csv"]},
@@ -311,9 +367,9 @@ class SplitScaleControlTests(unittest.TestCase):
                     [],
                 ),
             ),
-            patch.object(self.window, "_on_cmp_plot_param_changed"),
+            patch.object(type(self.window.compare_controller), "_on_cmp_plot_param_changed"),
         ):
-            self.window._cmp_auto_assign_channels()
+            self.window.compare_controller._cmp_auto_assign_channels()
 
         self.assertEqual(self.window.cmp_channel_combos["KK"].currentText(), "")
 
@@ -363,7 +419,8 @@ class SplitScaleControlTests(unittest.TestCase):
 
     def test_compact_sidebar_avoids_default_scrolling_and_horizontal_clipping(self) -> None:
         self.window.tabs.setCurrentWidget(self.window.drr_tab_scroll)
-        self.window.resize(1180, 700)
+        panels_height = self.window.menu_toolbar_host.panels_toolbar.height()
+        self.window.resize(1180, self.window.minimumHeight() + panels_height)
         self.app.processEvents()
 
         scroll = self.window.drr_tab_scroll
@@ -395,6 +452,8 @@ class SplitScaleControlTests(unittest.TestCase):
         self.window.workflow_tabs.setCurrentIndex(slides_index)
         QApplication.processEvents()
         self.assertIs(self.window.workspace_stack.currentWidget(), self.window.presentation_widget)
+        self.assertFalse(self.window.left_panel.isVisible())
+        self.assertFalse(self.window.data_source_context.isVisible())
         self.assertFalse(self.window.sidebar_toggle_btn.isEnabled())
         self.assertFalse(self.window.load_action.isEnabled())
         self.assertFalse(self.window.plot_action.isEnabled())
@@ -420,7 +479,7 @@ class SplitScaleControlTests(unittest.TestCase):
             self.window._set_spin_value_silent(self.window.drr_spins[key], value)
         self.window.drr_split_spins["x0"].setValue(0.25)
 
-        with patch.object(self.window, "_on_drr_plot_param_changed"):
+        with patch.object(type(self.window.drr_controller), "_on_drr_plot_param_changed"):
             self.window.drr_split_scale_chk.setChecked(True)
 
         self.assertAlmostEqual(self.window.drr_split_spins["x0"].value(), 1.5)
@@ -439,17 +498,91 @@ class SplitScaleControlTests(unittest.TestCase):
         self.window.loaded = LoadedState(mode="DRR", folder="", cube=cube)
         for key, value in (("xmin", 0.0), ("xmax", 3.0), ("ymin", 0.0), ("ymax", 1.0)):
             self.window._set_spin_value_silent(self.window.drr_spins[key], value)
-        with patch.object(self.window, "_on_drr_plot_param_changed"):
+        with patch.object(type(self.window.drr_controller), "_on_drr_plot_param_changed"):
             self.window.drr_split_scale_chk.setChecked(True)
         self.window._set_spin_value_silent(self.window.drr_spins["vmin"], -999.0)
         self.window._set_spin_value_silent(self.window.drr_spins["vmax"], 999.0)
 
-        with patch.object(self.window, "_on_drr_plot_param_changed") as replot:
+        with patch.object(type(self.window.drr_controller), "_on_drr_plot_param_changed") as replot:
             self.window.drr_split_scale_chk.setChecked(False)
 
         replot.assert_called_once()
         self.assertGreater(self.window.drr_spins["vmin"].value(), -999.0)
         self.assertLess(self.window.drr_spins["vmax"].value(), 999.0)
+
+    def test_drr_xmin_change_refreshes_ranges_with_centered_split(self) -> None:
+        cube = DataCube(
+            energy=np.array([0.0, 1.0, 2.0, 3.0]),
+            gate=np.array([0.0, 1.0]),
+            Z=np.asarray([[1.0, 2.0, 100.0, 200.0], [3.0, 4.0, 300.0, 400.0]]),
+            gate_label="Gate",
+            title="DRR range refresh",
+            cbar_label="DR/R",
+        )
+        self.window.loaded = LoadedState(mode="DRR", folder="", cube=cube)
+        for key, value in (("xmin", 0.0), ("xmax", 3.0), ("ymin", 0.0), ("ymax", 1.0)):
+            self.window._set_spin_value_silent(self.window.drr_spins[key], value)
+        self.window.drr_split_scale_chk.setChecked(True)
+        self.window._set_spin_value_silent(self.window.drr_split_spins["x0"], 0.5)
+        spin = self.window.drr_spins["xmin"]
+        with (
+            patch.object(self.window, "_schedule_plot_redraw"),
+        ):
+            spin.setValue(1.5)
+
+        self.assertAlmostEqual(self.window.drr_split_spins["x0"].value(), 2.5)
+
+    def test_compare_xmin_signal_source_centers_split_range(self) -> None:
+        cube = DataCube(
+            energy=np.array([0.0, 1.0, 2.0, 3.0]),
+            gate=np.array([0.0, 1.0]),
+            Z=np.asarray([[1.0, 2.0, 100.0, 200.0], [3.0, 4.0, 300.0, 400.0]]),
+            gate_label="Gate",
+            title="Compare range refresh",
+            cbar_label="Intensity",
+        )
+        self.window.loaded = LoadedState(
+            mode="Compare", folder="", compare_cubes={"KK": cube, "KKp": cube}
+        )
+        self.window.available_files = ["kk.csv", "kkp.csv"]
+        self.window.compare_controller._cmp_set_channel_combo_items()
+        self.window.cmp_channel_combos["KK"].setCurrentText("kk.csv")
+        self.window.cmp_channel_combos["KKp"].setCurrentText("kkp.csv")
+        for key, value in (("xmin", 0.0), ("xmax", 3.0), ("ymin", 0.0), ("ymax", 1.0)):
+            self.window._set_spin_value_silent(self.window.cmp_spins[key], value)
+        self.window.cmp_split_scale_chk.setChecked(True)
+        self.window._set_spin_value_silent(self.window.cmp_split_spins["x0"], 0.5)
+        with patch.object(self.window, "_schedule_plot_redraw"):
+            self.window.cmp_spins["xmin"].setValue(1.5)
+
+        self.assertAlmostEqual(self.window.cmp_split_spins["x0"].value(), 2.5)
+
+    def test_compare_auto_background_toggle_refreshes_color_range(self) -> None:
+        cube = DataCube(
+            energy=np.array([0.0, 1.0, 2.0, 3.0]),
+            gate=np.array([0.0, 1.0]),
+            Z=np.asarray([[10.0, 11.0, 12.0, 13.0], [14.0, 15.0, 16.0, 17.0]]),
+            gate_label="Gate",
+            title="Compare background refresh",
+            cbar_label="Intensity",
+        )
+        self.window.loaded = LoadedState(
+            mode="Compare", folder="", compare_cubes={"KK": cube, "KKp": cube}
+        )
+        self.window.available_files = ["kk.csv", "kkp.csv"]
+        self.window.compare_controller._cmp_set_channel_combo_items()
+        self.window.cmp_channel_combos["KK"].setCurrentText("kk.csv")
+        self.window.cmp_channel_combos["KKp"].setCurrentText("kkp.csv")
+        for key, value in (("xmin", 0.0), ("xmax", 3.0), ("ymin", 0.0), ("ymax", 1.0)):
+            self.window._set_spin_value_silent(self.window.cmp_spins[key], value)
+        self.window.cmp_vp_auto_background_chk.setChecked(False)
+        self.window._set_spin_value_silent(self.window.cmp_spins["vmin"], -999.0)
+        self.window._set_spin_value_silent(self.window.cmp_spins["vmax"], 999.0)
+
+        self.window.cmp_vp_auto_background_chk.setChecked(True)
+
+        self.assertGreater(self.window.cmp_spins["vmin"].value(), -999.0)
+        self.assertLess(self.window.cmp_spins["vmax"].value(), 999.0)
 
     def test_drr_derivative_refreshes_unfixed_color_limits(self) -> None:
         energy = np.linspace(0.0, 4.0, 21)
@@ -511,11 +644,11 @@ class SplitScaleControlTests(unittest.TestCase):
         self.window.loaded = LoadedState(mode="DRR", folder="", cube=None)
 
         with patch.object(
-            self.window,
+            type(self.window.drr_controller),
             "_open_drr_source_dialog",
             return_value=["new_760nmc_rep1.csv"],
         ), patch.object(self.window, "_start_load") as start_load:
-            self.window._edit_drr_measurements()
+            self.window.drr_controller._edit_drr_measurements()
 
         self.assertEqual(self.window.drr_baseline_files_manual, [])
         self.assertIsNone(self.window.loaded)
@@ -557,11 +690,11 @@ class SplitScaleControlTests(unittest.TestCase):
             selected = "Initial Data/sample_760nmc_rep1.csv"
 
             with patch.object(
-                self.window,
+                type(self.window.drr_controller),
                 "_open_drr_source_dialog",
                 return_value=[selected],
             ), patch.object(self.window, "_start_load") as start_load:
-                self.window._edit_drr_measurements()
+                self.window.drr_controller._edit_drr_measurements()
 
             self.assertEqual(self.window.drr_selected_files, [selected])
             self.assertEqual(
@@ -592,7 +725,7 @@ class SplitScaleControlTests(unittest.TestCase):
                 "Last frame from each file, then average"
             )
 
-            accepted = self.window._apply_drr_background_gate_default()
+            accepted = self.window.drr_controller._apply_drr_background_gate_default()
 
             self.assertTrue(accepted)
             self.assertEqual(
@@ -609,16 +742,112 @@ class SplitScaleControlTests(unittest.TestCase):
         self.window.drr_pin_baseline_chk.setChecked(True)
 
         with patch.object(
-            self.window,
+            type(self.window.drr_controller),
             "_open_drr_source_dialog",
             return_value=["new_760nmc_rep1.csv"],
         ), patch.object(self.window, "_start_load") as start_load:
-            self.window._edit_drr_measurements()
+            self.window.drr_controller._edit_drr_measurements()
 
         self.assertEqual(
             self.window.drr_baseline_files_manual, ["old_760nmc_back.csv"]
         )
         start_load.assert_called_once_with("DRR")
+
+
+class WindowLifecycleTests(unittest.TestCase):
+    """Regression: pending plot redraw timers must never fire after close."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_closing_window_cancels_pending_plot_redraw(self) -> None:
+        with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
+            window = MainWindow()
+        window.resize(1180, 820)
+        window.show()
+
+        energy = np.linspace(0.0, 4.0, 21)
+        cube = DataCube(
+            energy=energy,
+            gate=np.array([0.0, 1.0]),
+            Z=np.vstack((energy**2, 2.0 * energy**2)),
+            gate_label="Gate",
+            title="DRR derivative",
+            cbar_label="DR/R",
+        )
+        window.loaded = LoadedState(mode="DRR", folder="", cube=cube)
+        for key, value in (("xmin", 0.0), ("xmax", 4.0), ("ymin", 0.0), ("ymax", 1.0)):
+            window._set_spin_value_silent(window.drr_spins[key], value)
+        window._refresh_automatic_ranges("DRR")
+
+        redraw_calls: list[str] = []
+        original_run = window._run_scheduled_plot_redraw
+
+        def spy(mode: str) -> None:
+            redraw_calls.append(mode)
+            return original_run(mode)
+
+        window._run_scheduled_plot_redraw = spy
+
+        with patch.object(window, "_plot_mode") as plot_mode:
+            window.drr_derivative_combo.setCurrentText("dE")
+            timer = window._plot_redraw_timers.get("DRR")
+            self.assertIsNotNone(timer)
+            self.assertTrue(timer.isActive())
+
+            window.close()
+            # Closing must disarm the pending redraw timer.
+            self.assertFalse(timer.isActive())
+
+            window.deleteLater()
+            self.app.processEvents()
+            QTest.qWait(200)  # Give any surviving timer a chance to fire.
+            self.app.processEvents()
+
+            plot_mode.assert_not_called()
+
+        self.assertEqual(redraw_calls, [])
+
+    def test_automatic_update_check_does_not_fire_after_close(self) -> None:
+        calls: list[str] = []
+        with (
+            patch.object(MainWindow, "_restore_last_folder", lambda _self: None),
+            patch.object(MainWindow, "_auto_update_check_enabled", lambda _self: True),
+            patch.object(MainWindow, "_run_automatic_update_check", lambda _self: calls.append("fired")),
+        ):
+            window = MainWindow()
+        window.show()
+
+        window.close()
+        window.deleteLater()
+        self.app.processEvents()
+        QTest.qWait(1700)  # Well past the 1500 ms startup delay.
+        self.app.processEvents()
+
+        self.assertEqual(calls, [])
+
+    def test_automatic_update_check_fires_once_after_delay_while_alive(self) -> None:
+        calls: list[str] = []
+        with (
+            patch.object(MainWindow, "_restore_last_folder", lambda _self: None),
+            patch.object(MainWindow, "_auto_update_check_enabled", lambda _self: True),
+            patch.object(MainWindow, "_run_automatic_update_check", lambda _self: calls.append("fired")),
+        ):
+            window = MainWindow()
+        window.show()
+
+        self.assertEqual(calls, [])
+        QTest.qWait(1100)  # Before the 1500 ms startup delay.
+        self.app.processEvents()
+        self.assertEqual(calls, [])
+        QTest.qWait(700)  # Total ~1800 ms: the check must have fired once.
+        self.app.processEvents()
+        self.assertEqual(calls, ["fired"])
+
+        window.close()
+        window.deleteLater()
+        self.app.processEvents()
 
 
 if __name__ == "__main__":

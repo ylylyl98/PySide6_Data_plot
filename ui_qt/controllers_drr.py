@@ -2,7 +2,47 @@
 
 from __future__ import annotations
 
-from ui_qt.main_window import *
+from pathlib import Path
+from typing import List
+
+import numpy as np
+from PySide6.QtCore import QObject, QRunnable, Qt, Signal
+from PySide6.QtGui import QColor
+from scipy.optimize import curve_fit
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QPushButton,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
+)
+
+from core import data_io
+from core.drr_sources import (
+    assess_background_gate_files,
+    discover_drr_sources,
+    extract_wavelength_center_nm,
+    find_saved_drr_recipe,
+    guess_drr_background,
+    group_drr_sources,
+    inspect_csv_wavelength_center,
+    resolve_source_path,
+    wavelength_centers_match,
+)
+from core.loader import DataCube
+from core.processing import apply_sg_derivative_energy, clamp_sg_window, nearest_gate_spectrum
+from ui_qt.common import Worker
+from ui_qt.theme import alias as theme_alias
+from ui_qt.source_picker_dialog import SourcePickerDialog
 
 
 class _DrrFitSignals(QObject):
@@ -55,6 +95,296 @@ class DrrController:
         else:
             setattr(object.__getattribute__(self, "_owner"), name, value)
 
+    def _repopulate_drr_yaxis(self) -> None:
+        if not hasattr(self, "drr_yaxis_combo"):
+            return
+        first = self.drr_selected_files[0] if self.drr_selected_files else ""
+        self._repopulate_yaxis_combo("drr", xlsx=data_io.is_xlsx_map_file(first))
+
+    def _reject_mixed_xlsx_selection(self, selected: List[str]) -> None:
+        if not selected:
+            return
+        xlsx = [name for name in selected if data_io.is_xlsx_map_file(name)]
+        if not xlsx:
+            return
+        if len(xlsx) != 1 or len(selected) != 1:
+            raise ValueError(
+                "Select exactly one XLSX map for direct DR/R display "
+                "(XLSX maps cannot be mixed with CSV measurements)."
+            )
+
+    def _drr_source_center(self, source_name: str) -> float | None:
+        for source in self.drr_available_sources:
+            if source.source == source_name and source.wavelength_center_nm is not None:
+                return float(source.wavelength_center_nm)
+        named = extract_wavelength_center_nm(source_name)
+        if named is not None:
+            return float(named)
+        path = resolve_source_path(self.current_folder, source_name)
+        if path.suffix.lower() == ".csv" and path.is_file():
+            return inspect_csv_wavelength_center(path)
+        return None
+
+    def _restore_saved_drr_recipe(self) -> bool:
+        recipe = find_saved_drr_recipe(self.current_folder, self.drr_selected_files)
+        if recipe is None:
+            return False
+        missing = [
+            source
+            for source in recipe.baseline_files
+            if not resolve_source_path(self.current_folder, source).is_file()
+        ]
+        if missing:
+            self._status("Saved DRR background is unavailable; select a background manually.")
+            return False
+
+        measurement_center = self._drr_selected_wavelength_center()
+        baseline_centers = [
+            center
+            for source in recipe.baseline_files
+            if (center := self._drr_source_center(source)) is not None
+        ]
+        compatible = (
+            all(
+                wavelength_centers_match(baseline_centers[0], center)
+                for center in baseline_centers[1:]
+            )
+            if baseline_centers
+            else True
+        )
+        if (
+            not compatible
+            or measurement_center is not None
+            and baseline_centers
+            and not wavelength_centers_match(measurement_center, baseline_centers[0])
+        ):
+            self._status(
+                "Saved DRR background has an incompatible wavelength center; "
+                "select a background manually."
+            )
+            return False
+
+        mode = recipe.baseline_selection
+        if recipe.baseline_files or mode == "External":
+            mode = "External"
+        elif "first" in mode.casefold():
+            mode = "Self (first frame)"
+        else:
+            mode = "Self (last frame)"
+        combine_text = {
+            "first": "First frame from each file, then average",
+            "last": "Last frame from each file, then average",
+            "all": "Average all frames in each file, then average files",
+        }.get(recipe.baseline_which, "Last frame from each file, then average")
+
+        blocked = self.drr_baseline_combo.blockSignals(True)
+        self.drr_baseline_combo.setCurrentText(mode)
+        self.drr_baseline_combo.blockSignals(blocked)
+        blocked = self.drr_baseline_combine_combo.blockSignals(True)
+        self.drr_baseline_combine_combo.setCurrentText(combine_text)
+        self.drr_baseline_combine_combo.blockSignals(blocked)
+        self.drr_baseline_files_manual = list(recipe.baseline_files)
+        self.drr_baseline_files_found = list(recipe.baseline_files)
+        self._drr_background_guess = None
+        external = mode == "External"
+        self.drr_external_baseline_row.setVisible(external)
+        self.drr_baseline_combine_combo.setVisible(external)
+        self.drr_pin_baseline_chk.setVisible(external)
+        self._status(
+            f"Restored saved DRR recipe: {len(recipe.baseline_files)} background "
+            f"file{'s' if len(recipe.baseline_files) != 1 else ''}, mode={recipe.baseline_which}."
+        )
+        return True
+
+    def _apply_drr_background_gate_default(self) -> bool:
+        if not self.drr_baseline_files_manual:
+            return True
+        assessment = assess_background_gate_files(
+            self.current_folder,
+            self.drr_baseline_files_manual,
+        )
+        if not assessment.all_constant:
+            return True
+        if len(assessment.profiles) > 1 and not assessment.same_constant_values:
+            self._invalidate_drr_for_background_selection(
+                "Selected backgrounds have different constant gate values. "
+                "Choose files from one gate condition."
+            )
+            return False
+        blocked = self.drr_baseline_combine_combo.blockSignals(True)
+        self.drr_baseline_combine_combo.setCurrentText(
+            "Average all frames in each file, then average files"
+        )
+        self.drr_baseline_combine_combo.blockSignals(blocked)
+        self._status(
+            "Constant-gate background detected: averaging all frames per file"
+            + (" and then averaging files." if len(assessment.profiles) > 1 else ".")
+        )
+        return True
+
+    def _guess_drr_background_for_selection(self) -> bool:
+        guess = guess_drr_background(
+            self.current_folder,
+            self.drr_available_sources,
+            self.drr_selected_files,
+        )
+        if guess is None:
+            return False
+        combine_text = {
+            "first": "First frame from each file, then average",
+            "last": "Last frame from each file, then average",
+            "all": "Average all frames in each file, then average files",
+        }[guess.baseline_which]
+        blocked = self.drr_baseline_combo.blockSignals(True)
+        self.drr_baseline_combo.setCurrentText("External")
+        self.drr_baseline_combo.blockSignals(blocked)
+        blocked = self.drr_baseline_combine_combo.blockSignals(True)
+        self.drr_baseline_combine_combo.setCurrentText(combine_text)
+        self.drr_baseline_combine_combo.blockSignals(blocked)
+        self.drr_baseline_files_manual = list(guess.baseline_files)
+        self.drr_baseline_files_found = list(guess.baseline_files)
+        self._drr_background_guess = guess
+        self.drr_external_baseline_row.setVisible(True)
+        self.drr_baseline_combine_combo.setVisible(True)
+        self.drr_pin_baseline_chk.setVisible(True)
+        gap_minutes = guess.time_gap_seconds / 60.0
+        message = (
+            f"Auto-selected {len(guess.baseline_files)} background file"
+            f"{'s' if len(guess.baseline_files) != 1 else ''} "
+            f"({guess.confidence} confidence, {gap_minutes:.1f} min time separation): "
+            f"{guess.reason}. Original intensities were not modified."
+        )
+        self._status(message)
+        self._append_log(message)
+        return True
+
+    def _drr_selected_wavelength_center(self) -> float | None:
+        catalog_centers = {
+            source.source: source.wavelength_center_nm for source in self.drr_available_sources
+        }
+        centers = [
+            center
+            for name in self.drr_selected_files
+            if (
+                center := catalog_centers.get(name)
+                if catalog_centers.get(name) is not None
+                else extract_wavelength_center_nm(name)
+            ) is not None
+        ]
+        if not centers:
+            return None
+        first = float(centers[0])
+        return first if all(wavelength_centers_match(first, center) for center in centers[1:]) else None
+
+    def _drr_derivative_value(self) -> int | None:
+        text = self.drr_derivative_combo.currentText()
+        return None if text == "None" else (1 if text == "dE" else 2)
+
+    def _enforce_drr_sg_constraints(self, *, show_status: bool) -> int:
+        poly = int(self.drr_sg_poly_spin.value())
+        req_win = int(self.drr_sg_window_spin.value())
+        n_energy = (
+            int(np.asarray(self.loaded.cube.energy).size)
+            if self.loaded and self.loaded.mode == "DRR" and self.loaded.cube is not None
+            else 401
+        )
+        used_win = clamp_sg_window(req_win, n_energy=n_energy, polyorder=poly)
+        if used_win != req_win:
+            blocked = self.drr_sg_window_spin.blockSignals(True)
+            self.drr_sg_window_spin.setValue(used_win)
+            self.drr_sg_window_spin.blockSignals(blocked)
+            if show_status:
+                self._status(f"State: SG window clamped to {used_win} (odd, valid for order={poly}).")
+        return used_win
+
+    def _drr_cube_with_metadata(self) -> tuple[DataCube, int | None, int, int]:
+        """Return the DRR cube plus the derivative parameters actually applied."""
+        if not self.loaded or self.loaded.mode != "DRR" or self.loaded.cube is None:
+            raise ValueError("No DRR data loaded.")
+        deriv = self._drr_derivative_value()
+        poly = int(self.drr_sg_poly_spin.value())
+        req_win = self._enforce_drr_sg_constraints(show_status=True)
+        cache_key = (id(self.loaded.cube), deriv, int(req_win), poly)
+        cached = self._drr_derivative_cache.get(cache_key)
+        if cached is not None:
+            cube, used_win = cached
+            return cube, deriv, used_win, poly
+        cube, used_win = apply_sg_derivative_energy(
+            self.loaded.cube, derivative=deriv, window_length=req_win, polyorder=poly,
+        )
+        if len(self._drr_derivative_cache) >= 12:
+            self._drr_derivative_cache.pop(next(iter(self._drr_derivative_cache)))
+        self._drr_derivative_cache[cache_key] = (cube, int(used_win))
+        if deriv is not None and used_win != req_win:
+            self._status(f"State: SG window adjusted to {used_win}.")
+        return cube, deriv, used_win, poly
+
+    def _drr_cube_for_display(self) -> DataCube:
+        cube, _deriv, _used_win, _poly = self._drr_cube_with_metadata()
+        return cube
+
+    def _drr_baseline_key(self) -> str:
+        text = self.drr_baseline_combo.currentText()
+        if text == "Self (first frame)":
+            return "self_first"
+        if text == "External":
+            return f"external_{self.drr_baseline_combine_combo.currentText()}"
+        return "self_last"
+
+    def _read_drr_params(self):
+        s = self.drr_spins
+        return {
+            "baseline_mode": self.drr_baseline_combo.currentText(),
+            "baseline_which": self.drr_baseline_combine_combo.currentText(),
+            "baseline_files": tuple(self.drr_baseline_files_manual),
+            "selected_files": tuple(self.drr_selected_files),
+            "y_axis_spec": self._selected_y_axis_spec("drr"),
+            "derivative": self.drr_derivative_combo.currentText(),
+            "sg_window": int(self.drr_sg_window_spin.value()),
+            "sg_poly": int(self.drr_sg_poly_spin.value()),
+            "cmap": self._resolved_cmap(self.drr_cmap),
+            "vmin": float(s["vmin"].value()),
+            "vmax": float(s["vmax"].value()),
+            "xmin": float(s["xmin"].value()),
+            "xmax": float(s["xmax"].value()),
+            "ymin": float(s["ymin"].value()),
+            "ymax": float(s["ymax"].value()),
+            "gate": float(s["gate"].value()),
+            "log": bool(self.drr_log_chk.isChecked()),
+            "clip": bool(self.drr_clip_chk.isChecked()),
+            "center_zero": bool(self.drr_center_zero_chk.isChecked()),
+        }
+
+    def _is_drr_gate_only_change(self, new_key: tuple) -> bool:
+        if self._last_plot_params_key is None or self._last_plot_cube is None:
+            return False
+        if len(new_key) != len(self._last_plot_params_key):
+            return False
+        gate_idx = 16
+        return (
+            new_key[:gate_idx] == self._last_plot_params_key[:gate_idx]
+            and new_key[gate_idx + 1 :] == self._last_plot_params_key[gate_idx + 1 :]
+            and new_key[gate_idx] != self._last_plot_params_key[gate_idx]
+        )
+
+    def _ensure_gate_line(self, cube: DataCube, gate_value: float) -> None:
+        if self._drr_heatmap_ax is None:
+            return
+        gate = np.asarray(cube.gate, float).ravel()
+        gate_clamped = float(np.clip(gate_value, float(np.nanmin(gate)), float(np.nanmax(gate))))
+        if self._gate_line is None or getattr(self._gate_line, "axes", None) is not self._drr_heatmap_ax:
+            self._gate_line = self._drr_heatmap_ax.axhline(
+                y=gate_clamped,
+                lw=1.2,
+                alpha=0.9,
+                color="#222",
+                linestyle="--",
+                zorder=20,
+            )
+        else:
+            self._gate_line.set_ydata([gate_clamped, gate_clamped])
+            self._gate_line.set_linestyle("--")
+
     def _on_drr_derivative_changed(self) -> None:
         self._invalidate_pending_drr_fit("Fit discarded: derivative changed.")
         self._invalidate_export_move_sources()
@@ -66,7 +396,7 @@ class DrrController:
             self._refresh_automatic_ranges("DRR", refresh_split=True)
             self._schedule_plot_redraw("DRR")
 
-    def _on_drr_plot_param_changed(self) -> None:
+    def _on_drr_plot_param_changed(self, source=None) -> None:
         self._invalidate_pending_drr_fit("Fit discarded: plot range or display settings changed.")
         self._invalidate_export_move_sources()
         external_baseline = self.drr_baseline_combo.currentText() == "External"
@@ -79,7 +409,7 @@ class DrrController:
             )
             return
         if self.loaded and self.loaded.mode == "DRR" and not self._suspend_drr_autoplot:
-            sender = self.sender()
+            sender = source if source is not None else self.sender()
             if sender in (
                 self.drr_spins["xmin"], self.drr_spins["xmax"],
                 self.drr_spins["ymin"], self.drr_spins["ymax"],
@@ -183,7 +513,7 @@ class DrrController:
         self._repopulate_drr_yaxis()
     def _edit_drr_measurements(self) -> None:
         previous = list(self.drr_selected_files)
-        selected = self._owner._open_drr_source_dialog(
+        selected = self._open_drr_source_dialog(
             title="Choose DRR Measurement Group",
             selected=self.drr_selected_files,
             baseline_mode=False,
@@ -220,7 +550,7 @@ class DrrController:
         self._set_stage("No DRR measurement")
         self._update_action_states()
     def _edit_drr_baselines_dialog(self) -> None:
-        self.drr_baseline_files_manual = self._owner._open_drr_source_dialog(
+        self.drr_baseline_files_manual = self._open_drr_source_dialog(
             title="Choose Historical or External Baseline",
             selected=self.drr_baseline_files_manual,
             baseline_mode=True,
@@ -313,19 +643,11 @@ class DrrController:
         file_list = QListWidget()
         selected_list = QListWidget()
         for widget in (group_list, file_list, selected_list):
-            widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
-            widget.setWordWrap(True)
-            widget.setTextElideMode(Qt.ElideNone)
-            widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-            widget.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
-            widget.setUniformItemSizes(False)
-            # Adjust relayouts every row whenever the dialog is resized.  The
-            # delegate still computes wrapped row heights, while Fixed avoids
-            # the repeated full-list relayout that made this dialog feel
-            # sluggish during opening and resizing.
-            widget.setResizeMode(QListView.Fixed)
-            widget.setSpacing(3)
-            widget.setItemDelegate(WrappedFilenameDelegate(widget))
+            SourcePickerDialog.configure_source_list(
+                widget,
+                selection_mode=QAbstractItemView.ExtendedSelection,
+                spacing=3,
+            )
 
         def _panel(label: str, widget: QListWidget) -> QWidget:
             panel = QWidget()
@@ -495,7 +817,13 @@ class DrrController:
                         )
                     )
                     if not baseline_mode:
-                        item.setForeground(QColor("#237A3B" if group.processed else "#1769AA"))
+                        item.setForeground(
+                            QColor(
+                                theme_alias(
+                                    "source_processed_foreground" if group.processed else "source_new_foreground"
+                                )
+                            )
+                        )
                         font = item.font(); font.setBold(not group.processed); item.setFont(font)
                     group_list.addItem(item)
                 selected_row = next(
@@ -617,11 +945,9 @@ class DrrController:
         group_list.currentRowChanged.connect(lambda _row: _populate_files())
         group_list.itemDoubleClicked.connect(lambda _item: _add_group())
         file_list.itemDoubleClicked.connect(lambda _item: _add_files())
-        filter_timer = QTimer(dlg)
-        filter_timer.setSingleShot(True)
-        filter_timer.setInterval(180)
-        filter_timer.timeout.connect(_refresh_groups)
-        filter_edit.textChanged.connect(lambda _text: filter_timer.start())
+        SourcePickerDialog.connect_debounced_filter(
+            filter_edit, _refresh_groups, dlg, interval=180
+        )
         show_all.toggled.connect(lambda _checked: _refresh_groups())
         unprocessed_only.toggled.connect(lambda _checked: _refresh_groups())
         include_backgrounds.toggled.connect(lambda _checked: _refresh_groups())
