@@ -128,6 +128,7 @@ from ui_qt.feature_registry import FEATURES
 from ui_qt.features_tools import ToolsPageMixin
 from ui_qt.fluent_ui.style import apply_accessible_identity, set_fluent_property
 from ui_qt.theme import alias as theme_alias, theme_manager
+from ui_qt.matplotlib_theme import ThemeAwareFigureCanvasQTAgg
 from ui_qt.shell.status_bar import StatusBarView
 from ui_qt.shell.dock_host import DockHost
 from ui_qt.shell.menu_toolbar import MenuToolbarHost
@@ -174,7 +175,13 @@ class _PlotToolbar(NavigationToolbar2QT):
         if callable(prepare):
             prepare()
         try:
-            super().save_figure(*args)
+            canvas = self.canvas
+            publication = getattr(canvas, "publication_context", None)
+            if callable(publication):
+                with publication():
+                    super().save_figure(*args)
+            else:
+                super().save_figure(*args)
         finally:
             if callable(restore):
                 restore()
@@ -890,6 +897,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 lambda theme: self.menu_toolbar_host.apply_theme(
                     theme, navigation_toolbar=self.toolbar
                 )
+            )
+            self._theme_manager.themeChanged.connect(
+                self.mcd_controller._on_theme_changed
             )
         # Compatibility aliases remain owned by MainWindow for existing callers.
         self.show_log_action = self.menu_toolbar_host.show_log_action
@@ -1710,7 +1720,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         self.figure = Figure(figsize=(9, 7), dpi=100)
-        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.canvas = ThemeAwareFigureCanvasQTAgg(self.figure)
         self.toolbar = _PlotToolbar(self.canvas, box)
         layout.addWidget(self.toolbar)
         self.cmp_plot_view_bar = QFrame()

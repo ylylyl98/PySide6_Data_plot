@@ -210,6 +210,58 @@ class McdProcessingTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_mcd_theme_change_invalidates_blit_backgrounds(self) -> None:
+        window = MainWindow()
+        try:
+            window.mcd_controller._mcd_blit_enabled = True
+            window.mcd_controller._mcd_blit_backgrounds = {"heat": object()}
+            window.mcd_controller._mcd_blit_bboxes = {"heat": object()}
+            window.mcd_controller._on_theme_changed()
+            self.assertFalse(window.mcd_controller._mcd_blit_enabled)
+            self.assertEqual(window.mcd_controller._mcd_blit_backgrounds, {})
+            self.assertEqual(window.mcd_controller._mcd_blit_bboxes, {})
+        finally:
+            window.close()
+
+    def test_mcd_theme_change_rebuilds_blit_backgrounds_before_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_text:
+            folder = Path(folder_text)
+            self._write_sweep(folder)
+            window = MainWindow()
+            try:
+                window._set_current_folder(str(folder))
+                wait_for_file_catalog(window)
+                options = LoadOptions(
+                    mode="MCD", folder=str(folder), selected_files=["sweep.csv"], baseline_files=[],
+                    pl_log_scale=False, drr_baseline_text="", drr_baseline_which="", compare_log_scale=False,
+                    mcd_settings=McdSettings(max_sequence_gap=1, max_delta_b=0.01),
+                )
+
+                class Sink:
+                    def emit(self, *_args) -> None:
+                        pass
+
+                window._on_loaded(window._load_task(options, progress=Sink(), log=Sink()))
+                window.canvas.draw()
+                self.assertTrue(window.mcd_controller._mcd_blit_enabled)
+                old_backgrounds = dict(window.mcd_controller._mcd_blit_backgrounds)
+                self.assertIn("heat", old_backgrounds)
+
+                window.mcd_controller._on_theme_changed()
+                self.assertEqual(window.mcd_controller._mcd_blit_backgrounds, {})
+                self.assertEqual(window.mcd_controller._mcd_blit_bboxes, {})
+
+                window.canvas.draw()
+                rebuilt = window.mcd_controller._mcd_blit_backgrounds
+                self.assertTrue(window.mcd_controller._mcd_blit_enabled)
+                self.assertIn("heat", rebuilt)
+                self.assertNotEqual(id(old_backgrounds["heat"]), id(rebuilt["heat"]))
+                with patch.object(window.canvas, "blit", wraps=window.canvas.blit) as blit:
+                    self.assertTrue(window.mcd_controller._refresh_mcd_center_trace())
+                    self.assertGreater(blit.call_count, 0)
+            finally:
+                window.close()
+
     def test_current_acquisition_format_uses_mid_field_and_rotation_angle(self) -> None:
         with tempfile.TemporaryDirectory() as folder_text:
             path = Path(folder_text) / "current_format.csv"

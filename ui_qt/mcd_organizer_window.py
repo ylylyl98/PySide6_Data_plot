@@ -334,12 +334,12 @@ class McdOrganizerWindow(QMainWindow):
             return
         # Import and construct matplotlib only after Qt has had a chance to paint
         # the organizer window, keeping startup responsive on cold launches.
-        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
         from matplotlib.figure import Figure
+        from ui_qt.matplotlib_theme import ThemeAwareFigureCanvasQTAgg
         self.figure = Figure(figsize=(9, 5), dpi=100, facecolor="white")
-        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.canvas = ThemeAwareFigureCanvasQTAgg(self.figure)
         self.slope_figure = Figure(figsize=(9, 5), dpi=100, facecolor="white")
-        self.slope_canvas = FigureCanvasQTAgg(self.slope_figure)
+        self.slope_canvas = ThemeAwareFigureCanvasQTAgg(self.slope_figure)
         self._mcd_plot_layout.replaceWidget(self._mcd_plot_layout.itemAt(0).widget(), self.canvas)
         self._slope_plot_layout.replaceWidget(self._slope_plot_layout.itemAt(0).widget(), self.slope_canvas)
         self._show_empty_preview("Loading processed MCD catalog…")

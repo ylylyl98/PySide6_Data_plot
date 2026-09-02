@@ -11,7 +11,6 @@ from time import time as wall_time
 from typing import Any, Sequence
 from dataclasses import replace
 
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.transforms import Bbox
@@ -33,6 +32,7 @@ from core.mcd import (
 )
 from ui_qt.common import QComboBox, Worker
 from ui_qt.theme import alias as theme_alias
+from ui_qt.matplotlib_theme import ThemeAwareFigureCanvasQTAgg
 from ui_qt.source_picker_dialog import SourcePickerDialog
 
 from core.mcd import format_mcd_energy, suggest_mcd_window_centers
@@ -956,7 +956,7 @@ class McdController:
         dlg.resize(930, 680)
         layout = QVBoxLayout(dlg)
         figure = Figure(figsize=(8.2, 4.8), dpi=100)
-        canvas = FigureCanvasQTAgg(figure)
+        canvas = ThemeAwareFigureCanvasQTAgg(figure)
         spectrum_ax, score_ax = figure.subplots(2, 1, sharex=True, height_ratios=[2.2, 1.0])
         energy = np.asarray(suggestion.energy_ev, float)
         spectrum_ax.plot(energy, suggestion.median_reflectance, color="#303030", lw=1.1, label="full-sweep median reflectance")
@@ -1025,7 +1025,7 @@ class McdController:
         dlg.resize(980, 820)
         layout = QVBoxLayout(dlg)
         figure = Figure(figsize=(8.2, 4.7), dpi=100)
-        canvas = FigureCanvasQTAgg(figure)
+        canvas = ThemeAwareFigureCanvasQTAgg(figure)
         spectrum_ax, score_ax = figure.subplots(2, 1, sharex=True, height_ratios=[2.2, 1.0])
         layout.addWidget(canvas, 1)
         energy = np.asarray(suggestion.energy_ev, float)
@@ -1449,6 +1449,21 @@ class McdController:
         self._mcd_blit_axes = {}
         self._mcd_heat_dynamic_artists = []
         self._mcd_overlay_artists = {}
+
+    def _on_theme_changed(self, _theme: Any = None) -> None:
+        """Invalidate MCD blit backgrounds after display presentation changes."""
+        was_enabled = bool(self._mcd_blit_enabled)
+        self._disable_mcd_blitting()
+        canvas = getattr(self, "canvas", None)
+        if canvas is None:
+            return
+        try:
+            canvas.draw()
+        except Exception:
+            return
+        if was_enabled:
+            self._configure_mcd_blitting()
+            canvas.draw_idle()
 
     def _configure_mcd_blitting(self) -> None:
         if any(axis is None for axis in (
