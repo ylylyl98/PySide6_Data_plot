@@ -12,10 +12,17 @@ import pandas as pd
 from matplotlib.figure import Figure
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget
 
 from core.mcd import McdCenterCandidate, McdSettings, background_fit_regions, detect_angles, discover_mcd_processing_status, ensure_mcd_package_dir, export_mcd_analysis_bundle, export_mcd_tables, extract_mcd_acquisition_conditions, format_mcd_acquisition_conditions, format_mcd_energy, load_b_sweep_csv, low_field_mcd_branch_fits, pair_window_trace_by_branch, process_mcd, suggest_mcd_background_ranges, suggest_mcd_window_centers, window_trace, window_trace_comparison
-from ui_qt.main_window import LoadOptions, LoadedState, MainWindow, QDoubleSpinBox, QSpinBox
+from ui_qt.main_window import (
+    LoadOptions,
+    LoadedState,
+    MainWindow,
+    NavigationToolbar2QT,
+    QDoubleSpinBox,
+    QSpinBox,
+)
 from tests.ui_test_helpers import wait_for_file_catalog
 
 
@@ -53,6 +60,207 @@ class McdProcessingTests(unittest.TestCase):
             self.assertEqual(window._mcd_center_candidates, ())
         finally:
             window.close()
+
+    def test_mcd_plot_interaction_apis_are_controller_owned(self) -> None:
+        window = MainWindow()
+        try:
+            for name in (
+                "_mcd_pair_correction_label",
+                "_disable_mcd_blitting",
+                "_configure_mcd_blitting",
+                "_mcd_group_bbox",
+                "_draw_mcd_blit_group",
+                "_on_canvas_draw",
+                "_blit_mcd_regions",
+                "_prepare_mcd_toolbar_save",
+                "_restore_mcd_toolbar_save",
+                "_refresh_mcd_pair_panels",
+                "_mcd_preview_slope_lines",
+                "_mcd_preview_annotation_fontsize",
+                "_add_mcd_preview_slope_box",
+                "_refresh_mcd_trace_panel",
+                "_refresh_mcd_center_trace",
+                "_update_mcd_candidate_bar",
+                "_update_mcd_candidate_artist_styles",
+                "_on_mcd_canvas_motion",
+                "_on_mcd_canvas_click",
+                "_on_canvas_release",
+            ):
+                self.assertIn(name, type(window.mcd_controller).__dict__)
+                self.assertNotIn(name, MainWindow.__dict__)
+        finally:
+            window.close()
+
+    def test_main_canvas_dispatch_delegates_mcd_interactions(self) -> None:
+        window = MainWindow()
+        try:
+            window.last_plotted_mode = "MCD"
+            motion = object()
+            click = type(
+                "Click",
+                (),
+                {"button": 1, "xdata": None, "ydata": None, "inaxes": None, "key": None},
+            )()
+            with (
+                patch.object(
+                    type(window.mcd_controller), "_on_mcd_canvas_motion"
+                ) as motion_handler,
+                patch.object(
+                    type(window.mcd_controller), "_on_mcd_canvas_click"
+                ) as click_handler,
+            ):
+                window._on_canvas_motion(motion)
+                window._on_canvas_click(click)
+            motion_handler.assert_called_once_with(motion)
+            click_handler.assert_called_once_with(click)
+        finally:
+            window.close()
+
+    def test_main_canvas_hover_readback_does_not_replace_persistent_status(self) -> None:
+        window = MainWindow()
+        try:
+            window.status_bar_view.showMessage("State: Loading...")
+            window.last_plotted_mode = "SHG Processing"
+            window._shg_angle_ax = object()
+            event = type("Hover", (), {"inaxes": window._shg_angle_ax, "xdata": 12.5})()
+
+            window._on_canvas_motion(event)
+
+            self.assertEqual(window.status_bar_view.cursor_readback.text(), "Hover measured angle: 12.5 deg")
+            self.assertEqual(window.status_bar_view.currentMessage(), "State: Loading...")
+        finally:
+            window.close()
+
+    def test_main_canvas_heatmap_hover_routes_readback_without_replacing_status(self) -> None:
+        window = MainWindow()
+        try:
+            window.status_bar_view.showMessage("State: Ready")
+            window.last_plotted_mode = "PL"
+            window._pl_heatmap_ax = object()
+            window._pl_last_plot_cube = type("Cube", (), {"gate": np.array([1.0, 2.0])})()
+            event = type("Hover", (), {"inaxes": window._pl_heatmap_ax, "ydata": 1.25})()
+
+            window._on_canvas_motion(event)
+
+            self.assertEqual(window.status_bar_view.cursor_readback.text(), "Hover gate: 1.250 V")
+            self.assertEqual(window.status_bar_view.currentMessage(), "State: Ready")
+        finally:
+            window.close()
+
+    def test_mcd_drag_readback_does_not_replace_persistent_status(self) -> None:
+        window = MainWindow()
+        try:
+            window.status_bar_view.showMessage("Progress: processing")
+            window._mcd_window_dragging = True
+            window._mcd_window_drag_offset = 0.0
+            window._mcd_heatmap_ax = object()
+            window.loaded = type(
+                "Loaded",
+                (),
+                {"mcd_result": type("Result", (), {"energy_ev": np.array([1.0, 2.0])})()},
+            )()
+            event = type("Move", (), {"inaxes": window._mcd_heatmap_ax, "xdata": 1.5})()
+            with patch.object(type(window.mcd_controller), "_move_mcd_window_artists"):
+                window.mcd_controller._on_mcd_canvas_motion(event)
+
+            expected = (
+                f"Move MCD window: E = {format_mcd_energy(1.5)} eV "
+                f"(fixed width {window.mcd_window_width_spin.value():g} meV)"
+            )
+            self.assertEqual(window.status_bar_view.cursor_readback.text(), expected)
+            self.assertEqual(window.status_bar_view.currentMessage(), "Progress: processing")
+        finally:
+            window.close()
+
+    def test_mcd_band_hover_routes_readback_without_replacing_status(self) -> None:
+        window = MainWindow()
+        try:
+            window.status_bar_view.showMessage("State: Ready")
+            window._mcd_window_dragging = False
+            window._mcd_heatmap_ax = object()
+            event = type("Hover", (), {"inaxes": window._mcd_heatmap_ax, "xdata": 1.5})()
+            with patch.object(
+                type(window.mcd_controller), "_mcd_window_contains_energy", return_value=True
+            ):
+                window.mcd_controller._on_mcd_canvas_motion(event)
+
+            self.assertEqual(
+                window.status_bar_view.cursor_readback.text(),
+                "Drag the highlighted MCD band left or right; its width stays fixed.",
+            )
+            self.assertEqual(window.status_bar_view.currentMessage(), "State: Ready")
+        finally:
+            window.close()
+
+    def test_toolbar_save_uses_controller_hooks(self) -> None:
+        window = MainWindow()
+        try:
+            with (
+                patch.object(
+                    type(window.mcd_controller), "_prepare_mcd_toolbar_save"
+                ) as prepare,
+                patch.object(
+                    type(window.mcd_controller), "_restore_mcd_toolbar_save"
+                ) as restore,
+                patch.object(NavigationToolbar2QT, "save_figure"),
+            ):
+                window.toolbar.save_figure()
+            prepare.assert_called_once_with()
+            restore.assert_called_once_with()
+        finally:
+            window.close()
+
+    def test_mcd_theme_change_invalidates_blit_backgrounds(self) -> None:
+        window = MainWindow()
+        try:
+            window.mcd_controller._mcd_blit_enabled = True
+            window.mcd_controller._mcd_blit_backgrounds = {"heat": object()}
+            window.mcd_controller._mcd_blit_bboxes = {"heat": object()}
+            window.mcd_controller._on_theme_changed()
+            self.assertFalse(window.mcd_controller._mcd_blit_enabled)
+            self.assertEqual(window.mcd_controller._mcd_blit_backgrounds, {})
+            self.assertEqual(window.mcd_controller._mcd_blit_bboxes, {})
+        finally:
+            window.close()
+
+    def test_mcd_theme_change_rebuilds_blit_backgrounds_before_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_text:
+            folder = Path(folder_text)
+            self._write_sweep(folder)
+            window = MainWindow()
+            try:
+                window._set_current_folder(str(folder))
+                wait_for_file_catalog(window)
+                options = LoadOptions(
+                    mode="MCD", folder=str(folder), selected_files=["sweep.csv"], baseline_files=[],
+                    pl_log_scale=False, drr_baseline_text="", drr_baseline_which="", compare_log_scale=False,
+                    mcd_settings=McdSettings(max_sequence_gap=1, max_delta_b=0.01),
+                )
+
+                class Sink:
+                    def emit(self, *_args) -> None:
+                        pass
+
+                window._on_loaded(window._load_task(options, progress=Sink(), log=Sink()))
+                window.canvas.draw()
+                self.assertTrue(window.mcd_controller._mcd_blit_enabled)
+                old_backgrounds = dict(window.mcd_controller._mcd_blit_backgrounds)
+                self.assertIn("heat", old_backgrounds)
+
+                window.mcd_controller._on_theme_changed()
+                self.assertEqual(window.mcd_controller._mcd_blit_backgrounds, {})
+                self.assertEqual(window.mcd_controller._mcd_blit_bboxes, {})
+
+                window.canvas.draw()
+                rebuilt = window.mcd_controller._mcd_blit_backgrounds
+                self.assertTrue(window.mcd_controller._mcd_blit_enabled)
+                self.assertIn("heat", rebuilt)
+                self.assertNotEqual(id(old_backgrounds["heat"]), id(rebuilt["heat"]))
+                with patch.object(window.canvas, "blit", wraps=window.canvas.blit) as blit:
+                    self.assertTrue(window.mcd_controller._refresh_mcd_center_trace())
+                    self.assertGreater(blit.call_count, 0)
+            finally:
+                window.close()
 
     def test_current_acquisition_format_uses_mid_field_and_rotation_angle(self) -> None:
         with tempfile.TemporaryDirectory() as folder_text:
@@ -702,11 +910,11 @@ class McdProcessingTests(unittest.TestCase):
         window = MainWindow()
         try:
             window.loaded = LoadedState(mode="MCD", folder="")
-            window._on_mcd_params_changed()
-            self.assertTrue(window._mcd_auto_apply_timer.isActive())
+            window.mcd_controller._on_mcd_params_changed()
+            self.assertTrue(window.mcd_controller._mcd_auto_apply_timer.isActive())
             self.assertIn("Pending", window.mcd_apply_correction_btn.text())
         finally:
-            window._mcd_auto_apply_timer.stop()
+            window.mcd_controller._mcd_auto_apply_timer.stop()
             window.close()
 
     def test_spin_boxes_ignore_plain_mouse_wheel_events(self) -> None:
@@ -816,27 +1024,35 @@ class McdProcessingTests(unittest.TestCase):
                     key: id(line) for key, line in window._mcd_trace_lines.items()
                 }
                 with patch.object(window.canvas, "blit", wraps=window.canvas.blit) as blit:
-                    self.assertTrue(window._refresh_mcd_center_trace())
+                    self.assertTrue(window.mcd_controller._refresh_mcd_center_trace())
                     self.assertGreater(blit.call_count, 0)
                 self.assertEqual(
                     original_trace_artists,
                     {key: id(line) for key, line in window._mcd_trace_lines.items()},
                 )
                 with (
-                    patch.object(window, "_refresh_mcd_center_trace", return_value=True) as refresh,
+                    patch.object(
+                        type(window.mcd_controller),
+                        "_refresh_mcd_center_trace",
+                        return_value=True,
+                    ) as refresh,
                     patch.object(window, "_plot_mode") as full_replot,
                 ):
                     window.mcd_window_center_spin.setValue(
                         window.mcd_window_center_spin.value() + 1e-6
                     )
-                    self.assertTrue(window._mcd_center_refresh_timer.isActive())
-                    window._mcd_center_refresh_timer.stop()
-                    window._apply_pending_mcd_center_refresh()
+                    self.assertTrue(window.mcd_controller._mcd_center_refresh_timer.isActive())
+                    window.mcd_controller._mcd_center_refresh_timer.stop()
+                    window.mcd_controller._apply_pending_mcd_center_refresh()
                     refresh.assert_called_once_with()
                     full_replot.assert_not_called()
                 if window.mcd_pair_b_combo.count() > 1:
                     with (
-                        patch.object(window, "_refresh_mcd_pair_panels", return_value=True) as pair_refresh,
+                        patch.object(
+                            type(window.mcd_controller),
+                            "_refresh_mcd_pair_panels",
+                            return_value=True,
+                        ) as pair_refresh,
                         patch.object(window, "_plot_mode") as full_replot,
                     ):
                         target_index = 0 if window.mcd_pair_b_combo.currentIndex() != 0 else 1
@@ -900,13 +1116,13 @@ class McdProcessingTests(unittest.TestCase):
             window.mcd_available_files = ["mcd/a.csv", "mcd/b.csv", "mcd/c.csv"]
             window.mcd_processed_status = {"mcd/b.csv": "2026-08-24T20:00:00+00:00"}
 
-            self.assertEqual(window._mcd_saved_source_filter(), "all")
+            self.assertEqual(window.mcd_controller._mcd_saved_source_filter(), "all")
             self.assertEqual(
-                window._mcd_source_filter_counts(),
+                window.mcd_controller._mcd_source_filter_counts(),
                 {"all": 3, "unprocessed": 2, "processed": 1},
             )
             window._mcd_source_filter_preference = "processed"
-            self.assertEqual(window._mcd_saved_source_filter(), "processed")
+            self.assertEqual(window.mcd_controller._mcd_saved_source_filter(), "processed")
         finally:
             window.close()
 
@@ -935,7 +1151,8 @@ class McdProcessingTests(unittest.TestCase):
                 summary = window.mcd_selection_summary.text()
                 self.assertIn("✓ PROCESSED", summary)
                 self.assertIn("Last saved: 2026-08-24 21:30", summary)
-                self.assertIn("#237A3B", window.mcd_selection_summary.styleSheet())
+                self.assertEqual(window.mcd_selection_summary.property("appRole"), "sourceBadge")
+                self.assertEqual(window.mcd_selection_summary.property("badgeState"), "processed")
             finally:
                 window.close()
 
@@ -954,16 +1171,18 @@ class McdProcessingTests(unittest.TestCase):
                 wait_for_file_catalog(window)
                 with (
                     patch.object(
-                        window, "_open_mcd_source_dialog", return_value="mcd/sweep_2.csv"
+                        type(window.mcd_controller),
+                        "_open_mcd_source_dialog",
+                        return_value="mcd/sweep_2.csv",
                     ),
                     patch.object(window, "_start_load") as start_load,
                 ):
-                    window._edit_mcd_source()
+                    window.mcd_controller._edit_mcd_source()
                 self.assertEqual(window._selected(window.mcd_files), ["mcd/sweep_2.csv"])
                 self.assertIn("sweep_2.csv", window.mcd_selection_summary.toolTip())
                 start_load.assert_called_once_with("MCD")
 
-                window._clear_mcd_source()
+                window.mcd_controller._clear_mcd_source()
                 self.assertEqual(window._selected(window.mcd_files), [])
                 self.assertEqual(window.mcd_selection_summary.text(), "No MCD CSV selected.")
             finally:
@@ -986,7 +1205,7 @@ class McdProcessingTests(unittest.TestCase):
                 window._set_current_folder(str(folder))
                 wait_for_file_catalog(window)
                 self.assertEqual(
-                    window._mcd_sources_newest_first(),
+                    window.mcd_controller._mcd_sources_newest_first(),
                     ["mcd/newest.csv", "mcd/older.csv"],
                 )
             finally:
@@ -1037,6 +1256,34 @@ class McdProcessingTests(unittest.TestCase):
             self.assertFalse(window.mcd_show_unsigned_absolute_mean_chk.isChecked())
             self.assertFalse(window.mcd_show_integral_chk.isChecked())
             self.assertTrue(window.mcd_fit_zero_chk.isChecked())
+        finally:
+            window.close()
+
+    def test_mcd_color_range_row_is_contained_at_narrow_sidebar(self) -> None:
+        from ui_qt.theme import install_theme
+
+        install_theme(self.app, mode="light")
+        window = MainWindow()
+        try:
+            window.resize(900, 700)
+            window.show()
+            window.workspace_splitter.setSizes([380, 520])
+            window.tabs.setCurrentIndex(
+                next(i for i in range(window.tabs.count()) if window.tabs.tabText(i) == "MCD")
+            )
+            self.app.processEvents()
+            row = window.mcd_auto_v_btn.parentWidget()
+            children = [child for child in row.children() if isinstance(child, QWidget) and child.isVisible()]
+            self.assertEqual(len(children), 3)
+            for child in children:
+                self.assertTrue(row.contentsRect().contains(child.geometry()))
+            for index, previous in enumerate(children):
+                for current in children[index + 1 :]:
+                    self.assertFalse(previous.geometry().intersects(current.geometry()))
+            self.assertGreaterEqual(
+                window.mcd_auto_v_btn.width(),
+                window.mcd_auto_v_btn.fontMetrics().horizontalAdvance(window.mcd_auto_v_btn.text()) + 12,
+            )
         finally:
             window.close()
 
@@ -1101,7 +1348,7 @@ class McdProcessingTests(unittest.TestCase):
         try:
             window.figure.clear()
             axis = window.figure.add_axes([0.72, 0.55, 0.22, 0.34])
-            window._add_mcd_preview_slope_box(
+            window.mcd_controller._add_mcd_preview_slope_box(
                 axis,
                 {
                     "B increasing": (0.113441, 0.0),
@@ -1219,9 +1466,9 @@ class McdProcessingTests(unittest.TestCase):
                 window._on_canvas_click(press)
                 self.assertTrue(window._mcd_window_dragging)
                 window._on_canvas_motion(move)
-                window._on_canvas_release(release)
+                window.mcd_controller._on_canvas_release(release)
 
-                expected = window._clamp_mcd_window_center(
+                expected = window.mcd_controller._clamp_mcd_window_center(
                     target, window.loaded.mcd_result.energy_ev, original_width
                 )
                 self.assertAlmostEqual(window.mcd_window_center_spin.value(), expected, places=6)
@@ -1259,12 +1506,12 @@ class McdProcessingTests(unittest.TestCase):
                 window.mcd_window_center_spin.setValue(manual_center)
                 original_width = window.mcd_window_width_spin.value()
 
-                window._find_mcd_center_candidates()
+                window.mcd_controller._find_mcd_center_candidates()
                 self.assertGreaterEqual(len(window._mcd_center_candidates), 2)
                 self.assertFalse(window.mcd_candidate_buttons[0].isHidden())
                 self.assertIn("1", window.mcd_candidate_buttons[0].text())
                 second_center = window._mcd_center_candidates[1].center_ev
-                window._use_mcd_center_candidate(1)
+                window.mcd_controller._use_mcd_center_candidate(1)
                 self.assertAlmostEqual(window.mcd_window_center_spin.value(), second_center, places=6)
                 self.assertEqual(window.mcd_window_width_spin.value(), original_width)
                 self.assertTrue(window.mcd_candidate_buttons[1].isChecked())
@@ -1280,12 +1527,12 @@ class McdProcessingTests(unittest.TestCase):
                 )
 
                 ymin, ymax = window._mcd_heatmap_ax.get_ylim()
-                marker_index = window._mcd_candidate_marker_at(
+                marker_index = window.mcd_controller._mcd_candidate_marker_at(
                     window._mcd_center_candidates[0].center_ev,
                     ymin + 0.95 * (ymax - ymin),
                 )
                 self.assertEqual(marker_index, 0)
-                window._return_to_manual_mcd_center()
+                window.mcd_controller._return_to_manual_mcd_center()
                 self.assertEqual(window._mcd_center_candidates, ())
                 self.assertAlmostEqual(window.mcd_window_center_spin.value(), manual_center, places=6)
                 self.assertEqual(result.summary["window_center_selection"], {"method": "manual"})

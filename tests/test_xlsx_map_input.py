@@ -264,7 +264,7 @@ class XlsxMapDrrUiTests(unittest.TestCase):
         )
 
         self.window.drr_selected_files = ["dR_R.xlsx"]
-        self.window._update_drr_selection_labels()
+        self.window.drr_controller._update_drr_selection_labels()
         self.assertEqual(
             self._combo_items(),
             ["Auto / Default", "Doping (V)", "Efield (V)"],
@@ -279,20 +279,20 @@ class XlsxMapDrrUiTests(unittest.TestCase):
         self.assertEqual(self.window._selected_y_axis_spec("drr"), "efield")
 
         self.window.drr_selected_files = ["run.csv"]
-        self.window._update_drr_selection_labels()
+        self.window.drr_controller._update_drr_selection_labels()
         self.assertEqual(
             self._combo_items(),
             ["Auto / Default", "TG", "BG", "Bias", "Advanced..."],
         )
 
     def test_reject_mixed_xlsx_selection(self) -> None:
-        self.window._reject_mixed_xlsx_selection([])
-        self.window._reject_mixed_xlsx_selection(["a.csv", "b.csv"])
-        self.window._reject_mixed_xlsx_selection(["dR_R.xlsx"])
+        self.window.drr_controller._reject_mixed_xlsx_selection([])
+        self.window.drr_controller._reject_mixed_xlsx_selection(["a.csv", "b.csv"])
+        self.window.drr_controller._reject_mixed_xlsx_selection(["dR_R.xlsx"])
         with self.assertRaises(ValueError):
-            self.window._reject_mixed_xlsx_selection(["a.csv", "dR_R.xlsx"])
+            self.window.drr_controller._reject_mixed_xlsx_selection(["a.csv", "dR_R.xlsx"])
         with self.assertRaises(ValueError):
-            self.window._reject_mixed_xlsx_selection(["a.xlsx", "b.xlsx"])
+            self.window.drr_controller._reject_mixed_xlsx_selection(["a.xlsx", "b.xlsx"])
 
 
 if __name__ == "__main__":

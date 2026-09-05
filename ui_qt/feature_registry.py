@@ -34,6 +34,7 @@ FEATURES: tuple[FeatureSpec, ...] = (
     FeatureSpec("cmp", "Compare", "Compare measurement channels", "_build_compare_tab"),
     FeatureSpec("power", "Power", "Power Dependent", "_build_power_tab"),
     FeatureSpec("mcd", "MCD", "Magnetic circular dichroism", "_build_mcd_tab"),
+    FeatureSpec("mcd_peak_shift", "MCD Peak Shift", "Track reflection resonance energies versus magnetic field", "_build_mcd_peak_shift_tab"),
     FeatureSpec("shg", "SHG", "SHG Processing", "_build_shg_tab"),
     FeatureSpec("slides", "Slides", "Build a PowerPoint from processed plot PNGs"),
     FeatureSpec("tools", "Tools", "Log / Tools", "_build_tools_tab"),
