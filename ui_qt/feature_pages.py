@@ -14,6 +14,7 @@ import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QAbstractSpinBox,
     QCheckBox,
     QFileDialog,
     QFormLayout,
@@ -39,6 +40,7 @@ from core.plotting import COMPARE_PANEL_ORDER
 from ui_qt.common import UI_METRICS, QComboBox, QDoubleSpinBox, QSpinBox
 from ui_qt.fluent_ui.style import set_fluent_property
 from ui_qt.status_badge import StatusBadge
+from ui_qt.dense_form_layout import DenseFormRowLayout
 
 
 class FeatureTabsMixin:
@@ -65,7 +67,8 @@ class FeatureTabsMixin:
         self.pl_selection_summary.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.pl_select_source_btn = QPushButton("Select...")
         self.pl_select_source_btn.setFixedHeight(30)
-        self.pl_select_source_btn.setMaximumWidth(92)
+        self.pl_select_source_btn.setMinimumWidth(110)
+        self.pl_select_source_btn.setMaximumWidth(110)
         self.pl_clear_source_btn = QPushButton("Clear")
         self.pl_clear_source_btn.setFixedHeight(30)
         self.pl_clear_source_btn.setMaximumWidth(72)
@@ -91,21 +94,32 @@ class FeatureTabsMixin:
         layout.addWidget(self._make_expander("Measurement File", files, expanded=True))
 
         params = QGroupBox("Plot Options")
+        params.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         params_layout = QVBoxLayout(params)
         params_layout.setContentsMargins(6, 6, 6, 4)
         params_layout.setSpacing(4)
         cfg = QFormLayout()
+        cfg.setRowWrapPolicy(QFormLayout.WrapLongRows)
         cfg.setHorizontalSpacing(6)
         cfg.setVerticalSpacing(4)
         _grid, spins, _, _, cmap, fix_checks = self._build_common_range_grid("pl", "turbo")
         self.pl_yaxis_controls = self._build_y_axis_controls("pl")
+        self.pl_yaxis_combo.setMinimumWidth(200)
+        self.pl_yaxis_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         _pl_yc_row = QWidget()
-        _pl_yc_h = QHBoxLayout(_pl_yc_row)
+        _pl_yc_h = QVBoxLayout(_pl_yc_row)
         _pl_yc_h.setContentsMargins(0, 0, 0, 0)
         _pl_yc_h.setSpacing(6)
-        _pl_yc_h.addWidget(self.pl_yaxis_combo, 1)
-        _pl_yc_h.addWidget(QLabel("Cmap"))
-        _pl_yc_h.addWidget(cmap)
+        _pl_yc_h.addWidget(self.pl_yaxis_combo)
+        _pl_cmap_row = QWidget()
+        _pl_cmap_h = QHBoxLayout(_pl_cmap_row)
+        _pl_cmap_h.setContentsMargins(0, 0, 0, 0)
+        _pl_cmap_h.setSpacing(4)
+        _pl_cmap_h.addWidget(QLabel("Cmap"))
+        cmap.setMinimumWidth(112)
+        cmap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        _pl_cmap_h.addWidget(cmap, 1)
+        _pl_yc_h.addWidget(_pl_cmap_row)
         cfg.addRow("Y-axis", _pl_yc_row)
         cfg.addRow("", self.pl_yaxis_advanced_box)
         self.pl_dat_yaxis_label_edit = QLineEdit()
@@ -123,8 +137,10 @@ class FeatureTabsMixin:
         self.pl_dat_yaxis_unit_edit.setVisible(False)
         params_layout.addLayout(cfg)
         for s in spins.values():
-            s.setFixedWidth(UI_METRICS["spin_w"])
-            s.setFixedHeight(UI_METRICS["input_h"])
+            s.setMinimumWidth(116)
+            s.setMaximumWidth(120)
+            s.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            s.setMinimumHeight(UI_METRICS["input_h"])
 
         self.pl_auto_v_btn = QToolButton()
         self.pl_auto_x_btn = QToolButton()
@@ -133,22 +149,20 @@ class FeatureTabsMixin:
         basic = QGroupBox("Axis Ranges")
         basic_form = QFormLayout(basic)
         basic_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
+        basic_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         basic_form.setHorizontalSpacing(4)
         basic_form.setVerticalSpacing(UI_METRICS["row_spacing"])
         basic_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         basic_form.addRow(
-            "vmin / vmax",
-            self._make_axis_range_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.pl_auto_v_btn, "Auto V"),
+            self._make_axis_range_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.pl_auto_v_btn, "Auto V", dense=True, label_text="vmin / vmax"),
         )
         basic_form.addRow("Color scale", self.pl_split_scale_chk)
         basic_form.addRow(self.pl_split_scale_panel)
         basic_form.addRow(
-            "xmin / xmax",
-            self._make_axis_range_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.pl_auto_x_btn, "Auto X"),
+            self._make_axis_range_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.pl_auto_x_btn, "Auto X", dense=True, label_text="xmin / xmax"),
         )
         basic_form.addRow(
-            "ymin / ymax",
-            self._make_axis_range_row(spins["ymin"], spins["ymax"], fix_checks["ymin"], fix_checks["ymax"], self.pl_auto_y_btn, "Auto Y"),
+            self._make_axis_range_row(spins["ymin"], spins["ymax"], fix_checks["ymin"], fix_checks["ymax"], self.pl_auto_y_btn, "Auto Y", dense=True, label_text="ymin / ymax"),
         )
         basic_form.addRow("Cursor Gate", spins["gate"])
         flags = QWidget()
@@ -174,13 +188,13 @@ class FeatureTabsMixin:
         self.pl_peak_mode_combo = QComboBox()
         self.pl_peak_mode_combo.addItems(["Peaks", "Dips"])
         row1 = QWidget()
-        row1h = QHBoxLayout(row1)
+        row1h = QGridLayout(row1)
         row1h.setContentsMargins(0, 0, 0, 0)
         row1h.setSpacing(6)
-        row1h.addWidget(self.pl_peak_find_btn)
-        row1h.addWidget(self.pl_peak_mode_combo)
-        row1h.addWidget(self.pl_peak_show_chk)
-        row1h.addStretch(1)
+        row1h.addWidget(self.pl_peak_find_btn, 0, 0)
+        row1h.addWidget(self.pl_peak_mode_combo, 0, 1)
+        row1h.addWidget(self.pl_peak_show_chk, 1, 0, 1, 2)
+        row1h.setColumnStretch(1, 1)
         analysis_form.addRow("", row1)
         self.pl_peak_prom_spin = QDoubleSpinBox()
         self.pl_peak_prom_spin.setDecimals(3)
@@ -194,33 +208,41 @@ class FeatureTabsMixin:
         self.pl_peak_max_spin.setRange(1, 20)
         self.pl_peak_max_spin.setValue(6)
         row2 = QWidget()
-        row2h = QHBoxLayout(row2)
+        row2h = QGridLayout(row2)
         row2h.setContentsMargins(0, 0, 0, 0)
-        row2h.setSpacing(6)
-        row2h.addWidget(QLabel("Prom"))
-        row2h.addWidget(self.pl_peak_prom_spin)
-        row2h.addWidget(QLabel("Dist"))
-        row2h.addWidget(self.pl_peak_dist_spin)
-        row2h.addWidget(QLabel("Top"))
-        row2h.addWidget(self.pl_peak_max_spin)
+        row2h.setHorizontalSpacing(6)
+        row2h.setVerticalSpacing(4)
+        for spin, width in ((self.pl_peak_prom_spin, 80), (self.pl_peak_dist_spin, 56), (self.pl_peak_max_spin, 56)):
+            spin.setMinimumWidth(width)
+            spin.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        row2h.addWidget(QLabel("Prom"), 0, 0)
+        row2h.addWidget(self.pl_peak_prom_spin, 0, 1)
+        row2h.addWidget(QLabel("Dist"), 0, 2)
+        row2h.addWidget(self.pl_peak_dist_spin, 0, 3)
+        row2h.addWidget(QLabel("Top"), 1, 0)
+        row2h.addWidget(self.pl_peak_max_spin, 1, 1)
+        row2h.setColumnStretch(1, 1)
+        row2h.setColumnStretch(3, 1)
         analysis_form.addRow("", row2)
         self.pl_fit_btn = QPushButton("Fit Multi-Lorentz")
         self.pl_fit_clear_btn = QPushButton("Clear Fit")
+        self.pl_fit_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.pl_fit_clear_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.pl_fit_show_chk = QCheckBox("Show Fit")
         self.pl_fit_show_chk.setChecked(True)
         self.pl_fit_n_spin = QSpinBox()
         self.pl_fit_n_spin.setRange(1, 8)
         self.pl_fit_n_spin.setValue(3)
         row3 = QWidget()
-        row3h = QHBoxLayout(row3)
+        row3h = QGridLayout(row3)
         row3h.setContentsMargins(0, 0, 0, 0)
         row3h.setSpacing(6)
-        row3h.addWidget(self.pl_fit_btn)
-        row3h.addWidget(self.pl_fit_clear_btn)
-        row3h.addWidget(self.pl_fit_show_chk)
-        row3h.addWidget(QLabel("N"))
-        row3h.addWidget(self.pl_fit_n_spin)
-        row3h.addStretch(1)
+        row3h.addWidget(self.pl_fit_btn, 0, 0, 1, 3)
+        row3h.addWidget(self.pl_fit_clear_btn, 1, 0, 1, 3)
+        row3h.addWidget(self.pl_fit_show_chk, 2, 0)
+        row3h.addWidget(QLabel("N"), 2, 1)
+        row3h.addWidget(self.pl_fit_n_spin, 2, 2)
+        row3h.setColumnStretch(2, 1)
         analysis_form.addRow("", row3)
         self.pl_fit_status = QLabel("")
         set_fluent_property(self.pl_fit_status, "appRole", "fitStatus")
@@ -256,7 +278,8 @@ class FeatureTabsMixin:
         self.drr_measurement_summary.setWordWrap(True)
         self.drr_edit_measurements_btn = QPushButton("Select...")
         self.drr_edit_measurements_btn.setFixedHeight(30)
-        self.drr_edit_measurements_btn.setMaximumWidth(92)
+        self.drr_edit_measurements_btn.setMinimumWidth(110)
+        self.drr_edit_measurements_btn.setMaximumWidth(110)
         self.drr_clear_measurements_btn = QPushButton("Clear")
         self.drr_clear_measurements_btn.setFixedHeight(30)
         self.drr_clear_measurements_btn.setMaximumWidth(72)
@@ -276,7 +299,8 @@ class FeatureTabsMixin:
         self.drr_baseline_summary.setWordWrap(True)
         self.drr_edit_baselines_btn = QPushButton("Select...")
         self.drr_edit_baselines_btn.setFixedHeight(30)
-        self.drr_edit_baselines_btn.setMaximumWidth(92)
+        self.drr_edit_baselines_btn.setMinimumWidth(110)
+        self.drr_edit_baselines_btn.setMaximumWidth(110)
         self.drr_baseline_autofind_btn = QPushButton("Clear")
         self.drr_baseline_autofind_btn.setToolTip(
             "Clear the selected external background files."
@@ -312,6 +336,7 @@ class FeatureTabsMixin:
         layout.addWidget(self._make_expander("Data", files, expanded=True))
 
         params = QGroupBox("Plot Options")
+        params.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         params_layout = QVBoxLayout(params)
         params_layout.setContentsMargins(6, 6, 6, 4)
         params_layout.setSpacing(6)
@@ -327,13 +352,17 @@ class FeatureTabsMixin:
         _grid, spins, log_chk, clip_chk, cmap, fix_checks = self._build_common_range_grid("drr", "RdBu_r")
 
         for s in spins.values():
-            s.setFixedWidth(UI_METRICS["spin_w"])
-            s.setFixedHeight(UI_METRICS["input_h"])
-        self.drr_baseline_combo.setMinimumWidth(120)
-        self.drr_baseline_combo.setMaximumWidth(180)
+            s.setMinimumWidth(116)
+            s.setMaximumWidth(120)
+            s.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            s.setMinimumHeight(UI_METRICS["input_h"])
+        self.drr_baseline_combo.setMinimumWidth(210)
+        self.drr_baseline_combo.setMaximumWidth(320)
         self.drr_baseline_combo.setFixedHeight(UI_METRICS["input_h"])
         self.drr_baseline_combo.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.drr_yaxis_controls = self._build_y_axis_controls("drr")
+        self.drr_yaxis_combo.setMinimumWidth(200)
+        self.drr_yaxis_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         cmap.setMinimumWidth(90)
         cmap.setMaximumWidth(115)
         cmap.setFixedHeight(UI_METRICS["input_h"])
@@ -369,25 +398,35 @@ class FeatureTabsMixin:
         deriv_h.addWidget(self.drr_sg_poly_spin)
         deriv_h.addStretch(1)
 
-        self.drr_auto_v_btn = QToolButton()
-        self.drr_auto_x_btn = QToolButton()
-        self.drr_auto_y_btn = QToolButton()
+        # DRR range actions are real push buttons so their readable content
+        # width participates in the dense row's metric-based packing.
+        self.drr_auto_v_btn = QPushButton()
+        self.drr_auto_x_btn = QPushButton()
+        self.drr_auto_y_btn = QPushButton()
         self.drr_center_zero_chk = QCheckBox("Center Zero")
         self.drr_center_zero_chk.setToolTip("When enabled, DRR colormap is centered at zero.")
         self.drr_center_zero_chk.setChecked(False)
 
         # Config rows outside Axis Ranges — mirrors PL tab structure
         cfg = QFormLayout()
+        cfg.setRowWrapPolicy(QFormLayout.WrapLongRows)
         cfg.setHorizontalSpacing(6)
         cfg.setVerticalSpacing(UI_METRICS["row_spacing"])
         cfg.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         baseline_cmap_row = QWidget()
-        baseline_cmap_h = QHBoxLayout(baseline_cmap_row)
+        baseline_cmap_h = QVBoxLayout(baseline_cmap_row)
         baseline_cmap_h.setContentsMargins(0, 0, 0, 0)
-        baseline_cmap_h.setSpacing(6)
-        baseline_cmap_h.addWidget(self.drr_baseline_combo, 1)
-        baseline_cmap_h.addWidget(QLabel("Cmap"))
-        baseline_cmap_h.addWidget(cmap)
+        baseline_cmap_h.setSpacing(4)
+        baseline_cmap_h.addWidget(self.drr_baseline_combo)
+        drr_cmap_row = QWidget()
+        drr_cmap_h = QHBoxLayout(drr_cmap_row)
+        drr_cmap_h.setContentsMargins(0, 0, 0, 0)
+        drr_cmap_h.setSpacing(4)
+        drr_cmap_h.addWidget(QLabel("Cmap"))
+        cmap.setMinimumWidth(0)
+        cmap.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        drr_cmap_h.addWidget(cmap, 1)
+        baseline_cmap_h.addWidget(drr_cmap_row)
         _drr_yc_row = QWidget()
         _drr_yc_h = QHBoxLayout(_drr_yc_row)
         _drr_yc_h.setContentsMargins(0, 0, 0, 0)
@@ -401,6 +440,7 @@ class FeatureTabsMixin:
         params_layout.addLayout(cfg)
 
         basic = QGroupBox("Axis Ranges")
+        basic.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         basic_form = QFormLayout(basic)
         basic_form.setContentsMargins(
             4,
@@ -408,22 +448,20 @@ class FeatureTabsMixin:
             4,
             UI_METRICS["group_margin"],
         )
+        basic_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         basic_form.setHorizontalSpacing(4)
         basic_form.setVerticalSpacing(UI_METRICS["row_spacing"])
         basic_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         basic_form.addRow(
-            "vmin / vmax",
-            self._make_axis_range_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.drr_auto_v_btn, "Auto V"),
+            self._make_axis_range_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.drr_auto_v_btn, "Auto V", dense=True, label_text="vmin / vmax"),
         )
         basic_form.addRow("Color scale", self.drr_split_scale_chk)
         basic_form.addRow(self.drr_split_scale_panel)
         basic_form.addRow(
-            "xmin / xmax",
-            self._make_axis_range_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.drr_auto_x_btn, "Auto X"),
+            self._make_axis_range_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.drr_auto_x_btn, "Auto X", dense=True, label_text="xmin / xmax"),
         )
         basic_form.addRow(
-            "ymin / ymax",
-            self._make_axis_range_row(spins["ymin"], spins["ymax"], fix_checks["ymin"], fix_checks["ymax"], self.drr_auto_y_btn, "Auto Y"),
+            self._make_axis_range_row(spins["ymin"], spins["ymax"], fix_checks["ymin"], fix_checks["ymax"], self.drr_auto_y_btn, "Auto Y", dense=True, label_text="ymin / ymax"),
         )
         basic_form.addRow("Cursor Gate", spins["gate"])
         flags = QWidget()
@@ -469,6 +507,8 @@ class FeatureTabsMixin:
         self.drr_fit_btn = QPushButton("Fit Multi-Lorentz")
         self.drr_fit_btn.setToolTip("Fit multiple Lorentz peaks to current bottom spectrum.")
         self.drr_fit_clear_btn = QPushButton("Clear Fit")
+        self.drr_fit_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.drr_fit_clear_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.drr_fit_n_spin = QSpinBox()
         self.drr_fit_n_spin.setRange(1, 8)
         self.drr_fit_n_spin.setValue(3)
@@ -476,37 +516,43 @@ class FeatureTabsMixin:
         self.drr_fit_status = QLabel("")
 
         drr_row1 = QWidget()
-        drr_row1h = QHBoxLayout(drr_row1)
+        drr_row1h = QGridLayout(drr_row1)
         drr_row1h.setContentsMargins(0, 0, 0, 0)
         drr_row1h.setSpacing(6)
-        drr_row1h.addWidget(self.drr_peak_find_btn)
-        drr_row1h.addWidget(self.drr_peak_mode_combo)
-        drr_row1h.addWidget(self.drr_peak_show_chk)
-        drr_row1h.addStretch(1)
+        drr_row1h.addWidget(self.drr_peak_find_btn, 0, 0)
+        drr_row1h.addWidget(self.drr_peak_mode_combo, 0, 1)
+        drr_row1h.addWidget(self.drr_peak_show_chk, 1, 0, 1, 2)
+        drr_row1h.setColumnStretch(1, 1)
         analysis_form.addRow("", drr_row1)
 
         drr_row2 = QWidget()
-        drr_row2h = QHBoxLayout(drr_row2)
+        drr_row2h = QGridLayout(drr_row2)
         drr_row2h.setContentsMargins(0, 0, 0, 0)
-        drr_row2h.setSpacing(6)
-        drr_row2h.addWidget(QLabel("Prom"))
-        drr_row2h.addWidget(self.drr_peak_prom_spin)
-        drr_row2h.addWidget(QLabel("Dist"))
-        drr_row2h.addWidget(self.drr_peak_dist_spin)
-        drr_row2h.addWidget(QLabel("Top"))
-        drr_row2h.addWidget(self.drr_peak_max_spin)
+        drr_row2h.setHorizontalSpacing(6)
+        drr_row2h.setVerticalSpacing(4)
+        for spin, width in ((self.drr_peak_prom_spin, 80), (self.drr_peak_dist_spin, 56), (self.drr_peak_max_spin, 56)):
+            spin.setMinimumWidth(width)
+            spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        drr_row2h.addWidget(QLabel("Prom"), 0, 0)
+        drr_row2h.addWidget(self.drr_peak_prom_spin, 0, 1)
+        drr_row2h.addWidget(QLabel("Dist"), 0, 2)
+        drr_row2h.addWidget(self.drr_peak_dist_spin, 0, 3)
+        drr_row2h.addWidget(QLabel("Top"), 1, 0)
+        drr_row2h.addWidget(self.drr_peak_max_spin, 1, 1)
+        drr_row2h.setColumnStretch(1, 1)
+        drr_row2h.setColumnStretch(3, 1)
         analysis_form.addRow("", drr_row2)
 
         drr_row3 = QWidget()
-        drr_row3h = QHBoxLayout(drr_row3)
+        drr_row3h = QGridLayout(drr_row3)
         drr_row3h.setContentsMargins(0, 0, 0, 0)
         drr_row3h.setSpacing(6)
-        drr_row3h.addWidget(self.drr_fit_btn)
-        drr_row3h.addWidget(self.drr_fit_clear_btn)
-        drr_row3h.addWidget(self.drr_fit_show_chk)
-        drr_row3h.addWidget(QLabel("N"))
-        drr_row3h.addWidget(self.drr_fit_n_spin)
-        drr_row3h.addStretch(1)
+        drr_row3h.addWidget(self.drr_fit_btn, 0, 0, 1, 3)
+        drr_row3h.addWidget(self.drr_fit_clear_btn, 1, 0, 1, 3)
+        drr_row3h.addWidget(self.drr_fit_show_chk, 2, 0)
+        drr_row3h.addWidget(QLabel("N"), 2, 1)
+        drr_row3h.addWidget(self.drr_fit_n_spin, 2, 2)
+        drr_row3h.setColumnStretch(2, 1)
         analysis_form.addRow("", drr_row3)
         analysis_form.addRow("", self.drr_fit_status)
         self.drr_analysis_text = QPlainTextEdit()
@@ -529,6 +575,7 @@ class FeatureTabsMixin:
         layout.setSpacing(6)
 
         params = QGroupBox("Plot Options")
+        params.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         params_layout = QVBoxLayout(params)
         params_layout.setContentsMargins(6, 6, 6, 4)
         params_layout.setSpacing(4)
@@ -547,6 +594,9 @@ class FeatureTabsMixin:
             spin.setRange(-360.0, 360.0)
             spin.setValue(default)
             spin.setSuffix(" deg")
+            spin.setMinimumWidth(164)
+            spin.setMaximumWidth(180)
+            spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             spin.setToolTip("Approximate reference angle; matching uses the tolerance below.")
             return spin
 
@@ -567,23 +617,30 @@ class FeatureTabsMixin:
             "Suggest editable K/Kp references when exactly two filename-angle clusters are detected."
         )
         self.cmp_auto_assign_btn = QPushButton("Auto Detect")
+        for button in (self.cmp_infer_angles_btn, self.cmp_auto_assign_btn):
+            button.setMinimumWidth(button.fontMetrics().horizontalAdvance(button.text()) + 12)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         angle_box = QWidget()
         angle_grid = QGridLayout(angle_box)
         angle_grid.setContentsMargins(0, 0, 0, 0)
         angle_grid.setHorizontalSpacing(6)
         angle_grid.setVerticalSpacing(4)
         angle_grid.addWidget(QLabel("In K"), 0, 0)
-        angle_grid.addWidget(self.cmp_in_k_angle_spin, 0, 1)
-        angle_grid.addWidget(QLabel("In Kp"), 0, 2)
-        angle_grid.addWidget(self.cmp_in_kp_angle_spin, 0, 3)
-        angle_grid.addWidget(QLabel("Out K"), 1, 0)
-        angle_grid.addWidget(self.cmp_out_k_angle_spin, 1, 1)
-        angle_grid.addWidget(QLabel("Out Kp"), 1, 2)
-        angle_grid.addWidget(self.cmp_out_kp_angle_spin, 1, 3)
-        angle_grid.addWidget(QLabel("Tolerance"), 2, 0)
-        angle_grid.addWidget(self.cmp_angle_tolerance_spin, 2, 1)
-        angle_grid.addWidget(self.cmp_infer_angles_btn, 2, 2)
-        angle_grid.addWidget(self.cmp_auto_assign_btn, 2, 3)
+        angle_grid.addWidget(self.cmp_in_k_angle_spin, 0, 1, 1, 3)
+        angle_grid.addWidget(QLabel("In Kp"), 1, 0)
+        angle_grid.addWidget(self.cmp_in_kp_angle_spin, 1, 1, 1, 3)
+        angle_grid.addWidget(QLabel("Out K"), 2, 0)
+        angle_grid.addWidget(self.cmp_out_k_angle_spin, 2, 1, 1, 3)
+        angle_grid.addWidget(QLabel("Out Kp"), 3, 0)
+        angle_grid.addWidget(self.cmp_out_kp_angle_spin, 3, 1, 1, 3)
+        angle_grid.addWidget(QLabel("Tolerance"), 4, 0)
+        angle_grid.addWidget(self.cmp_angle_tolerance_spin, 4, 1, 1, 3)
+        # Keep the two long actions on a dedicated row so each retains its
+        # full label at the 380 px sidebar width.
+        angle_grid.addWidget(self.cmp_infer_angles_btn, 5, 0, 1, 4)
+        angle_grid.addWidget(self.cmp_auto_assign_btn, 6, 0, 1, 4)
+        angle_grid.setColumnStretch(1, 1)
+        angle_grid.setColumnStretch(3, 1)
         angle_grid.setColumnStretch(4, 1)
         assignment_form.addRow("Angle Rules", angle_box)
         assignment_layout.addLayout(assignment_form)
@@ -644,7 +701,7 @@ class FeatureTabsMixin:
         self.cmp_vp_background_spin.setDecimals(6)
         self.cmp_vp_background_spin.setRange(-1.0e12, 1.0e12)
         self.cmp_vp_background_spin.setSingleStep(100.0)
-        self.cmp_vp_background_spin.setFixedWidth(UI_METRICS["spin_w"] + 18)
+        self.cmp_vp_background_spin.setFixedWidth(116)
         self.cmp_vp_auto_background_chk = QCheckBox("Auto")
         self.cmp_vp_auto_background_chk.setChecked(True)
         self.cmp_vp_auto_background_chk.setToolTip("Estimate one constant background from KK and KKp.")
@@ -672,12 +729,15 @@ class FeatureTabsMixin:
         params_layout.addWidget(self._make_expander("VP", vp_box, expanded=False))
 
         cfg = QFormLayout()
+        cfg.setRowWrapPolicy(QFormLayout.WrapLongRows)
         cfg.setHorizontalSpacing(6)
         cfg.setVerticalSpacing(4)
         _grid, spins, _, _, cmap, fix_checks = self._build_common_range_grid("cmp", "turbo")
         self.cmp_yaxis_controls = self._build_y_axis_controls("cmp")
+        self.cmp_yaxis_combo.setMinimumWidth(200)
+        self.cmp_yaxis_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         _cmp_yc_row = QWidget()
-        _cmp_yc_h = QHBoxLayout(_cmp_yc_row)
+        _cmp_yc_h = QVBoxLayout(_cmp_yc_row)
         _cmp_yc_h.setContentsMargins(0, 0, 0, 0)
         _cmp_yc_h.setSpacing(6)
         _cmp_yc_h.addWidget(self.cmp_yaxis_combo, 1)
@@ -687,8 +747,10 @@ class FeatureTabsMixin:
         cfg.addRow("", self.cmp_yaxis_advanced_box)
         params_layout.addLayout(cfg)
         for s in spins.values():
-            s.setFixedWidth(UI_METRICS["spin_w"])
-            s.setFixedHeight(UI_METRICS["input_h"])
+            s.setMinimumWidth(116)
+            s.setMaximumWidth(120)
+            s.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            s.setMinimumHeight(UI_METRICS["input_h"])
 
         self.cmp_auto_v_btn = QToolButton()
         self.cmp_auto_x_btn = QToolButton()
@@ -696,22 +758,20 @@ class FeatureTabsMixin:
         basic = QGroupBox("Axis Ranges")
         basic_form = QFormLayout(basic)
         basic_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
+        basic_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         basic_form.setHorizontalSpacing(4)
         basic_form.setVerticalSpacing(UI_METRICS["row_spacing"])
         basic_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         basic_form.addRow(
-            "vmin / vmax",
-            self._make_axis_range_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.cmp_auto_v_btn, "Auto V"),
+            self._make_axis_range_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.cmp_auto_v_btn, "Auto V", dense=True, label_text="vmin / vmax"),
         )
         basic_form.addRow("Color scale", self.cmp_split_scale_chk)
         basic_form.addRow(self.cmp_split_scale_panel)
         basic_form.addRow(
-            "xmin / xmax",
-            self._make_axis_range_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.cmp_auto_x_btn, "Auto X"),
+            self._make_axis_range_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.cmp_auto_x_btn, "Auto X", dense=True, label_text="xmin / xmax"),
         )
         basic_form.addRow(
-            "ymin / ymax",
-            self._make_axis_range_row(spins["ymin"], spins["ymax"], fix_checks["ymin"], fix_checks["ymax"], self.cmp_auto_y_btn, "Auto Y"),
+            self._make_axis_range_row(spins["ymin"], spins["ymax"], fix_checks["ymin"], fix_checks["ymax"], self.cmp_auto_y_btn, "Auto Y", dense=True, label_text="ymin / ymax"),
         )
         basic_form.addRow("Cursor Gate", spins["gate"])
         flags = QWidget()
@@ -760,7 +820,8 @@ class FeatureTabsMixin:
         self.mcd_selection_summary.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.mcd_select_source_btn = QPushButton("Select...")
         self.mcd_select_source_btn.setFixedHeight(30)
-        self.mcd_select_source_btn.setMaximumWidth(92)
+        self.mcd_select_source_btn.setMinimumWidth(110)
+        self.mcd_select_source_btn.setMaximumWidth(110)
         self.mcd_clear_source_btn = QPushButton("Clear")
         self.mcd_clear_source_btn.setFixedHeight(30)
         self.mcd_clear_source_btn.setMaximumWidth(72)
@@ -797,26 +858,27 @@ class FeatureTabsMixin:
             "Detect the available angles in the selected CSV. When enabled, the largest angle is assigned to sigma+ and the smallest to sigma-. "
             "Turn this off to choose the sigma+ and sigma- assignments yourself."
         )
-        self.mcd_sigma_plus_combo = QComboBox(); self.mcd_sigma_minus_combo = QComboBox()
+        self.mcd_sigma_plus_combo = QComboBox(); self.mcd_sigma_plus_combo.setObjectName("mcd_sigma_plus_combo")
+        self.mcd_sigma_minus_combo = QComboBox(); self.mcd_sigma_minus_combo.setObjectName("mcd_sigma_minus_combo")
         for combo in (self.mcd_sigma_plus_combo, self.mcd_sigma_minus_combo):
             combo.addItem("-- Select source CSV first --", None)
             self._style_combo_popup(combo)
-        self.mcd_reference_mode_combo = QComboBox()
+        self.mcd_reference_mode_combo = QComboBox(); self.mcd_reference_mode_combo.setObjectName("mcd_reference_mode_combo")
         self.mcd_reference_mode_combo.addItems(["Nearest paired B (recommended)", "Median near-zero window"])
         self._style_combo_popup(self.mcd_reference_mode_combo)
         self.mcd_zero_spin = QDoubleSpinBox(); self.mcd_zero_spin.setRange(0.0, 10.0); self.mcd_zero_spin.setDecimals(4); self.mcd_zero_spin.setValue(0.02); self.mcd_zero_spin.setSuffix(" T")
         self.mcd_zero_spin.setEnabled(False)
         self.mcd_gap_spin = QSpinBox(); self.mcd_gap_spin.setRange(1, 50); self.mcd_gap_spin.setValue(3)
         self.mcd_delta_b_spin = QDoubleSpinBox(); self.mcd_delta_b_spin.setRange(0.0001, 10.0); self.mcd_delta_b_spin.setDecimals(4); self.mcd_delta_b_spin.setValue(0.1); self.mcd_delta_b_spin.setSuffix(" T")
-        self.mcd_pair_alignment_combo = QComboBox(); self.mcd_pair_alignment_combo.addItems(["Direct measured pair", "Interpolate both angles to Bpair"])
+        self.mcd_pair_alignment_combo = QComboBox(); self.mcd_pair_alignment_combo.setObjectName("mcd_pair_alignment_combo"); self.mcd_pair_alignment_combo.addItems(["Direct measured pair", "Interpolate both angles to Bpair"])
         self.mcd_bin_spin = QSpinBox(); self.mcd_bin_spin.setRange(0, 6); self.mcd_bin_spin.setValue(3)
-        self.mcd_gain_combo = QComboBox(); self.mcd_gain_combo.addItems(["Per wavelength", "Smoothed per wavelength", "Scalar (diagnostic only)"])
-        self.mcd_correction_mode_combo = QComboBox(); self.mcd_correction_mode_combo.addItems([
+        self.mcd_gain_combo = QComboBox(); self.mcd_gain_combo.setObjectName("mcd_gain_combo"); self.mcd_gain_combo.addItems(["Per wavelength", "Smoothed per wavelength", "Scalar (diagnostic only)"])
+        self.mcd_correction_mode_combo = QComboBox(); self.mcd_correction_mode_combo.setObjectName("mcd_correction_mode_combo"); self.mcd_correction_mode_combo.addItems([
             "Global reference gain (current)", "Global gain + per-pair scale", "Global gain + per-pair scale/offset",
             "Global gain + per-pair spectral baseline",
         ])
         self.mcd_correction_mode_combo.setCurrentIndex(3)
-        self.mcd_spectral_order_combo = QComboBox(); self.mcd_spectral_order_combo.addItems([
+        self.mcd_spectral_order_combo = QComboBox(); self.mcd_spectral_order_combo.setObjectName("mcd_spectral_order_combo"); self.mcd_spectral_order_combo.addItems([
             "Linear", "Quadratic (default)",
         ])
         self.mcd_spectral_order_combo.setCurrentIndex(1)
@@ -824,6 +886,7 @@ class FeatureTabsMixin:
         self.mcd_background_ranges_edit = QLineEdit()
         self.mcd_background_ranges_edit.setPlaceholderText("Auto outer 15%, or e.g. 1.50-1.58, 1.73-1.79")
         self.mcd_suggest_background_btn = QPushButton("Select protected regions")
+        self.mcd_suggest_background_btn.setAccessibleName("Select protected regions")
         self.mcd_suggest_background_btn.setToolTip(
             "Draw persistent feature-protection windows on the full-sweep reflection plot. "
             "Every sufficiently wide unprotected interval updates automatically as a background band."
@@ -833,10 +896,12 @@ class FeatureTabsMixin:
         self.mcd_background_preview.setMinimumWidth(0)
         self.mcd_background_preview.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.mcd_apply_correction_btn = QPushButton("Recalculate now")
+        self.mcd_apply_correction_btn.setAccessibleName("Recalculate now")
         self.mcd_apply_correction_btn.setToolTip(
             "MCD processing updates automatically after settings settle. Click to recalculate immediately or retry after an error."
         )
-        self.mcd_dark_pos_combo = QComboBox(); self.mcd_dark_neg_combo = QComboBox()
+        self.mcd_dark_pos_combo = QComboBox(); self.mcd_dark_pos_combo.setObjectName("mcd_dark_pos_combo")
+        self.mcd_dark_neg_combo = QComboBox(); self.mcd_dark_neg_combo.setObjectName("mcd_dark_neg_combo")
         for combo in (self.mcd_dark_pos_combo, self.mcd_dark_neg_combo):
             combo.addItem("-- No dark / offset file --", "")
             self._style_combo_popup(combo)
@@ -925,7 +990,7 @@ class FeatureTabsMixin:
         form.addRow("Pair dB", self.mcd_delta_b_spin)
         form.addRow("Gain", self.mcd_gain_combo)
         form.addRow("Drift correction", self.mcd_correction_mode_combo)
-        form.addRow("", self.mcd_apply_correction_btn)
+        form.addRow(self.mcd_apply_correction_btn)
         advanced_correction = QGroupBox("Advanced correction")
         advanced_form = QFormLayout(advanced_correction)
         advanced_form.setContentsMargins(4, 3, 4, 3)
@@ -934,7 +999,7 @@ class FeatureTabsMixin:
         advanced_form.addRow("Pair B alignment", self.mcd_pair_alignment_combo)
         advanced_form.addRow("B bin decimals", self.mcd_bin_spin)
         advanced_form.addRow("Fit bg E (eV)", self.mcd_background_ranges_edit)
-        advanced_form.addRow("", self.mcd_suggest_background_btn)
+        advanced_form.addRow(self.mcd_suggest_background_btn)
         advanced_form.addRow("Background", self.mcd_background_preview)
         advanced_form.addRow("Spectral fit", self.mcd_spectral_order_combo)
         advanced_form.addRow("Dark sigma+", self.mcd_dark_pos_combo)
@@ -958,6 +1023,7 @@ class FeatureTabsMixin:
 
         display = QGroupBox("Display and MCD(B)")
         display_form = QFormLayout(display)
+        display_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         display_form.setContentsMargins(6, 4, 6, 4)
         display_form.setHorizontalSpacing(6)
         display_form.setVerticalSpacing(3)
@@ -974,10 +1040,13 @@ class FeatureTabsMixin:
             # cap their width while retaining a usable minimum.  They must not
             # be Ignored: the trailing stretch in _pair_row would then shrink
             # the Energy/B-field inputs to zero width.
-            spin.setMinimumWidth(72)
+            spin.setMinimumWidth(116)
+            spin.setMaximumWidth(130)
             spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.mcd_center_zero_chk = QCheckBox("Zero-centered"); self.mcd_center_zero_chk.setChecked(True)
         self.mcd_auto_v_btn = QPushButton("Auto color")
+        self.mcd_auto_v_btn.setMinimumWidth(136)
+        self.mcd_auto_v_btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         self.mcd_pair_b_combo = QComboBox(); self._style_combo_popup(self.mcd_pair_b_combo)
         self.mcd_pair_b_combo.setToolTip(
             "Choose the paired measurement used for the spectra and MCD linecut. "
@@ -1018,8 +1087,8 @@ class FeatureTabsMixin:
         for combo in (self.mcd_map_combo, self.mcd_pair_b_combo, self.mcd_cmap, self.mcd_window_metric_combo):
             combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             combo.setMinimumContentsLength(10)
-            combo.setMinimumWidth(0)
-            combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            combo.setMinimumWidth(120)
+            combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         display_form.addRow("Map", self.mcd_map_combo)
         display_form.addRow("Color", self._pair_row(self.mcd_spins["vmin"], self.mcd_spins["vmax"], self.mcd_auto_v_btn))
         display_form.addRow("Energy", self._pair_row(self.mcd_spins["xmin"], self.mcd_spins["xmax"]))
@@ -1043,10 +1112,13 @@ class FeatureTabsMixin:
         layout.setSpacing(6)
         source = QGroupBox("Reflection peak source")
         form = QFormLayout(source)
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         self.mcd_peak_source_summary = QLabel("No MCD result loaded. Load an MCD sweep to begin.")
         self.mcd_peak_source_summary.setWordWrap(True)
         self.mcd_peak_source_combo = QComboBox()
         self.mcd_peak_source_combo.addItems(["Corrected average", "Corrected pos", "Corrected neg", "Raw average", "Raw pos", "Raw neg"])
+        self.mcd_peak_source_combo.setMinimumWidth(210)
+        self.mcd_peak_source_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.mcd_peak_source_combo.setToolTip("Reflection spectrum used for peak detection; this is not the raw K-K' intensity difference.")
         self.mcd_peak_display_combo = QComboBox()
         self.mcd_peak_display_combo.addItems(["Delta E", "Absolute E"])
@@ -1057,16 +1129,35 @@ class FeatureTabsMixin:
         layout.addWidget(source)
         controls = QGroupBox("Detection and tracking")
         cform = QFormLayout(controls)
+        cform.setHorizontalSpacing(6)
+        cform.setVerticalSpacing(4)
         self.mcd_peak_prom_spin = QDoubleSpinBox(); self.mcd_peak_prom_spin.setRange(0.0, 1.0); self.mcd_peak_prom_spin.setDecimals(3); self.mcd_peak_prom_spin.setValue(0.03)
         self.mcd_peak_dist_spin = QSpinBox(); self.mcd_peak_dist_spin.setRange(1, 500); self.mcd_peak_dist_spin.setValue(5)
         self.mcd_peak_smooth_spin = QSpinBox(); self.mcd_peak_smooth_spin.setRange(3, 101); self.mcd_peak_smooth_spin.setSingleStep(2); self.mcd_peak_smooth_spin.setValue(7)
         self.mcd_peak_jump_spin = QDoubleSpinBox(); self.mcd_peak_jump_spin.setRange(0.0001, 2.0); self.mcd_peak_jump_spin.setDecimals(4); self.mcd_peak_jump_spin.setValue(0.04); self.mcd_peak_jump_spin.setSuffix(" eV")
         self.mcd_peak_max_spin = QSpinBox(); self.mcd_peak_max_spin.setRange(1, 12); self.mcd_peak_max_spin.setValue(6)
-        cform.addRow("Prominence fraction", self.mcd_peak_prom_spin)
-        cform.addRow("Minimum separation", self.mcd_peak_dist_spin)
-        cform.addRow("Smoothing points", self.mcd_peak_smooth_spin)
-        cform.addRow("Maximum jump", self.mcd_peak_jump_spin)
-        cform.addRow("Maximum peaks", self.mcd_peak_max_spin)
+        for spin in (self.mcd_peak_prom_spin, self.mcd_peak_dist_spin, self.mcd_peak_smooth_spin, self.mcd_peak_jump_spin, self.mcd_peak_max_spin):
+            spin.setMinimumWidth(128 if isinstance(spin, QDoubleSpinBox) else 72)
+            spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.mcd_peak_prom_spin.setToolTip("Prominence fraction used for reflection-peak detection.")
+        self.mcd_peak_dist_spin.setToolTip("Minimum separation between detected peaks, in points.")
+        self.mcd_peak_smooth_spin.setToolTip("Smoothing window length, in points.")
+        self.mcd_peak_jump_spin.setToolTip("Maximum allowed peak jump in eV.")
+        self.mcd_peak_max_spin.setToolTip("Maximum number of peaks to track.")
+        def _peak_control_row(label: str, spin: QAbstractSpinBox) -> QWidget:
+            row = QWidget()
+            row_layout = QVBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(2)
+            row_layout.addWidget(QLabel(label))
+            row_layout.addWidget(spin)
+            return row
+
+        cform.addRow(_peak_control_row("Prominence fraction", self.mcd_peak_prom_spin))
+        cform.addRow(_peak_control_row("Minimum separation", self.mcd_peak_dist_spin))
+        cform.addRow(_peak_control_row("Smoothing points", self.mcd_peak_smooth_spin))
+        cform.addRow(_peak_control_row("Maximum jump", self.mcd_peak_jump_spin))
+        cform.addRow(_peak_control_row("Maximum peaks", self.mcd_peak_max_spin))
         row = QHBoxLayout()
         self.mcd_peak_analyze_btn = QPushButton("Analyze")
         self.mcd_peak_analyze_btn.setAccessibleName("Analyze MCD reflection peak shifts")
@@ -1251,6 +1342,8 @@ class FeatureTabsMixin:
         self.shg_files.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.shg_files.setToolTip("Select an SHG sweep CSV to load")
         self.shg_background_combo = QComboBox()
+        self.shg_background_combo.setMinimumWidth(124)
+        self.shg_background_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._style_combo_popup(self.shg_background_combo)
         self.shg_summary = QPlainTextEdit()
         self.shg_summary.setReadOnly(True)
@@ -1311,7 +1404,8 @@ class FeatureTabsMixin:
             spin.setRange(0.0, 5000.0)
             spin.setSingleStep(0.1)
             spin.setValue(value)
-            spin.setFixedWidth(UI_METRICS["spin_w"] + 12)
+            spin.setMinimumWidth(128)
+            spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             return spin
 
         integration = QGroupBox("SHG Peak Integration")
@@ -1334,16 +1428,16 @@ class FeatureTabsMixin:
         self.shg_sigma_clip_spin.setRange(1.0, 10.0)
         self.shg_sigma_clip_spin.setSingleStep(0.5)
         self.shg_sigma_clip_spin.setValue(3.0)
-        self.shg_sigma_clip_spin.setFixedWidth(UI_METRICS["spin_w"])
+        self.shg_sigma_clip_spin.setMinimumWidth(88)
+        self.shg_sigma_clip_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         def value_row(spin: QDoubleSpinBox, suffix: str = "nm") -> QWidget:
             widget = QWidget()
-            row_layout = QHBoxLayout(widget)
+            row_layout = QVBoxLayout(widget)
             row_layout.setContentsMargins(0, 0, 0, 0)
-            row_layout.setSpacing(6)
+            row_layout.setSpacing(3)
             row_layout.addWidget(spin)
             row_layout.addWidget(QLabel(suffix))
-            row_layout.addStretch(1)
             return widget
 
         integration_form.addRow("Integration wavelength", value_row(self.shg_peak_center_spin))
@@ -1386,6 +1480,7 @@ class FeatureTabsMixin:
 
         angle_box = QGroupBox("Measured Angle")
         angle_form = QFormLayout(angle_box)
+        angle_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
         angle_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
         angle_form.setSpacing(6)
         self.shg_angle_scale_spin = QDoubleSpinBox()
@@ -1396,6 +1491,10 @@ class FeatureTabsMixin:
         self.shg_angle_offset_spin.setDecimals(6)
         self.shg_angle_offset_spin.setRange(-1.0e6, 1.0e6)
         self.shg_angle_offset_spin.setValue(0.0)
+        for spin in (self.shg_angle_scale_spin, self.shg_angle_offset_spin):
+            spin.setMinimumWidth(180)
+            spin.setMaximumWidth(180)
+            spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.shg_angle_wrap_combo = QComboBox()
         self.shg_angle_wrap_combo.addItems(["None", "0-180°", "0-360°"])
         self._style_combo_popup(self.shg_angle_wrap_combo)
@@ -1425,13 +1524,16 @@ class FeatureTabsMixin:
             spin.setRange(-1.0e6, 1.0e6)
             spin.setValue(value)
         fit_range_row = QWidget()
-        fit_range_layout = QHBoxLayout(fit_range_row)
+        fit_range_layout = QVBoxLayout(fit_range_row)
         fit_range_layout.setContentsMargins(0, 0, 0, 0)
-        fit_range_layout.setSpacing(6)
+        fit_range_layout.setSpacing(3)
+        for spin in (self.shg_fit_min_spin, self.shg_fit_max_spin):
+            spin.setMinimumWidth(128)
+            spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        fit_range_layout.addWidget(QLabel("Minimum"))
         fit_range_layout.addWidget(self.shg_fit_min_spin)
-        fit_range_layout.addWidget(QLabel("to"))
+        fit_range_layout.addWidget(QLabel("Maximum"))
         fit_range_layout.addWidget(self.shg_fit_max_spin)
-        fit_range_layout.addWidget(QLabel("deg"))
         self.shg_fit_weighted_chk = QCheckBox("Use area uncertainty weights")
         self.shg_fit_weighted_chk.setChecked(True)
         self.shg_fit_include_excluded_chk = QCheckBox("Include excluded acquisition rows")

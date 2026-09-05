@@ -85,14 +85,15 @@ class WorkspaceShellTests(unittest.TestCase):
             self.assertIs(window.workspace_stack.widget(0), window.workspace_splitter)
             self.assertIs(window.workspace_stack.widget(1), window.presentation_widget)
             self.assertEqual(window.centralWidget().layout().count(), 2)
-            self.assertIs(window.data_source_context.parentWidget(), window.left_panel)
-            self.assertIs(window.left_panel.layout().itemAt(1).widget(), window.data_source_context)
+            self.assertIs(window.centralWidget().layout().itemAt(1).widget(), window.workspace_stack)
+            self.assertIs(window.data_source_context.parentWidget(), window.menu_toolbar_host.main_toolbar)
+            self.assertTrue(window.data_source_context.isVisible())
             self.assertFalse(window.tabs.tabBar().isVisible())
             self.assertFalse(window.workspace_splitter.childrenCollapsible())
         finally:
             window.close()
 
-    def test_sidebar_presents_data_source_context_above_workflow_controls(self):
+    def test_toolbar_source_context_is_independent_of_sidebar_and_reuses_source_widgets(self):
         from ui_qt.main_window import MainWindow
 
         window = MainWindow()
@@ -100,13 +101,22 @@ class WorkspaceShellTests(unittest.TestCase):
             window.show()
             self.app.processEvents()
             context = window.data_source_context
-            self.assertTrue(context.isVisible())
-            self.assertIs(context.parentWidget(), window.left_panel)
-            self.assertIs(window.left_panel.layout().itemAt(2).widget(), window.tabs)
+            self.assertIs(context.parentWidget(), window.menu_toolbar_host.main_toolbar)
+            self.assertTrue(window.menu_toolbar_host.source_widget_action.isVisible())
+            self.assertIs(window.recent_folder_combo.lineEdit(), window.folder_edit)
+            self.assertEqual(len(context.findChildren(type(window.folder_edit))), 1)
+            self.assertEqual(
+                len([child for child in window.findChildren(type(window.folder_edit)) if child.objectName() == "folderEdit"]),
+                1,
+            )
+            self.assertEqual(
+                len([child for child in window.findChildren(type(window.browse_btn)) if child.objectName() in {"browseFolderButton", "openFileButton", "refreshButton"}]),
+                3,
+            )
             window.sidebar_toggle_btn.setChecked(False)
             self.app.processEvents()
             self.assertFalse(window.left_panel.isVisible())
-            self.assertFalse(context.isVisible())
+            self.assertTrue(window.menu_toolbar_host.source_widget_action.isVisible())
 
             slides_index = next(
                 index for index in range(window.tabs.count())
@@ -114,7 +124,26 @@ class WorkspaceShellTests(unittest.TestCase):
             )
             window.workflow_tabs.setCurrentIndex(slides_index)
             self.app.processEvents()
+            self.assertFalse(window.menu_toolbar_host.source_widget_action.isVisible())
+            self.assertFalse(window.menu_toolbar_host.source_separator_action.isVisible())
             self.assertFalse(context.isVisible())
+            window.tabs.setCurrentIndex(0)
+            self.app.processEvents()
+            self.assertTrue(window.menu_toolbar_host.source_widget_action.isVisible())
+            self.assertTrue(window.menu_toolbar_host.source_separator_action.isVisible())
+        finally:
+            window.close()
+
+    def test_sidebar_starts_with_workflow_controls_without_data_source_banner(self):
+        from ui_qt.main_window import MainWindow
+
+        window = MainWindow()
+        try:
+            layout = window.left_panel.layout()
+            widgets = [layout.itemAt(i).widget() for i in range(layout.count()) if layout.itemAt(i).widget()]
+            self.assertFalse(any(getattr(widget, "title", lambda: "")() == "Data Source" for widget in widgets))
+            self.assertFalse(any(getattr(widget, "property", lambda *_: None)("appRole") == "stepBanner" for widget in widgets))
+            self.assertIs(widgets[0], window.tabs)
         finally:
             window.close()
 

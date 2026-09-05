@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -14,11 +16,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QLineEdit, QListWidget, QScrollArea, QSplitter, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QLineEdit, QListWidget, QScrollArea, QSplitter, QStyle, QStyleOptionSpinBox, QToolButton, QWidget
 
 from core.loader import DataCube
 from core.drr_sources import DrrSource
 from ui_qt.main_window import LoadedState, MainWindow, UI_METRICS
+from ui_qt.theme import install_theme
 from tests.ui_test_helpers import wait_for_file_catalog
 
 
@@ -26,6 +29,9 @@ class SplitScaleControlTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
+        # Match packaged startup: Fluent light theme is installed before any
+        # real MainWindow is constructed so QSS-driven size hints are active.
+        install_theme(cls.app, mode="light")
 
     def setUp(self) -> None:
         with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
@@ -73,6 +79,168 @@ class SplitScaleControlTests(unittest.TestCase):
         right_edge = max(child.geometry().right() for child in visible_children)
         self.assertLessEqual(right_edge, panel.contentsRect().right())
 
+    def test_axis_range_rows_keep_fix_and_auto_controls_contained(self) -> None:
+        """Real PL/DRR/Compare/Power rows stay contained on the production platform."""
+        if QApplication.platformName() == "offscreen":
+            env = os.environ.copy()
+            env["QT_QPA_PLATFORM"] = "windows"
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "unittest",
+                    "tests.test_ui_split_scale_controls.SplitScaleControlTests.test_axis_range_rows_keep_fix_and_auto_controls_contained",
+                    "-v",
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=180,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return
+
+        self.window.workspace_splitter.setSizes([UI_METRICS["left_width"], 900])
+        self.assertEqual(self.window.left_panel.width(), UI_METRICS["left_width"])
+
+        for mode, prefix in (("PL", "pl"), ("DRR", "drr"), ("Compare", "cmp"), ("Power", "power")):
+            tab_index = next(i for i in range(self.window.tabs.count()) if self.window.tabs.tabText(i) == mode)
+            self.window.tabs.setCurrentIndex(tab_index)
+            scroll = getattr(self.window, f"{prefix}_tab_scroll")
+            manual_heads = [
+                button
+                for button in scroll.widget().findChildren(QToolButton)
+                if button.text() == "Manual plot ranges"
+            ]
+            self.assertEqual(len(manual_heads), 1)
+            manual_heads[0].setChecked(True)
+            scroll.widget().layout().activate()
+            self.app.processEvents()
+            axis_box = next(
+                group for group in scroll.widget().findChildren(QWidget)
+                if getattr(group, "title", lambda: None)() == "Axis Ranges"
+            )
+            self.assertTrue(axis_box.isVisible())
+            spins = getattr(self.window, f"{prefix}_spins")
+            fixes = getattr(self.window, f"{prefix}_fix_checks")
+
+            for axis, auto_name in (("v", "auto_v"), ("x", "auto_x"), ("y", "auto_y")):
+                first = spins[f"{axis}min"]
+                second = spins[f"{axis}max"]
+                first_fix = fixes[f"{axis}min"]
+                second_fix = fixes[f"{axis}max"]
+                auto = getattr(self.window, f"{prefix}_{auto_name}_btn")
+                row = first.parentWidget()
+                self.assertIs(row, second.parentWidget())
+                self.assertIs(row, first_fix.parentWidget())
+                self.assertIs(row, second_fix.parentWidget())
+                self.assertIs(row, auto.parentWidget())
+                self.assertTrue(axis_box.contentsRect().contains(row.geometry()))
+                self.assertGreater(row.width(), 0)
+
+                row_widgets = [
+                    row.layout().itemAt(index).widget()
+                    for index in range(row.layout().count())
+                    if row.layout().itemAt(index).widget() is not None
+                    and row.layout().itemAt(index).widget().isVisible()
+                ]
+                expected_widgets = [first, first_fix, second, second_fix, auto]
+                label_widget = row.layout().labelWidget() if hasattr(row.layout(), "labelWidget") else None
+                if label_widget is not None and label_widget.isVisible():
+                    expected_widgets.insert(0, label_widget)
+                self.assertEqual(row_widgets[:len(expected_widgets)], expected_widgets)
+                for child in row_widgets:
+                    self.assertTrue(row.contentsRect().contains(child.geometry()))
+                self.assertLessEqual(
+                    max(child.geometry().bottom() for child in row_widgets),
+                    row.contentsRect().bottom(),
+                )
+                for index, previous in enumerate(row_widgets):
+                    for current in row_widgets[index + 1 :]:
+                        self.assertFalse(previous.geometry().intersects(current.geometry()))
+                self.assertGreaterEqual(
+                    auto.width(), auto.fontMetrics().horizontalAdvance(auto.text()) + 12
+                )
+                self.assertGreaterEqual(
+                    first_fix.width(), first_fix.fontMetrics().horizontalAdvance(first_fix.text()) + 20
+                )
+                self.assertGreaterEqual(first_fix.width(), first_fix.minimumSizeHint().width())
+                self.assertTrue(row.contentsRect().contains(auto.geometry()))
+                self.assertTrue(axis_box.contentsRect().contains(row.geometry()))
+
+                if prefix == "power":
+                    themed_min_height = max(
+                        spin.minimumSizeHint().height() for spin in (first, second)
+                    )
+                    for spin in (first, second):
+                        self.assertGreaterEqual(
+                            spin.height(),
+                            themed_min_height,
+                            f"{mode} {axis} spinbox is below themed minimum height",
+                        )
+
+            # Verify the same production spinbox style in normal and read-only states.
+            spin = spins["vmin"]
+            original_read_only = spin.isReadOnly()
+            original_property = spin.property("readOnly")
+            try:
+                for read_only in (False, True):
+                    spin.setReadOnly(read_only)
+                    spin.setProperty("readOnly", read_only)
+                    spin.style().unpolish(spin)
+                    spin.style().polish(spin)
+                    self.app.processEvents()
+                    option = QStyleOptionSpinBox()
+                    spin.initStyleOption(option)
+                    edit = spin.style().subControlRect(
+                        QStyle.CC_SpinBox, option, QStyle.SC_SpinBoxEditField, spin
+                    )
+                    up = spin.style().subControlRect(
+                        QStyle.CC_SpinBox, option, QStyle.SC_SpinBoxUp, spin
+                    )
+                    down = spin.style().subControlRect(
+                        QStyle.CC_SpinBox, option, QStyle.SC_SpinBoxDown, spin
+                    )
+                    self.assertFalse(edit.intersects(up))
+                    self.assertFalse(edit.intersects(down))
+                    self.assertTrue(spin.rect().contains(up))
+                    self.assertTrue(spin.rect().contains(down))
+            finally:
+                spin.setReadOnly(original_read_only)
+                spin.setProperty("readOnly", original_property)
+                spin.style().unpolish(spin)
+                spin.style().polish(spin)
+                self.app.processEvents()
+
+    def test_axis_range_rows_fit_ordinary_formatted_values_at_minimum_sidebar(self) -> None:
+        """Negative ordinary bounds remain fully visible beside steppers and actions."""
+        self.window.workspace_splitter.setSizes([UI_METRICS["left_width"], 900])
+        self.assertEqual(self.window.left_panel.width(), UI_METRICS["left_width"])
+        for mode, prefix in (("PL", "pl"), ("DRR", "drr"), ("Compare", "cmp"), ("Power", "power")):
+            tab_index = next(i for i in range(self.window.tabs.count()) if self.window.tabs.tabText(i) == mode)
+            self.window.tabs.setCurrentIndex(tab_index)
+            page = self.window.tabs.widget(tab_index)
+            head = next((button for button in page.findChildren(QToolButton) if button.text() == "Manual plot ranges"), None)
+            if head is not None:
+                head.setChecked(True)
+            self.app.processEvents()
+            spins = getattr(self.window, f"{prefix}_spins")
+            for axis in ("v", "x", "y"):
+                first, second = spins[f"{axis}min"], spins[f"{axis}max"]
+                first.setValue(-12.0)
+                second.setValue(12.0)
+                self.app.processEvents()
+                for spin in (first, second):
+                    line = spin.lineEdit()
+                    margins = line.textMargins()
+                    available = line.contentsRect().width() - margins.left() - margins.right()
+                    self.assertGreaterEqual(
+                        available,
+                        line.fontMetrics().horizontalAdvance(spin.text()),
+                        f"{mode} {axis} {spin.text()}",
+                    )
+
     def test_empty_canvas_guidance_is_passive_and_tracks_scientific_axes(self) -> None:
         overlay = self.window.empty_canvas_overlay
         self.assertTrue(overlay.isVisible())
@@ -92,12 +260,11 @@ class SplitScaleControlTests(unittest.TestCase):
         self.assertTrue(overlay.isVisible())
 
     def test_data_source_spacing_is_tight_at_default_sidebar_width(self) -> None:
-        self.window.workspace_splitter.setSizes([UI_METRICS["left_width"], 900])
+        self.window.show()
         self.app.processEvents()
         margins = self.window.data_source_context.layout().contentsMargins()
-        self.assertEqual((margins.left(), margins.top(), margins.right(), margins.bottom()), (8, 4, 8, 6))
-        self.assertEqual(self.window.data_source_context.layout().horizontalSpacing(), 6)
-        self.assertEqual(self.window.data_source_context.layout().verticalSpacing(), 6)
+        self.assertEqual((margins.left(), margins.top(), margins.right(), margins.bottom()), (0, 0, 0, 0))
+        self.assertEqual(self.window.data_source_context.layout().spacing(), 0)
 
     def test_sidebar_can_resize_within_bounds_and_canvas_remains_dominant(self) -> None:
         splitter = self.window.workspace_splitter
@@ -425,10 +592,25 @@ class SplitScaleControlTests(unittest.TestCase):
 
         scroll = self.window.drr_tab_scroll
         self.assertIsInstance(scroll, QScrollArea)
-        self.assertEqual(scroll.verticalScrollBar().maximum(), 0)
         self.assertEqual(
             scroll.horizontalScrollBarPolicy(), Qt.ScrollBarAlwaysOff
         )
+        self.assertEqual(scroll.horizontalScrollBar().maximum(), 0)
+        self.assertLessEqual(scroll.widget().width(), scroll.viewport().width())
+
+        # The themed compact page may need vertical scrolling, but every
+        # visible control remains reachable without horizontal clipping.
+        for control in (
+            self.window.drr_baseline_combo,
+            self.window.drr_yaxis_combo,
+            self.window.drr_derivative_combo,
+        ):
+            scroll.ensureWidgetVisible(control)
+            self.app.processEvents()
+            top_left = control.mapTo(scroll.viewport(), control.rect().topLeft())
+            bottom_right = control.mapTo(scroll.viewport(), control.rect().bottomRight())
+            self.assertTrue(scroll.viewport().rect().contains(top_left))
+            self.assertTrue(scroll.viewport().rect().contains(bottom_right))
 
     def test_workflow_navigation_is_above_the_collapsible_sidebar(self) -> None:
         self.assertFalse(self.window.tabs.tabBar().isVisible())
@@ -442,6 +624,25 @@ class SplitScaleControlTests(unittest.TestCase):
         self.window.sidebar_toggle_btn.setChecked(True)
         self.app.processEvents()
         self.assertTrue(self.window.left_panel.isVisible())
+
+    def test_source_toolbar_action_is_visible_for_scientific_workflows_and_hidden_for_slides(self) -> None:
+        self.assertTrue(self.window.menu_toolbar_host.source_widget_action.isVisible())
+        slides_index = next(i for i in range(self.window.tabs.count()) if self.window.tabs.tabText(i) == "Slides")
+        self.window.tabs.setCurrentIndex(slides_index)
+        self.app.processEvents()
+        self.assertFalse(self.window.menu_toolbar_host.source_widget_action.isVisible())
+        self.assertFalse(self.window.menu_toolbar_host.source_separator_action.isVisible())
+        self.window.tabs.setCurrentIndex(0)
+        self.app.processEvents()
+        self.assertTrue(self.window.menu_toolbar_host.source_widget_action.isVisible())
+        self.assertTrue(self.window.menu_toolbar_host.source_separator_action.isVisible())
+
+    def test_drag_feedback_still_targets_the_existing_folder_edit(self) -> None:
+        self.window.current_folder = ""
+        self.window._set_drop_highlight(True)
+        self.assertEqual(self.window.folder_edit.property("appRole"), "dropTarget")
+        self.window._set_drop_highlight(False)
+        self.assertIsNone(self.window.folder_edit.property("appRole"))
 
     def test_slides_workspace_is_full_width_and_owns_its_build_controls(self) -> None:
         slides_index = next(

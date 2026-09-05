@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import sys
+import threading
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -16,7 +17,7 @@ from matplotlib.lines import Line2D
 from matplotlib.ticker import PercentFormatter
 from matplotlib.transforms import Bbox
 from matplotlib.widgets import SpanSelector
-from PySide6.QtCore import QFileSystemWatcher, QMimeData, QProcess, QSettings, Qt, QThreadPool, QTimer, QUrl, Signal
+from PySide6.QtCore import QFileSystemWatcher, QMimeData, QProcess, QSettings, Qt, QRunnable, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -146,7 +147,44 @@ from ui_qt.common import (
     Worker,
     WorkerSignals,
 )
+
+
+class _OwnedRunnable(QRunnable):
+    """Execute a MainWindow runnable while retaining it through run return."""
+
+    def __init__(self, pool: "_MainWindowThreadPool", runnable: QRunnable) -> None:
+        super().__init__()
+        self._pool = pool
+        self._runnable = runnable
+
+    def run(self) -> None:
+        try:
+            self._runnable.run()
+        finally:
+            self._pool._run_finished(self._runnable)
+
+
+class _MainWindowThreadPool(QThreadPool):
+    """Per-window pool that owns every runnable until execution has returned."""
+
+    def __init__(self, owner: "MainWindow") -> None:
+        super().__init__(owner)
+        self._owner = owner
+        self._registry_lock = threading.Lock()
+        owner._owned_workers: set[QRunnable] = set()
+
+    def start(self, runnable: QRunnable, priority: int = 0) -> None:
+        if getattr(self._owner, "_is_closing", False):
+            return
+        with self._registry_lock:
+            self._owner._owned_workers.add(runnable)
+        super().start(_OwnedRunnable(self, runnable), priority)
+
+    def _run_finished(self, runnable: QRunnable) -> None:
+        with self._registry_lock:
+            self._owner._owned_workers.discard(runnable)
 from ui_qt.feature_pages import FeatureTabsMixin
+from ui_qt.dense_form_layout import DenseFormRowLayout
 from ui_qt.controllers_pl import PlController
 from ui_qt.controllers_drr import DrrController
 from ui_qt.controllers_mcd import McdController
@@ -237,7 +275,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         register_colormaps()
         self.setWindowTitle("DPTK Desktop (PySide6)")
         self.setMinimumSize(1180, 700)
-        self.thread_pool = QThreadPool.globalInstance()
+        self._is_closing = False
+        self.thread_pool = _MainWindowThreadPool(self)
         self.settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
         saved_mcd_filter = str(
             self.settings.value(self.SETTINGS_MCD_SOURCE_FILTER, "all")
@@ -311,7 +350,6 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         # once per intermediate value.
         self._plot_redraw_timers: dict[str, QTimer] = {}
         self._plot_redraw_pending: set[str] = set()
-        self._is_closing = False
         self._automatic_update_timer: QTimer | None = None
         self._sidebar_last_expanded_width = UI_METRICS["left_width"]
         self._drr_heatmap_ax = None
@@ -424,6 +462,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._is_closing = True
         for timer in self._plot_redraw_timers.values():
             timer.stop()
+        self.folder_refresh_timer.stop()
         self.shg_controller._stop_shg_reprocessing()
         self.mcd_controller._shutdown_mcd_lifecycle()
         if self._automatic_update_timer is not None:
@@ -431,11 +470,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._file_refresh_generation += 1
         self._drr_refresh_generation += 1
         self._watch_generation += 1
-        # Angle/catalog workers may still own an open CSV on Windows.  A short
-        # bounded wait prevents callers (and temporary-folder cleanup) from
-        # racing those reads while keeping close deterministic.
-        if (self._file_refresh_workers or self._drr_refresh_workers or self.mcd_controller._mcd_angle_workers or self._watch_workers):
-            self.thread_pool.waitForDone(3000)
+        # This pool is private to the window, so waiting cannot stall unrelated
+        # global-pool work.  The ownership registry retains each runnable until
+        # its run method has actually returned.
+        self.thread_pool.waitForDone()
         super().closeEvent(event)
 
     def showEvent(self, event) -> None:  # noqa: N802 - Qt API
@@ -528,6 +566,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     current_idx = idx
             self.recent_folder_combo.setCurrentIndex(current_idx)
             self.recent_folder_combo.setEnabled(bool(self.recent_folders))
+            # The combo's display labels are intentionally compact; retain the
+            # complete current path in the shared read-only line edit.
+            if self.current_folder:
+                self.folder_edit.setText(self.current_folder)
+            else:
+                self.folder_edit.clear()
         finally:
             self.recent_folder_combo.blockSignals(old)
 
@@ -556,6 +600,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         return True
 
     def _watch_current_folder(self) -> None:
+        if self._is_closing:
+            return
         self._watch_generation += 1
         generation = self._watch_generation
         watched = list(self.folder_watcher.directories())
@@ -889,6 +935,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self,
             log_dock=self.log_dock,
             results_dock=self.results_dock,
+            data_source_context=self.data_source_context,
         )
         self.menu_toolbar_host.apply_theme(navigation_toolbar=self.toolbar)
         self._theme_manager = theme_manager()
@@ -970,40 +1017,66 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(UI_METRICS["row_spacing"])
 
-        # Workflow step banner
-        steps_label = QLabel("Select  ›  Load  ›  Plot  ›  Export")
-        steps_label.setAlignment(Qt.AlignCenter)
-        set_fluent_property(steps_label, "appRole", "stepBanner")
-        layout.addWidget(steps_label)
-
-        # Data source section
-        folder_box = QGroupBox("Data Source")
-        folder_grid = QGridLayout(folder_box)
-        folder_grid.setContentsMargins(8, 4, 8, 6)
-        folder_grid.setHorizontalSpacing(6)
-        folder_grid.setVerticalSpacing(6)
+        # Shared source controls are composed in the workbench Source Bar.
+        folder_box = QWidget()
+        folder_box.setObjectName("dataSourceContext")
+        folder_grid = QHBoxLayout(folder_box)
+        # Toolbar presentation is intentionally compact: one row with no
+        # group-box framing or extra vertical padding.
+        folder_grid.setContentsMargins(0, 0, 0, 0)
+        folder_grid.setSpacing(0)
         self.folder_edit = QLineEdit()
+        self.folder_edit.setObjectName("folderEdit")
         self.folder_edit.setReadOnly(True)
         self.folder_edit.setPlaceholderText("No folder selected — click Browse or Open File")
         self.folder_edit.setToolTip("Current working folder for data files")
+        apply_accessible_identity(
+            self.folder_edit,
+            name="Current data folder",
+            description="Current working folder for data files",
+            identifier="source.folder",
+        )
         self.browse_btn = QPushButton("Browse Folder")
+        self.browse_btn.setObjectName("browseFolderButton")
         self.browse_btn.setToolTip("Select a folder containing CSV data files")
+        apply_accessible_identity(self.browse_btn, name="Browse Folder", identifier="source.browse")
         self.open_file_btn = QPushButton("Open File")
+        self.open_file_btn.setObjectName("openFileButton")
         self.open_file_btn.setToolTip("Open a single CSV file and set its folder as the working directory")
+        apply_accessible_identity(self.open_file_btn, name="Open File", identifier="source.open")
         self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.setObjectName("refreshButton")
         self.refresh_btn.setToolTip("Re-scan the current folder for new or changed CSV files")
+        apply_accessible_identity(self.refresh_btn, name="Refresh", identifier="source.refresh")
         self.recent_folder_combo = QComboBox()
+        self.recent_folder_combo.setObjectName("recentFolderCombo")
+        self.recent_folder_combo.setEditable(True)
+        self.recent_folder_combo.setLineEdit(self.folder_edit)
+        self.recent_folder_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.recent_folder_combo.setMinimumWidth(0)
+        # Ignored lets this first (stretched) item contract before the fixed
+        # readable action buttons when the toolbar reaches its minimum width.
+        self.recent_folder_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.recent_folder_combo.setToolTip("Switch to a recently used data folder")
+        apply_accessible_identity(
+            self.recent_folder_combo,
+            name="Recent data folders",
+            description="Choose a recently used data folder",
+            identifier="source.recent",
+        )
         self._style_combo_popup(self.recent_folder_combo)
-        folder_grid.addWidget(self.folder_edit, 0, 0, 1, 3)
-        folder_grid.addWidget(self.browse_btn, 1, 0)
-        folder_grid.addWidget(self.open_file_btn, 1, 1)
-        folder_grid.addWidget(self.refresh_btn, 1, 2)
-        folder_grid.addWidget(QLabel("Recent"), 2, 0)
-        folder_grid.addWidget(self.recent_folder_combo, 2, 1, 1, 2)
+        source_label = QLabel("Source:")
+        source_label.setObjectName("sourceLabel")
+        apply_accessible_identity(source_label, name="Data source")
+        folder_grid.addWidget(source_label)
+        folder_grid.addWidget(self.recent_folder_combo, 1)
+        folder_grid.addWidget(self.browse_btn)
+        folder_grid.addWidget(self.open_file_btn)
+        folder_grid.addWidget(self.refresh_btn)
+        QWidget.setTabOrder(self.recent_folder_combo, self.browse_btn)
+        QWidget.setTabOrder(self.browse_btn, self.open_file_btn)
+        QWidget.setTabOrder(self.open_file_btn, self.refresh_btn)
         self.data_source_context = folder_box
-        self.data_source_context.setObjectName("dataSourceContext")
-        layout.addWidget(self.data_source_context)
 
         self.tabs = QTabWidget()
         self.tabs.tabBar().setExpanding(True)
@@ -1031,11 +1104,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        # MCD has several detailed controls, but it must still fit the fixed
-        # left sidebar.  Ignored lets the form/layout elide controls instead
-        # of imposing its widest child as a horizontal minimum.
-        horizontal_policy = QSizePolicy.Ignored if key == "mcd" else QSizePolicy.Expanding
-        page.setSizePolicy(horizontal_policy, QSizePolicy.Maximum)
+        # Every workflow page lives in the fixed-width controls sidebar.  An
+        # ignored horizontal policy lets the page follow the viewport width
+        # instead of keeping a wide size hint that would be clipped while the
+        # window is at its supported minimum size.
+        page.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         scroll.setWidget(page)
         setattr(self, f"{key}_tab_scroll", scroll)
         return scroll
@@ -1099,6 +1172,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             h = QHBoxLayout(row)
             h.setContentsMargins(0, 0, 0, 0)
             h.setSpacing(4)
+            fix_checks[k].setMinimumWidth(0)
+            fix_checks[k].setMaximumWidth(34)
             h.addWidget(spins[k])
             h.addWidget(fix_checks[k])
             h.addStretch(1)
@@ -1126,6 +1201,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         cmap.setCurrentIndex(0)
         cmap.setProperty("default_cmap", default_cmap)
         cmap.setToolTip("Colormap for heatmap rendering")
+        # Let the narrow controls sidebar allocate this combo to the grid
+        # column instead of allowing its natural text width to overflow.
+        cmap.setMinimumWidth(0)
+        cmap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._style_combo_popup(cmap)
 
         flags = QWidget()
@@ -1249,6 +1328,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         combo = QComboBox()
         combo.addItems(["Auto / Default", "TG", "BG", "Bias", "Advanced..."])
         combo.setToolTip("Choose how the plot y-axis is derived from gate variables.")
+        combo.setMinimumWidth(0)
+        combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self._style_combo_popup(combo)
 
         advanced = QGroupBox("Advanced Linear Combination")
@@ -1311,23 +1392,77 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         fb: QCheckBox,
         auto_btn: QToolButton,
         auto_text: str,
+        *,
+        dense: bool = False,
+        label_text: str | None = None,
     ) -> QWidget:
         """Build a min/max spin pair with Fix checkboxes and an Auto button."""
-        auto_btn.setText(auto_text)
-        auto_btn.setAutoRaise(True)
-        auto_btn.setFixedWidth(UI_METRICS["tool_w"])
-        auto_btn.setFixedHeight(UI_METRICS["tool_h"])
+        auto_btn.setText("Auto" if dense else auto_text)
+        if hasattr(auto_btn, "setAutoRaise"):
+            auto_btn.setAutoRaise(True)
+        # Keep the compact action readable while allowing the row to flex at
+        # the supported narrow sidebar width.
+        auto_width = max(UI_METRICS["tool_w"], auto_btn.fontMetrics().horizontalAdvance(auto_text) + 12)
+        auto_btn.setMinimumWidth(auto_width)
+        auto_btn.setMaximumWidth(auto_width)
+        auto_btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        auto_btn.setMinimumHeight(UI_METRICS["tool_h"])
         auto_btn.setToolTip(f"Set {auto_text.replace('Auto ', '')} bounds automatically from loaded data")
         row = QWidget()
-        h = QHBoxLayout(row)
-        h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(4)
-        h.addWidget(a)
-        h.addWidget(fa)
-        h.addWidget(b)
-        h.addWidget(fb)
-        h.addWidget(auto_btn)
-        h.addStretch(1)
+        if dense:
+            # Stage 1 integrates the metric-driven layout only for DRR Axis
+            # Ranges. Other workflow rows intentionally keep this helper's
+            # existing grid behavior until their migration stage.
+            for spin in (a, b):
+                spin.setMinimumWidth(0)
+                # Keep the dense DRR control's proven ordinary-value width
+                # stable in compact wrapped rows; expansion remains available
+                # to unconstrained text-bearing controls in DenseFormRowLayout.
+                spin.setMaximumWidth(130)
+                spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            for fix in (fa, fb):
+                fix.setMinimumWidth(0)
+                fix.setMaximumWidth(row.maximumWidth())
+            auto_btn.setMinimumWidth(0)
+            auto_btn.setMaximumWidth(row.maximumWidth())
+            label = QLabel(label_text) if label_text else None
+            if label is not None:
+                label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            dense_layout = DenseFormRowLayout(row, spacing=4, label=label)
+            row.setLayout(dense_layout)
+            dense_layout.add_group((a, fa), role="range", priority=10, grow_weight=1)
+            dense_layout.add_group((b, fb), role="range", priority=10, grow_weight=1)
+            dense_layout.add_group((auto_btn,), role="action", priority=1, grow_weight=0)
+            return row
+        # Keep the normal application font so formatted values remain
+        # readable.  The pair controls occupy the first grid row and the
+        # Auto action wraps below when the sidebar reaches its minimum width;
+        # this avoids compressing either spinbox to an unusable edit field.
+        for spin in (a, b):
+            # Reserve enough edit-field width for the ordinary ``-12.0000``
+            # sentinel while retaining the native stepper controls.
+            spin.setMinimumWidth(max(spin.minimumWidth(), 128))
+            spin.setMaximumWidth(max(spin.maximumWidth(), 130))
+            spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        fix_width = max(34, fa.minimumSizeHint().width(), fb.minimumSizeHint().width())
+        for fix in (fa, fb):
+            # Keep both the indicator and the visible ``F`` label within the
+            # checkbox hit target at the narrow sidebar width.
+            fix.setMinimumWidth(fix_width)
+            fix.setMaximumWidth(fix_width)
+        grid = QGridLayout(row)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(4)
+        grid.setVerticalSpacing(2)
+        # Each range pair gets its own line; the row widget itself remains a
+        # single direct-child region so callers can reason about containment.
+        grid.addWidget(a, 0, 0, 1, 3)
+        grid.addWidget(fa, 0, 3)
+        grid.addWidget(b, 1, 0, 1, 3)
+        grid.addWidget(fb, 1, 3)
+        grid.addWidget(auto_btn, 2, 0, 1, 4, Qt.AlignLeft)
+        for column in range(3):
+            grid.setColumnStretch(column, 1)
         return row
 
     def _style_combo_popup(self, combo: QComboBox) -> None:
@@ -1503,9 +1638,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
     @staticmethod
     def _pair_row(*widgets: QWidget) -> QWidget:
-        row = QWidget(); h = QHBoxLayout(row); h.setContentsMargins(0, 0, 0, 0); h.setSpacing(6)
-        for widget in widgets: h.addWidget(widget)
-        h.addStretch(1)
+        # Dense MCD rows wrap each control onto its own line at the supported
+        # sidebar width so numerical fields retain a readable edit area.
+        row = QWidget()
+        layout = QVBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        for widget in widgets:
+            layout.addWidget(widget)
         return row
 
 
@@ -1517,16 +1657,19 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
         grouping = QGroupBox("Power Sweep Files")
         grouping_form = QFormLayout(grouping)
+        grouping_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         grouping_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
         grouping_form.setHorizontalSpacing(6)
         grouping_form.setVerticalSpacing(UI_METRICS["row_spacing"])
         self.power_group_combo = QComboBox()
+        self.power_group_combo.setMinimumWidth(0)
+        self.power_group_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self._style_combo_popup(self.power_group_combo)
         self.power_group_combo.setToolTip("Select a full-sweep CSV with Power_uW, or a legacy filename-based series.")
         self.power_refresh_groups_btn = QPushButton("Detect")
         self.power_refresh_groups_btn.setToolTip("Detect Power_uW tables and legacy filename-based power series.")
         group_row = QWidget()
-        group_h = QHBoxLayout(group_row)
+        group_h = QVBoxLayout(group_row)
         group_h.setContentsMargins(0, 0, 0, 0)
         group_h.setSpacing(6)
         group_h.addWidget(self.power_group_combo, 1)
@@ -1536,11 +1679,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.power_group_summary.setMaximumHeight(88)
         self.power_kk_group_combo = QComboBox()
         self.power_kkp_group_combo = QComboBox()
+        for combo in (self.power_kk_group_combo, self.power_kkp_group_combo):
+            combo.setMinimumWidth(0)
+            combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self._style_combo_popup(self.power_kk_group_combo)
         self._style_combo_popup(self.power_kkp_group_combo)
         self.power_kk_group_combo.setToolTip("Power-sweep source to treat as KK in VP view.")
         self.power_kkp_group_combo.setToolTip("Power-sweep source to treat as KKp in VP view.")
-        grouping_form.addRow("Intensity", group_row)
+        grouping_form.addRow(group_row)
         grouping_form.addRow("Summary", self.power_group_summary)
         grouping_form.addRow("KK sweep", self.power_kk_group_combo)
         grouping_form.addRow("KKp sweep", self.power_kkp_group_combo)
@@ -1560,12 +1706,16 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.power_pair_mode_combo.addItems(["Stage", "Power Interpolation"])
         self._style_combo_popup(self.power_pair_mode_combo)
         self.power_pair_mode_combo.setToolTip("Choose how KK and KKp spectra are paired for VP.")
+        for combo in (self.power_axis_scale_combo, self.power_pair_mode_combo):
+            combo.setMinimumWidth(0)
+            combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.power_background_spin = QDoubleSpinBox()
         self.power_background_spin.setDecimals(6)
         self.power_background_spin.setRange(-1.0e12, 1.0e12)
         self.power_background_spin.setSingleStep(100.0)
-        self.power_background_spin.setFixedWidth(UI_METRICS["spin_w"] + 18)
+        self.power_background_spin.setFixedWidth(140)
         self.power_background_auto_chk = QCheckBox("Auto")
+        self.power_background_auto_chk.setFixedWidth(40)
         self.power_background_auto_chk.setChecked(True)
         self.power_background_auto_chk.setToolTip("Estimate one constant background from low-percentile intensity.")
         bkg_row = QWidget()
@@ -1587,15 +1737,19 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         setup_grid.addWidget(cmap, 0, 3)
         setup_grid.addWidget(QLabel("VP Pair By"), 1, 0)
         setup_grid.addWidget(self.power_pair_mode_combo, 1, 1)
-        setup_grid.addWidget(QLabel("Background"), 1, 2)
-        setup_grid.addWidget(bkg_row, 1, 3)
+        # Give the background field a full-width row; the former narrow
+        # fourth column compressed the spinbox beneath its text hit target.
+        setup_grid.addWidget(QLabel("Background"), 2, 0)
+        setup_grid.addWidget(bkg_row, 2, 1, 1, 3)
         setup_grid.setColumnStretch(1, 1)
         setup_grid.setColumnStretch(3, 1)
         params_layout.addWidget(self._make_expander("Plot Setup", setup, expanded=True))
 
         for s in spins.values():
-            s.setFixedWidth(UI_METRICS["spin_w"])
-            s.setFixedHeight(UI_METRICS["input_h"])
+            s.setMinimumWidth(116)
+            s.setMaximumWidth(130)
+            s.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            s.setMinimumHeight(s.minimumSizeHint().height())
 
         self.power_auto_v_btn = QToolButton()
         self.power_auto_x_btn = QToolButton()
@@ -1606,20 +1760,15 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         basic_form.setHorizontalSpacing(4)
         basic_form.setVerticalSpacing(UI_METRICS["row_spacing"])
         basic_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        basic_form.addRow(
-            "vmin / vmax",
-            self._make_axis_range_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.power_auto_v_btn, "Auto V"),
-        )
+        power_v_range_row = self._make_axis_range_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.power_auto_v_btn, "Auto V", dense=True, label_text="vmin / vmax")
+        power_x_range_row = self._make_axis_range_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.power_auto_x_btn, "Auto X", dense=True, label_text="xmin / xmax")
+        power_y_range_row = self._make_axis_range_row(spins["ymin"], spins["ymax"], fix_checks["ymin"], fix_checks["ymax"], self.power_auto_y_btn, "Auto Y", dense=True, label_text="pmin / pmax")
+        power_range_rows = (power_v_range_row, power_x_range_row, power_y_range_row)
+        basic_form.addRow(power_v_range_row)
         basic_form.addRow("Color scale", self.power_split_scale_chk)
         basic_form.addRow(self.power_split_scale_panel)
-        basic_form.addRow(
-            "xmin / xmax",
-            self._make_axis_range_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.power_auto_x_btn, "Auto X"),
-        )
-        basic_form.addRow(
-            "pmin / pmax",
-            self._make_axis_range_row(spins["ymin"], spins["ymax"], fix_checks["ymin"], fix_checks["ymax"], self.power_auto_y_btn, "Auto Y"),
-        )
+        basic_form.addRow(power_x_range_row)
+        basic_form.addRow(power_y_range_row)
         basic_form.addRow("Cursor Power", spins["gate"])
         flags = QWidget()
         flags_h = QHBoxLayout(flags)
@@ -1632,7 +1781,22 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         flags_h.addStretch(1)
         basic_form.addRow("Color / Clip", flags)
         self._set_form_label_width(basic_form, UI_METRICS["label_col_width"])
-        params_layout.addWidget(self._make_expander("Manual plot ranges", basic, expanded=False))
+        manual_ranges = self._make_expander("Manual plot ranges", basic, expanded=False)
+        manual_ranges_head = manual_ranges.findChild(QToolButton)
+
+        def _contain_power_range_rows(expanded: bool) -> None:
+            if not expanded:
+                return
+            for range_row in power_range_rows:
+                dense_layout = range_row.layout()
+                range_row.setMinimumHeight(dense_layout.heightForWidth(range_row.width()))
+            basic_form.invalidate()
+            basic.setMinimumHeight(basic.minimumSizeHint().height())
+            basic_form.activate()
+
+        if manual_ranges_head is not None:
+            manual_ranges_head.toggled.connect(_contain_power_range_rows)
+        params_layout.addWidget(manual_ranges)
 
         layout.addWidget(self._make_expander("Parameters", params, expanded=True))
         layout.addStretch(1)
@@ -1712,7 +1876,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             if btn.minimumHeight() < UI_METRICS["tool_h"]:
                 btn.setMinimumHeight(UI_METRICS["tool_h"])
         for combo in (self.pl_cmap, self.cmp_cmap):
-            combo.setMinimumWidth(UI_METRICS["short_combo_w"])
+            # These combos sit in rows shared with the y-axis selector.  A
+            # hard minimum wider than the sidebar causes clipping at the
+            # supported minimum window size, so let the row elide naturally.
+            combo.setMinimumWidth(0)
+            combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
 
     def _build_plot_panel(self) -> QWidget:
         box = QWidget()
@@ -2280,6 +2448,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         slides_active = self.tabs.tabText(self.tabs.currentIndex()) == "Slides"
         if hasattr(self, "workspace_stack"):
             self.workspace_stack.setCurrentIndex(1 if slides_active else 0)
+        if hasattr(self, "menu_toolbar_host"):
+            self.menu_toolbar_host.source_widget_action.setVisible(not slides_active)
+            self.menu_toolbar_host.source_separator_action.setVisible(not slides_active)
         if hasattr(self, "sidebar_toggle_btn"):
             self.sidebar_toggle_btn.setEnabled(not slides_active)
         if hasattr(self, "show_sidebar_action"):
@@ -2363,6 +2534,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
     def _refresh_file_lists(self, *, auto: bool = False) -> None:
         """Queue a folder catalog refresh and apply it only if still current."""
+        if self._is_closing:
+            return
         if self._file_refresh_running:
             self._file_refresh_pending = True
             self._file_refresh_pending_auto = self._file_refresh_pending_auto or auto
@@ -2483,6 +2656,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
     def _queue_drr_catalog_refresh(self, *, auto: bool, old_source_files: set[str]) -> None:
         """Coalesce DRR scans while keeping unrelated file-list refreshes synchronous."""
+        if self._is_closing:
+            return
         if self._drr_refresh_running:
             self._drr_refresh_pending = True
             self._drr_refresh_pending_auto = self._drr_refresh_pending_auto or auto
@@ -2492,7 +2667,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._start_drr_catalog_refresh(auto=auto, old_source_files=old_source_files)
 
     def _start_drr_catalog_refresh(self, *, auto: bool, old_source_files: set[str]) -> None:
-        if not self.current_folder:
+        if self._is_closing or not self.current_folder:
             return
         self._drr_refresh_running = True
         self._drr_refresh_generation += 1
@@ -2911,6 +3086,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
 
     def _start_load(self, mode: str) -> None:
+        if self._is_closing:
+            return
         if self._load_in_progress:
             self._status("State: Load already in progress.")
             return
@@ -5681,6 +5858,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.pl_controller._update_pl_spectrum_and_gate_line(self._pl_last_plot_cube)
 
     def _start_export(self, mode: str) -> None:
+        if self._is_closing:
+            return
         if self._export_in_progress:
             self._status("Save already in progress.")
             return
@@ -6385,7 +6564,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
     def _on_auto_update_check_toggled(self, checked: bool) -> None:
         self.settings.setValue(self.SETTINGS_AUTO_UPDATE_CHECK, bool(checked))
     def _schedule_automatic_update_check(self) -> None:
-        if not self._auto_update_check_enabled():
+        if self._is_closing or not self._auto_update_check_enabled():
             return
         timer = QTimer(self)
         timer.setSingleShot(True)
@@ -6400,7 +6579,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
     def _manual_check_updates(self) -> None:
         self._start_update_check(automatic=False)
     def _start_update_check(self, *, automatic: bool) -> None:
-        if automatic and not self._auto_update_check_enabled():
+        if self._is_closing or (automatic and not self._auto_update_check_enabled()):
             return
         worker = Worker(self._update_check_task)
         worker.signals.result.connect(lambda result: self._on_update_check_done(automatic, result))
@@ -6479,7 +6658,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return downloads
         return Path(tempfile.gettempdir())
     def _start_update_download(self, result: CheckResult) -> None:
-        if self._download_in_progress:
+        if self._is_closing or self._download_in_progress:
             return
         if not result.installer_url or not result.sums_url or result.latest_version is None:
             self._show_update_error('This update is missing its installer files.')
@@ -6525,6 +6704,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         elif clicked is open_folder_btn and path is not None:
             self._open_download_folder(path)
     def _confirm_and_launch_installer(self, path: Path, expected_sha256: str | None) -> None:
+        if self._is_closing:
+            return
         if not path.is_file():
             QMessageBox.warning(self, 'Install Update', 'The downloaded installer could not be found.')
             return

@@ -370,6 +370,12 @@ class PresentationBuilderWidget(QWidget):
         self.advanced_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.advanced_btn.setCheckable(True)
         self.advanced_btn.setAutoRaise(True)
+        self.advanced_btn.setToolTip("Advanced presentation options: show or hide optional settings")
+        apply_accessible_identity(
+            self.advanced_btn,
+            name="Advanced presentation options",
+            description="Show or hide optional presentation copy and recovery settings",
+        )
         setup.addWidget(self.advanced_btn, 0, 6)
         self.advanced_widget = QWidget()
         advanced = QHBoxLayout(self.advanced_widget)

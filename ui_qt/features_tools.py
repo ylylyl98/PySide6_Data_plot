@@ -28,7 +28,8 @@ class ToolsPageMixin:
         log_layout.addWidget(hint)
         log_btn_row = QHBoxLayout()
         log_btn_row.setSpacing(8)
-        self.show_log_btn = QPushButton("Show / Hide Log Panel")
+        self.show_log_btn = QPushButton("Log panel")
+        self.show_log_btn.setAccessibleName("Show or hide Log Panel")
         self.show_log_btn.setToolTip("Toggle the bottom log dock panel")
         self.clear_log_btn = QPushButton("Clear Log")
         self.clear_log_btn.setToolTip("Clear all messages from the log")
@@ -61,7 +62,8 @@ class ToolsPageMixin:
         data_hint.setWordWrap(True)
         set_fluent_property(data_hint, "appRole", "hintText")
         data_layout.addWidget(data_hint)
-        self.mcd_extract_btn = QPushButton("Open standalone MCD Organizer…")
+        self.mcd_extract_btn = QPushButton("Open MCD Organizer")
+        self.mcd_extract_btn.setAccessibleName("Open standalone MCD Organizer")
         self.mcd_extract_btn.setToolTip(
             "Launch the processed-MCD comparison and export tool in a separate window."
         )

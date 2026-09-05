@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QToolBar,
     QWidgetAction,
+    QWidget,
+    QSizePolicy,
 )
 from ui_qt.fluent_ui.style import themed_icon
 
@@ -24,6 +26,7 @@ class MenuToolbarHost:
         *,
         log_dock: QDockWidget,
         results_dock: QDockWidget,
+        data_source_context: QWidget | None = None,
     ) -> None:
         self.view_menu = window.menuBar().addMenu("View")
         self.show_log_action = log_dock.toggleViewAction()
@@ -68,6 +71,15 @@ class MenuToolbarHost:
         self.plot_action.setToolTip("Plot/update current state")
         self.save_action = QAction("Save PNG + DAT", window)
         self.save_action.setToolTip("Export for the active tab")
+        self.source_separator_action = QAction(window)
+        self.source_separator_action.setSeparator(True)
+        self.source_widget_action = QWidgetAction(window)
+        if data_source_context is None:
+            data_source_context = QWidget()
+            data_source_context.setObjectName("dataSourceContext")
+        data_source_context.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.source_widget_action.setDefaultWidget(data_source_context)
+        self.data_source_context = data_source_context
         self.move_now_btn = QPushButton("Move Exported Sources")
         self.move_now_btn.setToolTip("Save first to enable moving exported source files.")
         self.clean_verified_sources_chk = QCheckBox("Clean verified source copies after successful export")
@@ -83,6 +95,9 @@ class MenuToolbarHost:
         self.main_toolbar.addAction(self.load_action)
         self.main_toolbar.addAction(self.plot_action)
         self.main_toolbar.addAction(self.save_action)
+        self.main_toolbar.addAction(self.source_separator_action)
+        self.main_toolbar.addAction(self.source_widget_action)
+        data_source_context.show()
         self.apply_theme()
 
     def apply_theme(self, theme=None, *, navigation_toolbar=None) -> None:

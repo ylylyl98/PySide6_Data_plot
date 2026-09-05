@@ -296,13 +296,13 @@ QSpinBox::down-button, QDoubleSpinBox::down-button {
 }
 
 QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
-    image: url("@{spin_up_icon}");
+    image: url("@{spin_up_icon_disabled}");
     width: @{icon_size_small};
     height: @{icon_size_small};
 }
 
 QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
-    image: url("@{spin_down_icon}");
+    image: url("@{spin_down_icon_disabled}");
     width: @{icon_size_small};
     height: @{icon_size_small};
 }
@@ -330,6 +330,22 @@ QSpinBox::down-arrow:hover, QDoubleSpinBox::down-arrow:hover {
     image: url("@{spin_down_icon_interactive}");
 }
 
+QSpinBox::up-arrow:pressed, QDoubleSpinBox::up-arrow:pressed {
+    image: url("@{spin_up_icon_interactive}");
+}
+
+QSpinBox::down-arrow:pressed, QDoubleSpinBox::down-arrow:pressed {
+    image: url("@{spin_down_icon_interactive}");
+}
+
+QSpinBox::up-arrow:focus, QDoubleSpinBox::up-arrow:focus {
+    image: url("@{spin_up_icon_interactive}");
+}
+
+QSpinBox::down-arrow:focus, QDoubleSpinBox::down-arrow:focus {
+    image: url("@{spin_down_icon_interactive}");
+}
+
 QSpinBox::up-button:disabled, QDoubleSpinBox::up-button:disabled,
 QSpinBox::down-button:disabled, QDoubleSpinBox::down-button:disabled,
 QSpinBox:disabled::up-button, QDoubleSpinBox:disabled::up-button,
@@ -337,13 +353,11 @@ QSpinBox:disabled::down-button, QDoubleSpinBox:disabled::down-button {
     background-color: transparent;
 }
 
-QSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:disabled,
-QSpinBox:disabled::up-arrow, QDoubleSpinBox:disabled::up-arrow {
+QSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:disabled {
     image: url("@{spin_up_icon_disabled}");
 }
 
-QSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:disabled,
-QSpinBox:disabled::down-arrow, QDoubleSpinBox:disabled::down-arrow {
+QSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {
     image: url("@{spin_down_icon_disabled}");
 }
 
@@ -358,6 +372,11 @@ QSpinBox[readOnly="true"]::up-arrow, QDoubleSpinBox[readOnly="true"]::up-arrow {
 
 QSpinBox[readOnly="true"]::down-arrow, QDoubleSpinBox[readOnly="true"]::down-arrow {
     image: url("@{spin_down_icon_disabled}");
+}
+
+/* Keep numeric text clear of the dedicated stepper hit target. */
+QSpinBox, QDoubleSpinBox {
+    padding: 3px 4px 3px @{space_s};
 }
 
 QSpinBox[readOnly="true"]::up-button:hover, QDoubleSpinBox[readOnly="true"]::up-button:hover,
@@ -375,11 +394,15 @@ QSpinBox[readOnly="true"]::down-button:focus, QDoubleSpinBox[readOnly="true"]::d
     background-color: transparent;
 }
 
-QSpinBox[readOnly="true"]::up-arrow:hover, QDoubleSpinBox[readOnly="true"]::up-arrow:hover {
+QSpinBox[readOnly="true"]::up-arrow:hover, QDoubleSpinBox[readOnly="true"]::up-arrow:hover,
+QSpinBox[readOnly="true"]::up-arrow:pressed, QDoubleSpinBox[readOnly="true"]::up-arrow:pressed,
+QSpinBox[readOnly="true"]::up-arrow:focus, QDoubleSpinBox[readOnly="true"]::up-arrow:focus {
     image: url("@{spin_up_icon_disabled}");
 }
 
-QSpinBox[readOnly="true"]::down-arrow:hover, QDoubleSpinBox[readOnly="true"]::down-arrow:hover {
+QSpinBox[readOnly="true"]::down-arrow:hover, QDoubleSpinBox[readOnly="true"]::down-arrow:hover,
+QSpinBox[readOnly="true"]::down-arrow:pressed, QDoubleSpinBox[readOnly="true"]::down-arrow:pressed,
+QSpinBox[readOnly="true"]::down-arrow:focus, QDoubleSpinBox[readOnly="true"]::down-arrow:focus {
     image: url("@{spin_down_icon_disabled}");
 }
 

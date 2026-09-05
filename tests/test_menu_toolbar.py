@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QToolBar,
     QWidgetAction,
+    QWidget,
 )
 from PySide6.QtCore import Qt
 
@@ -66,14 +67,20 @@ class MenuToolbarHostTests(unittest.TestCase):
         window = QMainWindow()
         log_dock = QDockWidget("Run Log", window)
         results_dock = QDockWidget("Analysis Results", window)
-        host = MenuToolbarHost(window, log_dock=log_dock, results_dock=results_dock)
+        source = QWidget()
+        source.setObjectName("dataSourceContext")
+        host = MenuToolbarHost(window, log_dock=log_dock, results_dock=results_dock, data_source_context=source)
         try:
             self.assertEqual(host.main_toolbar.windowTitle(), "Main")
             self.assertFalse(host.main_toolbar.isMovable())
             self.assertEqual(
                 [action.text() for action in host.main_toolbar.actions()],
-                ["Load", "Plot / Update", "Save PNG + DAT"],
+                ["Load", "Plot / Update", "Save PNG + DAT", "", ""],
             )
+            self.assertEqual(host.main_toolbar.actions()[3], host.source_separator_action)
+            self.assertEqual(host.main_toolbar.actions()[4], host.source_widget_action)
+            self.assertIs(host.source_widget_action.defaultWidget(), source)
+            self.assertIs(host.main_toolbar.widgetForAction(host.source_widget_action), source)
             self.assertEqual(host.load_action.toolTip(), "Load data for the active tab")
             self.assertEqual(host.plot_action.toolTip(), "Plot/update current state")
             self.assertEqual(host.save_action.toolTip(), "Export for the active tab")
@@ -102,7 +109,8 @@ class MenuToolbarHostTests(unittest.TestCase):
         window = QMainWindow()
         log_dock = QDockWidget("Run Log", window)
         results_dock = QDockWidget("Analysis Results", window)
-        host = MenuToolbarHost(window, log_dock=log_dock, results_dock=results_dock)
+        source = QWidget()
+        host = MenuToolbarHost(window, log_dock=log_dock, results_dock=results_dock, data_source_context=source)
         try:
             self.assertFalse(host.load_action.icon().isNull())
             self.assertFalse(host.plot_action.icon().isNull())

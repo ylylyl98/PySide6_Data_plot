@@ -12,7 +12,7 @@ import pandas as pd
 from matplotlib.figure import Figure
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget
 
 from core.mcd import McdCenterCandidate, McdSettings, background_fit_regions, detect_angles, discover_mcd_processing_status, ensure_mcd_package_dir, export_mcd_analysis_bundle, export_mcd_tables, extract_mcd_acquisition_conditions, format_mcd_acquisition_conditions, format_mcd_energy, load_b_sweep_csv, low_field_mcd_branch_fits, pair_window_trace_by_branch, process_mcd, suggest_mcd_background_ranges, suggest_mcd_window_centers, window_trace, window_trace_comparison
 from ui_qt.main_window import (
@@ -1256,6 +1256,34 @@ class McdProcessingTests(unittest.TestCase):
             self.assertFalse(window.mcd_show_unsigned_absolute_mean_chk.isChecked())
             self.assertFalse(window.mcd_show_integral_chk.isChecked())
             self.assertTrue(window.mcd_fit_zero_chk.isChecked())
+        finally:
+            window.close()
+
+    def test_mcd_color_range_row_is_contained_at_narrow_sidebar(self) -> None:
+        from ui_qt.theme import install_theme
+
+        install_theme(self.app, mode="light")
+        window = MainWindow()
+        try:
+            window.resize(900, 700)
+            window.show()
+            window.workspace_splitter.setSizes([380, 520])
+            window.tabs.setCurrentIndex(
+                next(i for i in range(window.tabs.count()) if window.tabs.tabText(i) == "MCD")
+            )
+            self.app.processEvents()
+            row = window.mcd_auto_v_btn.parentWidget()
+            children = [child for child in row.children() if isinstance(child, QWidget) and child.isVisible()]
+            self.assertEqual(len(children), 3)
+            for child in children:
+                self.assertTrue(row.contentsRect().contains(child.geometry()))
+            for index, previous in enumerate(children):
+                for current in children[index + 1 :]:
+                    self.assertFalse(previous.geometry().intersects(current.geometry()))
+            self.assertGreaterEqual(
+                window.mcd_auto_v_btn.width(),
+                window.mcd_auto_v_btn.fontMetrics().horizontalAdvance(window.mcd_auto_v_btn.text()) + 12,
+            )
         finally:
             window.close()
 

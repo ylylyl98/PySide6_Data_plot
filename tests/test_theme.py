@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from ui_qt.fluent_ui.style import render_qss_file
 from ui_qt.fluent_ui.tokens import ResolvedTheme, TokenValidationError
 from ui_qt.theme import PROJECT_ALIASES, ProjectTokenRepository, alias
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import QApplication, QDoubleSpinBox, QSpinBox
 
 _RESOURCES = Path(__file__).resolve().parent.parent / "ui_qt" / "fluent_ui" / "resources"
 _QSS_TEMPLATE = (
@@ -121,6 +124,103 @@ class ThemeLayerTests(unittest.TestCase):
                     f'{widget}[readOnly="true"]::{direction}-arrow:hover',
                     rendered,
                 )
+
+    def test_spinbox_arrow_assets_are_subdued_until_hover_or_focus(self) -> None:
+        """Arrow imagery must distinguish quiet, interactive, and read-only states."""
+
+        def declaration_for_selector(rendered: str, selector: str) -> str:
+            for match in re.finditer(r"(?ms)(?P<header>[^{}]+)\{(?P<body>[^{}]*)\}", rendered):
+                selectors = {part.strip() for part in match.group("header").split(",")}
+                if selector in selectors:
+                    return match.group("body")
+            self.fail(f"selector not found: {selector}")
+
+        repository = _repository()
+        with tempfile.TemporaryDirectory() as asset_dir:
+            for name in ("light", "dark"):
+                rendered = render_qss_file(
+                    _QSS_TEMPLATE,
+                    repository.resolve(name, shell_profile="fluent-workbench"),
+                    asset_directory=asset_dir,
+                )
+                for widget in ("QSpinBox", "QDoubleSpinBox"):
+                    for direction in ("up", "down"):
+                        quiet = declaration_for_selector(rendered, f"{widget}::{direction}-arrow")
+                        self.assertIn("-text_disabled-", quiet)
+
+                        hover = declaration_for_selector(
+                            rendered, f"{widget}::{direction}-arrow:hover"
+                        )
+                        self.assertIn("-text_primary-", hover)
+
+                        pressed = declaration_for_selector(
+                            rendered, f"{widget}::{direction}-arrow:pressed"
+                        )
+                        self.assertIn("-text_primary-", pressed)
+
+                        focus = declaration_for_selector(
+                            rendered, f"{widget}::{direction}-arrow:focus"
+                        )
+                        self.assertIn("-text_primary-", focus)
+
+                        disabled = declaration_for_selector(
+                            rendered, f"{widget}::{direction}-arrow:disabled"
+                        )
+                        self.assertIn("-text_disabled-", disabled)
+
+                        read_only = declaration_for_selector(
+                            rendered, f'{widget}[readOnly="true"]::{direction}-arrow'
+                        )
+                        self.assertIn("-text_disabled-", read_only)
+                        for state in ("hover", "pressed", "focus"):
+                            override = declaration_for_selector(
+                                rendered,
+                                f'{widget}[readOnly="true"]::{direction}-arrow:{state}',
+                            )
+                            self.assertIn("-text_disabled-", override)
+                        self.assertNotIn(
+                            f"{widget}:focus::{direction}-arrow", rendered
+                        )
+
+    def test_spinbox_has_no_duplicate_center_arrow(self) -> None:
+        """Only the two dedicated stepper arrows may render an icon."""
+        app = QApplication.instance() or QApplication([])
+        repository = _repository()
+        previous = app.styleSheet()
+        try:
+            for name in ("light", "dark"):
+                with tempfile.TemporaryDirectory() as asset_dir:
+                    theme = repository.resolve(name, shell_profile="fluent-workbench")
+                    app.setStyleSheet(
+                        render_qss_file(_QSS_TEMPLATE, theme, asset_directory=asset_dir)
+                    )
+                    for spin_type in (QSpinBox, QDoubleSpinBox):
+                        spin = spin_type()
+                        spin.setRange(0, 100)
+                        spin.setValue(42)
+                        spin.resize(180, 40)
+                        spin.show()
+                        app.processEvents()
+                        arrow_colors = {
+                            QColor(theme.aliases["text_disabled"]).rgba(),
+                            QColor(theme.aliases["text_primary"]).rgba(),
+                        }
+                        image = spin.grab().toImage()
+                        center_matches = sum(
+                            1
+                            for x in range(70, 120)
+                            for y in range(4, image.height() - 4)
+                            if image.pixelColor(x, y).alpha() > 200
+                            and image.pixelColor(x, y).rgba() in arrow_colors
+                        )
+                        self.assertLess(
+                            center_matches,
+                            5,
+                            f"unexpected center arrow rendered for {name} {spin_type.__name__}",
+                        )
+                        spin.deleteLater()
+        finally:
+            app.setStyleSheet(previous)
 
     def test_approved_shell_icons_are_current_color_svg_assets(self) -> None:
         icon_root = _QSS_TEMPLATE.parent / "icons"
