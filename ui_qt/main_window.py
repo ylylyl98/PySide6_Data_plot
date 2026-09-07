@@ -59,6 +59,7 @@ from app_version import __version__
 from core import data_io
 from core.drr_sources import (
     DrrSource,
+    DrrMeasurementAssignment,
     DrrSourceCache,
     assess_background_gate_files,
     compatible_drr_repeats,
@@ -70,6 +71,7 @@ from core.drr_sources import (
     inspect_csv_wavelength_center,
     resolve_source_path,
     wavelength_centers_match,
+    resolve_drr_background_assignments,
 )
 from core.colormaps import CUSTOM_COLORMAPS, STANDARD_COLORMAPS, register_colormaps, resolve_cmap
 from core.update_checker import (
@@ -333,6 +335,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.drr_selected_files: List[str] = []
         self.drr_baseline_files_manual: List[str] = []
         self.drr_baseline_files_found: List[str] = []
+        self._drr_assignments: tuple[DrrMeasurementAssignment, ...] = ()
+        self._drr_assignments_automatic = False
+        self._drr_baseline_user_selected = False
         self._drr_background_guess = None
         self.loaded: LoadedState | None = None
         self.last_plotted_mode: str | None = None
@@ -2824,14 +2829,35 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     if source.source not in selected_now and source.source in compatible:
                         self.drr_selected_files.append(source.source)
                         selected_now.add(source.source)
-        self.drr_baseline_files_manual = [
-            f for f in self.drr_baseline_files_manual
-            if f in drr_candidates or (Path(f).is_absolute() and Path(f).is_file())
-        ]
+        if not self._drr_assignments_automatic:
+            self.drr_baseline_files_manual = [
+                f for f in self.drr_baseline_files_manual
+                if f in drr_candidates or (Path(f).is_absolute() and Path(f).is_file())
+            ]
         self.drr_baseline_files_found = [
             f for f in self.drr_baseline_files_found if f in drr_candidates
         ]
         self.drr_controller._update_drr_selection_labels()
+        if self._drr_assignments_automatic and self.drr_selected_files:
+            resolved = resolve_drr_background_assignments(
+                self.current_folder, self.drr_available_sources, self.drr_selected_files,
+            )
+            if resolved.resolved:
+                self._drr_assignments = tuple(resolved.assignments)
+                self.drr_baseline_files_manual = list(dict.fromkeys(
+                    source for assignment in resolved.assignments
+                    for source in assignment.baseline_files
+                ))
+            else:
+                self._drr_assignments = ()
+                # Keep the automatic intent while the assignment set is
+                # unresolved.  The display union must never become a manual
+                # common-background recipe on the next load.
+                self.drr_baseline_files_manual = []
+                self.drr_baseline_files_found = []
+                self._invalidate_drr_for_background_selection(
+                    resolved.reason or "DRR background assignments became unresolved after refresh."
+                )
 
         new_source_files = (
             set(self.available_files)
@@ -2892,6 +2918,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.drr_selected_files = []
         self.drr_baseline_files_manual = []
         self.drr_baseline_files_found = []
+        self._drr_assignments = ()
+        self._drr_assignments_automatic = False
+        self._drr_baseline_user_selected = False
         self._drr_background_guess = None
         self._drr_source_cache.clear()
         self._pl_auto_next_queue = []
@@ -3193,6 +3222,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         shg_fit_settings: ShgFitSettings | None = None
         shg_compare = False
         mcd_settings: McdSettings | None = None
+        drr_assignments: tuple[DrrMeasurementAssignment, ...] = ()
 
         if mode == "PL":
             selected = self._selected(self.pl_files)
@@ -3216,6 +3246,55 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             drr_baseline_which = which_map.get(self.drr_baseline_combine_combo.currentText(), "last")
             y_axis_spec = self._selected_y_axis_spec("drr")
             power_group_key = ""
+            if selected and not data_io.is_xlsx_map_file(selected[0]):
+                if self._drr_assignments_automatic and not self.drr_pin_baseline_chk.isChecked():
+                    drr_assignments = tuple(self._drr_assignments)
+                    # The combo boxes show a readable summary only.  Keep the
+                    # actual per-measurement recipes authoritative even when
+                    # their display union is non-empty.
+                    drr_baseline = "Automatic"
+                    if drr_assignments:
+                        resolved = None
+                    else:
+                        resolved = resolve_drr_background_assignments(
+                            self.current_folder, self.drr_available_sources, selected,
+                        )
+                elif not baselines and self._drr_baseline_user_selected and drr_baseline in {"Self (first frame)", "Self (last frame)"}:
+                    resolved = resolve_drr_background_assignments(
+                        self.current_folder, self.drr_available_sources, selected,
+                        explicit_baseline_mode=drr_baseline,
+                        explicit_baseline_which=drr_baseline_which,
+                    )
+                elif baselines:
+                    resolved = resolve_drr_background_assignments(
+                        self.current_folder, self.drr_available_sources, selected,
+                        explicit_baseline_files=baselines,
+                        explicit_baseline_mode="External",
+                        explicit_baseline_which=drr_baseline_which,
+                    )
+                else:
+                    resolved = resolve_drr_background_assignments(
+                        self.current_folder, self.drr_available_sources, selected,
+                    )
+                if resolved is None:
+                    pass
+                elif resolved.resolved:
+                    drr_assignments = resolved.assignments
+                    self._drr_assignments = drr_assignments
+                    self._drr_assignments_automatic = not baselines and not self._drr_baseline_user_selected
+                    if self._drr_assignments_automatic:
+                        drr_baseline = "Automatic"
+                        drr_baseline_which = resolved.assignments[0].baseline_which
+                elif resolved is not None and not resolved.resolved and self._drr_assignments_automatic:
+                    self.drr_baseline_files_manual = []
+                    self.drr_baseline_files_found = []
+                    self._invalidate_drr_for_background_selection(
+                        resolved.reason or "DRR background assignments are unresolved."
+                    )
+                    return
+                elif baselines or drr_baseline in {"External", "Self (last frame)", "Self (first frame)"}:
+                    self._invalidate_drr_for_background_selection(resolved.reason)
+                    return
             if drr_baseline == "External" and not baselines:
                 self._invalidate_drr_for_background_selection(
                     "Select an external background before processing."
@@ -3310,6 +3389,13 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if mode == "MCD" and selected and self.mcd_controller._mcd_source_needs_stability_wait(selected[0]):
             return
 
+        drr_selection_metadata: dict[str, Any] = {}
+        if mode == "DRR" and drr_assignments:
+            drr_selection_metadata = {
+                "selection_method": "automatic_per_measurement" if self._drr_assignments_automatic else "explicit_per_measurement",
+                "numerical_path": "pending",
+                "drr_background_assignments": [item.to_dict() for item in drr_assignments],
+            }
         options = LoadOptions(
             mode=mode,
             folder=self.current_folder,
@@ -3356,7 +3442,16 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 and tuple(baselines) == tuple(self._drr_background_guess.baseline_files)
                 else {}
             ),
+            drr_assignments=drr_assignments,
         )
+        if drr_selection_metadata:
+            options = LoadOptions(**{
+                **options.__dict__,
+                "drr_background_selection": {
+                    **dict(options.drr_background_selection),
+                    **drr_selection_metadata,
+                },
+            })
 
         self._set_stage("Loading...")
         self._load_in_progress = True
@@ -3450,6 +3545,56 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     y_axis_spec=options.y_axis_spec,
                     provenance_records=provenance_records,
                 )
+            assignments = tuple(options.drr_assignments)
+            if not assignments and options.selected_files:
+                explicit_mode = options.drr_baseline_text
+                if explicit_mode == "Automatic":
+                    resolved = resolve_drr_background_assignments(
+                        folder, discover_drr_sources(folder), options.selected_files,
+                    )
+                else:
+                    resolved = resolve_drr_background_assignments(
+                        folder, discover_drr_sources(folder), options.selected_files,
+                        explicit_baseline_files=options.baseline_files,
+                        explicit_baseline_mode=explicit_mode,
+                        explicit_baseline_which=options.drr_baseline_which,
+                    )
+                if not resolved.resolved:
+                    raise ValueError(resolved.reason or "DRR background assignment is unresolved.")
+                assignments = tuple(resolved.assignments)
+            if assignments:
+                cube = data_io.load_drr_resolved_cube(
+                    folder, options.selected_files, assignments,
+                    y_axis=options.y_axis_spec, derivative=None,
+                )
+                numerical_path = getattr(cube, "drr_numerical_path", "common")
+                mode_label = (
+                    "DR/R Automatic" if numerical_path != "common"
+                    else "DR/R Self" if assignments[0].baseline_mode.startswith("Self")
+                    else "DR/R External"
+                )
+                return LoadedState(
+                    mode="DRR",
+                    folder=folder,
+                    primary_file=options.selected_files[0],
+                    selected_files=options.selected_files,
+                    baseline_files=list(dict.fromkeys(
+                        source for assignment in assignments
+                        for source in assignment.baseline_files
+                    )),
+                    cube=cube,
+                    drr_mode_label=mode_label,
+                    drr_derivative_label="None",
+                    drr_baseline_text=options.drr_baseline_text,
+                    drr_baseline_which=options.drr_baseline_which,
+                    drr_background_selection={
+                        **dict(options.drr_background_selection),
+                        "numerical_path": numerical_path,
+                    },
+                    drr_assignments=assignments,
+                    y_axis_spec=options.y_axis_spec,
+                    provenance_records=provenance_records,
+                )
             baseline = options.drr_baseline_text
             if baseline == "External":
                 if not options.baseline_files:
@@ -3484,7 +3629,17 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 drr_derivative_label="None",
                 drr_baseline_text=baseline,
                 drr_baseline_which=options.drr_baseline_which,
-                drr_background_selection=dict(options.drr_background_selection),
+                drr_background_selection={
+                    **dict(options.drr_background_selection),
+                    "selection_method": (
+                        "automatic_per_measurement"
+                        if options.drr_baseline_text == "Automatic"
+                        else "explicit_per_measurement"
+                    ),
+                    "numerical_path": getattr(cube, "drr_numerical_path", "common"),
+                    "drr_background_assignments": [item.to_dict() for item in assignments],
+                },
+                drr_assignments=assignments,
                 y_axis_spec=options.y_axis_spec,
                 provenance_records=provenance_records,
             )
@@ -3619,6 +3774,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if loaded.mode == self._active_load_mode:
             self._active_load_succeeded = True
         self.loaded = loaded
+        if loaded.mode == "DRR":
+            self._drr_assignments = tuple(getattr(loaded, "drr_assignments", ()))
+            self._drr_assignments_automatic = (
+                str(getattr(loaded, "drr_background_selection", {}).get("selection_method", ""))
+                == "automatic_per_measurement"
+            )
         self._drr_derivative_cache.clear()
         self.last_plotted_mode = None
         self._last_plot_params_key = None
@@ -5713,7 +5874,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return (mode, int(self.tabs.currentIndex()), self.last_plotted_mode, self._current_y_axis_spec_for_mode(mode))
         p = self.drr_controller._read_drr_params()
         return (
-            "DRR", p["baseline_mode"], p["baseline_which"], p["baseline_files"], p["selected_files"],
+            "DRR", p["baseline_mode"], p["baseline_which"], p["baseline_files"], p["selected_files"], p.get("drr_assignments", ()),
             p["y_axis_spec"], p["derivative"], p["sg_window"], p["sg_poly"], p["cmap"], p["vmin"], p["vmax"],
             p["xmin"], p["xmax"], p["ymin"], p["ymax"], p["gate"], p["log"], p["clip"], p["center_zero"],
             self._split_scale_key("drr"),
@@ -5727,6 +5888,35 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         baselines = list(p["baseline_files"])
         baseline_text = p["baseline_mode"]
         y_axis_spec = str(p["y_axis_spec"])
+        try:
+            assignments = tuple(
+                DrrMeasurementAssignment.from_mapping(item)
+                for item in p.get("drr_assignments", ())
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid DRR background assignment: {exc}") from exc
+        if not assignments and selected and not data_io.is_xlsx_map_file(selected[0]):
+            if baseline_text == "Automatic":
+                resolved = resolve_drr_background_assignments(
+                    self.current_folder, self.drr_available_sources, selected,
+                )
+            else:
+                explicit_mode = baseline_text if baseline_text in {
+                    "Self (first frame)", "Self (last frame)", "External",
+                } else "Self (last frame)"
+                resolved = resolve_drr_background_assignments(
+                    self.current_folder, self.drr_available_sources, selected,
+                    explicit_baseline_files=baselines,
+                    explicit_baseline_mode=explicit_mode,
+                    explicit_baseline_which={
+                        "Last frame from each file, then average": "last",
+                        "First frame from each file, then average": "first",
+                        "Average all frames in each file, then average files": "all",
+                    }.get(str(p["baseline_which"]), "last"),
+                )
+            if not resolved.resolved:
+                raise ValueError(resolved.reason or "DRR background assignment is unresolved.")
+            assignments = resolved.assignments
         which_map = {
             "Last frame from each file, then average": "last",
             "First frame from each file, then average": "first",
@@ -5738,6 +5928,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             or baseline_text != self.loaded.drr_baseline_text
             or baseline_which != self.loaded.drr_baseline_which
             or baselines != list(self.loaded.baseline_files)
+            or tuple(assignments) != tuple(getattr(self.loaded, "drr_assignments", ()))
             or y_axis_spec != getattr(self.loaded, "y_axis_spec", "auto")
         )
         if needs_reload:
@@ -5746,6 +5937,20 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 cube = data_io.load_drr_map_cube(self.current_folder, selected[0], y_axis=y_axis_spec)
                 mode_label = "DR/R Map"
                 baselines = []
+            elif assignments:
+                cube = data_io.load_drr_resolved_cube(
+                    self.current_folder, selected, assignments,
+                    y_axis=y_axis_spec, derivative=None,
+                )
+                numerical_path = getattr(cube, "drr_numerical_path", "common")
+                mode_label = (
+                    "DR/R Automatic" if numerical_path != "common"
+                    else "DR/R Self" if assignments[0].baseline_mode.startswith("Self")
+                    else "DR/R External"
+                )
+                baselines = list(dict.fromkeys(
+                    source for assignment in assignments for source in assignment.baseline_files
+                ))
             elif baseline_text == "External":
                 if not baselines:
                     raise ValueError("External DRR mode requires baseline files.")
@@ -5767,6 +5972,15 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     derivative=None,
                 )
                 mode_label = "DR/R Self"
+            numerical_path = getattr(cube, "drr_numerical_path", "common")
+            selection_metadata = {
+                "selection_method": (
+                    "automatic_per_measurement" if baseline_text == "Automatic"
+                    else "explicit_per_measurement"
+                ),
+                "numerical_path": numerical_path,
+                "drr_background_assignments": [item.to_dict() for item in assignments],
+            }
             self.loaded = LoadedState(
                 mode="DRR",
                 folder=self.current_folder,
@@ -5778,11 +5992,18 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 drr_derivative_label=self.drr_derivative_combo.currentText(),
                 drr_baseline_text=baseline_text,
                 drr_baseline_which=baseline_which,
+                drr_assignments=tuple(assignments),
+                drr_background_selection=selection_metadata if assignments else {},
                 y_axis_spec=y_axis_spec,
                 provenance_records=self._drr_provenance_records(
                     self.current_folder, selected, baselines
                 ),
             )
+            # Keep the controller state in lockstep with the freshly loaded
+            # state so the next parameter key/cache comparison sees the same
+            # assignment identity.
+            self._drr_assignments = tuple(assignments)
+            self._drr_assignments_automatic = baseline_text == "Automatic"
             self._last_plot_cube = None
             self._last_plot_params_key = None
             self._apply_auto_limits_for_loaded()
@@ -6229,6 +6450,71 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             )
             drr_inputs = [("measurement", name) for name in loaded.selected_files]
             drr_inputs.extend(("background", name) for name in loaded.baseline_files)
+            # The loaded assignments and numerical path are authoritative.
+            # Older metadata may contain a stale mapping from a prior load;
+            # never let that dictionary overwrite the current recipe.
+            is_precomputed_map = (
+                loaded.drr_baseline_text == "None"
+                or loaded.drr_mode_label == "DR/R Map"
+            )
+            drr_assignments = [
+                item.to_dict() if hasattr(item, "to_dict") else dict(item)
+                for item in getattr(loaded, "drr_assignments", ())
+            ]
+            if not drr_assignments and loaded.selected_files and not is_precomputed_map:
+                if loaded.drr_baseline_text == "Automatic":
+                    resolved = resolve_drr_background_assignments(
+                        folder, discover_drr_sources(folder), loaded.selected_files,
+                    )
+                else:
+                    resolved = resolve_drr_background_assignments(
+                        folder, discover_drr_sources(folder), loaded.selected_files,
+                        explicit_baseline_files=loaded.baseline_files,
+                        explicit_baseline_mode=loaded.drr_baseline_text,
+                        explicit_baseline_which=loaded.drr_baseline_which,
+                    )
+                if not resolved.resolved:
+                    raise ValueError(resolved.reason or "DRR background assignment is unresolved.")
+                drr_assignments = [item.to_dict() for item in resolved.assignments]
+            current_selection = dict(getattr(loaded, "drr_background_selection", {}) or {})
+            for key in (
+                "mode", "baseline_selection", "baseline_which", "average_count",
+                "average_method", "derivative_order", "savgol_window",
+                "savgol_polyorder", "derivative_grid", "y_axis",
+                "drr_background_assignments", "selection_method", "numerical_path",
+            ):
+                current_selection.pop(key, None)
+            export_numerical_path = (
+                getattr(loaded.cube, "drr_numerical_path", None)
+                or current_selection.get("numerical_path", "common")
+            )
+            drr_processing = {
+                "mode": loaded.drr_mode_label,
+                "baseline_selection": loaded.drr_baseline_text,
+                "baseline_which": loaded.drr_baseline_which,
+                "average_count": len(loaded.selected_files),
+                "average_method": (
+                    "per-file dR/R, align to first measurement grid without extrapolation, then nanmean"
+                    if export_numerical_path == "heterogeneous"
+                    else "per-file dR/R, then nanmean"
+                ),
+                "derivative_order": options.drr_derivative_order,
+                "savgol_window": options.drr_sg_window,
+                "savgol_polyorder": options.drr_sg_polyorder,
+                "derivative_grid": options.drr_sg_mode_label,
+                "y_axis": loaded.y_axis_spec,
+            }
+            if not is_precomputed_map:
+                drr_processing.update({
+                    "drr_background_assignments": drr_assignments,
+                    "selection_method": (
+                        "automatic_per_measurement"
+                        if loaded.drr_baseline_text == "Automatic"
+                        else "explicit_per_measurement"
+                    ),
+                    "numerical_path": export_numerical_path,
+                    **current_selection,
+                })
             paths = export_drr_png_and_dat(
                 folder,
                 cube=options.drr_cube,
@@ -6236,19 +6522,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 export_base=base,
                 processed_name=str(Path("Processed Data") / "DRR"),
                 metadata_input_files=drr_inputs,
-                metadata_processing={
-                    "mode": loaded.drr_mode_label,
-                    "baseline_selection": loaded.drr_baseline_text,
-                    "baseline_which": loaded.drr_baseline_which,
-                    "average_count": len(loaded.selected_files),
-                    "average_method": "per-file dR/R, then nanmean",
-                    "derivative_order": options.drr_derivative_order,
-                    "savgol_window": options.drr_sg_window,
-                    "savgol_polyorder": options.drr_sg_polyorder,
-                    "derivative_grid": options.drr_sg_mode_label,
-                    "y_axis": loaded.y_axis_spec,
-                    **loaded.drr_background_selection,
-                },
+                metadata_processing=drr_processing,
                 metadata_extra=metadata_extra,
             )
             save_status = getattr(paths, "save_status", "created")

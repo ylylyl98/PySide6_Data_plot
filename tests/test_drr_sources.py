@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from typing import Sequence
 from unittest.mock import patch
 
 from core.drr_sources import (
@@ -21,11 +22,215 @@ from core.drr_sources import (
     newest_measurement_group,
     portable_source_name,
     validate_named_wavelength_centers,
+    DrrMeasurementAssignment,
+    resolve_drr_background_assignments,
 )
 from core.provenance import verify_initial_data_working_file
 
 
 class DrrSourceCatalogTests(unittest.TestCase):
+    @staticmethod
+    def _write_drr_csv(
+        path: Path,
+        values: Sequence[float],
+        *,
+        varying_gates: bool = False,
+        gate_value: float = 0.0,
+    ) -> None:
+        rows = ["Vbg,Vtg," + ",".join(str(700 + index) for index in range(len(values)))]
+        for index, value in enumerate(values):
+            gate = index if varying_gates else gate_value
+            rows.append(f"{gate},0," + ",".join(str(item) for item in values))
+        path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    def test_auto_resolver_accepts_one_unique_high_coverage_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initial = root / "Initial Data"
+            initial.mkdir()
+            measurement = initial / "YZ_p3n1_1.67KREF_760nmc_0p05sx20_data_rep1_1.csv"
+            background = initial / "YZ_p3n1_1.67KREF_760nmc_0p05sx20_back_rep1_1.csv"
+            self._write_drr_csv(measurement, list(range(10, 22)), varying_gates=True)
+            self._write_drr_csv(background, list(range(10, 22)))
+            resolution = resolve_drr_background_assignments(
+                root,
+                discover_drr_sources(root),
+                [portable_source_name(root, measurement)],
+            )
+            self.assertTrue(resolution.resolved)
+            self.assertEqual(resolution.assignments[0].baseline_files, (portable_source_name(root, background),))
+
+    def test_auto_resolver_rejects_sparse_joint_background_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initial = root / "Initial Data"
+            initial.mkdir()
+            measurement = initial / "sample_1.67KREF_p3n1_760nmc_0p05sx20_data.csv"
+            background = initial / "sample_1.67KREF_p3n1_760nmc_0p05sx20_back.csv"
+            self._write_drr_csv(measurement, list(range(10, 22)), varying_gates=True)
+            self._write_drr_csv(background, [10, 11, 12] + [float("nan")] * 9)
+            resolution = resolve_drr_background_assignments(
+                root,
+                discover_drr_sources(root),
+                [portable_source_name(root, measurement)],
+            )
+            self.assertFalse(resolution.resolved)
+
+    def test_auto_resolver_rejects_known_point_or_exposure_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initial = root / "Initial Data"
+            initial.mkdir()
+            measurement = initial / "sample_1.67KREF_p3n1_760nmc_0p05sx20_data.csv"
+            wrong_point = initial / "sample_1.67KREF_p3n2_760nmc_0p05sx20_back.csv"
+            wrong_exposure = initial / "sample_1.67KREF_p3n1_760nmc_0p05sx40_back.csv"
+            self._write_drr_csv(measurement, list(range(10, 22)), varying_gates=True)
+            self._write_drr_csv(wrong_point, list(range(10, 22)))
+            self._write_drr_csv(wrong_exposure, list(range(10, 22)))
+            resolution = resolve_drr_background_assignments(
+                root,
+                discover_drr_sources(root),
+                [portable_source_name(root, measurement)],
+            )
+            self.assertFalse(resolution.resolved)
+
+    def test_auto_resolver_rejects_conflicting_constant_gate_files_in_one_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initial = root / "Initial Data"
+            initial.mkdir()
+            measurement = initial / "sample_1.67KREF_p3n1_760nmc_0p05sx20_data.csv"
+            background_a = initial / "sample_1.67KREF_p3n1_760nmc_0p05sx20_back_rep1_1.csv"
+            background_b = initial / "sample_1.67KREF_p3n1_760nmc_0p05sx20_back_rep1_2.csv"
+            self._write_drr_csv(measurement, list(range(10, 22)), varying_gates=True)
+            self._write_drr_csv(background_a, list(range(10, 22)))
+            self._write_drr_csv(background_b, list(range(10, 22)), gate_value=1.0)
+            resolution = resolve_drr_background_assignments(
+                root,
+                discover_drr_sources(root),
+                [portable_source_name(root, measurement)],
+            )
+            self.assertFalse(resolution.resolved)
+
+    def test_resolver_uses_saved_member_assignment_without_flattening_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initial = root / "Initial Data"
+            output = root / "Processed Data" / "DRR"
+            initial.mkdir(parents=True)
+            output.mkdir(parents=True)
+            measurements = [initial / "a_760nmc_data.csv", initial / "b_760nmc_data.csv"]
+            backgrounds = [initial / "a_760nmc_back.csv", initial / "b_760nmc_back.csv"]
+            for path in (*measurements, *backgrounds):
+                path.write_text("Vbg,Vtg,740,760\n0,0,1,2\n", encoding="utf-8")
+            (output / "result.metadata.json").write_text(json.dumps({
+                "operation": "DR/R",
+                "sources": [
+                    {"role": "measurement", "source_path": str(measurements[0])},
+                    {"role": "measurement", "source_path": str(measurements[1])},
+                    {"role": "background", "source_path": str(backgrounds[0])},
+                    {"role": "background", "source_path": str(backgrounds[1])},
+                ],
+                "processing": {
+                    "baseline_selection": "External",
+                    "baseline_which": "last",
+                    "drr_background_assignments": [
+                        {"measurement": str(measurements[0]), "baseline_files": [str(backgrounds[0])]},
+                        {"measurement": str(measurements[1]), "baseline_files": [str(backgrounds[1])]},
+                    ],
+                },
+            }), encoding="utf-8")
+            resolution = resolve_drr_background_assignments(
+                root, discover_drr_sources(root),
+                [portable_source_name(root, path) for path in measurements],
+            )
+            self.assertEqual(resolution.numerical_path, "heterogeneous")
+            self.assertEqual(
+                [assignment.baseline_files for assignment in resolution.assignments],
+                [(portable_source_name(root, backgrounds[0]),), (portable_source_name(root, backgrounds[1]),)],
+            )
+
+    def test_resolver_does_not_guess_when_saved_member_file_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initial = root / "Initial Data"
+            output = root / "Processed Data" / "DRR"
+            initial.mkdir(parents=True)
+            output.mkdir(parents=True)
+            measurement = initial / "sample_760nmc_data.csv"
+            measurement.write_text("Vbg,Vtg,740,760\n0,0,1,2\n", encoding="utf-8")
+            (output / "result.metadata.json").write_text(json.dumps({
+                "operation": "DR/R",
+                "sources": [{"role": "measurement", "source_path": str(measurement)}],
+                "processing": {
+                    "baseline_selection": "External",
+                    "drr_background_assignments": [{
+                        "measurement": str(measurement),
+                        "baseline_files": ["Initial Data/missing_back.csv"],
+                    }],
+                },
+            }), encoding="utf-8")
+            resolution = resolve_drr_background_assignments(
+                root, discover_drr_sources(root), [portable_source_name(root, measurement)]
+            )
+            self.assertFalse(resolution.resolved)
+            self.assertEqual(resolution.assignments, ())
+
+    def test_malformed_assignment_mapping_does_not_fall_back_to_background_union(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initial = root / "Initial Data"
+            output = root / "Processed Data" / "DRR"
+            initial.mkdir(parents=True)
+            output.mkdir(parents=True)
+            measurements = [initial / "a.csv", initial / "b.csv"]
+            backgrounds = [initial / "bg_a.csv", initial / "bg_b.csv"]
+            for path in (*measurements, *backgrounds):
+                path.write_text("Vbg,Vtg,740,760\n0,0,1,2\n", encoding="utf-8")
+            (output / "result.metadata.json").write_text(json.dumps({
+                "operation": "DR/R",
+                "sources": [
+                    *({"role": "measurement", "source_path": str(path)} for path in measurements),
+                    *({"role": "background", "source_path": str(path)} for path in backgrounds),
+                ],
+                "processing": {
+                    "baseline_selection": "External",
+                    "drr_background_assignments": None,
+                },
+            }), encoding="utf-8")
+            selected = [portable_source_name(root, path) for path in measurements]
+            resolution = resolve_drr_background_assignments(
+                root, discover_drr_sources(root), selected
+            )
+            self.assertFalse(resolution.resolved)
+            self.assertEqual(resolution.assignments, ())
+            linked = {
+                source.source: source.linked_backgrounds
+                for source in discover_drr_sources(root)
+                if source.source in selected
+            }
+            self.assertEqual(linked, {selected[0]: (), selected[1]: ()})
+
+    def test_assignment_round_trip_is_portable(self) -> None:
+        assignment = DrrMeasurementAssignment(
+            measurement_file="Initial Data/a.csv",
+            baseline_mode="External",
+            baseline_files=("Initial Data/bg.csv",),
+            baseline_which="all",
+            source_recipe="Processed Data/DRR/r.metadata.json",
+            selection_reason="saved member assignment",
+        )
+        restored = DrrMeasurementAssignment.from_mapping(assignment.to_dict())
+        self.assertEqual(restored, assignment)
+
+    def test_assignment_mapping_rejects_explicit_blank_mode(self) -> None:
+        with self.assertRaises(ValueError):
+            DrrMeasurementAssignment.from_mapping({
+                "measurement": "m.csv",
+                "baseline_mode": "",
+                "baseline_files": [],
+            })
+
     def test_discovery_cache_reuses_unchanged_file_inspections(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
