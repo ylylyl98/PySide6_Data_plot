@@ -21,4 +21,11 @@ if not exist "dist\PySide6_Data_Plot\PySide6_Data_Plot.exe" (
     exit /b 1
 )
 
+"dist\PySide6_Data_Plot\PySide6_Data_Plot.exe" --check-powerpoint-integration
+if errorlevel 1 (
+    echo The packaged application is missing live PowerPoint integration.
+    echo Confirm pywin32 is installed from requirements.txt, then rebuild.
+    exit /b 1
+)
+
 echo Built: %CD%\dist\PySide6_Data_Plot\PySide6_Data_Plot.exe

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import json
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
@@ -13,6 +14,7 @@ from core import processing_run as P
 XLSX_Y_LABEL_DOPING = "Doping (V)"
 XLSX_Y_LABEL_EFIELD = "Efield (V)"
 XLSX_Y_LABEL_OPTIONS = (XLSX_Y_LABEL_DOPING, XLSX_Y_LABEL_EFIELD)
+DAT_Y_AXIS_OPTIONS = ("Y", "Doping", "Electric field", "Gate voltage", "Custom")
 
 
 def is_xlsx_map_file(file_name: str) -> bool:
@@ -36,6 +38,107 @@ class DataCube:
     gate_label: str
     title: str
     cbar_label: str
+    gate_unit: str = ""
+    y_axis_semantic: str = ""
+
+
+def _dat_sidecar_candidates(path: Path) -> tuple[Path, ...]:
+    return (
+        path.with_suffix(".metadata.json"),
+        Path(f"{path}.plotmeta.json"),
+    )
+
+
+def _load_dat_sidecar(path: Path) -> dict:
+    for sidecar in _dat_sidecar_candidates(path):
+        if not sidecar.is_file():
+            continue
+        try:
+            value = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+    return {}
+
+
+def resolve_dat_y_axis(choice: str, *, custom_label: str = "", custom_unit: str = "") -> tuple[str, str, str]:
+    """Map a user-facing DAT Y-axis choice to label, unit, and semantic id."""
+    selected = str(choice or "Y").strip()
+    if selected == "Doping":
+        return "Doping", str(custom_unit).strip(), "doping"
+    if selected == "Electric field":
+        return "Electric field", str(custom_unit).strip(), "electric_field"
+    if selected == "Gate voltage":
+        return "Gate voltage", str(custom_unit).strip(), "gate_voltage"
+    if selected == "Custom":
+        label = str(custom_label).strip() or "Y"
+        return label, str(custom_unit).strip(), "custom"
+    return "Y", "", "y"
+
+
+def load_dat(path: str | Path) -> DataCube:
+    """Load an Origin-friendly exported DAT matrix into the normal DataCube model."""
+    dat_path = Path(path)
+    if not dat_path.is_file():
+        raise FileNotFoundError(f"DAT file not found: {dat_path}")
+    try:
+        lines = dat_path.read_text(encoding="utf-8-sig").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"Could not read DAT file {dat_path}: {exc}") from exc
+    content = [line for line in lines if line.strip() and not line.lstrip().startswith("#")]
+    if not content:
+        raise ValueError(f"DAT file {dat_path.name!r} contains no numeric table.")
+    header = content[0].split("\t")
+    if len(header) < 2:
+        raise ValueError(f"DAT file {dat_path.name!r} must contain an X column and at least one Y column.")
+    try:
+        gate = np.asarray([float(value.strip()) for value in header[1:]], dtype=float)
+    except ValueError as exc:
+        raise ValueError(f"DAT file {dat_path.name!r} has non-numeric Y/gate headers.") from exc
+    rows: list[list[float]] = []
+    for row_number, line in enumerate(content[1:], start=2):
+        fields = line.split("\t")
+        if len(fields) != len(header):
+            raise ValueError(
+                f"DAT file {dat_path.name!r} row {row_number} has {len(fields)} columns; expected {len(header)}."
+            )
+        try:
+            rows.append([float(value.strip()) for value in fields])
+        except ValueError as exc:
+            raise ValueError(f"DAT file {dat_path.name!r} has non-numeric data on row {row_number}.") from exc
+    if not rows:
+        raise ValueError(f"DAT file {dat_path.name!r} contains no data rows.")
+    table = np.asarray(rows, dtype=float)
+    energy = table[:, 0]
+    z = table[:, 1:].T.copy()
+    metadata = _load_dat_sidecar(dat_path)
+    plot = metadata.get("plot", {}) if isinstance(metadata.get("plot", {}), dict) else {}
+    if isinstance(plot.get("linear"), dict):
+        plot = plot["linear"]
+    processing = metadata.get("processing", {}) if isinstance(metadata.get("processing", {}), dict) else {}
+    mode = str(metadata.get("operation", processing.get("mode", "")))
+    sidecar_label = metadata.get("y_axis_label", processing.get("y_axis_label", plot.get("ylabel", "Y")))
+    sidecar_unit = metadata.get("y_axis_unit", processing.get("y_axis_unit", plot.get("y_unit", "")))
+    sidecar_semantic = metadata.get("y_axis_semantic", processing.get("y_axis_semantic", ""))
+    if not sidecar_semantic:
+        sidecar_semantic = {
+            "doping": "doping",
+            "electric field": "electric_field",
+            "gate voltage": "gate_voltage",
+        }.get(str(sidecar_label).strip().lower(), "" if str(sidecar_label).strip() in {"", "Y"} else "custom")
+    cube = DataCube(
+        energy=energy,
+        gate=gate,
+        Z=z,
+        gate_label=str(sidecar_label or "Y"),
+        title=str(plot.get("title", dat_path.stem)),
+        cbar_label=str(plot.get("cbar_label", mode or "Imported DAT")),
+        gate_unit=str(sidecar_unit or ""),
+        y_axis_semantic=str(sidecar_semantic or ""),
+    )
+    cube.plot_metadata = plot
+    cube.import_metadata = metadata
+    return cube
 
 
 def _validate_cube_arrays(energy: np.ndarray, gate: np.ndarray, Z: np.ndarray, *, context: str) -> None:
@@ -53,15 +156,20 @@ def _validate_cube_arrays(energy: np.ndarray, gate: np.ndarray, Z: np.ndarray, *
         )
 
 
+def _source_path(user_folder: str, file_name: str) -> Path:
+    requested = Path(file_name)
+    return requested.resolve() if requested.is_absolute() else (Path(user_folder) / requested).resolve()
+
+
 def _csv_signature(user_folder: str, file_name: str) -> Tuple[int, int]:
-    """Return cache key pieces from the root CSV mtime and size."""
+    """Return cache key pieces from a CSV mtime and size."""
     folder = Path(user_folder)
     if not folder.exists() or not folder.is_dir():
         raise FileNotFoundError(f"Folder does not exist: {user_folder}")
 
-    csv_path = folder / Path(file_name).name
+    csv_path = _source_path(user_folder, file_name)
     if not csv_path.exists() or not csv_path.is_file():
-        raise FileNotFoundError(f"CSV not found in folder root: {csv_path}")
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
 
     stt = csv_path.stat()
     return int(stt.st_mtime_ns), int(stt.st_size)
@@ -131,14 +239,14 @@ def load_pl(user_folder: str, file_name: str, *, log_scale: bool = False, y_axis
 
 
 def _xlsx_signature(user_folder: str, file_name: str) -> Tuple[int, int]:
-    """Return cache key pieces from the root XLSX mtime and size."""
+    """Return cache key pieces from an XLSX mtime and size."""
     folder = Path(user_folder)
     if not folder.exists() or not folder.is_dir():
         raise FileNotFoundError(f"Folder does not exist: {user_folder}")
 
-    xlsx_path = folder / Path(file_name).name
+    xlsx_path = _source_path(user_folder, file_name)
     if not xlsx_path.exists() or not xlsx_path.is_file():
-        raise FileNotFoundError(f"XLSX not found in folder root: {xlsx_path}")
+        raise FileNotFoundError(f"XLSX not found: {xlsx_path}")
 
     stat = xlsx_path.stat()
     return int(stat.st_mtime_ns), int(stat.st_size)
@@ -168,7 +276,7 @@ def _load_xlsx_map_cached(
 
     from openpyxl import load_workbook
 
-    path = Path(user_folder) / Path(file_name).name
+    path = _source_path(user_folder, file_name)
     workbook = load_workbook(path, read_only=True, data_only=False)
     try:
         sheet_names = workbook.sheetnames
@@ -243,14 +351,10 @@ def load_xlsx_map(
 ) -> DataCube:
     """Load a precomputed dR/R XLSX map into the standard DataCube contract."""
     raw_name = str(file_name)
-    if Path(raw_name).name != raw_name:
-        raise ValueError(
-            f"XLSX map must reference a root-level file name, got {raw_name!r}"
-        )
     if not is_xlsx_map_file(raw_name):
         raise ValueError(f"XLSX map must reference a .xlsx file, got {raw_name!r}")
     signature = _xlsx_signature(user_folder, file_name)
-    energy, gate, z, title = _load_xlsx_map_cached(user_folder, Path(file_name).name, signature)
+    energy, gate, z, title = _load_xlsx_map_cached(user_folder, raw_name, signature)
     _validate_cube_arrays(energy, gate, z, context="XLSX map load")
     return DataCube(
         energy=np.asarray(energy, dtype=float).copy(),

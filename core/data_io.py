@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import lru_cache
+import json
+import re
 from pathlib import Path
 from typing import Dict, List, Sequence
 
@@ -9,12 +12,14 @@ import numpy as np
 import pandas as pd
 
 from core.file_ops import _nat_key, archive_selected, list_root_csvs
+from core.drr_sources import resolve_source_path, validate_named_wavelength_centers
 from core.loader import (
     DataCube,
     XLSX_Y_LABEL_OPTIONS,
     build_external_baseline,
     is_xlsx_map_file,
     load_drr_avg,
+    load_dat,
     load_pl,
     load_xlsx_map,
     resolve_xlsx_y_label,
@@ -113,13 +118,149 @@ def list_csv_files(folder: str) -> List[str]:
     return list_root_csvs(folder)
 
 
+def list_mcd_csv_files(folder: str) -> List[str]:
+    """Return MCD acquisition CSVs, preferring the dedicated ``mcd`` folder.
+
+    Acquisition writes MCD sweeps below ``<experiment>/mcd``.  Relative paths
+    are returned so the existing loaders and export metadata remain portable.
+    Root-level CSVs are retained as a fallback for older experiment folders.
+    """
+    root = Path(folder)
+    if not root.exists() or not root.is_dir():
+        return []
+    try:
+        mcd_roots = [
+            child
+            for child in root.iterdir()
+            if child.is_dir() and child.name.casefold() == "mcd"
+        ]
+        candidates = [
+            path
+            for mcd_root in mcd_roots
+            for path in mcd_root.rglob("*.csv")
+            if path.is_file()
+        ]
+    except OSError:
+        candidates = []
+    if not candidates:
+        return list_root_csvs(folder)
+    names = {path.relative_to(root).as_posix() for path in candidates}
+    return sorted(names, key=_nat_key)
+
+
+def list_pl_source_files(folder: str) -> List[str]:
+    """Return raw PL inputs plus saved PL DAT results as portable paths."""
+    root = Path(folder)
+    if not root.is_dir():
+        return []
+    candidates: list[Path] = []
+    try:
+        candidates.extend(
+            path
+            for path in root.iterdir()
+            if path.is_file() and path.suffix.lower() in {".csv", ".xlsx", ".dat"}
+        )
+        initial = root / "Initial Data"
+        if initial.is_dir():
+            candidates.extend(
+                path
+                for path in initial.rglob("*")
+                if path.is_file() and path.suffix.lower() in {".csv", ".xlsx", ".dat"}
+            )
+        processed = root / "Processed Data" / "PL"
+        if processed.is_dir():
+            candidates.extend(path for path in processed.rglob("*.dat") if path.is_file())
+    except OSError:
+        pass
+    names = {path.relative_to(root).as_posix() for path in candidates}
+    return sorted(names, key=_nat_key)
+
+
+_PL_SOURCE_MARKER_RE = re.compile(
+    r"(?:^|[_\-\s])(?P<kind>PL|REF)(?=$|[_\-\s])"
+    r"|(?P<temperature>\d+(?:\.\d+)?)K(?P<attached>PL|REF)(?=$|[_\-\s])",
+    re.IGNORECASE,
+)
+
+
+def classify_pl_source(source: str | Path) -> str:
+    """Classify a raw PL filename conservatively as PL, REF, or Unknown."""
+    suffix = Path(source).suffix.lower()
+    if suffix == ".dat":
+        return "DAT"
+    if suffix not in {".csv", ".xlsx"}:
+        return "Unknown"
+    kinds = {
+        (match.group("kind") or match.group("attached")).upper()
+        for match in _PL_SOURCE_MARKER_RE.finditer(Path(source).stem)
+    }
+    return next(iter(kinds)) if len(kinds) == 1 else "Unknown"
+
+
+def discover_pl_processing_status(
+    experiment_root: str | Path, sources: Sequence[str]
+) -> dict[str, str]:
+    """Map raw PL sources to the newest matching export-metadata timestamp."""
+    root = Path(experiment_root)
+    metadata_root = root / "Processed Data" / "PL"
+    if not metadata_root.is_dir():
+        return {}
+    raw_sources = [
+        str(source)
+        for source in sources
+        if not str(source).replace("\\", "/").casefold().startswith("processed data/pl/")
+    ]
+    by_name: dict[str, list[str]] = {}
+    by_relative: dict[str, str] = {}
+    for source in raw_sources:
+        by_name.setdefault(Path(source).name.casefold(), []).append(source)
+        by_relative[source.replace("\\", "/").casefold()] = source
+    status: dict[str, str] = {}
+    try:
+        metadata_files = metadata_root.rglob("*.metadata.json")
+        for metadata_path in metadata_files:
+            try:
+                payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            workflow = str(payload.get("workflow", payload.get("operation", ""))).casefold()
+            if workflow != "pl":
+                continue
+            created = str(payload.get("created_utc", "")).strip()
+            if not created:
+                try:
+                    created = datetime.fromtimestamp(
+                        metadata_path.stat().st_mtime, timezone.utc
+                    ).isoformat()
+                except OSError:
+                    created = "processed"
+            for descriptor in payload.get("sources", payload.get("inputs", [])):
+                if not isinstance(descriptor, dict):
+                    continue
+                raw = str(descriptor.get("name", descriptor.get("source_path", "")))
+                normalized = raw.replace("\\", "/").casefold()
+                matches: list[str] = []
+                if normalized in by_relative:
+                    matches.append(by_relative[normalized])
+                filename = Path(raw).name.casefold()
+                matches.extend(by_name.get(filename, []))
+                for source in dict.fromkeys(matches):
+                    if created > status.get(source, ""):
+                        status[source] = created
+    except OSError:
+        return status
+    return status
+
+
 def list_map_input_files(folder: str) -> List[str]:
-    """Return root-level CSV and XLSX map filenames, naturally sorted."""
+    """Return root-level CSV, XLSX, and exported DAT filenames, naturally sorted."""
     p = Path(folder)
     if not p.exists() or not p.is_dir():
         return []
     try:
-        names = {f.name for f in p.glob("*.csv")} | {f.name for f in p.glob("*.xlsx")}
+        names = ({f.name for f in p.glob("*.csv")} |
+                 {f.name for f in p.glob("*.xlsx")} |
+                 {f.name for f in p.glob("*.dat")})
     except OSError:
         return []
     return sorted(names, key=_nat_key)
@@ -138,6 +279,8 @@ def move_selected_to_archive(folder: str, file_names: Sequence[str], archive_nam
 
 
 def load_pl_cube(folder: str, file_name: str, *, log_scale: bool = False, y_axis: str = "auto") -> DataCube:
+    if Path(file_name).suffix.lower() == ".dat":
+        return load_dat(resolve_source_path(folder, file_name))
     return load_pl(folder, file_name, log_scale=log_scale, y_axis=y_axis)
 
 
@@ -173,6 +316,7 @@ def load_drr_external_cube(
     y_axis: str = "auto",
     derivative: int | None = None,
 ) -> DataCube:
+    validate_named_wavelength_centers(files, baseline_files)
     baseline = build_external_baseline(folder, baseline_files, which=baseline_which)
     return load_drr_avg(
         folder,

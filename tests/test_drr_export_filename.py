@@ -129,7 +129,7 @@ class DrrExportMetadataUiTests(unittest.TestCase):
             self.window.drr_sg_poly_spin.blockSignals(False)
             self.window.drr_sg_window_spin.blockSignals(False)
 
-        _export_cube, deriv, used_win, poly = self.window._drr_cube_with_metadata()
+        _export_cube, deriv, used_win, poly = self.window.drr_controller._drr_cube_with_metadata()
 
         self.assertEqual(deriv, 1)
         self.assertEqual(poly, 6)
