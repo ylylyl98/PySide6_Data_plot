@@ -226,6 +226,28 @@ class MCDPeakShiftUITests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
+    def test_default_tab_entry_displays_raw_and_derivative_results_without_local_fit(self):
+        from ui_qt.main_window import LoadedState, MainWindow
+        window = MainWindow()
+        try:
+            source = _result([-1., 0., 0., 1.])
+            source.pair_raw_neg = np.asarray([
+                np.interp(source.energy_ev + .003 * field, source.energy_ev, row)
+                for field, row in zip(source.pair_b, source.pair_raw_neg)
+            ])
+            window.loaded = LoadedState(mode="MCD", folder="", mcd_result=source)
+            window._update_mcd_peak_shift_source(source)
+            index = next(i for i in range(window.tabs.count()) if window.tabs.tabText(i) == "MCD Peak Shift")
+            with patch.object(window.thread_pool, "start") as start:
+                window.tabs.setCurrentIndex(index)
+                self.assertEqual(set(window.mcd_peak_method_results), {"Raw spectrum", "Second derivative"})
+                self.assertTrue(window.mcd_peak_show_derivative_chk.isChecked())
+                methods = {getattr(line, "_mcd_peak_method", None) for line in window.mcd_peak_shift_ax.lines}
+                self.assertTrue({"Raw spectrum", "Second derivative"}.issubset(methods))
+                start.assert_not_called()
+        finally:
+            window.close()
+
     def test_page_exists_and_empty_state_is_safe(self):
         from ui_qt.main_window import MainWindow
         window = MainWindow()
@@ -237,14 +259,14 @@ class MCDPeakShiftUITests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_local_fit_defaults_to_raw_r_and_routes_each_physical_channel(self):
+    def test_raw_r_source_and_local_fit_route_each_physical_channel(self):
         from ui_qt.feature_pages import _mcd_fit_source_for_channel, _mcd_local_fit_worker
 
         window = None
         try:
             from ui_qt.main_window import MainWindow
             window = MainWindow()
-            self.assertEqual(window.mcd_peak_tracker_method_combo.currentText(), "Local mixed fit")
+            self.assertEqual(window.mcd_peak_tracker_method_combo.currentText(), "Raw spectrum")
             self.assertEqual(
                 [window.mcd_peak_source_combo.itemText(index) for index in range(window.mcd_peak_source_combo.count())],
                 ["Raw R", "MCD-corrected R"],
@@ -301,6 +323,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
         from ui_qt.main_window import LoadedState, MainWindow
 
         window = MainWindow()
+        window.mcd_peak_tracker_method_combo.setCurrentText("Local mixed fit")
         try:
             fields = np.asarray([-1.0, 1.0])
             branches = np.asarray(["B increasing", "B increasing"])
@@ -379,6 +402,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
         from ui_qt.main_window import LoadedState, MainWindow
 
         window = MainWindow()
+        window.mcd_peak_tracker_method_combo.setCurrentText("Local mixed fit")
         try:
             source = _result([-1.0, 0.0, 1.0], n_peaks=3)
             window.loaded = LoadedState(mode="MCD", folder="", mcd_result=source)

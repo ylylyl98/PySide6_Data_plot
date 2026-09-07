@@ -2454,8 +2454,17 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         }.get(text)
 
     def _on_central_tab_changed(self, _index: int) -> None:
-        if self.tabs.tabText(int(_index)) == "MCD Peak Shift":
+        label = self.tabs.tabText(int(_index))
+        if label == "MCD Peak Shift":
             self._plot_mode("MCD Peak Shift")
+            self._ensure_mcd_peak_analysis()
+        elif (
+            label == "MCD"
+            and self.loaded is not None
+            and self.loaded.mode == "MCD"
+            and self.loaded.mcd_result is not None
+        ):
+            self._plot_mode("MCD")
 
     def _toolbar_load(self) -> None:
         mode = self._active_mode()
@@ -3310,6 +3319,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if not self.current_folder:
             self._show_error("Choose a folder first.")
             return
+        if mode == "MCD" and not self.mcd_controller._mcd_angles_ready():
+            self.mcd_controller._request_mcd_load()
+            return
         self._invalidate_export_move_sources()
         compare_sources: Dict[str, str] = {}
         power_group_key = ""
@@ -4046,7 +4058,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         plot_mode = "MCD Peak Shift" if loaded.mode == "MCD" and current_tab == "MCD Peak Shift" else loaded.mode
         self._plot_mode(plot_mode, auto=True)
         if plot_mode == "MCD Peak Shift" and loaded.mcd_result is not None:
-            self._analyze_mcd_peak_shift()
+            self._ensure_mcd_peak_analysis()
         if (
             loaded.mode == "MCD"
             and loaded.mcd_result is not None
@@ -4087,6 +4099,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self._mcd_reload_pending = False
                 self._status("Loading the newly selected MCD source...")
                 self.mcd_controller._request_mcd_load()
+            elif succeeded and self.tabs.tabText(self.tabs.currentIndex()) == "MCD Peak Shift":
+                self._ensure_mcd_peak_analysis()
 
     def _split_prefix_mode(self, prefix: str) -> str:
         return {
