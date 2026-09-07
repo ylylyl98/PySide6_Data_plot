@@ -61,6 +61,7 @@ from core.drr_sources import (
     DrrSource,
     DrrSourceCache,
     assess_background_gate_files,
+    compatible_drr_repeats,
     discover_drr_sources,
     extract_wavelength_center_nm,
     find_saved_drr_recipe,
@@ -2809,8 +2810,18 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             for group in group_drr_sources(sources):
                 if group.key not in selected_complete_group_keys:
                     continue
+                if group.is_background:
+                    continue
+                selected_members = [
+                    source for source in group.files if source.source in selected_now
+                ]
+                if not selected_members:
+                    continue
+                compatible = set(
+                    compatible_drr_repeats(sources, selected_members[0].source)
+                )
                 for source in group.files:
-                    if source.source not in selected_now:
+                    if source.source not in selected_now and source.source in compatible:
                         self.drr_selected_files.append(source.source)
                         selected_now.add(source.source)
         self.drr_baseline_files_manual = [

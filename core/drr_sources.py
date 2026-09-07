@@ -17,7 +17,11 @@ from core.processing import split_group_and_sort_key
 
 
 SUPPORTED_DRR_SUFFIXES = {".csv", ".xlsx"}
-_BACKGROUND_TOKEN = re.compile(r"(?:^|[_\-\s])(back(?:ground)?|bg|dark|i0|reference|ref)(?:$|[_\-\s])", re.IGNORECASE)
+_BACKGROUND_TOKEN = re.compile(
+    r"(?:^|[_\-\s])(?:[np]?back(?:ground)?\d*|bg\d*|dark|i0|reference|ref)"
+    r"(?=$|[_\-\s(\[])",
+    re.IGNORECASE,
+)
 _WAVELENGTH_CENTER_TOKEN = re.compile(
     r"(?<![A-Za-z0-9])(?P<value>\d+(?:[pP.]\d+)?)\s*(?:nmc|nm[_\-\s]?center)(?![A-Za-z0-9])",
     re.IGNORECASE,
@@ -44,6 +48,15 @@ class DrrSource:
     size_bytes: int = 0
     wavelength_center_nm: float | None = None
     wavelength_center_source: str = ""
+    metadata_role: str = ""
+    linked_backgrounds: tuple[str, ...] = ()
+    saved_baseline_modes: tuple[str, ...] = ()
+    gate_grid: tuple[tuple[float, ...], ...] = ()
+    spectral_grid: tuple[float, ...] = ()
+    gate_direction: str = ""
+    gate_ranges: tuple[tuple[float, float], ...] = ()
+    gate_labels: tuple[str, ...] = ()
+    grid_complete: bool = False
 
 
 @dataclass(frozen=True)
@@ -57,6 +70,14 @@ class DrrSourceGroup:
     processed: bool
     classification: str = "measurement"
     wavelength_centers_nm: tuple[float, ...] = ()
+    processed_count: int = 0
+    frame_count_range: tuple[int, int] | None = None
+    linked_backgrounds: tuple[str, ...] = ()
+    saved_baseline_modes: tuple[str, ...] = ()
+    gate_direction: str = ""
+    gate_ranges: tuple[tuple[float, float], ...] = ()
+    gate_labels: tuple[str, ...] = ()
+    grid_complete: bool = False
 
 
 class DrrSourceCache:
@@ -120,6 +141,12 @@ class DrrGateProfile:
     varies: bool | None
     frame_count: int | None
     constant_values: tuple[float, ...] = ()
+    gate_grid: tuple[tuple[float, ...], ...] = ()
+    spectral_grid: tuple[float, ...] = ()
+    gate_direction: str = ""
+    gate_ranges: tuple[tuple[float, float], ...] = ()
+    gate_labels: tuple[str, ...] = ()
+    grid_complete: bool = False
 
 
 @dataclass(frozen=True)
@@ -227,6 +254,111 @@ def validate_named_wavelength_centers(
     return expected
 
 
+def _metadata_source_name(root: Path, item: dict[str, object], *, require_exists: bool = False) -> str | None:
+    """Resolve a metadata source using only the paths recorded in that item.
+
+    Export metadata contains both an absolute path and a portable ``name``.
+    A moved experiment can therefore recover the portable path when it exists,
+    while an unrelated file with the same basename is never substituted.
+    """
+    candidates: list[str] = []
+    for key in ("source_path", "path", "processing_input_path", "name"):
+        value = item.get(key)
+        # A basename-only ``name`` is insufficient evidence after a move.
+        # Keep it only when it carries a relative directory or is the only
+        # recorded path (legacy metadata).
+        if key == "name" and isinstance(value, str) and not Path(value).parent.parts:
+            if any(candidates):
+                continue
+        if isinstance(value, str) and value.strip() and value not in candidates:
+            candidates.append(value)
+    if not candidates:
+        return None
+    fallback: str | None = None
+    for raw in candidates:
+        resolved = resolve_source_path(root, raw)
+        if fallback is None:
+            fallback = portable_source_name(root, resolved)
+        try:
+            if resolved.is_file():
+                return portable_source_name(root, resolved)
+        except OSError:
+            continue
+    return None if require_exists else fallback
+
+
+def _read_drr_metadata(
+    root: Path, *, require_drr_operation: bool = False
+) -> tuple[dict[str, set[str]], list[DrrSavedRecipe]]:
+    """Read valid DR/R source roles and associations without trusting filenames."""
+    roles: dict[str, set[str]] = {}
+    records: list[DrrSavedRecipe] = []
+    metadata_root = root / "Processed Data" / "DRR"
+    if not metadata_root.is_dir():
+        return roles, records
+    try:
+        metadata_files = metadata_root.rglob("*.metadata.json")
+    except OSError:
+        return roles, records
+    for metadata_path in metadata_files:
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        operation = payload.get("operation", payload.get("workflow"))
+        if (
+            operation != "DR/R"
+            if require_drr_operation
+            else operation not in (None, "DR/R")
+        ):
+            continue
+        inputs = payload.get("sources", payload.get("inputs", []))
+        if not isinstance(inputs, list):
+            continue
+        measurements: list[str] = []
+        baselines: list[str] = []
+        for item in inputs:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").casefold()
+            if role not in {"measurement", "background"}:
+                continue
+            source = _metadata_source_name(root, item)
+            if source is None:
+                continue
+            identity = str(resolve_source_path(root, source)).casefold()
+            roles.setdefault(identity, set()).add(role)
+            if role == "measurement":
+                measurements.append(source)
+            else:
+                baselines.append(source)
+        if not measurements:
+            continue
+        processing = payload.get("processing", {})
+        if not isinstance(processing, dict):
+            processing = {}
+        try:
+            saved_time = float(metadata_path.stat().st_mtime)
+        except OSError:
+            saved_time = 0.0
+        records.append(
+            DrrSavedRecipe(
+                measurement_files=tuple(measurements),
+                baseline_files=tuple(baselines),
+                baseline_selection=str(
+                    processing.get("baseline_selection")
+                    or ("External" if baselines else "Self (last frame)")
+                ),
+                baseline_which=str(processing.get("baseline_which") or "last"),
+                metadata_path=str(metadata_path),
+                saved_time=saved_time,
+            )
+        )
+    return roles, records
+
+
 def assess_background_gate_files(
     root: str | Path,
     sources: Sequence[str],
@@ -272,63 +404,23 @@ def find_saved_drr_recipe(
         str(resolve_source_path(experiment_root, source)).casefold()
         for source in measurement_files
     }
+    _roles, records = _read_drr_metadata(experiment_root, require_drr_operation=True)
     matches: list[DrrSavedRecipe] = []
-    try:
-        metadata_files = metadata_root.rglob("*.metadata.json")
-    except OSError:
-        return None
-    for metadata_path in metadata_files:
-        try:
-            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
-            continue
-        if payload.get("operation") != "DR/R":
-            continue
-        inputs = payload.get("sources", payload.get("inputs", []))
-        if not isinstance(inputs, list):
-            continue
-        measurements: list[str] = []
-        baselines: list[str] = []
-        for item in inputs:
-            if not isinstance(item, dict):
-                continue
-            raw = item.get("source_path") or item.get("path") or item.get("name")
-            if not raw:
-                continue
-            portable = portable_source_name(
-                experiment_root,
-                resolve_source_path(experiment_root, str(raw)),
-            )
-            if item.get("role") == "measurement":
-                measurements.append(portable)
-            elif item.get("role") == "background":
-                baselines.append(portable)
+    for record in records:
         found = {
             str(resolve_source_path(experiment_root, source)).casefold()
-            for source in measurements
+            for source in record.measurement_files
         }
         if found != wanted:
             continue
-        processing = payload.get("processing", {})
-        if not isinstance(processing, dict):
-            processing = {}
-        try:
-            saved_time = float(metadata_path.stat().st_mtime)
-        except OSError:
-            saved_time = 0.0
-        matches.append(
-            DrrSavedRecipe(
-                measurement_files=tuple(measurements),
-                baseline_files=tuple(baselines),
-                baseline_selection=str(
-                    processing.get("baseline_selection")
-                    or ("External" if baselines else "Self (last frame)")
-                ),
-                baseline_which=str(processing.get("baseline_which") or "last"),
-                metadata_path=str(metadata_path),
-                saved_time=saved_time,
-            )
-        )
+        matches.append(DrrSavedRecipe(
+            measurement_files=record.measurement_files,
+            baseline_files=record.baseline_files,
+            baseline_selection=record.baseline_selection,
+            baseline_which=record.baseline_which,
+            metadata_path=record.metadata_path,
+            saved_time=record.saved_time,
+        ))
     return max(matches, key=lambda recipe: recipe.saved_time, default=None)
 
 
@@ -629,10 +721,11 @@ def inspect_csv_gate_profile(
     *,
     max_rows: int | None = 32,
 ) -> DrrGateProfile:
-    """Return gate variation, sampled frame count, and constant gate values.
+    """Return gate variation, frame count, gate grid, and spectral axis.
 
-    This intentionally samples only the start of each file so catalog refreshes
-    remain quick even when Initial Data contains a long measurement history.
+    Callers that need a cheap preview can retain the default row limit.  The
+    catalog passes ``max_rows=None`` so frame counts and acquisition grids are
+    complete; the result is cached by file size and modification timestamp.
     """
     source = Path(path)
     try:
@@ -665,15 +758,45 @@ def inspect_csv_gate_profile(
             or name in {"gate", "gatev", "field", "efield", "doping"}
         ]
         data_rows = rows[1:]
+        spectral_indices = [
+            index for index, value in enumerate(header) if _as_float(value) is not None
+        ]
+        spectral_grid = tuple(float(_as_float(header[index])) for index in spectral_indices)
+        gate_labels = tuple(str(header[index]).strip() for index in gate_indices)
     else:
         gate_indices = [index for index in (0, 1) if index < len(header)]
         data_rows = rows[1:]
+        spectral_indices = [
+            index for index, value in enumerate(header)
+            if _as_float(value) is not None and float(_as_float(value)) > 50.0
+        ]
+        spectral_grid = tuple(float(_as_float(header[index])) for index in spectral_indices)
+        gate_labels = tuple(f"gate {index + 1}" for index in range(len(gate_indices)))
 
     if not gate_indices:
         return DrrGateProfile(None, len(data_rows))
     varied = False
     found_gate_values = False
     constant_values: list[float] = []
+    gate_grid: list[tuple[float, ...]] = []
+    grid_complete = True
+    for row in data_rows:
+        values = tuple(
+            float(_as_float(row[index]))
+            for index in gate_indices
+            if index < len(row) and _as_float(row[index]) is not None
+        )
+        if len(values) != len(gate_indices):
+            grid_complete = False
+            continue
+        if spectral_indices and any(
+            index >= len(row) or _as_float(row[index]) is None
+            for index in spectral_indices
+        ):
+            grid_complete = False
+            continue
+        if values:
+            gate_grid.append(values)
     for index in gate_indices:
         values = [value for row in data_rows if index < len(row) for value in [_as_float(row[index])] if value is not None]
         if not values:
@@ -682,41 +805,54 @@ def inspect_csv_gate_profile(
         constant_values.append(statistics.fmean(values))
         if max(values) - min(values) > 1e-9 * max(1.0, abs(min(values)), abs(max(values))):
             varied = True
+    direction = ""
+    if gate_grid and len(gate_grid[0]) >= 1 and len(gate_grid) > 1:
+        directions: list[str] = []
+        for column in range(len(gate_grid[0])):
+            values = [row[column] for row in gate_grid]
+            if all(second > first for first, second in zip(values, values[1:])):
+                directions.append("increasing")
+            elif all(second < first for first, second in zip(values, values[1:])):
+                directions.append("decreasing")
+            elif all(second == first for first, second in zip(values, values[1:])):
+                directions.append("constant")
+            else:
+                directions.append("mixed")
+        direction = ", ".join(
+            f"{gate_labels[index] if index < len(gate_labels) else f'gate {index + 1}'} {value}"
+            for index, value in enumerate(directions)
+        )
     return DrrGateProfile(
         varied if found_gate_values else None,
         len(data_rows),
         tuple(constant_values) if found_gate_values and not varied else (),
+        tuple(gate_grid),
+        spectral_grid,
+        direction,
+        tuple(
+            (min(row[index] for row in gate_grid), max(row[index] for row in gate_grid))
+            for index in range(len(gate_indices))
+        ) if gate_grid else (),
+        gate_labels,
+        grid_complete and bool(spectral_grid),
     )
 
 
-def inspect_csv_gate(path: str | Path, *, max_rows: int = 32) -> tuple[bool | None, int | None]:
+def inspect_csv_gate(
+    path: str | Path,
+    *,
+    max_rows: int | None = 32,
+    include_profile: bool = False,
+) -> tuple[bool | None, int | None] | DrrGateProfile:
     profile = inspect_csv_gate_profile(path, max_rows=max_rows)
-    return profile.varies, profile.frame_count
+    return profile if include_profile else (profile.varies, profile.frame_count)
 
 
 def _processed_measurement_paths(root: Path) -> set[str]:
-    processed: set[str] = set()
-    metadata_root = root / "Processed Data" / "DRR"
-    if not metadata_root.is_dir():
-        return processed
-    try:
-        metadata_files = metadata_root.rglob("*.metadata.json")
-    except OSError:
-        return processed
-    for metadata_file in metadata_files:
-        try:
-            payload = json.loads(metadata_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
-            continue
-        for item in payload.get("sources", payload.get("inputs", [])):
-            if not isinstance(item, dict) or item.get("role") != "measurement":
-                continue
-            raw = item.get("source_path") or item.get("path") or item.get("name")
-            if not raw:
-                continue
-            path = resolve_source_path(root, str(raw))
-            processed.add(str(path).casefold())
-    return processed
+    roles, _records = _read_drr_metadata(root)
+    return {
+        identity for identity, values in roles.items() if "measurement" in values
+    }
 
 
 def discover_drr_sources(
@@ -730,7 +866,15 @@ def discover_drr_sources(
         if cache is not None:
             cache.clear()
         return []
-    processed_paths = _processed_measurement_paths(experiment_root)
+    metadata_roles, metadata_records = _read_drr_metadata(experiment_root)
+    processed_paths = {
+        identity for identity, values in metadata_roles.items() if "measurement" in values
+    }
+    metadata_links: dict[str, list[DrrSavedRecipe]] = {}
+    for record in metadata_records:
+        for measurement in record.measurement_files:
+            identity = str(resolve_source_path(experiment_root, measurement)).casefold()
+            metadata_links.setdefault(identity, []).append(record)
     candidates: list[Path] = []
     try:
         candidates.extend(path for path in experiment_root.iterdir() if path.is_file())
@@ -767,9 +911,12 @@ def discover_drr_sources(
             else None
         )
         if cached is None:
-            gate_varies, frame_count = (
-                inspect_csv_gate(path) if path.suffix.lower() == ".csv" else (None, None)
+            profile = (
+                inspect_csv_gate(path, max_rows=None, include_profile=True)
+                if path.suffix.lower() == ".csv"
+                else DrrGateProfile(None, None)
             )
+            gate_varies, frame_count = profile.varies, profile.frame_count
             named_center = extract_wavelength_center_nm(path.name)
             spectral_center = (
                 inspect_csv_wavelength_center(path)
@@ -779,6 +926,12 @@ def discover_drr_sources(
             cached = {
                 "gate_varies": gate_varies,
                 "frame_count": frame_count,
+                "gate_grid": profile.gate_grid,
+                "spectral_grid": profile.spectral_grid,
+                "gate_direction": profile.gate_direction,
+                "gate_ranges": profile.gate_ranges,
+                "gate_labels": profile.gate_labels,
+                "grid_complete": profile.grid_complete,
                 "wavelength_center_nm": named_center if named_center is not None else spectral_center,
                 "wavelength_center_source": (
                     "filename" if named_center is not None
@@ -814,13 +967,25 @@ def discover_drr_sources(
     sources: list[DrrSource] = []
     for item in inspected:
         path = item["path"]
+        source_roles = tuple(sorted(metadata_roles.get(item["identity"], ())))
+        metadata_role = (
+            "measurement" if "measurement" in source_roles
+            else "background" if "background" in source_roles
+            else ""
+        )
         named_background = is_background_name(path.name)
         small_size = median_size > 0 and item["size_bytes"] <= 0.35 * median_size
         small_frames = (
             item["frame_count"] is not None
             and item["frame_count"] <= max(3, int(0.25 * median_frames))
         )
-        if named_background:
+        if metadata_role == "measurement":
+            classification = "measurement"
+            reason = "saved metadata role: measurement"
+        elif metadata_role == "background":
+            classification = "background"
+            reason = "saved metadata role: background"
+        elif named_background:
             classification = "background"
             reason = "background keyword in filename"
         elif item["gate_varies"] is False and (small_size or small_frames):
@@ -838,6 +1003,11 @@ def discover_drr_sources(
             classification = "measurement"
             reason = "gate varies" if item["gate_varies"] is True else "no background indicators found"
         is_background = classification in {"background", "likely_background"}
+        links = metadata_links.get(item["identity"], [])
+        linked_backgrounds = tuple(dict.fromkeys(
+            baseline for record in links for baseline in record.baseline_files
+        ))
+        saved_modes = tuple(dict.fromkeys(record.baseline_selection for record in links))
         sources.append(
             DrrSource(
                 source=portable_source_name(experiment_root, path),
@@ -854,6 +1024,15 @@ def discover_drr_sources(
                 size_bytes=item["size_bytes"],
                 wavelength_center_nm=item["wavelength_center_nm"],
                 wavelength_center_source=item["wavelength_center_source"],
+                metadata_role=metadata_role,
+                linked_backgrounds=linked_backgrounds,
+                saved_baseline_modes=saved_modes,
+                gate_grid=item.get("gate_grid", ()),
+                spectral_grid=item.get("spectral_grid", ()),
+                gate_direction=item.get("gate_direction", ""),
+                gate_ranges=item.get("gate_ranges", ()),
+                gate_labels=item.get("gate_labels", ()),
+                grid_complete=bool(item.get("grid_complete", False)),
             )
         )
     return sorted(sources, key=lambda item: (-item.modified_time, item.filename.casefold()))
@@ -867,6 +1046,17 @@ def group_drr_sources(sources: Sequence[DrrSource]) -> list[DrrSourceGroup]:
     for (session_date, key, is_background), files in grouped.items():
         ordered = tuple(sorted(files, key=lambda item: (item.filename.casefold(), item.modified_time)))
         latest = max((item.modified_time for item in ordered), default=0.0)
+        frame_counts = [item.frame_count for item in ordered if item.frame_count is not None]
+        linked_backgrounds = tuple(dict.fromkeys(
+            path for item in ordered for path in item.linked_backgrounds
+        ))
+        saved_modes = tuple(dict.fromkeys(
+            mode for item in ordered for mode in item.saved_baseline_modes
+        ))
+        directions = {item.gate_direction for item in ordered if item.gate_direction}
+        labels = next((item.gate_labels for item in ordered if item.gate_labels), ())
+        ranges = next((item.gate_ranges for item in ordered if item.gate_ranges), ())
+        complete = bool(ordered) and all(item.grid_complete for item in ordered)
         result.append(
             DrrSourceGroup(
                 key=f"{session_date}|{key}|{'background' if is_background else 'measurement'}",
@@ -890,10 +1080,67 @@ def group_drr_sources(sources: Sequence[DrrSource]) -> list[DrrSourceGroup]:
                     for item in ordered
                     if item.wavelength_center_nm is not None
                 })),
+                processed_count=sum(1 for item in ordered if item.processed),
+                frame_count_range=(min(frame_counts), max(frame_counts)) if frame_counts else None,
+                linked_backgrounds=linked_backgrounds,
+                saved_baseline_modes=saved_modes,
+                gate_direction=next(iter(directions)) if len(directions) == 1 else "mixed" if directions else "",
+                gate_ranges=ranges,
+                gate_labels=labels,
+                grid_complete=complete,
             )
         )
     return sorted(result, key=lambda item: (-item.modified_time, item.title.casefold()))
 
+
+def compatible_drr_repeats(
+    catalog: Sequence[DrrSource], reference_file: str
+) -> tuple[str, ...]:
+    """Return files compatible with a selected reference's full acquisition grid.
+
+    Compatibility requires a known, ordered gate grid, an identical spectral
+    axis, and the existing filename-derived condition group.  Unknown grids
+    produce no automatic additions, leaving manual selection available.
+    """
+    reference = next((item for item in catalog if item.source == reference_file), None)
+    if reference is None or reference.is_background:
+        return ()
+    if not reference.grid_complete or not reference.gate_grid or len(reference.spectral_grid) < 2:
+        return ()
+    compatible: list[DrrSource] = []
+    for source in catalog:
+        if source.is_background or source.group_key != reference.group_key:
+            continue
+        if not source.grid_complete or not source.gate_grid or len(source.spectral_grid) < 2:
+            continue
+        if len(source.gate_grid) != len(reference.gate_grid):
+            continue
+        reference_gate_array = np.asarray(reference.gate_grid, float)
+        source_gate_array = np.asarray(source.gate_grid, float)
+        if reference_gate_array.shape != source_gate_array.shape:
+            continue
+        if tuple(label.casefold() for label in source.gate_labels) != tuple(
+            label.casefold() for label in reference.gate_labels
+        ):
+            continue
+        if len(source.spectral_grid) != len(reference.spectral_grid):
+            continue
+        if not np.allclose(
+            source_gate_array,
+            reference_gate_array,
+            rtol=1e-9,
+            atol=1e-10,
+        ):
+            continue
+        if not np.allclose(
+            np.asarray(source.spectral_grid, float),
+            np.asarray(reference.spectral_grid, float),
+            rtol=1e-9,
+            atol=1e-10,
+        ):
+            continue
+        compatible.append(source)
+    return tuple(item.source for item in sorted(compatible, key=lambda item: (item.filename.casefold(), item.modified_time)))
 
 def newest_measurement_group(
     groups: Iterable[DrrSourceGroup], *, prefer_unprocessed: bool = True
