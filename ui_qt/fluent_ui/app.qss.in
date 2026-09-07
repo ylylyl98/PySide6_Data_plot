@@ -595,6 +595,28 @@ QFrame#workflowNavigation QFrame#workflowUtilitySeparator[fluentRole="divider"] 
     max-height: @{control_height_large};
 }
 
+QToolButton[appRole="sidebarToggle"] {
+    min-height: 28px;
+    padding: 3px 8px;
+    border-radius: @{radius_medium};
+    background-color: transparent;
+    border-color: transparent;
+}
+
+QToolButton[appRole="sidebarToggle"]:hover {
+    background-color: @{subtle_hover};
+    border-color: @{border_subtle};
+}
+
+QToolButton[appRole="sidebarToggle"]:checked {
+    background-color: @{brand_background_subtle};
+    border-color: @{brand_border};
+}
+
+QToolButton[appRole="sidebarToggle"]:focus {
+    border: @{stroke_thin} solid @{focus_border};
+}
+
 /* ---- Tabs ---- */
 QTabWidget::pane {
     background-color: @{canvas_background};
@@ -728,6 +750,10 @@ QToolBar#panelsToolbar QToolButton:hover {
 QToolBar#panelsToolbar QToolButton:checked {
     background-color: @{brand_background_subtle};
     border-color: @{brand_border};
+}
+
+QToolBar#panelsToolbar QToolButton[appRole="panelSelector"]:focus {
+    border: @{stroke_thin} solid @{focus_border};
 }
 
 QToolBar::separator {

@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QRect
+from PySide6.QtCore import QCoreApplication, QEvent, QRect
 from PySide6.QtTest import QSignalSpy
 from PySide6.QtWidgets import QApplication, QCheckBox, QDoubleSpinBox, QLabel, QPushButton, QToolButton, QWidget, QSizePolicy, QStyle, QStyleOptionSpinBox, QStyleOptionButton
 
@@ -239,7 +239,9 @@ class DenseFormRowLayoutTests(unittest.TestCase):
             self.assertEqual(measured_before, measured_after)
             self.assertEqual(getattr(window, f"{prefix}_auto_v_btn").text(), "Auto")
         finally:
-            window.close(); window.deleteLater(); self.app.processEvents()
+            window.close(); window.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+            self.app.processEvents()
 
     def test_real_pl_axis_rows_use_dense_layout_at_sidebar_width(self) -> None:
         self._assert_real_axis_rows_use_dense_layout("PL", "pl")
@@ -249,6 +251,69 @@ class DenseFormRowLayoutTests(unittest.TestCase):
 
     def test_real_compare_axis_rows_use_dense_layout_at_sidebar_width(self) -> None:
         self._assert_real_axis_rows_use_dense_layout("Compare", "cmp")
+
+    def test_real_widget_ownership_roots_and_mcd_descendants_teardown(self) -> None:
+        import shiboken6
+
+        install_theme(self.app, mode="light")
+        with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
+            window = MainWindow()
+
+        roots = [
+            window.pl_yaxis_controls,
+            window.drr_yaxis_controls,
+            window.cmp_yaxis_controls,
+            window._tools_tab_placeholder,
+            window.mcd_split_scale_panel,
+            window.mcd_split_scale_chk,
+        ]
+        mcd_descendants = [
+            *window.mcd_split_spins.values(),
+            *window.mcd_split_fix_checks.values(),
+            window.mcd_split_boundary_chk,
+            window.mcd_split_auto_left_btn,
+            window.mcd_split_auto_right_btn,
+        ]
+        retained = [*roots, *mcd_descendants]
+        destroyed_spies = [(widget, QSignalSpy(widget.destroyed)) for widget in retained]
+
+        def lifetime_descends(widget: QWidget, ancestor: QWidget) -> bool:
+            current = widget.parent()
+            while current is not None:
+                if current is ancestor:
+                    return True
+                current = current.parent()
+            return False
+
+        try:
+            for root in roots:
+                self.assertTrue(lifetime_descends(root, window), root.objectName())
+            self.assertTrue(lifetime_descends(window.mcd_split_scale_panel, window))
+            for descendant in mcd_descendants:
+                self.assertTrue(lifetime_descends(descendant, window), type(descendant).__name__)
+
+            window.resize(1180, 820)
+            window.show()
+            self.app.processEvents()
+            for label in ("PL", "DRR", "Compare", "Power", "MCD", "MCD Peak Shift", "SHG", "Tools", "PL"):
+                index = next(i for i in range(window.tabs.count()) if window.tabs.tabText(i) == label)
+                window.tabs.setCurrentIndex(index)
+                self.app.processEvents()
+                for prefix in ("pl", "drr", "cmp"):
+                    self.assertFalse(getattr(window, f"{prefix}_yaxis_controls").isVisible())
+                    self.assertFalse(getattr(window, f"{prefix}_yaxis_advanced_box").isVisible())
+                self.assertFalse(window.mcd_split_scale_panel.isVisible())
+                self.assertFalse(window.mcd_split_scale_chk.isVisible())
+                if label != "Tools":
+                    self.assertFalse(window._tools_tab_placeholder.isVisible())
+        finally:
+            window.close()
+            window.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+            self.app.processEvents()
+            for widget, spy in destroyed_spies:
+                self.assertFalse(shiboken6.isValid(widget), type(widget).__name__)
+                self.assertGreaterEqual(spy.count(), 1, type(widget).__name__)
 
     def test_real_power_axis_rows_use_dense_layout_at_sidebar_width(self) -> None:
         self._assert_real_axis_rows_use_dense_layout("Power", "power")

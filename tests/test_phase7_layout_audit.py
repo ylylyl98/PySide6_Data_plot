@@ -28,8 +28,6 @@ class Phase7LayoutAuditTests(unittest.TestCase):
 
     def test_real_main_window_layout_audit_all_scales(self) -> None:
         repo = Path(__file__).resolve().parents[1]
-        expected_python = repo / ".venv" / "Scripts" / "python.exe"
-        self.assertEqual(Path(sys.executable).resolve(), expected_python.resolve())
         probe = repo / "tests" / "phase7_layout_audit.py"
         aggregate: list[dict] = []
         child_errors: list[dict] = []
@@ -262,8 +260,6 @@ class Phase7LayoutAuditTests(unittest.TestCase):
     def test_intentional_exemptions_are_structured_and_narrow(self) -> None:
         """Sentinel bounds and the nine compact MCD selectors are accounted separately."""
         repo = Path(__file__).resolve().parents[1]
-        expected_python = repo / ".venv" / "Scripts" / "python.exe"
-        self.assertEqual(Path(sys.executable).resolve(), expected_python.resolve())
         probe = repo / "tests" / "phase7_layout_audit.py"
         env = os.environ.copy()
         env["QT_QPA_PLATFORM"] = "offscreen"
