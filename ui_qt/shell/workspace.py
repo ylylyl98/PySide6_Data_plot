@@ -26,7 +26,6 @@ class WorkspaceShell:
         left_panel: QWidget,
         plot_panel: QWidget,
         presentation_widget: QWidget,
-        tools_widget: QWidget | None = None,
     ) -> None:
         self.central_widget = QWidget()
         window.setCentralWidget(self.central_widget)
@@ -47,9 +46,6 @@ class WorkspaceShell:
         self.workspace_stack = QStackedWidget()
         self.workspace_stack.addWidget(self.workspace_splitter)
         self.workspace_stack.addWidget(presentation_widget)
-        self.tools_widget = tools_widget
-        if tools_widget is not None:
-            self.workspace_stack.addWidget(tools_widget)
 
         layout = QVBoxLayout(self.central_widget)
         margin = UI_METRICS["main_margin"]

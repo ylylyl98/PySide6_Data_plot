@@ -61,7 +61,6 @@ from core.drr_sources import (
     DrrSource,
     DrrSourceCache,
     assess_background_gate_files,
-    compatible_drr_repeats,
     discover_drr_sources,
     extract_wavelength_center_nm,
     find_saved_drr_recipe,
@@ -884,24 +883,6 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         presentation_widget = PresentationBuilderWidget()
         presentation_widget.status_message.connect(self._status)
         presentation_widget.log_message.connect(self._append_log)
-        self._tools_tab_index = next(
-            (index for index in range(self.tabs.count()) if self.tabs.tabText(index) == "Tools"),
-            -1,
-        )
-        self._tools_tab_widget = (
-            self.tabs.widget(self._tools_tab_index) if self._tools_tab_index >= 0 else None
-        )
-        self._tools_tab_placeholder = QWidget(self)
-        self._tools_tab_placeholder.setObjectName("toolsTabPlaceholder")
-        self._tools_tab_placeholder.hide()
-        self.tools_workspace = QWidget()
-        self.tools_workspace.setObjectName("toolsWorkspace")
-        tools_layout = QVBoxLayout(self.tools_workspace)
-        tools_layout.setContentsMargins(0, 0, 0, 0)
-        tools_layout.setSpacing(0)
-        self._tools_workspace_layout = tools_layout
-        self._tools_in_workspace = False
-        self._tools_transitioning = False
         self.workflow_navigation = WorkflowNavigation(self.tabs, self)
         # Compatibility aliases remain owned by MainWindow for existing callers.
         self.sidebar_toggle_btn = self.workflow_navigation.sidebar_toggle_btn
@@ -916,7 +897,6 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             left_panel=left,
             plot_panel=right,
             presentation_widget=presentation_widget,
-            tools_widget=self.tools_workspace,
         )
         # Compatibility aliases remain owned by MainWindow for existing callers.
         self.central_widget = self.workspace_shell.central_widget
@@ -1245,11 +1225,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         return grid, spins, log_chk, clip_chk, cmap, fix_checks
 
     def _build_split_scale_controls(self, prefix: str) -> None:
-        toggle = QCheckBox(
-            "Use split color scale", self if prefix == "mcd" else None
-        )
-        if prefix == "mcd":
-            toggle.hide()
+        toggle = QCheckBox("Use split color scale")
         toggle.setToolTip("Use independent color limits on the two sides of x0.")
 
         def split_spin() -> QDoubleSpinBox:
@@ -1290,9 +1266,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 f"Keep the {region}-region color {bound} when {region.title()} Auto is used."
             )
 
-        panel = QGroupBox(
-            "Two X-Region Color Limits", self if prefix == "mcd" else None
-        )
+        panel = QGroupBox("Two X-Region Color Limits")
         grid = QGridLayout(panel)
         grid.setContentsMargins(6, 8, 6, 6)
         grid.setHorizontalSpacing(5)
@@ -1346,8 +1320,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         setattr(self, f"{prefix}_split_auto_right_btn", auto_right)
 
     def _build_y_axis_controls(self, prefix: str) -> QWidget:
-        host = QWidget(self)
-        host.hide()
+        host = QWidget()
         layout = QVBoxLayout(host)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
@@ -2123,7 +2096,6 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.cmp_angle_tolerance_spin.valueChanged.connect(self.compare_controller._on_cmp_auto_assign_requested)
         self.cmp_infer_angles_btn.clicked.connect(self.compare_controller._on_cmp_infer_angles_requested)
         self.cmp_auto_assign_btn.clicked.connect(self.compare_controller._on_cmp_auto_assign_requested)
-        self.cmp_source_filter_combo.currentTextChanged.connect(self.compare_controller._on_cmp_source_filter_changed)
         self.cmp_view_intensity_btn.clicked.connect(lambda: self.compare_controller._on_cmp_plot_view_button_clicked("Intensity Compare"))
         self.cmp_view_vp_btn.clicked.connect(lambda: self.compare_controller._on_cmp_plot_view_button_clicked("Valley Polarization"))
         self.cmp_vp_background_spin.valueChanged.connect(lambda _value: self.compare_controller._on_cmp_plot_param_changed(self.cmp_vp_background_spin))
@@ -2472,34 +2444,20 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
 
     def _on_tab_changed(self, _index: int) -> None:
-        if self._tools_transitioning:
-            return
         self._invalidate_export_move_sources()
-        current_label = self.tabs.tabText(self.tabs.currentIndex())
-        slides_active = current_label == "Slides"
-        tools_active = current_label == "Tools"
-        if tools_active and not self._tools_in_workspace:
-            self._enter_tools_workspace()
-        elif not tools_active and self._tools_in_workspace:
-            self._leave_tools_workspace()
-            # Reinsert the utility tab without stealing the requested target
-            # index (removing the current tab temporarily shifts Qt's index).
-            if int(_index) != self.tabs.currentIndex():
-                self.tabs.setCurrentIndex(int(_index))
+        slides_active = self.tabs.tabText(self.tabs.currentIndex()) == "Slides"
         if hasattr(self, "workspace_stack"):
-            self.workspace_stack.setCurrentIndex(1 if slides_active else 2 if tools_active else 0)
+            self.workspace_stack.setCurrentIndex(1 if slides_active else 0)
         if hasattr(self, "menu_toolbar_host"):
             self.menu_toolbar_host.source_widget_action.setVisible(not slides_active)
             self.menu_toolbar_host.source_separator_action.setVisible(not slides_active)
         if hasattr(self, "sidebar_toggle_btn"):
-            self.sidebar_toggle_btn.setEnabled(not slides_active and not tools_active)
+            self.sidebar_toggle_btn.setEnabled(not slides_active)
         if hasattr(self, "show_sidebar_action"):
-            self.show_sidebar_action.setEnabled(not slides_active and not tools_active)
+            self.show_sidebar_action.setEnabled(not slides_active)
         if slides_active:
             self.left_panel.setVisible(False)
             self.presentation_widget.set_experiment_folder(self.current_folder or None)
-        elif tools_active:
-            self.left_panel.setVisible(False)
         elif hasattr(self, "left_panel"):
             self._set_sidebar_visible(self.sidebar_toggle_btn.isChecked())
         self._update_action_states()
@@ -2516,46 +2474,6 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             and (not self.loaded or self.loaded.mode != "DRR")
         ):
             QTimer.singleShot(0, lambda: self._start_load("DRR"))
-
-    def _enter_tools_workspace(self) -> None:
-        """Move the existing Tools page into the full-width utility workspace."""
-        if self._tools_tab_widget is None or self._tools_in_workspace:
-            return
-        index = self._tools_tab_index
-        if index < 0 or self.tabs.widget(index) is not self._tools_tab_widget:
-            return
-        self._tools_transitioning = True
-        try:
-            self.tabs.removeTab(index)
-            self.tabs.insertTab(index, self._tools_tab_placeholder, "Tools")
-            self.tabs.setTabToolTip(index, "Log / Tools")
-            self.tabs.setCurrentIndex(index)
-            self._tools_tab_placeholder.show()
-            self._tools_workspace_layout.addWidget(self._tools_tab_widget)
-            self._tools_tab_widget.show()
-            self._tools_in_workspace = True
-        finally:
-            self._tools_transitioning = False
-
-    def _leave_tools_workspace(self) -> None:
-        """Restore the Tools page to its original tab without recreating controls."""
-        if self._tools_tab_widget is None or not self._tools_in_workspace:
-            return
-        self._tools_transitioning = True
-        try:
-            self._tools_workspace_layout.removeWidget(self._tools_tab_widget)
-            self._tools_tab_widget.setParent(None)
-            index = self._tools_tab_index
-            if self.tabs.widget(index) is self._tools_tab_placeholder:
-                self.tabs.removeTab(index)
-                self._tools_tab_placeholder.hide()
-                self.tabs.insertTab(index, self._tools_tab_widget, "Tools")
-                self.tabs.setTabToolTip(index, "Log / Tools")
-                self.tabs.setCurrentIndex(index)
-            self._tools_tab_widget.show()
-            self._tools_in_workspace = False
-        finally:
-            self._tools_transitioning = False
 
 
     def _show_error(self, message: str) -> None:
@@ -2810,18 +2728,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             for group in group_drr_sources(sources):
                 if group.key not in selected_complete_group_keys:
                     continue
-                if group.is_background:
-                    continue
-                selected_members = [
-                    source for source in group.files if source.source in selected_now
-                ]
-                if not selected_members:
-                    continue
-                compatible = set(
-                    compatible_drr_repeats(sources, selected_members[0].source)
-                )
                 for source in group.files:
-                    if source.source not in selected_now and source.source in compatible:
+                    if source.source not in selected_now:
                         self.drr_selected_files.append(source.source)
                         selected_now.add(source.source)
         self.drr_baseline_files_manual = [

@@ -31,11 +31,9 @@ class MenuToolbarHost:
         self.view_menu = window.menuBar().addMenu("View")
         self.show_log_action = log_dock.toggleViewAction()
         self.show_log_action.setText("Show Log")
-        self.show_log_action.setIconText("Log")
         self.view_menu.addAction(self.show_log_action)
         self.show_results_action = results_dock.toggleViewAction()
         self.show_results_action.setText("Show Analysis Results")
-        self.show_results_action.setIconText("Results")
         self.view_menu.addAction(self.show_results_action)
         self.show_sidebar_action = QAction("Show Controls Sidebar", window)
         self.view_menu.addAction(self.show_sidebar_action)
@@ -50,19 +48,6 @@ class MenuToolbarHost:
         self.panels_toolbar.setIconSize(QSize(16, 16))
         self.panels_toolbar.addAction(self.show_results_action)
         self.panels_toolbar.addAction(self.show_log_action)
-        # Keep the dock-owned QAction instances intact while presenting
-        # concise selector labels in the compact bottom bar.
-        results_button = self.panels_toolbar.widgetForAction(self.show_results_action)
-        log_button = self.panels_toolbar.widgetForAction(self.show_log_action)
-        if results_button is not None:
-            results_button.setObjectName("resultsPanelButton")
-            results_button.setToolTip("Show or hide Analysis Results")
-            results_button.setProperty("appRole", "panelSelector")
-        if log_button is not None:
-            log_button.setObjectName("logPanelButton")
-            log_button.setToolTip("Show or hide Run Log")
-            log_button.setProperty("appRole", "panelSelector")
-        self._panel_buttons = (results_button, log_button)
 
         self.data_maintenance_menu = window.menuBar().addMenu("Data Maintenance")
 

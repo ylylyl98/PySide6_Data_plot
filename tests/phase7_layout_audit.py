@@ -620,13 +620,7 @@ def audit_window(window, scale: str, app: QApplication) -> dict:
             findings.append({"workflow": workflow, "scale": scale, "check": "FATAL", "reason": "workflow tab missing"})
             continue
         window.tabs.setCurrentIndex(index)
-        # Tools is hosted in the full-width utility workspace while retaining
-        # an indexed tab placeholder for navigation compatibility.
-        page = (
-            getattr(window, "tools_workspace", None)
-            if workflow == "Tools"
-            else window.tabs.widget(index)
-        ) or window.tabs.widget(index)
+        page = window.tabs.widget(index)
         changed_expanders = _expand_safe(page, workflow)
         expanded_headers[workflow] = [
             button.text()

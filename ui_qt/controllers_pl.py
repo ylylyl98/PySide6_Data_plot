@@ -106,10 +106,8 @@ class PlController:
         self._repopulate_yaxis_combo("pl", xlsx=data_io.is_xlsx_map_file(file_name))
 
     def _pl_is_saved_dat(self, source: str) -> bool:
-        return data_io.classify_pl_source(source) == "DAT"
-
-    def _pl_source_kind(self, source: str) -> str:
-        return data_io.classify_pl_source(source)
+        normalized = source.replace("\\", "/").casefold()
+        return normalized.startswith("processed data/pl/") and Path(source).suffix.lower() == ".dat"
 
     def _pl_source_is_processed(self, source: str) -> bool:
         return self._pl_is_saved_dat(source) or source in self.pl_processed_status
@@ -126,10 +124,7 @@ class PlController:
         source = selected[0]
         display_name = Path(source).name.replace("_", "_\u200b").replace("-", "-\u200b")
         processed_at = self.pl_processed_status.get(source, "")
-        if self._pl_source_kind(source) == "REF":
-            state = "REF raw preview · No background subtraction"
-            badge_state = "new"
-        elif self._pl_is_saved_dat(source):
+        if self._pl_is_saved_dat(source):
             state = "◆ SAVED DAT — Processed result"
             badge_state = "saved"
         elif processed_at:
@@ -166,32 +161,25 @@ class PlController:
         value = str(getattr(self, "_pl_source_filter_preference", "all")).casefold()
         return value if value in {"all", "unprocessed", "processed"} else "all"
 
-    def _pl_source_filter_counts(self, source_kind: str | None = None) -> dict[str, int]:
-        wanted = source_kind or str(getattr(self, "_pl_source_type_preference", "PL"))
-        sources = [
-            source for source in self.pl_available_files
-            if not self._pl_is_saved_dat(source)
-            and (wanted == "All" or self._pl_source_kind(source) == wanted)
-        ]
-        processed = sum(1 for source in sources if self._pl_source_is_processed(source))
+    def _pl_source_filter_counts(self) -> dict[str, int]:
+        processed = sum(1 for source in self.pl_available_files if self._pl_source_is_processed(source))
         return {
-            "all": len(sources),
-            "unprocessed": len(sources) - processed,
+            "all": len(self.pl_available_files),
+            "unprocessed": len(self.pl_available_files) - processed,
             "processed": processed,
         }
 
-    def _open_pl_source_dialog(self, selected: str, *, saved_only: bool = False) -> str | None:
+    def _open_pl_source_dialog(self, selected: str) -> str | None:
         state_filter = QComboBox()
         self._style_combo_popup(state_filter)
-        type_filter = QComboBox()
-        self._style_combo_popup(type_filter)
         dlg = SourcePickerDialog(
             self._owner,
-            title="Choose Saved PL Results" if saved_only else "Choose PL File",
-            hint=("Choose one saved PL result, newest first." if saved_only else
-                  "Choose one PL raw source. CSV/XLSX inputs default to PL; use All to show REF and Unknown files."),
+            title="Choose PL File",
+            hint=(
+            "Choose one PL source. Raw CSV/XLSX inputs and saved PL DAT results are listed together, newest first."
+            ),
             selected=selected,
-            filter_controls=(() if saved_only else (("Type", type_filter), ("Status", state_filter))),
+            filter_controls=(("Status", state_filter),),
             filter_interval=140,
         )
         file_list = dlg.source_list
@@ -200,10 +188,8 @@ class PlController:
         refresh_btn = dlg.refresh_button
 
         def _populate_filter_counts() -> None:
-            if saved_only:
-                return
             current = str(state_filter.currentData() or self._pl_saved_source_filter())
-            counts = self._pl_source_filter_counts(str(type_filter.currentData() or "PL"))
+            counts = self._pl_source_filter_counts()
             blocked = state_filter.blockSignals(True)
             state_filter.clear()
             state_filter.addItem(f"All ({counts['all']})", "all")
@@ -213,56 +199,25 @@ class PlController:
             state_filter.setCurrentIndex(index if index >= 0 else 0)
             state_filter.blockSignals(blocked)
 
-        def _populate_type_filter() -> None:
-            if saved_only:
-                return
-            current = str(type_filter.currentData() or getattr(self, "_pl_source_type_preference", "PL"))
-            counts = {kind: sum(1 for source in self.pl_available_files if not self._pl_is_saved_dat(source) and self._pl_source_kind(source) == kind) for kind in ("PL", "REF", "Unknown")}
-            blocked = type_filter.blockSignals(True)
-            type_filter.clear()
-            type_filter.addItem(f"PL ({counts['PL']})", "PL")
-            type_filter.addItem(f"REF ({counts['REF']})", "REF")
-            type_filter.addItem(f"All raw data ({sum(counts.values())})", "All")
-            index = type_filter.findData(current)
-            type_filter.setCurrentIndex(index if index >= 0 else 0)
-            type_filter.blockSignals(blocked)
-
         def _refresh_view() -> None:
             needle = filter_edit.text().strip().casefold()
             wanted = str(state_filter.currentData() or "all")
-            wanted_type = str(type_filter.currentData() or "PL")
             def _populate(widget) -> None:
                 for source in self._pl_sources_newest_first():
-                    is_saved = self._pl_is_saved_dat(source)
-                    if saved_only and not is_saved:
-                        continue
-                    if not saved_only and is_saved:
-                        continue
-                    if not saved_only and wanted_type != "All" and self._pl_source_kind(source) != wanted_type:
-                        continue
                     is_processed = self._pl_source_is_processed(source)
-                    if not saved_only and wanted == "unprocessed" and is_processed:
+                    if wanted == "unprocessed" and is_processed:
                         continue
-                    if not saved_only and wanted == "processed" and not is_processed:
+                    if wanted == "processed" and not is_processed:
                         continue
                     if needle and needle not in source.casefold():
                         continue
                     modified = self._pl_source_modified(source)
                     modified_text = datetime.fromtimestamp(modified).strftime("%Y-%m-%d %H:%M") if modified else "date unavailable"
                     processed_at = self.pl_processed_status.get(source, "")
-                    source_kind = self._pl_source_kind(source)
-                    if source_kind == "REF":
-                        text = f"REF RAW — {Path(source).name}\nModified {modified_text} · No background subtraction"
-                        color = QColor(theme_alias("source_new_foreground"))
-                        bold = True
-                    elif self._pl_is_saved_dat(source):
+                    if self._pl_is_saved_dat(source):
                         text = f"◆ SAVED DAT — {Path(source).name}\nModified {modified_text} · Ready to view"
                         color = QColor(theme_alias("source_saved_foreground"))
                         bold = False
-                    elif source_kind == "Unknown":
-                        text = f"? UNKNOWN — {Path(source).name}\nModified {modified_text} · Unclassified raw data"
-                        color = QColor(theme_alias("source_new_foreground"))
-                        bold = True
                     elif processed_at:
                         text = f"✓ PROCESSED — {Path(source).name}\nModified {modified_text} · Saved {processed_at[:16].replace('T', ' ')}"
                         color = QColor(theme_alias("source_processed_foreground"))
@@ -283,18 +238,11 @@ class PlController:
             item = file_list.currentItem()
             ok_button.setEnabled(item is not None)
             if item is None:
-                details.setText(
-                    "No matching saved PL results." if saved_only else
-                    "No matching PL raw files. Use Type → All raw data to show REF and Unknown files."
-                )
+                details.setText("No matching PL files.")
                 return
             source = str(item.data(Qt.UserRole))
             if self._pl_is_saved_dat(source):
                 state = "◆ SAVED DAT — Previously exported PL result."
-            elif self._pl_source_kind(source) == "REF":
-                state = "REF raw preview · No background subtraction"
-            elif self._pl_source_kind(source) == "Unknown":
-                state = "? UNKNOWN — Unclassified raw data; choose All raw data to view by default."
             elif source in self.pl_processed_status:
                 state = f"✓ PROCESSED — Last saved {self.pl_processed_status[source][:16].replace('T', ' ')}"
             else:
@@ -303,7 +251,7 @@ class PlController:
 
         def _reload_catalog() -> None:
             self._refresh_file_lists(auto=True)
-            _populate_type_filter(); _populate_filter_counts(); _refresh_view(); _update_details()
+            _populate_filter_counts(); _refresh_view(); _update_details()
 
         def _on_filter_changed() -> None:
             value = str(state_filter.currentData() or "all")
@@ -311,33 +259,15 @@ class PlController:
             self.settings.setValue(self.SETTINGS_PL_SOURCE_FILTER, value)
             _refresh_view()
 
-        def _on_type_changed() -> None:
-            value = str(type_filter.currentData() or "PL")
-            self._pl_source_type_preference = value
-            _populate_filter_counts()
-            _refresh_view()
-
         filter_edit = dlg.filter_edit
         dlg.filter_requested.connect(_refresh_view)
         state_filter.currentIndexChanged.connect(lambda _index: _on_filter_changed())
-        if not saved_only:
-            type_filter.currentIndexChanged.connect(lambda _index: _on_type_changed())
         file_list.currentItemChanged.connect(lambda _current, _previous: _update_details())
         refresh_btn.clicked.connect(_reload_catalog)
-        _populate_type_filter(); _populate_filter_counts(); _refresh_view(); _update_details()
+        _populate_filter_counts(); _refresh_view(); _update_details()
         if dlg.exec() != SourcePickerDialog.Accepted:
             return None
         return dlg.selected_source()
-
-    def _open_pl_saved_results(self) -> None:
-        selected = self._selected(self.pl_files)
-        chosen = self._open_pl_source_dialog(selected[0] if selected else "", saved_only=True)
-        if chosen:
-            self._restore_list_selection(self.pl_files, [chosen])
-            self._pl_auto_next_queue = []
-            self._pl_auto_next_active = False
-            self._status(f"Selected saved PL result: {Path(chosen).name}. Loading now...")
-            self._start_load("PL")
 
     def _edit_pl_source(self) -> None:
         selected = self._selected(self.pl_files)
@@ -368,15 +298,10 @@ class PlController:
     def _auto_load_next_unprocessed_pl(self, completed_source: str) -> bool:
         if not hasattr(self, "pl_auto_next_chk") or not self.pl_auto_next_chk.isChecked():
             return False
-        completed_kind = self._pl_source_kind(completed_source)
-        if completed_kind == "DAT":
-            self._status("Saved PL results do not auto-advance.")
-            return False
         self._pl_auto_next_queue = [
             source
             for source in self._pl_sources_newest_first()
             if not self._pl_is_saved_dat(source)
-            and self._pl_source_kind(source) == completed_kind
             and source not in self.pl_processed_status
             and source != completed_source
         ]

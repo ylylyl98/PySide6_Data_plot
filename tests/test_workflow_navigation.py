@@ -39,8 +39,6 @@ class WorkflowNavigationTests(unittest.TestCase):
         self.assertEqual(navigation.workflow_tabs.tabToolTip(1), "Load selected data")
         self.assertTrue(navigation.sidebar_toggle_btn.isCheckable())
         self.assertTrue(navigation.sidebar_toggle_btn.isChecked())
-        self.assertTrue(navigation.sidebar_toggle_btn.autoRaise())
-        self.assertEqual(navigation.sidebar_toggle_btn.property("appRole"), "sidebarToggle")
         self.assertEqual(navigation.sidebar_toggle_btn.text(), "Controls")
         self.assertEqual(
             navigation.sidebar_toggle_btn.toolTip(),

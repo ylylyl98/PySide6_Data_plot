@@ -12,7 +12,6 @@ from scipy.optimize import curve_fit
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
-    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -21,7 +20,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
-    QMessageBox,
     QPushButton,
     QSplitter,
     QVBoxLayout,
@@ -31,7 +29,6 @@ from PySide6.QtWidgets import (
 from core import data_io
 from core.drr_sources import (
     assess_background_gate_files,
-    compatible_drr_repeats,
     discover_drr_sources,
     extract_wavelength_center_nm,
     find_saved_drr_recipe,
@@ -641,32 +638,10 @@ class DrrController:
         filter_row.addWidget(refresh_btn)
         layout.addLayout(filter_row)
 
-        type_row = QHBoxLayout()
-        type_row.addWidget(QLabel("Data type"))
-        type_combo = QComboBox()
-        type_combo.setObjectName("drr_source_type_combo")
-        type_combo.addItem("REF", "REF")
-        type_combo.addItem("All data", "All")
-        type_combo.setToolTip("Filter files by PL source marker. All data includes PL, REF, and Unknown.")
-        type_row.addWidget(type_combo)
-        type_hint = QLabel()
-        type_hint.setWordWrap(True)
-        type_hint.setVisible(False)
-        type_hint.setObjectName("drrSourceTypeHint")
-        type_row.addWidget(type_hint, 1)
-        empty_hint = QLabel()
-        empty_hint.setWordWrap(True)
-        empty_hint.setObjectName("drrSourceEmptyHint")
-        type_row.addWidget(empty_hint, 1)
-        layout.addLayout(type_row)
-
         panes = QSplitter(Qt.Horizontal)
         group_list = QListWidget()
         file_list = QListWidget()
         selected_list = QListWidget()
-        group_list.setObjectName("drr_source_group_list")
-        file_list.setObjectName("drr_source_file_list")
-        selected_list.setObjectName("drr_source_chosen_list")
         for widget in (group_list, file_list, selected_list):
             SourcePickerDialog.configure_source_list(
                 widget,
@@ -691,40 +666,20 @@ class DrrController:
         panes.setSizes([440, 330, 330])
         layout.addWidget(panes, 1)
 
-        group_detail = QLabel()
-        group_detail.setWordWrap(True)
-        group_detail.setObjectName("drrSourceGroupDetail")
-        layout.addWidget(group_detail)
-
         action_row = QHBoxLayout()
         add_group_btn = QPushButton("Add Entire Group")
         add_files_btn = QPushButton("Add Selected Files")
-        add_compatible_btn = QPushButton("Add Compatible Repeats")
-        add_compatible_btn.setToolTip(
-            "Add repeats matching the selected reference file's full gate and spectral grids."
-        )
-        add_compatible_btn.setVisible(not baseline_mode)
         remove_btn = QPushButton("Remove")
         clear_btn = QPushButton("Clear")
         browse_btn = QPushButton("Browse File Anywhere...")
         browse_btn.setVisible(baseline_mode)
         action_row.addWidget(add_group_btn)
         action_row.addWidget(add_files_btn)
-        action_row.addWidget(add_compatible_btn)
         action_row.addWidget(browse_btn)
         action_row.addStretch(1)
         action_row.addWidget(remove_btn)
         action_row.addWidget(clear_btn)
         layout.addLayout(action_row)
-
-        def _source_kind(source) -> str:
-            source_path = source.source if hasattr(source, "source") else str(source)
-            return data_io.classify_pl_source(source_path)
-
-        def _source_label(source) -> str:
-            source_path = source.source if hasattr(source, "source") else str(source)
-            suffix = " · XLSX map" if data_io.is_xlsx_map_file(source_path) else ""
-            return f"{_source_kind(source)}{suffix}"
 
         def _catalog_groups():
             catalog_sources = (
@@ -736,11 +691,6 @@ class DrrController:
                 if baseline_mode
                 else self.drr_available_sources
             )
-            selected_type = str(type_combo.currentData() or "REF")
-            if selected_type != "All":
-                catalog_sources = [
-                    source for source in catalog_sources if _source_kind(source) == selected_type
-                ]
             result = group_drr_sources(catalog_sources)
             if baseline_mode:
                 result = sorted(
@@ -767,11 +717,7 @@ class DrrController:
             }
             if source in existing:
                 return
-            catalog_source = next(
-                (entry for entry in self.drr_available_sources if entry.source == source),
-                source,
-            )
-            item = QListWidgetItem(f"[{_source_label(catalog_source)}] {Path(source).name}")
+            item = QListWidgetItem(Path(source).name)
             item.setData(Qt.UserRole, source)
             item.setToolTip(source)
             selected_list.addItem(item)
@@ -793,96 +739,16 @@ class DrrController:
             try:
                 file_list.clear()
                 if group is None:
-                    group_detail.clear()
                     return
-                frame_text = (
-                    f"{group.frame_count_range[0]}–{group.frame_count_range[1]}"
-                    if group.frame_count_range else "unknown"
-                )
-                modes = (
-                    f" · saved baseline modes: {', '.join(group.saved_baseline_modes)}"
-                    if group.saved_baseline_modes else ""
-                )
-                source_by_path = {source.source: source for source in self.drr_available_sources}
-                def _linked_label(path: str) -> str:
-                    linked = source_by_path.get(path)
-                    if linked is None:
-                        try:
-                            exists = resolve_source_path(self.current_folder, path).is_file()
-                        except OSError:
-                            exists = False
-                        return f"{path} ({'gate details unavailable' if exists else 'missing'})"
-                    if linked.gate_ranges:
-                        gate_text = ", ".join(
-                            f"{label} {low:g}–{high:g}"
-                            for label, (low, high) in zip(linked.gate_labels, linked.gate_ranges)
-                        )
-                    elif linked.gate_grid:
-                        first_frame = linked.gate_grid[0]
-                        gate_text = "first frame: " + ", ".join(
-                            f"{label}={first_frame[index]:g}"
-                            for index, label in enumerate(linked.gate_labels)
-                            if index < len(first_frame)
-                        )
-                    else:
-                        gate_text = "gate details unavailable"
-                    return f"{path} [{gate_text}]"
-                links = (
-                    " · linked backgrounds: " + ", ".join(
-                        _linked_label(path) for path in group.linked_backgrounds
-                    )
-                    if group.linked_backgrounds else ""
-                )
-                gate_ranges = (
-                    " · first file gate ranges: " + ", ".join(
-                        f"{label} {low:g}–{high:g}"
-                        for label, (low, high) in zip(group.gate_labels, group.gate_ranges)
-                    )
-                    if group.gate_ranges else ""
-                )
-                group_detail.setText(
-                    f"{group.title} · processed {group.processed_count}/{len(group.files)}"
-                    f" · frames/file {frame_text} · gate direction {group.gate_direction or 'unknown'}"
-                    f" · per-file acquisition grids {'known' if group.grid_complete else 'unknown'}"
-                    f"{gate_ranges}{modes}{links}"
-                )
                 for source in group.files:
-                    status = "processed" if source.processed else "new"
-                    frames = (
-                        f"{source.frame_count} frames"
-                        if source.frame_count is not None else "frames unknown"
+                    detail = (
+                        f"\n{source.classification_reason}"
+                        if source.classification != "measurement"
+                        else ""
                     )
-                    spectral = (
-                        f"spectral grid {len(source.spectral_grid)} pts"
-                        f" ({source.spectral_grid[0]:g}–{source.spectral_grid[-1]:g})"
-                        if len(source.spectral_grid) >= 2 else "spectral grid unknown"
-                    )
-                    ranges = (
-                        " · " + ", ".join(
-                            f"{label} {low:g}–{high:g}"
-                            for label, (low, high) in zip(source.gate_labels, source.gate_ranges)
-                        )
-                        if source.gate_ranges else ""
-                    )
-                    detail = f" · {status} · {frames} · {spectral} · gate {source.gate_direction or 'unknown'}{ranges}"
-                    if source.saved_baseline_modes:
-                        detail += f"\nSaved baseline: {', '.join(source.saved_baseline_modes)}"
-                    if source.classification != "measurement":
-                        detail += f"\n{source.classification_reason}"
-                    item = QListWidgetItem(f"[{_source_label(source)}] {source.filename}\n{detail.lstrip(' ·')}")
+                    item = QListWidgetItem(f"{source.filename}{detail}")
                     item.setData(Qt.UserRole, source.source)
-                    tooltip_links = (
-                        "\nLinked backgrounds: " + ", ".join(
-                            _linked_label(path) for path in source.linked_backgrounds
-                        )
-                        if source.linked_backgrounds else ""
-                    )
-                    item.setToolTip(
-                        f"{source.source}\nType: {_source_label(source)}\n"
-                        f"Status: {status}; {frames}; {spectral}; gate {source.gate_direction or 'unknown'}\n"
-                        f"{source.classification_reason}"
-                        f"{tooltip_links}"
-                    )
+                    item.setToolTip(f"{source.source}\n{source.classification_reason}")
                     file_list.addItem(item)
             finally:
                 file_list.setUpdatesEnabled(True)
@@ -912,17 +778,13 @@ class DrrController:
                     )
                 ):
                     continue
-                if not baseline_mode and unprocessed_only.isChecked() and group.processed:
+                if unprocessed_only.isVisible() and unprocessed_only.isChecked() and group.processed:
                     continue
                 if needle and needle not in group_search_text.get(group.key, ""):
                     continue
                 visible.append(group)
             if not all_history:
                 visible = visible[:25]
-            if not visible and str(type_combo.currentData() or "REF") == "REF":
-                empty_hint.setText("No matching REF files; choose All data for PL or unclassified files.")
-            else:
-                empty_hint.clear()
             group_list.setUpdatesEnabled(False)
             signals_blocked = group_list.blockSignals(True)
             try:
@@ -939,31 +801,18 @@ class DrrController:
                         else " · wavelength unknown"
                     )
                     summary = (
-                        f"Modified {group.session_date} · {len(group.files)} file"
+                        f"{group.session_date} · {len(group.files)} file"
                         f"{'s' if len(group.files) != 1 else ''} · {kind}{center_text}"
                     )
                     if not baseline_mode:
-                        badge = (
-                            f"{group.processed_count}/{len(group.files)} PROCESSED"
-                            if group.processed_count == len(group.files)
-                            else f"PARTIAL {group.processed_count}/{len(group.files)}"
-                            if group.processed_count
-                            else f"0/{len(group.files)}"
-                        )
+                        badge = "✓ PROCESSED" if group.processed else "● NEW"
                         summary = f"{badge} · {summary}"
-                    type_counts = {}
-                    for source in group.files:
-                        kind = _source_kind(source)
-                        type_counts[kind] = type_counts.get(kind, 0) + 1
-                    type_text = " · ".join(
-                        f"{kind} {count}" for kind, count in sorted(type_counts.items())
-                    )
-                    item = QListWidgetItem(f"{summary} · {type_text}\n{group.title}")
+                    item = QListWidgetItem(f"{summary}\n{group.title}")
                     item.setData(Qt.UserRole, group.key)
                     item.setToolTip(
                         f"{group.title}\n{summary}\n\n"
                         + "\n".join(
-                            f"[{_source_label(source)}] {source.source} — {source.classification_reason}"
+                            f"{source.source} — {source.classification_reason}"
                             for source in group.files
                         )
                     )
@@ -992,13 +841,6 @@ class DrrController:
                 group_list.setUpdatesEnabled(True)
                 group_list.viewport().update()
             _populate_files()
-
-        def _change_type_filter(_index: int) -> None:
-            nonlocal groups, groups_by_key, group_search_text
-            groups = _catalog_groups()
-            groups_by_key = {group.key: group for group in groups}
-            group_search_text = {group.key: _group_search_text(group) for group in groups}
-            _refresh_groups()
 
         refresh_generation = 0
         refresh_in_progress = False
@@ -1078,63 +920,17 @@ class DrrController:
 
         def _add_group() -> None:
             group = _selected_group()
-            if group is None:
-                return
-            members = list(group.files)
-            if not baseline_mode and len(members) > 1:
-                reference = members[0].source
-                compatible = set(compatible_drr_repeats(self.drr_available_sources, reference))
-                member_paths = {source.source for source in members}
-                if member_paths - compatible:
-                    answer = QMessageBox.question(
-                        dlg,
-                        "Review acquisition grid",
-                        "This group contains a different or unknown full gate/spectral grid. Add it anyway?",
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                        QMessageBox.StandardButton.No,
-                    )
-                    if answer != QMessageBox.StandardButton.Yes:
-                        return
-            for source in members:
-                _add_chosen(source.source)
-            _update_type_hint()
+            if group is not None:
+                for source in group.files:
+                    _add_chosen(source.source)
 
         def _add_files() -> None:
             for item in file_list.selectedItems():
                 _add_chosen(str(item.data(Qt.UserRole)))
-            _update_type_hint()
-
-        def _add_compatible() -> None:
-            item = file_list.currentItem()
-            if item is None:
-                self._status("Select a reference file before adding compatible repeats.")
-                return
-            reference = str(item.data(Qt.UserRole))
-            group = _selected_group()
-            if group is None:
-                self._status("Select a group before adding compatible repeats.")
-                return
-            compatible = compatible_drr_repeats(self.drr_available_sources, reference)
-            group_members = {source.source for source in group.files}
-            compatible = tuple(source for source in compatible if source in group_members)
-            if not compatible:
-                self._status(
-                    "No compatible repeats found: full gate or spectral grid is unknown or different."
-                )
-                return
-            for source in compatible:
-                _add_chosen(source)
-            _update_type_hint()
-            self._status(f"Added {len(compatible)} repeat(s) compatible with {Path(reference).name}.")
 
         def _remove() -> None:
             for item in selected_list.selectedItems():
                 selected_list.takeItem(selected_list.row(item))
-            _update_type_hint()
-
-        def _clear_chosen() -> None:
-            selected_list.clear()
-            _update_type_hint()
 
         def _browse_external() -> None:
             paths, _selected_filter = QFileDialog.getOpenFileNames(
@@ -1145,22 +941,6 @@ class DrrController:
             )
             for path in paths:
                 _add_chosen(str(Path(path).resolve()))
-            _update_type_hint()
-
-        def _update_type_hint() -> None:
-            chosen_kinds = {
-                _source_kind(path)
-                for path in (
-                    str(selected_list.item(index).data(Qt.UserRole))
-                    for index in range(selected_list.count())
-                )
-            }
-            if "PL" in chosen_kinds:
-                type_hint.setText("Marked PL; confirm suitability for DRR.")
-                type_hint.setVisible(True)
-            else:
-                type_hint.clear()
-                type_hint.setVisible(False)
 
         group_list.currentRowChanged.connect(lambda _row: _populate_files())
         group_list.itemDoubleClicked.connect(lambda _item: _add_group())
@@ -1172,16 +952,13 @@ class DrrController:
         unprocessed_only.toggled.connect(lambda _checked: _refresh_groups())
         include_backgrounds.toggled.connect(lambda _checked: _refresh_groups())
         show_incompatible.toggled.connect(lambda _checked: _refresh_groups())
-        type_combo.currentIndexChanged.connect(_change_type_filter)
         add_group_btn.clicked.connect(_add_group)
         add_files_btn.clicked.connect(_add_files)
-        add_compatible_btn.clicked.connect(_add_compatible)
         remove_btn.clicked.connect(_remove)
-        clear_btn.clicked.connect(_clear_chosen)
+        clear_btn.clicked.connect(selected_list.clear)
         browse_btn.clicked.connect(_browse_external)
         refresh_btn.clicked.connect(_reload_catalog)
         _refresh_groups()
-        _update_type_hint()
         dlg.finished.connect(_mark_dialog_closed)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
