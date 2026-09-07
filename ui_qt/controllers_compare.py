@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
-import numpy as np
+from collections import Counter
 from pathlib import Path
+
+import numpy as np
+
+from PySide6.QtCore import Qt
 
 from core import data_io
 from core.export import compare_source_title, vp_compare_export_base, vp_compare_title
@@ -38,20 +42,80 @@ class CompareController:
             setattr(object.__getattribute__(self, "_owner"), name, value)
 
     def _cmp_assign_candidate_files(self) -> list[str]:
-        return list(self.available_files)
+        pl_sources = getattr(self, "pl_available_files", None)
+        sources = pl_sources or getattr(self, "available_files", [])
+        raw_sources = [
+            str(source) for source in sources
+            if Path(source).suffix.lower() in {".csv", ".xlsx"}
+            and data_io.classify_pl_source(source) != "DAT"
+        ]
+        if self._cmp_source_filter() == "all":
+            return raw_sources
+        return [source for source in raw_sources if data_io.classify_pl_source(source) == "PL"]
+
+    def _cmp_source_filter(self) -> str:
+        combo = getattr(self, "cmp_source_filter_combo", None)
+        value = str(combo.currentData() if combo is not None else "pl")
+        return value if value in {"pl", "all"} else "pl"
+
+    def _cmp_source_filter_label(self) -> str:
+        return "All raw data" if self._cmp_source_filter() == "all" else "PL raw sources"
 
     def _cmp_set_channel_combo_items(self) -> None:
-        files = [""] + list(self.available_files)
+        all_sources = {
+            str(source) for source in (getattr(self, "pl_available_files", None) or getattr(self, "available_files", []))
+            if Path(source).suffix.lower() in {".csv", ".xlsx"}
+            and data_io.classify_pl_source(source) != "DAT"
+        }
+        candidates = self._cmp_assign_candidate_files()
         for combo in self.cmp_channel_combos.values():
             current = combo.currentText()
             old = combo.blockSignals(True)
             try:
                 combo.clear()
-                combo.addItems(files)
-                if current in files:
+                combo.addItem("")
+                for source in candidates:
+                    combo.addItem(source)
+                    kind = data_io.classify_pl_source(source)
+                    if kind == "Unknown":
+                        combo.setItemData(
+                            combo.count() - 1,
+                            "Unknown raw data; choose All raw data for automatic detection.",
+                            Qt.ToolTipRole,
+                        )
+                if current and current not in candidates and current in all_sources:
+                    combo.addItem(current)
+                    index = combo.findText(current)
+                    combo.setItemData(index, f"Currently assigned; outside {self._cmp_source_filter_label()}.", Qt.ToolTipRole)
+                if current:
                     combo.setCurrentText(current)
             finally:
                 combo.blockSignals(old)
+
+    def _on_cmp_source_filter_changed(self, _value: str = "") -> None:
+        self._cmp_set_channel_combo_items()
+        self._cmp_update_assignment_summary()
+
+    def _cmp_assignment_advisories(self, mapping: dict[str, str]) -> list[str]:
+        values = [combo.currentText().strip() for combo in self.cmp_channel_combos.values()]
+        duplicates = sorted({name for name, count in Counter(v for v in values if v).items() if count > 1})
+        advisories: list[str] = []
+        if duplicates:
+            advisories.append("Advisory: duplicate assignment(s): " + ", ".join(duplicates))
+        if self._cmp_is_vp_view():
+            missing = [key for key in ("KK", "KKp") if key not in mapping]
+            if missing:
+                advisories.append("Advisory: VP missing required channel(s): " + ", ".join(missing))
+        else:
+            visible = self._cmp_visible_channels(mapping)
+            if len(visible) < 2:
+                advisories.append("Advisory: select at least two visible channels for Intensity Compare")
+        groups = {parse_compare_gate_condition(name) for name in mapping.values()}
+        groups.discard(None)
+        groups.discard("")
+        if len(groups) > 1:
+            advisories.append("Advisory: assigned files use inconsistent gate/condition groups")
+        return advisories
 
     def _cmp_view_mode(self) -> str:
         if hasattr(self, "cmp_view_vp_btn") and self.cmp_view_vp_btn.isChecked():
@@ -197,7 +261,7 @@ class CompareController:
     def _cmp_update_assignment_summary(self) -> None:
         mapping = self._cmp_current_mapping()
         visible = self._cmp_visible_channels(mapping)
-        lines = []
+        lines = self._cmp_assignment_advisories(mapping)
         for key in COMPARE_PANEL_ORDER:
             lines.append(f"{key} -> {mapping.get(key, 'missing')}")
         if self._cmp_is_vp_view():
@@ -206,6 +270,7 @@ class CompareController:
             lines.append("Visible -> " + ", ".join(visible))
         else:
             lines.append("Visible -> none")
+        lines.append(f"Sources -> {self._cmp_source_filter_label()}")
         self.cmp_assignment_summary.setPlainText("\n".join(lines))
         self._cmp_update_title_previews()
 

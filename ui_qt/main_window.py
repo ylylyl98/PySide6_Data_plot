@@ -2122,6 +2122,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.cmp_angle_tolerance_spin.valueChanged.connect(self.compare_controller._on_cmp_auto_assign_requested)
         self.cmp_infer_angles_btn.clicked.connect(self.compare_controller._on_cmp_infer_angles_requested)
         self.cmp_auto_assign_btn.clicked.connect(self.compare_controller._on_cmp_auto_assign_requested)
+        self.cmp_source_filter_combo.currentTextChanged.connect(self.compare_controller._on_cmp_source_filter_changed)
         self.cmp_view_intensity_btn.clicked.connect(lambda: self.compare_controller._on_cmp_plot_view_button_clicked("Intensity Compare"))
         self.cmp_view_vp_btn.clicked.connect(lambda: self.compare_controller._on_cmp_plot_view_button_clicked("Valley Polarization"))
         self.cmp_vp_background_spin.valueChanged.connect(lambda _value: self.compare_controller._on_cmp_plot_param_changed(self.cmp_vp_background_spin))
