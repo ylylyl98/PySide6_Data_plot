@@ -1011,6 +1011,48 @@ class McdProcessingTests(unittest.TestCase):
         self.assertTrue(np.any(aligned.pair_interpolated_neg[1:-1]))
         self.assertLess(np.nanmean(np.abs(aligned.pair_mcd_corrected[1:-1])), np.nanmean(np.abs(direct.pair_mcd_corrected[1:-1])))
 
+    def test_mcd_and_peak_tabs_switch_plots_without_reloading_or_reanalyzing(self) -> None:
+        class Sink:
+            def emit(self, *_args):
+                pass
+
+        with tempfile.TemporaryDirectory() as folder_text:
+            wavelength = np.linspace(620., 820., 101)
+            rows = []
+            for field in (-1., 0., 0., 1.):
+                for angle, sign in ((10., -1.), (73., 1.)):
+                    spectrum = 1. + np.exp(-((1240. / wavelength - (1.7 + sign * .004 * field)) / .012) ** 2)
+                    rows.append({"B_T": field, "angle_deg": angle, **dict(zip(map(str, wavelength), spectrum))})
+            pd.DataFrame(rows).to_csv(Path(folder_text) / "sweep.csv", index=False)
+            window = self._own_window(MainWindow())
+            window.current_folder = folder_text
+            options = LoadOptions(
+                mode="MCD", folder=folder_text, selected_files=["sweep.csv"], baseline_files=[],
+                pl_log_scale=False, drr_baseline_text="", drr_baseline_which="", compare_log_scale=False,
+                mcd_settings=McdSettings(max_sequence_gap=1, max_delta_b=0.01),
+            )
+            window._on_loaded(window._load_task(options, progress=Sink(), log=Sink()))
+            loaded = window.loaded
+            mcd_tab = next(i for i in range(window.tabs.count()) if window.tabs.tabText(i) == "MCD")
+            peak_tab = next(i for i in range(window.tabs.count()) if window.tabs.tabText(i) == "MCD Peak Shift")
+            window.tabs.setCurrentIndex(mcd_tab)
+            window.tabs.setCurrentIndex(peak_tab)
+            self.assertEqual(window.last_plotted_mode, "MCD Peak Shift")
+            peak_result = window.mcd_peak_result
+            self.assertIsNotNone(peak_result, window.mcd_peak_status.text())
+            with patch.object(window, "_start_load") as load, \
+                 patch("ui_qt.feature_pages.analyze_peak_shift") as analyze:
+                for _ in range(2):
+                    window.tabs.setCurrentIndex(mcd_tab)
+                    self.assertEqual(window.last_plotted_mode, "MCD")
+                    self.assertIn(window._mcd_heatmap_ax, window.figure.axes)
+                    window.tabs.setCurrentIndex(peak_tab)
+                    self.assertEqual(window.last_plotted_mode, "MCD Peak Shift")
+                    self.assertIs(window.mcd_peak_result, peak_result)
+                self.assertIs(window.loaded, loaded)
+                load.assert_not_called()
+                analyze.assert_not_called()
+
     def test_loaded_mcd_renders_its_embedded_plots(self) -> None:
         class Sink:
             def emit(self, *_args) -> None:

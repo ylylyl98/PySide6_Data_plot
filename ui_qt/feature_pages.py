@@ -1278,7 +1278,8 @@ class FeatureTabsMixin:
         preview_form.addRow("Selected field", field_row)
         self.mcd_peak_map_mode_combo = QComboBox(); self.mcd_peak_map_mode_combo.addItems(["Raw R", "Second derivative"])
         self.mcd_peak_tracker_method_combo = QComboBox(); self.mcd_peak_tracker_method_combo.addItems(["Local mixed fit", "Raw spectrum", "Second derivative"])
-        self.mcd_peak_tracker_method_combo.setToolTip("Default fits one selected raw-R resonance locally. Raw and second derivative remain available for locator inspection.")
+        self.mcd_peak_tracker_method_combo.setCurrentText("Raw spectrum")
+        self.mcd_peak_tracker_method_combo.setToolTip("By default, show Raw spectrum and Second derivative peak-finding results together. This selector chooses the candidate list; Local mixed fit is optional.")
         self.mcd_peak_result_mode_combo = QComboBox(); self.mcd_peak_result_mode_combo.addItems(["Valley splitting", "Single peak shift"])
         self.mcd_peak_result_mode_combo.setToolTip("Choose absolute Kp−K valley splitting or the selected per-channel peak shift.")
         self.mcd_peak_deriv_window_spin = QSpinBox(); self.mcd_peak_deriv_window_spin.setRange(7, 101); self.mcd_peak_deriv_window_spin.setSingleStep(2); self.mcd_peak_deriv_window_spin.setValue(35)
@@ -1434,6 +1435,14 @@ class FeatureTabsMixin:
     def _update_mcd_peak_shift_source(self, result) -> None:
         if not hasattr(self, "mcd_peak_source_summary"):
             return
+        if result is not None and result is getattr(self, "_mcd_peak_analysis_source", None):
+            return
+        self._mcd_peak_analysis_source = result
+        self._mcd_peak_analysis_key = None
+        self._mcd_peak_local_pending_key = None
+        cancel = getattr(self, "_mcd_peak_fit_cancel_event", None)
+        if cancel is not None:
+            cancel.set()
         self._mcd_peak_fit_generation = int(getattr(self, "_mcd_peak_fit_generation", 0)) + 1
         self._mcd_peak_local_fit_cache = {}
         self._mcd_peak_locator_results = {}
@@ -1471,10 +1480,40 @@ class FeatureTabsMixin:
         self.mcd_peak_table.setRowCount(0)
         self.mcd_valley_table.setRowCount(0)
 
+    def _mcd_peak_computation_key(self) -> tuple:
+        """Cheap freshness check; display controls do not affect computation."""
+        return (
+            id(self.loaded.mcd_result),
+            self.mcd_peak_source_combo.currentText(),
+            self.mcd_peak_tracker_method_combo.currentText(),
+            self.mcd_peak_background_combo.currentText(),
+            self.mcd_peak_prom_spin.value(), self.mcd_peak_dist_spin.value(),
+            self.mcd_peak_smooth_spin.value(), self.mcd_peak_jump_spin.value(),
+            self.mcd_peak_max_spin.value(), self.mcd_peak_deriv_window_spin.value(),
+        )
+
+    def _ensure_mcd_peak_analysis(self) -> None:
+        if self.loaded is None or self.loaded.mode != "MCD" or self.loaded.mcd_result is None:
+            return
+        if self._load_in_progress or self.mcd_controller._mcd_auto_apply_timer.isActive():
+            return
+        key = self._mcd_peak_computation_key()
+        cancel = getattr(self, "_mcd_peak_fit_cancel_event", None)
+        pending = getattr(self, "_mcd_peak_local_pending_key", None) is not None and cancel is not None and not cancel.is_set()
+        if key == getattr(self, "_mcd_peak_analysis_key", None) and (self.mcd_peak_result is not None or pending):
+            return
+        self._analyze_mcd_peak_shift()
+
     def _analyze_mcd_peak_shift(self) -> None:
+        if self.loaded is not None and self.loaded.mode == "MCD" and self.loaded.mcd_result is not None:
+            self._mcd_peak_analysis_key = self._mcd_peak_computation_key()
         if self.mcd_peak_tracker_method_combo.currentText() == "Local mixed fit":
             self._request_mcd_local_fit()
             return
+        cancel = getattr(self, "_mcd_peak_fit_cancel_event", None)
+        if cancel is not None:
+            cancel.set()
+        self._mcd_peak_local_pending_key = None
         self._mcd_peak_fit_generation = int(getattr(self, "_mcd_peak_fit_generation", 0)) + 1
         self._analyze_mcd_peak_shift_legacy()
 
@@ -1524,13 +1563,6 @@ class FeatureTabsMixin:
             self.mcd_peak_status.setText("Error: no MCD result is loaded.")
             return
         source = self.loaded.mcd_result
-        self._mcd_peak_fit_generation = int(getattr(self, "_mcd_peak_fit_generation", 0)) + 1
-        generation = self._mcd_peak_fit_generation
-        previous_cancel = getattr(self, "_mcd_peak_fit_cancel_event", None)
-        if previous_cancel is not None:
-            previous_cancel.set()
-        cancel_event = threading.Event()
-        self._mcd_peak_fit_cancel_event = cancel_event
         selected = selection_key if selection_key is not None else self.mcd_peak_selector_combo.currentData()
         selected_track = None
         locator_results = getattr(self, "_mcd_peak_locator_results", {})
@@ -1603,6 +1635,20 @@ class FeatureTabsMixin:
             requested_id, requested_branch,
         )
         cache_key = local_fit_cache_key(source, source=spectrum_source, background_model=background_model, window_ev=window_ev, seed_energy_ev=seed_energy_ev, settings=settings)
+        previous_cancel = getattr(self, "_mcd_peak_fit_cancel_event", None)
+        if (
+            cache_key == getattr(self, "_mcd_peak_local_pending_key", None)
+            and previous_cancel is not None and not previous_cancel.is_set()
+        ):
+            return
+        self._mcd_peak_fit_generation = int(getattr(self, "_mcd_peak_fit_generation", 0)) + 1
+        generation = self._mcd_peak_fit_generation
+        if previous_cancel is not None:
+            previous_cancel.set()
+        cancel_event = threading.Event()
+        self._mcd_peak_fit_cancel_event = cancel_event
+        self._mcd_peak_local_pending_key = None
+        self._mcd_peak_analysis_key = self._mcd_peak_computation_key()
         cache = getattr(self, "_mcd_peak_local_fit_cache", {})
         cached = cache.get(cache_key)
         if cached is not None:
@@ -1636,6 +1682,7 @@ class FeatureTabsMixin:
             cancel_event=cancel_event,
         )
         self._mcd_peak_fit_worker = worker
+        self._mcd_peak_local_pending_key = cache_key
         worker.signals.result.connect(lambda results, w=worker, g=generation, key=cache_key: self._finish_mcd_local_fit(w, g, results, source, seed_energy_ev, locator_energy_ev, feature_kind, key))
         worker.signals.error.connect(lambda message, g=generation: self._mcd_local_fit_error(g, message))
         worker.signals.finished.connect(lambda w=worker, g=generation: self._mcd_local_fit_finished(w, g))
@@ -1655,6 +1702,8 @@ class FeatureTabsMixin:
 
     def _mcd_local_fit_finished(self, worker, generation: int) -> None:
         if generation == int(getattr(self, "_mcd_peak_fit_generation", -1)):
+            self._mcd_peak_local_pending_key = None
+            self._mcd_peak_fit_worker = None
             self.mcd_peak_analyze_btn.setEnabled(True)
 
     def _select_mcd_peak_key_blocked(self, key: tuple | None) -> None:

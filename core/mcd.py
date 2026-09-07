@@ -176,7 +176,23 @@ def _load_reference_file(path: str, wavelength_nm: np.ndarray) -> np.ndarray:
     return values_sorted[np.argsort(target_order)]
 
 
-def _coalesce_angle_readback(angle: np.ndarray, *, tolerance_deg: float = 0.01) -> np.ndarray:
+MCD_ANGLE_TOLERANCE_DEG = 0.01
+
+
+def match_mcd_angle(requested: float, available: Sequence[float]) -> float:
+    """Resolve readback jitter without rounding or relabeling acquired values."""
+    values = np.unique(np.asarray(available, dtype=float))
+    matches = values[np.isclose(values, requested, rtol=0, atol=MCD_ANGLE_TOLERANCE_DEG)]
+    if matches.size != 1:
+        raise ValueError(
+            f"Selected MCD angle {requested:g} deg has no unique match in the CSV "
+            f"within {MCD_ANGLE_TOLERANCE_DEG:g} deg; available angles: "
+            + ", ".join(f"{value:g}" for value in values)
+        )
+    return float(matches[0])
+
+
+def _coalesce_angle_readback(angle: np.ndarray, *, tolerance_deg: float = MCD_ANGLE_TOLERANCE_DEG) -> np.ndarray:
     """Group sub-hundredth-degree readback jitter into commanded angles."""
     values = np.asarray(angle, float)
     if values.size < 2:
@@ -428,8 +444,8 @@ def _pair_angles(
     angles = np.unique(angle)
     if angles.size < 2:
         raise ValueError("MCD data needs spectra from two waveplate/analyser angles.")
-    pos = float(settings.pos_angle) if settings.pos_angle is not None else float(np.max(angles))
-    neg = float(settings.neg_angle) if settings.neg_angle is not None else float(np.min(angles))
+    pos = match_mcd_angle(settings.pos_angle, angles) if settings.pos_angle is not None else float(np.max(angles))
+    neg = match_mcd_angle(settings.neg_angle, angles) if settings.neg_angle is not None else float(np.min(angles))
     if np.isclose(pos, neg):
         raise ValueError("The two selected MCD angles must be different.")
     if not np.any(np.isclose(angle, pos)) or not np.any(np.isclose(angle, neg)):
@@ -1188,8 +1204,8 @@ def process_mcd(path: str, settings: McdSettings | None = None) -> McdResult:
     if settings.pair_b_alignment == "interpolate":
         i_pos, pair_interpolated_pos = _interpolate_pair_spectra(b, angle, spectra, pair_pos_index, pair_b)
         i_neg, pair_interpolated_neg = _interpolate_pair_spectra(b, angle, spectra, pair_neg_index, pair_b)
-    pos_angle = float(settings.pos_angle) if settings.pos_angle is not None else float(np.max(np.unique(angle)))
-    neg_angle = float(settings.neg_angle) if settings.neg_angle is not None else float(np.min(np.unique(angle)))
+    pos_angle = match_mcd_angle(settings.pos_angle, angle) if settings.pos_angle is not None else float(np.max(angle))
+    neg_angle = match_mcd_angle(settings.neg_angle, angle) if settings.neg_angle is not None else float(np.min(angle))
     dark_pos = _load_reference_file(settings.dark_pos_file, wavelength) if settings.dark_pos_file else np.zeros_like(wavelength)
     dark_neg = _load_reference_file(settings.dark_neg_file, wavelength) if settings.dark_neg_file else np.zeros_like(wavelength)
     corrected_pos = i_pos - dark_pos

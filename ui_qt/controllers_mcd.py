@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
 from core.drr_sources import resolve_source_path
 from core.mcd import (
     McdBackgroundSuggestion, McdResult, McdSettings, background_fit_regions,
-    detect_angles, discover_mcd_processing_status, low_field_mcd_branch_fits,
+    detect_angles, discover_mcd_processing_status, low_field_mcd_branch_fits, match_mcd_angle,
     mcd_annotation_layout, pair_window_trace_by_branch,
     suggest_mcd_background_ranges,
 )
@@ -61,6 +61,8 @@ class McdController:
         "_mcd_angle_generation",
         "_mcd_angle_workers",
         "_mcd_load_after_angle_generation",
+        "_mcd_angle_ready_source",
+        "_mcd_angle_pending_source",
     })
 
     def __init__(self, owner) -> None:
@@ -92,6 +94,8 @@ class McdController:
         object.__setattr__(self, "_mcd_angle_generation", 0)
         object.__setattr__(self, "_mcd_angle_workers", [])
         object.__setattr__(self, "_mcd_load_after_angle_generation", None)
+        object.__setattr__(self, "_mcd_angle_ready_source", None)
+        object.__setattr__(self, "_mcd_angle_pending_source", None)
 
     def __getattr__(self, name):
         owner = object.__getattribute__(self, "_owner")
@@ -173,17 +177,36 @@ class McdController:
         self._request_mcd_load()
 
     def _mcd_angles_ready(self) -> bool:
-        return (
-            self.mcd_sigma_plus_combo.currentData() is not None
-            and self.mcd_sigma_minus_combo.currentData() is not None
-        )
+        try:
+            fingerprint = self._mcd_selected_source_fingerprint()
+            if fingerprint is None or fingerprint != self._mcd_angle_ready_source:
+                return False
+            angles = self._mcd_angle_cache[fingerprint[0]][2]
+            plus = match_mcd_angle(float(self.mcd_sigma_plus_combo.currentData()), angles)
+            minus = match_mcd_angle(float(self.mcd_sigma_minus_combo.currentData()), angles)
+            return plus != minus
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
+
+    def _mcd_selected_source_fingerprint(self) -> tuple[str, int, int] | None:
+        selected = self._selected(self.mcd_files)
+        if not self.current_folder or not selected:
+            return None
+        path = resolve_source_path(self.current_folder, selected[0])
+        stat = path.stat()
+        return str(path.resolve()).casefold(), int(stat.st_size), int(stat.st_mtime_ns)
 
     def _request_mcd_load(self) -> None:
+        if not self._mcd_angles_ready():
+            self._mcd_detect_available_angles()
         if not self._mcd_angles_ready():
             self._mcd_load_after_angle_generation = self._mcd_angle_generation
             self._status("Detecting MCD angles before loading the selected source...")
             return
         self._mcd_load_after_angle_generation = None
+        if self._load_in_progress:
+            self._owner._mcd_reload_pending = True
+            return
         self._start_load("MCD")
 
     def _on_mcd_angle_assignment_changed(self, automatic: bool) -> None:
@@ -798,8 +821,19 @@ class McdController:
         self._mcd_detect_available_angles()
 
     def _mcd_detect_available_angles(self) -> None:
+        try:
+            fingerprint = self._mcd_selected_source_fingerprint()
+        except (OSError, ValueError):
+            fingerprint = None
+        if fingerprint is not None and fingerprint == self._mcd_angle_pending_source:
+            return
+        resume_load = self._mcd_load_after_angle_generation is not None
         self._mcd_angle_generation += 1
         generation = self._mcd_angle_generation
+        self._mcd_angle_ready_source = None
+        self._mcd_angle_pending_source = None
+        if resume_load:
+            self._mcd_load_after_angle_generation = generation
         if not self.current_folder:
             return
         selected = self._selected(self.mcd_files)
@@ -822,14 +856,17 @@ class McdController:
             if cached is not None and cached[:2] == signature:
                 angles = cached[2]
                 self._apply_mcd_detected_angles(angles)
+                self._mcd_angle_ready_source = (cache_key, *signature)
                 return
         except Exception as exc:
+            self._apply_mcd_detected_angles(())
             message = f"Could not read MCD angles: {str(exc).splitlines()[0]}"
             self.mcd_source_summary.setText(message)
             self.mcd_source_summary.setToolTip(message)
             return
         self.mcd_source_summary.setText("Detecting MCD angles…")
         self.mcd_source_summary.setToolTip(str(source_path))
+        self._mcd_angle_pending_source = (cache_key, *signature)
         for combo in (self.mcd_sigma_plus_combo, self.mcd_sigma_minus_combo):
             blocked = combo.blockSignals(True)
             combo.clear()
@@ -856,19 +893,30 @@ class McdController:
         try:
             if str(resolve_source_path(self.current_folder, current[0]).resolve()).casefold() != source_key:
                 return
+            fingerprint = self._mcd_selected_source_fingerprint()
         except (IndexError, OSError):
+            self._mcd_angle_pending_source = None
+            self._apply_mcd_detected_angles(())
+            return
+        self._mcd_angle_pending_source = None
+        if fingerprint != (source_key, *signature):
+            self._mcd_detect_available_angles()
             return
         self._mcd_angle_cache[source_key] = (int(signature[0]), int(signature[1]), tuple(angles))
         self._apply_mcd_detected_angles(tuple(angles))
+        self._mcd_angle_ready_source = fingerprint
         if (
             self._mcd_load_after_angle_generation == generation
             and not self._load_in_progress
             and self._selected(self.mcd_files)
+            and self._mcd_angles_ready()
         ):
             self._request_mcd_load()
 
     def _on_mcd_angles_error(self, message: str, generation: int) -> None:
         if generation == self._mcd_angle_generation:
+            self._mcd_angle_pending_source = None
+            self._mcd_angle_ready_source = None
             self._mcd_load_after_angle_generation = None
             first = str(message).splitlines()[0]
             self.mcd_source_summary.setText(f"Could not read MCD angles: {first}")
@@ -881,6 +929,11 @@ class McdController:
 
     def _apply_mcd_detected_angles(self, angles: tuple[float, ...]) -> None:
         if len(angles) < 2:
+            for combo in (self.mcd_sigma_plus_combo, self.mcd_sigma_minus_combo):
+                blocked = combo.blockSignals(True)
+                combo.clear()
+                combo.addItem("-- Two distinct angles required --", None)
+                combo.blockSignals(blocked)
             message = "MCD CSV needs at least two distinct angle values."
             self.mcd_source_summary.setText(message)
             self.mcd_source_summary.setToolTip(message)
@@ -898,6 +951,11 @@ class McdController:
                 self.mcd_sigma_plus_combo.setCurrentIndex(len(angles) - 1)
                 self.mcd_sigma_minus_combo.setCurrentIndex(0)
             else:
+                try:
+                    plus_old = match_mcd_angle(float(plus_old), angles)
+                    minus_old = match_mcd_angle(float(minus_old), angles)
+                except (TypeError, ValueError):
+                    pass
                 plus_index = self.mcd_sigma_plus_combo.findData(plus_old)
                 minus_index = self.mcd_sigma_minus_combo.findData(minus_old)
                 self.mcd_sigma_plus_combo.setCurrentIndex(plus_index if plus_index >= 0 else len(angles) - 1)
