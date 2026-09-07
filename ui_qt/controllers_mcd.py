@@ -60,6 +60,7 @@ class McdController:
         "_mcd_angle_cache",
         "_mcd_angle_generation",
         "_mcd_angle_workers",
+        "_mcd_load_after_angle_generation",
     })
 
     def __init__(self, owner) -> None:
@@ -90,6 +91,7 @@ class McdController:
         object.__setattr__(self, "_mcd_angle_cache", {})
         object.__setattr__(self, "_mcd_angle_generation", 0)
         object.__setattr__(self, "_mcd_angle_workers", [])
+        object.__setattr__(self, "_mcd_load_after_angle_generation", None)
 
     def __getattr__(self, name):
         owner = object.__getattribute__(self, "_owner")
@@ -156,16 +158,32 @@ class McdController:
     def _on_mcd_source_changed(self) -> None:
         self._mcd_background_suggestion = None
         self._mcd_center_refresh_timer.stop()
+        self._invalidate_mcd_peak_shift(queue_reload=True)
         self._update_mcd_selection_summary()
         self._mcd_detect_available_angles()
         if not self._selected(self.mcd_files):
+            self._mcd_load_after_angle_generation = None
             return
         self._mcd_auto_apply_timer.stop()
         if self._load_in_progress:
-            self._mcd_reapply_pending = True
+            self._mcd_load_after_angle_generation = self._mcd_angle_generation
             self.mcd_apply_correction_btn.setText("Pending update...")
             return
         self._status("Loading the selected MCD source...")
+        self._request_mcd_load()
+
+    def _mcd_angles_ready(self) -> bool:
+        return (
+            self.mcd_sigma_plus_combo.currentData() is not None
+            and self.mcd_sigma_minus_combo.currentData() is not None
+        )
+
+    def _request_mcd_load(self) -> None:
+        if not self._mcd_angles_ready():
+            self._mcd_load_after_angle_generation = self._mcd_angle_generation
+            self._status("Detecting MCD angles before loading the selected source...")
+            return
+        self._mcd_load_after_angle_generation = None
         self._start_load("MCD")
 
     def _on_mcd_angle_assignment_changed(self, automatic: bool) -> None:
@@ -499,29 +517,66 @@ class McdController:
             self._on_mcd_plot_changed()
 
     def _update_mcd_selection_summary(self) -> None:
-        if not hasattr(self, "mcd_selection_summary"):
+        if not hasattr(self, "mcd_files"):
             return
         selected = self._selected(self.mcd_files)
-        if not selected:
+        if not selected and hasattr(self, "mcd_selection_summary"):
             self.mcd_selection_summary.set_status(
                 "No MCD CSV selected.", tooltip="", app_role=None, badge_state=None
             )
-            return
-        source = selected[0]
-        display_name = Path(source).name.replace("_", "_\u200b").replace("-", "-\u200b")
-        processed_at = self.mcd_processed_status.get(source, "")
-        if processed_at:
-            state = f"✓ PROCESSED\nLast saved: {processed_at[:16].replace('T', ' ')}"
-            badge_state = "processed"
-        else:
-            state = "● NEW — No saved analysis"
-            badge_state = "new"
-        self.mcd_selection_summary.set_status(
-            f"{state}\nSelected: {display_name}",
-            tooltip=source,
-            app_role="sourceBadge",
-            badge_state=badge_state,
-        )
+        elif selected:
+            source = selected[0]
+            display_name = Path(source).name.replace("_", "_\u200b").replace("-", "-\u200b")
+            processed_at = self.mcd_processed_status.get(source, "")
+            if processed_at:
+                state = f"✓ PROCESSED\nLast saved: {processed_at[:16].replace('T', ' ')}"
+                badge_state = "processed"
+            else:
+                state = "● NEW — No saved analysis"
+                badge_state = "new"
+            if hasattr(self, "mcd_selection_summary"):
+                self.mcd_selection_summary.set_status(
+                    f"{state}\nSelected: {display_name}",
+                    tooltip=source,
+                    app_role="sourceBadge",
+                    badge_state=badge_state,
+                )
+        peak_summary = getattr(self, "mcd_peak_source_selection_summary", None)
+        if peak_summary is not None:
+            if selected:
+                source = selected[0]
+                display_name = Path(source).name.replace("_", "_\u200b").replace("-", "-\u200b")
+                peak_summary.set_status(
+                    f"Selected: {display_name}",
+                    tooltip=source,
+                    app_role="sourceBadge",
+                    badge_state="selected",
+                )
+            else:
+                peak_summary.set_status(
+                    "No MCD CSV selected.", tooltip="", app_role=None, badge_state=None
+                )
+
+    def _invalidate_mcd_peak_shift(self, *, queue_reload: bool) -> None:
+        """Drop peak-shift state whenever the shared raw MCD source changes."""
+        self._owner._mcd_source_generation = getattr(self._owner, "_mcd_source_generation", 0) + 1
+        self._mcd_auto_apply_timer.stop()
+        self._mcd_reapply_pending = False
+        self._mcd_load_after_angle_generation = None
+        self._owner._mcd_peak_drag = None
+        if queue_reload and self._load_in_progress:
+            self._owner._mcd_reload_pending = True
+        elif not queue_reload:
+            self._owner._mcd_reload_pending = False
+        if self.loaded is not None and self.loaded.mode == "MCD":
+            self.loaded = None
+        self._update_mcd_peak_shift_source(None)
+        if self.last_plotted_mode in {"MCD", "MCD Peak Shift"}:
+            self.last_plotted_mode = None
+            self._disable_mcd_blitting()
+            self.figure.clear()
+            self.canvas.draw_idle()
+        self._update_action_states()
 
     def _mcd_source_modified(self, source: str) -> float:
         try:
@@ -674,23 +729,26 @@ class McdController:
             blocked = self.mcd_files.blockSignals(True)
             self._restore_list_selection(self.mcd_files, [chosen])
             self.mcd_files.blockSignals(blocked)
-            self._update_mcd_selection_summary()
-            self._mcd_detect_available_angles()
+        self._invalidate_mcd_peak_shift(queue_reload=True)
+        self._update_mcd_selection_summary()
+        self._mcd_detect_available_angles()
         self._mcd_auto_apply_timer.stop()
         self._mcd_reapply_pending = False
+        if self._load_in_progress:
+            self._mcd_load_after_angle_generation = self._mcd_angle_generation
+            self.mcd_apply_correction_btn.setText("Pending update...")
+            self._status(f"Selected MCD source: {Path(chosen).name}. Waiting for the current load to finish...")
+            return
         self._status(f"Selected MCD source: {Path(chosen).name}. Loading now...")
-        self._start_load("MCD")
+        self._request_mcd_load()
 
     def _clear_mcd_source(self) -> None:
+        blocked = self.mcd_files.blockSignals(True)
         self.mcd_files.clearSelection()
+        self.mcd_files.blockSignals(blocked)
+        self._invalidate_mcd_peak_shift(queue_reload=False)
+        self._update_mcd_selection_summary()
         self._invalidate_export_move_sources()
-        if self.loaded and self.loaded.mode == "MCD":
-            self.loaded = None
-        if self.last_plotted_mode == "MCD":
-            self.last_plotted_mode = None
-            self._disable_mcd_blitting()
-            self.figure.clear()
-            self.canvas.draw_idle()
         self._set_stage("No MCD source")
         self._update_action_states()
 
@@ -772,6 +830,11 @@ class McdController:
             return
         self.mcd_source_summary.setText("Detecting MCD angles…")
         self.mcd_source_summary.setToolTip(str(source_path))
+        for combo in (self.mcd_sigma_plus_combo, self.mcd_sigma_minus_combo):
+            blocked = combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("-- Detecting angles --", None)
+            combo.blockSignals(blocked)
         worker = Worker(_detect_mcd_angles_worker, str(source_path), signature)
         self._mcd_angle_workers.append(worker)
         worker.signals.result.connect(
@@ -797,9 +860,16 @@ class McdController:
             return
         self._mcd_angle_cache[source_key] = (int(signature[0]), int(signature[1]), tuple(angles))
         self._apply_mcd_detected_angles(tuple(angles))
+        if (
+            self._mcd_load_after_angle_generation == generation
+            and not self._load_in_progress
+            and self._selected(self.mcd_files)
+        ):
+            self._request_mcd_load()
 
     def _on_mcd_angles_error(self, message: str, generation: int) -> None:
         if generation == self._mcd_angle_generation:
+            self._mcd_load_after_angle_generation = None
             first = str(message).splitlines()[0]
             self.mcd_source_summary.setText(f"Could not read MCD angles: {first}")
 

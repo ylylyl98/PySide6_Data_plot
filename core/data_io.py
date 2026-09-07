@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 import json
+import re
 from pathlib import Path
 from typing import Dict, List, Sequence
 
@@ -11,13 +12,18 @@ import numpy as np
 import pandas as pd
 
 from core.file_ops import _nat_key, archive_selected, list_root_csvs
-from core.drr_sources import resolve_source_path, validate_named_wavelength_centers
+from core.drr_sources import (
+    DrrMeasurementAssignment,
+    resolve_source_path,
+    validate_named_wavelength_centers,
+)
 from core.loader import (
     DataCube,
     XLSX_Y_LABEL_OPTIONS,
     build_external_baseline,
     is_xlsx_map_file,
     load_drr_avg,
+    load_drr_resolved_avg,
     load_dat,
     load_pl,
     load_xlsx_map,
@@ -175,6 +181,27 @@ def list_pl_source_files(folder: str) -> List[str]:
     return sorted(names, key=_nat_key)
 
 
+_PL_SOURCE_MARKER_RE = re.compile(
+    r"(?:^|[_\-\s])(?P<kind>PL|REF)(?=$|[_\-\s])"
+    r"|(?P<temperature>\d+(?:\.\d+)?)K(?P<attached>PL|REF)(?=$|[_\-\s])",
+    re.IGNORECASE,
+)
+
+
+def classify_pl_source(source: str | Path) -> str:
+    """Classify a raw PL filename conservatively as PL, REF, or Unknown."""
+    suffix = Path(source).suffix.lower()
+    if suffix == ".dat":
+        return "DAT"
+    if suffix not in {".csv", ".xlsx"}:
+        return "Unknown"
+    kinds = {
+        (match.group("kind") or match.group("attached")).upper()
+        for match in _PL_SOURCE_MARKER_RE.finditer(Path(source).stem)
+    }
+    return next(iter(kinds)) if len(kinds) == 1 else "Unknown"
+
+
 def discover_pl_processing_status(
     experiment_root: str | Path, sources: Sequence[str]
 ) -> dict[str, str]:
@@ -303,6 +330,39 @@ def load_drr_external_cube(
         y_axis=y_axis,
         external_vector=np.asarray(baseline["I0"], float),
         external_energy=np.asarray(baseline["energy"], float),
+        derivative=derivative,
+    )
+
+
+def load_drr_resolved_cube(
+    folder: str,
+    files: Sequence[str],
+    assignments: Sequence[DrrMeasurementAssignment],
+    *,
+    y_axis: str = "auto",
+    derivative: int | None = None,
+) -> DataCube:
+    """Load DRR using validated per-measurement background assignments."""
+    selected = tuple(str(item) for item in files)
+    by_measurement = {item.measurement_file: item for item in assignments}
+    if (
+        len(assignments) != len(selected)
+        or len(by_measurement) != len(selected)
+        or set(by_measurement) != set(selected)
+    ):
+        raise ValueError("DRR assignments must contain exactly one entry per measurement file.")
+    for measurement in selected:
+        assignment = by_measurement[measurement]
+        if assignment.baseline_mode == "External":
+            # Validate filename-declared centers before the loader reaches a
+            # heterogeneous numerical path.  The canonical loader validates
+            # actual grids; this catches named center mismatches as well.
+            validate_named_wavelength_centers([measurement], assignment.baseline_files)
+    return load_drr_resolved_avg(
+        folder,
+        files,
+        assignments=assignments,
+        y_axis=y_axis,
         derivative=derivative,
     )
 

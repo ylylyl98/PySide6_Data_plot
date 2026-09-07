@@ -186,6 +186,10 @@ class MenuToolbarHostTests(unittest.TestCase):
                 self.assertTrue(button.isVisible())
                 self.assertTrue(button.text())
             self.assertEqual(
+                [host.panels_toolbar.widgetForAction(action).text() for action in host.panels_toolbar.actions()],
+                ["Results", "Log"],
+            )
+            self.assertEqual(
                 [action.text() for action in host.view_menu.actions()],
                 ["Show Log", "Show Analysis Results", "Show Controls Sidebar"],
             )

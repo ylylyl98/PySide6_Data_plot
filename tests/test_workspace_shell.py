@@ -21,12 +21,14 @@ class WorkspaceShellTests(unittest.TestCase):
         left_panel = QWidget()
         plot_panel = QWidget()
         presentation_widget = QWidget()
+        tools_widget = QWidget()
         shell = WorkspaceShell(
             window,
             navigation=navigation,
             left_panel=left_panel,
             plot_panel=plot_panel,
             presentation_widget=presentation_widget,
+            tools_widget=tools_widget,
         )
         try:
             window.resize(1500, 800)
@@ -61,10 +63,11 @@ class WorkspaceShellTests(unittest.TestCase):
             self.assertEqual(left_panel.sizePolicy().horizontalPolicy(), QSizePolicy.Preferred)
 
             self.assertIsInstance(shell.workspace_stack, QStackedWidget)
-            self.assertEqual(shell.workspace_stack.count(), 2)
+            self.assertEqual(shell.workspace_stack.count(), 3)
             self.assertEqual(shell.workspace_stack.currentIndex(), 0)
             self.assertIs(shell.workspace_stack.widget(0), shell.workspace_splitter)
             self.assertIs(shell.workspace_stack.widget(1), presentation_widget)
+            self.assertIs(shell.workspace_stack.widget(2), tools_widget)
         finally:
             window.close()
 
@@ -169,6 +172,35 @@ class WorkspaceShellTests(unittest.TestCase):
             self.assertEqual(window.workspace_stack.currentIndex(), 0)
             self.assertTrue(window.sidebar_toggle_btn.isEnabled())
             self.assertTrue(window.show_sidebar_action.isEnabled())
+        finally:
+            window.close()
+
+    def test_tools_workspace_is_full_width_and_preserves_tool_instances(self):
+        from ui_qt.main_window import MainWindow
+
+        window = MainWindow()
+        try:
+            window.show()
+            self.app.processEvents()
+            tools_index = next(i for i in range(window.tabs.count()) if window.tabs.tabText(i) == "Tools")
+            organizer = window.mcd_extract_btn
+            show_log = window.show_log_btn
+            window.workflow_tabs.setCurrentIndex(tools_index)
+            self.app.processEvents()
+            self.assertEqual(window.workspace_stack.currentWidget(), window.tools_workspace)
+            self.assertFalse(window.left_panel.isVisible())
+            self.assertFalse(window.toolbar.isVisible())
+            self.assertFalse(window.canvas.isVisible())
+            self.assertTrue(window.menu_toolbar_host.source_widget_action.isVisible())
+            self.assertIs(window.mcd_extract_btn, organizer)
+            self.assertIs(window.show_log_btn, show_log)
+            window.workflow_tabs.setCurrentIndex(0)
+            self.app.processEvents()
+            self.assertEqual(window.workspace_stack.currentWidget(), window.workspace_splitter)
+            self.assertTrue(window.left_panel.isVisible())
+            self.assertTrue(window.toolbar.isVisible())
+            self.assertIs(window.mcd_extract_btn, organizer)
+            self.assertIs(window.show_log_btn, show_log)
         finally:
             window.close()
 

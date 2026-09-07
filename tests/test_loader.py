@@ -9,6 +9,7 @@ from unittest.mock import patch
 import numpy as np
 
 import core.loader as loader
+from core.drr_sources import DrrMeasurementAssignment
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -182,6 +183,60 @@ class LoaderTests(unittest.TestCase):
                 loader.P.build_external_baseline_avg(
                     "unused", ["first.csv", "second.csv"], which="last"
                 )
+
+    def test_resolved_loader_averages_heterogeneous_native_drr_before_alignment(self) -> None:
+        canonical = {
+            "a.csv": {"energy": np.array([1., 2., 3.]), "gate_axis": np.array([0.]), "Z": np.array([[20., 20., 20.]]), "gate_label": "Gate", "title_name": "a", "stem": "a"},
+            "b.csv": {"energy": np.array([1., 2.5, 3.]), "gate_axis": np.array([0.]), "Z": np.array([[40., 40., 40.]]), "gate_label": "Gate", "title_name": "b", "stem": "b"},
+            "bg_a.csv": {"energy": np.array([1., 2., 3.]), "gate_axis": np.array([0.]), "Z": np.array([[10., 10., 10.]]), "gate_label": "Gate", "title_name": "bg_a", "stem": "bg_a"},
+            "bg_b.csv": {"energy": np.array([1., 2.5, 3.]), "gate_axis": np.array([0.]), "Z": np.array([[40., 40., 40.]]), "gate_label": "Gate", "title_name": "bg_b", "stem": "bg_b"},
+        }
+        assignments = (
+            DrrMeasurementAssignment("a.csv", "External", ("bg_a.csv",), "last"),
+            DrrMeasurementAssignment("b.csv", "External", ("bg_b.csv",), "last"),
+        )
+
+        def fake_load(_folder, name, **_kwargs):
+            return canonical[name]
+
+        with patch.object(loader.P, "_load_canonical", side_effect=fake_load):
+            cube = loader.load_drr_resolved_avg("unused", ["a.csv", "b.csv"], assignments=assignments)
+
+        self.assertTrue(np.allclose(cube.Z, np.full((1, 3), 0.5), equal_nan=True))
+        self.assertTrue(np.array_equal(cube.energy, np.array([1., 2., 3.])))
+
+    def test_resolved_loader_rejects_actual_center_shift_in_heterogeneous_baseline(self) -> None:
+        canonical = {
+            "a.csv": {"energy": np.array([1.9, 2.0, 2.1]), "gate_axis": np.array([0.]), "Z": np.array([[20., 20., 20.]]), "gate_label": "Gate", "title_name": "a", "stem": "a"},
+            "b.csv": {"energy": np.array([1.9, 2.0, 2.1]), "gate_axis": np.array([0.]), "Z": np.array([[40., 40., 40.]]), "gate_label": "Gate", "title_name": "b", "stem": "b"},
+            "bg_a.csv": {"energy": np.array([1.9, 2.0, 2.1]), "gate_axis": np.array([0.]), "Z": np.array([[10., 10., 10.]]), "gate_label": "Gate", "title_name": "bg_a", "stem": "bg_a"},
+            "bg_b.csv": {"energy": np.array([1.95, 2.05, 2.15]), "gate_axis": np.array([0.]), "Z": np.array([[20., 20., 20.]]), "gate_label": "Gate", "title_name": "bg_b", "stem": "bg_b"},
+        }
+        assignments = (
+            DrrMeasurementAssignment("a.csv", "External", ("bg_a.csv",), "last"),
+            DrrMeasurementAssignment("b.csv", "External", ("bg_b.csv",), "last"),
+        )
+        def fake_load(_folder, name, **_kwargs):
+            return canonical[name]
+
+        with patch.object(loader.P, "_load_canonical", side_effect=fake_load):
+            with self.assertRaisesRegex(ValueError, "wavelength center"):
+                loader.load_drr_resolved_avg("unused", ["a.csv", "b.csv"], assignments=assignments)
+
+    def test_resolved_loader_keeps_common_external_loader_path(self) -> None:
+        assignments = (
+            DrrMeasurementAssignment("a.csv", "External", ("bg.csv",), "all"),
+            DrrMeasurementAssignment("b.csv", "External", ("bg.csv",), "all"),
+        )
+        with patch.object(loader, "load_drr_avg") as common, patch.object(
+            loader, "build_external_baseline", return_value={"energy": np.array([1.]), "I0": np.array([1.])}
+        ):
+            common.return_value = loader.DataCube(
+                np.array([1.]), np.array([0.]), np.array([[0.]]), "Gate", "DRR", "DR/R"
+            )
+            cube = loader.load_drr_resolved_avg("unused", ["a.csv", "b.csv"], assignments=assignments)
+        common.assert_called_once()
+        self.assertEqual(cube.Z.tolist(), [[0.]])
 
 
 if __name__ == "__main__":

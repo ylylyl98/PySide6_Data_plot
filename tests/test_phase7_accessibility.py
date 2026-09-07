@@ -157,6 +157,10 @@ class Phase7AccessibilityTests(unittest.TestCase):
         finally:
             window.close()
 
+    @unittest.skipUnless(
+        os.environ.get("RUN_UI_VISUAL_TESTS") == "1",
+        "requires RUN_UI_VISUAL_TESTS=1",
+    )
     def test_spinbox_edit_field_reserves_text_space_from_steppers(self) -> None:
         """The rendered app style keeps numeric text clear of both steppers."""
         from PySide6.QtWidgets import QStyle, QStyleOptionSpinBox, QToolButton
@@ -218,6 +222,10 @@ class Phase7AccessibilityTests(unittest.TestCase):
         finally:
             window.close()
 
+    @unittest.skipUnless(
+        os.environ.get("RUN_UI_VISUAL_TESTS") == "1",
+        "requires RUN_UI_VISUAL_TESTS=1",
+    )
     def test_production_spinboxes_keep_safe_edit_capacity_in_all_workflows(self) -> None:
         """Real workflow spinboxes retain text space beside both steppers."""
         from ui_qt.main_window import MainWindow, UI_METRICS

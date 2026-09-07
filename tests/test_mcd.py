@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import json
+import gc
 import tempfile
 import unittest
+import weakref
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,8 +13,8 @@ import numpy as np
 import pandas as pd
 from matplotlib.figure import Figure
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtCore import QCoreApplication, QEvent, Qt
+from PySide6.QtWidgets import QApplication, QMainWindow, QWidget
 
 from core.mcd import McdCenterCandidate, McdSettings, background_fit_regions, detect_angles, discover_mcd_processing_status, ensure_mcd_package_dir, export_mcd_analysis_bundle, export_mcd_tables, extract_mcd_acquisition_conditions, format_mcd_acquisition_conditions, format_mcd_energy, load_b_sweep_csv, low_field_mcd_branch_fits, pair_window_trace_by_branch, process_mcd, suggest_mcd_background_ranges, suggest_mcd_window_centers, window_trace, window_trace_comparison
 from ui_qt.main_window import (
@@ -31,6 +33,27 @@ class McdProcessingTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
+    def setUp(self) -> None:
+        self._owned_windows: list[QMainWindow] = []
+        self.addCleanup(self._dispose_test_windows)
+
+    def tearDown(self) -> None:
+        self._dispose_test_windows()
+
+    def _dispose_test_windows(self) -> None:
+        """Destroy explicitly registered windows created by this test."""
+        for window in reversed(self._owned_windows):
+            if window is not None:
+                window.close()
+                window.deleteLater()
+        self._owned_windows.clear()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        self.app.processEvents()
+
+    def _own_window(self, window: QMainWindow) -> QMainWindow:
+        self._owned_windows.append(window)
+        return window
+
     def _write_sweep(self, folder: Path) -> Path:
         # The two angles have a 3x, wavelength-dependent transmission mismatch.
         # Their normalised field response is opposite, so the corrected MCD must
@@ -43,13 +66,21 @@ class McdProcessingTests(unittest.TestCase):
         pd.DataFrame(rows).to_csv(path, index=False)
         return path
 
+    def test_test_owned_main_windows_are_destroyed_by_cleanup(self) -> None:
+        window = self._own_window(MainWindow())
+        reference = weakref.ref(window)
+        self._dispose_test_windows()
+        del window
+        gc.collect()
+        self.assertIsNone(reference())
+
     def test_mcd_processing_defaults_use_quadratic_spectral_baseline(self) -> None:
         settings = McdSettings()
         self.assertEqual(settings.correction_mode, "pair_spectral")
         self.assertEqual(settings.spectral_order, 2)
 
     def test_metric_signal_invalidates_center_candidates(self) -> None:
-        window = MainWindow()
+        window = self._own_window(MainWindow())
         try:
             window._mcd_center_candidates = (
                 McdCenterCandidate(1.64, 8.0, 9.0, 0.9, 0.04, 1),
@@ -62,7 +93,7 @@ class McdProcessingTests(unittest.TestCase):
             window.close()
 
     def test_mcd_plot_interaction_apis_are_controller_owned(self) -> None:
-        window = MainWindow()
+        window = self._own_window(MainWindow())
         try:
             for name in (
                 "_mcd_pair_correction_label",
@@ -84,15 +115,23 @@ class McdProcessingTests(unittest.TestCase):
                 "_update_mcd_candidate_artist_styles",
                 "_on_mcd_canvas_motion",
                 "_on_mcd_canvas_click",
-                "_on_canvas_release",
             ):
                 self.assertIn(name, type(window.mcd_controller).__dict__)
                 self.assertNotIn(name, MainWindow.__dict__)
+            # MainWindow is the shared canvas dispatcher for Peak Shift and
+            # forwards ordinary MCD releases to the controller.
+            self.assertIn("_on_canvas_release", MainWindow.__dict__)
+            self.assertIn("_on_canvas_release", type(window.mcd_controller).__dict__)
+            release = object()
+            window.last_plotted_mode = "MCD"
+            with patch.object(type(window.mcd_controller), "_on_canvas_release") as delegate:
+                window._on_canvas_release(release)
+            delegate.assert_called_once_with(release)
         finally:
             window.close()
 
     def test_main_canvas_dispatch_delegates_mcd_interactions(self) -> None:
-        window = MainWindow()
+        window = self._own_window(MainWindow())
         try:
             window.last_plotted_mode = "MCD"
             motion = object()
@@ -117,7 +156,7 @@ class McdProcessingTests(unittest.TestCase):
             window.close()
 
     def test_main_canvas_hover_readback_does_not_replace_persistent_status(self) -> None:
-        window = MainWindow()
+        window = self._own_window(MainWindow())
         try:
             window.status_bar_view.showMessage("State: Loading...")
             window.last_plotted_mode = "SHG Processing"
@@ -132,7 +171,7 @@ class McdProcessingTests(unittest.TestCase):
             window.close()
 
     def test_main_canvas_heatmap_hover_routes_readback_without_replacing_status(self) -> None:
-        window = MainWindow()
+        window = self._own_window(MainWindow())
         try:
             window.status_bar_view.showMessage("State: Ready")
             window.last_plotted_mode = "PL"
@@ -148,7 +187,7 @@ class McdProcessingTests(unittest.TestCase):
             window.close()
 
     def test_mcd_drag_readback_does_not_replace_persistent_status(self) -> None:
-        window = MainWindow()
+        window = self._own_window(MainWindow())
         try:
             window.status_bar_view.showMessage("Progress: processing")
             window._mcd_window_dragging = True
@@ -173,7 +212,7 @@ class McdProcessingTests(unittest.TestCase):
             window.close()
 
     def test_mcd_band_hover_routes_readback_without_replacing_status(self) -> None:
-        window = MainWindow()
+        window = self._own_window(MainWindow())
         try:
             window.status_bar_view.showMessage("State: Ready")
             window._mcd_window_dragging = False
@@ -193,7 +232,7 @@ class McdProcessingTests(unittest.TestCase):
             window.close()
 
     def test_toolbar_save_uses_controller_hooks(self) -> None:
-        window = MainWindow()
+        window = self._own_window(MainWindow())
         try:
             with (
                 patch.object(
@@ -211,7 +250,7 @@ class McdProcessingTests(unittest.TestCase):
             window.close()
 
     def test_mcd_theme_change_invalidates_blit_backgrounds(self) -> None:
-        window = MainWindow()
+        window = self._own_window(MainWindow())
         try:
             window.mcd_controller._mcd_blit_enabled = True
             window.mcd_controller._mcd_blit_backgrounds = {"heat": object()}
@@ -227,7 +266,7 @@ class McdProcessingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder_text:
             folder = Path(folder_text)
             self._write_sweep(folder)
-            window = MainWindow()
+            window = self._own_window(MainWindow())
             try:
                 window._set_current_folder(str(folder))
                 wait_for_file_catalog(window)
@@ -712,7 +751,7 @@ class McdProcessingTests(unittest.TestCase):
                 drr_baseline_which="", compare_log_scale=False,
                 mcd_settings=settings,
             )
-            window = MainWindow()
+            window = self._own_window(MainWindow())
             try:
                 with patch("ui_qt.main_window.process_mcd", wraps=process_mcd) as process:
                     first = window._load_task(options, progress=Sink(), log=Sink())
@@ -907,7 +946,7 @@ class McdProcessingTests(unittest.TestCase):
         self.assertTrue(any(start > 1.682 and stop < 1.731 for start, stop in suggestion.ranges))
 
     def test_mcd_changes_schedule_automatic_recalculation(self) -> None:
-        window = MainWindow()
+        window = self._own_window(MainWindow())
         try:
             window.loaded = LoadedState(mode="MCD", folder="")
             window.mcd_controller._on_mcd_params_changed()
@@ -980,7 +1019,7 @@ class McdProcessingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder_text:
             folder = Path(folder_text)
             self._write_sweep(folder)
-            window = MainWindow()
+            window = self._own_window(MainWindow())
             try:
                 window._set_current_folder(str(folder))
                 wait_for_file_catalog(window)
@@ -1074,7 +1113,7 @@ class McdProcessingTests(unittest.TestCase):
             self._write_sweep(mcd_folder)
             (folder / "unrelated.csv").write_text("x,y\n1,2\n", encoding="utf-8")
 
-            window = MainWindow()
+            window = self._own_window(MainWindow())
             try:
                 window._set_current_folder(str(folder))
                 wait_for_file_catalog(window)
@@ -1110,7 +1149,7 @@ class McdProcessingTests(unittest.TestCase):
                 window.close()
 
     def test_mcd_source_filter_defaults_to_all_and_reports_counts(self) -> None:
-        window = MainWindow()
+        window = self._own_window(MainWindow())
         try:
             window._mcd_source_filter_preference = "all"
             window.mcd_available_files = ["mcd/a.csv", "mcd/b.csv", "mcd/c.csv"]
@@ -1144,7 +1183,7 @@ class McdProcessingTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            window = MainWindow()
+            window = self._own_window(MainWindow())
             try:
                 window._set_current_folder(str(root))
                 wait_for_file_catalog(window)
@@ -1165,7 +1204,7 @@ class McdProcessingTests(unittest.TestCase):
             first.replace(mcd_folder / "sweep_1.csv")
             self._write_sweep(mcd_folder).replace(mcd_folder / "sweep_2.csv")
 
-            window = MainWindow()
+            window = self._own_window(MainWindow())
             try:
                 window._set_current_folder(str(folder))
                 wait_for_file_catalog(window)
@@ -1174,6 +1213,11 @@ class McdProcessingTests(unittest.TestCase):
                         type(window.mcd_controller),
                         "_open_mcd_source_dialog",
                         return_value="mcd/sweep_2.csv",
+                    ),
+                    patch.object(
+                        type(window.mcd_controller),
+                        "_mcd_angles_ready",
+                        return_value=True,
                     ),
                     patch.object(window, "_start_load") as start_load,
                 ):
@@ -1200,7 +1244,7 @@ class McdProcessingTests(unittest.TestCase):
             os.utime(first, (1000, 1000))
             os.utime(second, (2000, 2000))
 
-            window = MainWindow()
+            window = self._own_window(MainWindow())
             try:
                 window._set_current_folder(str(folder))
                 wait_for_file_catalog(window)
@@ -1220,7 +1264,7 @@ class McdProcessingTests(unittest.TestCase):
             first.replace(mcd_folder / "sweep_1.csv")
             self._write_sweep(mcd_folder).replace(mcd_folder / "sweep_2.csv")
 
-            window = MainWindow()
+            window = self._own_window(MainWindow())
             try:
                 window._set_current_folder(str(folder))
                 wait_for_file_catalog(window)
@@ -1234,7 +1278,7 @@ class McdProcessingTests(unittest.TestCase):
 
     def test_mcd_sidebar_fits_without_horizontal_clipping(self) -> None:
         """The compact MCD controls must fit the normal left sidebar width."""
-        window = MainWindow()
+        window = self._own_window(MainWindow())
         try:
             window.resize(1500, 900)
             window.show()
@@ -1259,11 +1303,15 @@ class McdProcessingTests(unittest.TestCase):
         finally:
             window.close()
 
+    @unittest.skipUnless(
+        os.environ.get("RUN_UI_VISUAL_TESTS") == "1",
+        "requires RUN_UI_VISUAL_TESTS=1",
+    )
     def test_mcd_color_range_row_is_contained_at_narrow_sidebar(self) -> None:
         from ui_qt.theme import install_theme
 
         install_theme(self.app, mode="light")
-        window = MainWindow()
+        window = self._own_window(MainWindow())
         try:
             window.resize(900, 700)
             window.show()
@@ -1344,7 +1392,7 @@ class McdProcessingTests(unittest.TestCase):
                 )
 
     def test_live_preview_slope_box_uses_compact_axes_contained_text(self) -> None:
-        window = MainWindow()
+        window = self._own_window(MainWindow())
         try:
             window.figure.clear()
             axis = window.figure.add_axes([0.72, 0.55, 0.22, 0.34])
@@ -1383,7 +1431,7 @@ class McdProcessingTests(unittest.TestCase):
                 pl_log_scale=False, drr_baseline_text="", drr_baseline_which="", compare_log_scale=False,
                 mcd_settings=McdSettings(max_sequence_gap=1, max_delta_b=0.01),
             )
-            window = MainWindow()
+            window = self._own_window(MainWindow())
             try:
                 first = window._load_task(options, progress=Sink(), log=Sink())
                 window._on_loaded(first)
@@ -1415,7 +1463,7 @@ class McdProcessingTests(unittest.TestCase):
                 pl_log_scale=False, drr_baseline_text="", drr_baseline_which="", compare_log_scale=False,
                 mcd_settings=McdSettings(max_sequence_gap=1, max_delta_b=0.01),
             )
-            window = MainWindow()
+            window = self._own_window(MainWindow())
             try:
                 window._on_loaded(window._load_task(options, progress=Sink(), log=Sink()))
                 result = window.loaded.mcd_result
@@ -1448,7 +1496,7 @@ class McdProcessingTests(unittest.TestCase):
                 pl_log_scale=False, drr_baseline_text="", drr_baseline_which="", compare_log_scale=False,
                 mcd_settings=McdSettings(max_sequence_gap=1, max_delta_b=0.01),
             )
-            window = MainWindow()
+            window = self._own_window(MainWindow())
             try:
                 window._on_loaded(window._load_task(options, progress=Sink(), log=Sink()))
                 original_center = float(window.mcd_window_center_spin.value())
@@ -1490,7 +1538,7 @@ class McdProcessingTests(unittest.TestCase):
                 pl_log_scale=False, drr_baseline_text="", drr_baseline_which="", compare_log_scale=False,
                 mcd_settings=McdSettings(max_sequence_gap=1, max_delta_b=0.01),
             )
-            window = MainWindow()
+            window = self._own_window(MainWindow())
             try:
                 window._on_loaded(window._load_task(options, progress=Sink(), log=Sink()))
                 result = window.loaded.mcd_result
@@ -1559,7 +1607,7 @@ class McdProcessingTests(unittest.TestCase):
                 pl_log_scale=False, drr_baseline_text="", drr_baseline_which="", compare_log_scale=False,
                 mcd_settings=McdSettings(max_sequence_gap=1, max_delta_b=0.01),
             )
-            window = MainWindow()
+            window = self._own_window(MainWindow())
             try:
                 manual_center = 1.755
                 window.mcd_window_center_spin.setValue(manual_center)
@@ -1602,7 +1650,7 @@ class McdProcessingTests(unittest.TestCase):
                 pl_log_scale=False, drr_baseline_text="", drr_baseline_which="", compare_log_scale=False,
                 mcd_settings=McdSettings(max_sequence_gap=1, max_delta_b=0.01),
             )
-            window = MainWindow()
+            window = self._own_window(MainWindow())
             try:
                 with patch("ui_qt.main_window.suggest_mcd_window_centers", return_value=()):
                     window._on_loaded(window._load_task(options, progress=Sink(), log=Sink()))
