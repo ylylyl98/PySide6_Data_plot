@@ -2,7 +2,24 @@
 
 from __future__ import annotations
 
-from ui_qt.main_window import *
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+from PySide6.QtCore import QObject, QRunnable, Qt, Signal
+from PySide6.QtGui import QColor
+from scipy.optimize import curve_fit
+from PySide6.QtWidgets import (
+    QListWidgetItem,
+)
+
+from core import data_io
+from core.drr_sources import resolve_source_path
+from core.loader import DataCube
+from core.processing import nearest_gate_spectrum
+from ui_qt.common import QComboBox
+from ui_qt.theme import alias as theme_alias
+from ui_qt.source_picker_dialog import SourcePickerDialog
 
 
 def _multi_lorentz_model_worker(x: np.ndarray, *p: float) -> np.ndarray:
@@ -67,6 +84,20 @@ class PlController:
         else:
             setattr(object.__getattribute__(self, "_owner"), name, value)
 
+    def _set_pl_gate_spin_value(self, gate_value: float) -> None:
+        spin = self.pl_spins["gate"]
+        old = spin.blockSignals(True)
+        try:
+            spin.setValue(float(gate_value))
+        finally:
+            spin.blockSignals(old)
+
+    def _current_pl_spectrum(self, cube: DataCube) -> tuple[float, np.ndarray, np.ndarray]:
+        gate_value = float(self.pl_spins["gate"].value())
+        gate_used, y = nearest_gate_spectrum(cube, gate_value)
+        x = np.asarray(cube.energy, float).ravel()
+        return gate_used, x, np.asarray(y, float).ravel()
+
     def _on_pl_selection_changed(self) -> None:
         self._invalidate_pending_pl_fit("Fit discarded: PL source changed.")
         selected = self._selected(self.pl_files)
@@ -86,25 +117,28 @@ class PlController:
             return
         selected = self._selected(self.pl_files)
         if not selected:
-            self.pl_selection_summary.setText("No PL file selected.")
-            self.pl_selection_summary.setToolTip("")
-            self.pl_selection_summary.setStyleSheet("")
+            self.pl_selection_summary.set_status(
+                "No PL file selected.", tooltip="", app_role=None, badge_state=None
+            )
             return
         source = selected[0]
         display_name = Path(source).name.replace("_", "_\u200b").replace("-", "-\u200b")
         processed_at = self.pl_processed_status.get(source, "")
         if self._pl_is_saved_dat(source):
             state = "◆ SAVED DAT — Processed result"
-            style = "QLabel { color: #6F42A5; background: #F3EDFA; border: 1px solid #BCA1D8; border-radius: 4px; padding: 5px; font-weight: 600; }"
+            badge_state = "saved"
         elif processed_at:
             state = f"✓ PROCESSED\nLast saved: {processed_at[:16].replace('T', ' ')}"
-            style = "QLabel { color: #237A3B; background: #EAF6ED; border: 1px solid #8BC79A; border-radius: 4px; padding: 5px; font-weight: 600; }"
+            badge_state = "processed"
         else:
             state = "● NEW — No saved analysis"
-            style = "QLabel { color: #1769AA; background: #EAF3FC; border: 1px solid #86B8E3; border-radius: 4px; padding: 5px; font-weight: 600; }"
-        self.pl_selection_summary.setText(f"{state}\nSelected: {display_name}")
-        self.pl_selection_summary.setToolTip(source)
-        self.pl_selection_summary.setStyleSheet(style)
+            badge_state = "new"
+        self.pl_selection_summary.set_status(
+            f"{state}\nSelected: {display_name}",
+            tooltip=source,
+            app_role="sourceBadge",
+            badge_state=badge_state,
+        )
 
     def _pl_source_modified(self, source: str) -> float:
         cached = self._pl_source_mtime_cache.get(source)
@@ -136,51 +170,22 @@ class PlController:
         }
 
     def _open_pl_source_dialog(self, selected: str) -> str | None:
-        dlg = QDialog(self._owner)
-        dlg.setWindowTitle("Choose PL File")
-        if not self.windowIcon().isNull():
-            dlg.setWindowIcon(self.windowIcon())
-        dlg.setMinimumSize(820, 520)
-        dlg.resize(980, 640)
-        layout = QVBoxLayout(dlg)
-        hint = QLabel(
-            "Choose one PL source. Raw CSV/XLSX inputs and saved PL DAT results are listed together, newest first."
-        )
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
-        filter_row = QHBoxLayout()
-        filter_edit = QLineEdit()
-        filter_edit.setPlaceholderText("Search filename...")
         state_filter = QComboBox()
         self._style_combo_popup(state_filter)
-        refresh_btn = QPushButton("Refresh")
-        filter_row.addWidget(QLabel("Find"))
-        filter_row.addWidget(filter_edit, 1)
-        filter_row.addWidget(QLabel("Status"))
-        filter_row.addWidget(state_filter)
-        filter_row.addWidget(refresh_btn)
-        layout.addLayout(filter_row)
-
-        file_list = QListWidget()
-        file_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        file_list.setWordWrap(True)
-        file_list.setTextElideMode(Qt.ElideNone)
-        file_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        file_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
-        file_list.setResizeMode(QListView.Fixed)
-        file_list.setItemDelegate(WrappedFilenameDelegate(file_list))
-        layout.addWidget(file_list, 1)
-        details = QLabel("Select one PL file.")
-        details.setWordWrap(True)
-        details.setMinimumHeight(42)
-        layout.addWidget(details)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        ok_button = buttons.button(QDialogButtonBox.Ok)
-        ok_button.setEnabled(False)
-        buttons.accepted.connect(dlg.accept)
-        buttons.rejected.connect(dlg.reject)
-        layout.addWidget(buttons)
+        dlg = SourcePickerDialog(
+            self._owner,
+            title="Choose PL File",
+            hint=(
+            "Choose one PL source. Raw CSV/XLSX inputs and saved PL DAT results are listed together, newest first."
+            ),
+            selected=selected,
+            filter_controls=(("Status", state_filter),),
+            filter_interval=140,
+        )
+        file_list = dlg.source_list
+        details = dlg.details_label
+        ok_button = dlg.ok_button
+        refresh_btn = dlg.refresh_button
 
         def _populate_filter_counts() -> None:
             current = str(state_filter.currentData() or self._pl_saved_source_filter())
@@ -195,47 +200,39 @@ class PlController:
             state_filter.blockSignals(blocked)
 
         def _refresh_view() -> None:
-            current_item = file_list.currentItem()
-            current = str(current_item.data(Qt.UserRole)) if current_item is not None else selected
             needle = filter_edit.text().strip().casefold()
             wanted = str(state_filter.currentData() or "all")
-            file_list.clear()
-            selected_row = -1
-            for source in self._pl_sources_newest_first():
-                is_processed = self._pl_source_is_processed(source)
-                if wanted == "unprocessed" and is_processed:
-                    continue
-                if wanted == "processed" and not is_processed:
-                    continue
-                if needle and needle not in source.casefold():
-                    continue
-                modified = self._pl_source_modified(source)
-                modified_text = datetime.fromtimestamp(modified).strftime("%Y-%m-%d %H:%M") if modified else "date unavailable"
-                processed_at = self.pl_processed_status.get(source, "")
-                if self._pl_is_saved_dat(source):
-                    text = f"◆ SAVED DAT — {Path(source).name}\nModified {modified_text} · Ready to view"
-                    color = QColor("#6F42A5")
-                    bold = False
-                elif processed_at:
-                    text = f"✓ PROCESSED — {Path(source).name}\nModified {modified_text} · Saved {processed_at[:16].replace('T', ' ')}"
-                    color = QColor("#237A3B")
-                    bold = False
-                else:
-                    text = f"● NEW — {Path(source).name}\nModified {modified_text} · No saved analysis"
-                    color = QColor("#1769AA")
-                    bold = True
-                item = QListWidgetItem(text)
-                item.setData(Qt.UserRole, source)
-                item.setToolTip(source)
-                item.setForeground(color)
-                font = item.font(); font.setBold(bold); item.setFont(font)
-                file_list.addItem(item)
-                if source == current:
-                    selected_row = file_list.count() - 1
-            if selected_row >= 0:
-                file_list.setCurrentRow(selected_row)
-            elif file_list.count() == 1:
-                file_list.setCurrentRow(0)
+            def _populate(widget) -> None:
+                for source in self._pl_sources_newest_first():
+                    is_processed = self._pl_source_is_processed(source)
+                    if wanted == "unprocessed" and is_processed:
+                        continue
+                    if wanted == "processed" and not is_processed:
+                        continue
+                    if needle and needle not in source.casefold():
+                        continue
+                    modified = self._pl_source_modified(source)
+                    modified_text = datetime.fromtimestamp(modified).strftime("%Y-%m-%d %H:%M") if modified else "date unavailable"
+                    processed_at = self.pl_processed_status.get(source, "")
+                    if self._pl_is_saved_dat(source):
+                        text = f"◆ SAVED DAT — {Path(source).name}\nModified {modified_text} · Ready to view"
+                        color = QColor(theme_alias("source_saved_foreground"))
+                        bold = False
+                    elif processed_at:
+                        text = f"✓ PROCESSED — {Path(source).name}\nModified {modified_text} · Saved {processed_at[:16].replace('T', ' ')}"
+                        color = QColor(theme_alias("source_processed_foreground"))
+                        bold = False
+                    else:
+                        text = f"● NEW — {Path(source).name}\nModified {modified_text} · No saved analysis"
+                        color = QColor(theme_alias("source_new_foreground"))
+                        bold = True
+                    item = QListWidgetItem(text)
+                    item.setData(Qt.UserRole, source)
+                    item.setToolTip(source)
+                    item.setForeground(color)
+                    font = item.font(); font.setBold(bold); item.setFont(font)
+                    widget.addItem(item)
+            dlg.repopulate(_populate, fallback_selection=selected)
 
         def _update_details() -> None:
             item = file_list.currentItem()
@@ -262,27 +259,20 @@ class PlController:
             self.settings.setValue(self.SETTINGS_PL_SOURCE_FILTER, value)
             _refresh_view()
 
-        filter_timer = QTimer(dlg)
-        filter_timer.setSingleShot(True)
-        filter_timer.setInterval(140)
-        filter_timer.timeout.connect(_refresh_view)
-        filter_edit.textChanged.connect(lambda _text: filter_timer.start())
+        filter_edit = dlg.filter_edit
+        dlg.filter_requested.connect(_refresh_view)
         state_filter.currentIndexChanged.connect(lambda _index: _on_filter_changed())
         file_list.currentItemChanged.connect(lambda _current, _previous: _update_details())
-        file_list.itemDoubleClicked.connect(lambda _item: dlg.accept())
         refresh_btn.clicked.connect(_reload_catalog)
         _populate_filter_counts(); _refresh_view(); _update_details()
-        if dlg.exec() != QDialog.Accepted:
+        if dlg.exec() != SourcePickerDialog.Accepted:
             return None
-        item = file_list.currentItem()
-        return str(item.data(Qt.UserRole)) if item is not None else None
+        return dlg.selected_source()
 
     def _edit_pl_source(self) -> None:
         selected = self._selected(self.pl_files)
         previous = selected[0] if selected else ""
-        # Call through the owner facade so existing integrations/tests that
-        # override the dialog entry point continue to work.
-        chosen = self._owner._open_pl_source_dialog(previous)
+        chosen = self._open_pl_source_dialog(previous)
         if not chosen:
             return
         if chosen != previous:

@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from PySide6.QtCore import QThreadPool, QTimer, Qt
@@ -51,6 +50,7 @@ from core.mcd_extract import (
     record_order_value,
 )
 from ui_qt.mcd_async import McdScanWorker
+from ui_qt.matplotlib_theme import ThemeAwareFigureCanvasQTAgg
 
 
 def _number_text(value: float | None, decimals: int = 6) -> str:
@@ -260,7 +260,7 @@ class McdExtractDialog(QDialog):
             "Preview — increasing and decreasing sweeps remain separate even when they share B values."
         ))
         self.figure = Figure(figsize=(10, 4), dpi=100, facecolor="white")
-        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.canvas = ThemeAwareFigureCanvasQTAgg(self.figure)
         preview_layout.addWidget(self.canvas, 1)
         splitter.addWidget(preview_container)
         self.table.setMinimumHeight(120)

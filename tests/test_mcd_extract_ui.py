@@ -13,6 +13,7 @@ from PySide6.QtCore import Qt, QThreadPool
 from PySide6.QtWidgets import QApplication
 
 from ui_qt.mcd_extract_dialog import McdExtractDialog
+from ui_qt.matplotlib_theme import ThemeAwareFigureCanvasQTAgg
 
 
 class McdExtractDialogTests(unittest.TestCase):
@@ -27,6 +28,14 @@ class McdExtractDialogTests(unittest.TestCase):
             if not dialog._scan_running:
                 return
         self.fail("MCD extract scan worker did not finish")
+
+    def test_preview_canvas_uses_theme_aware_qtagg_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_text:
+            dialog = McdExtractDialog(Path(folder_text))
+            try:
+                self.assertIsInstance(dialog.canvas, ThemeAwareFigureCanvasQTAgg)
+            finally:
+                dialog.close()
 
     def _write_result(
         self, root: Path, *, name: str = "sample", doping: float = 6.3

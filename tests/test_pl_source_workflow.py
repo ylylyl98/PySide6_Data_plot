@@ -7,12 +7,16 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import numpy as np
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from core import data_io
+from core.loader import DataCube
+from ui_qt.controllers_pl import PlController
 from ui_qt.main_window import MainWindow, QComboBox, QDoubleSpinBox, QSpinBox
 from tests.ui_test_helpers import wait_for_file_catalog
 
@@ -73,10 +77,10 @@ class PlSourceWorkflowTests(unittest.TestCase):
                 window._set_current_folder(str(root), remember=False)
                 wait_for_file_catalog(window)
                 with (
-                    patch.object(window, "_open_pl_source_dialog", return_value="second.csv"),
+                    patch.object(PlController, "_open_pl_source_dialog", return_value="second.csv"),
                     patch.object(window, "_start_load") as start_load,
                 ):
-                    window._edit_pl_source()
+                    window.pl_controller._edit_pl_source()
                 self.assertEqual(window._selected(window.pl_files), ["second.csv"])
                 self.assertIn("● NEW", window.pl_selection_summary.text())
                 start_load.assert_called_once_with("PL")
@@ -97,7 +101,7 @@ class PlSourceWorkflowTests(unittest.TestCase):
                 window.pl_processed_status = {"done.csv": "2026-08-24T22:00:00+00:00"}
                 window.pl_auto_next_chk.setChecked(True)
                 with patch.object(window, "_start_load") as start_load:
-                    advanced = window._auto_load_next_unprocessed_pl("done.csv")
+                    advanced = window.pl_controller._auto_load_next_unprocessed_pl("done.csv")
                 self.assertTrue(advanced)
                 self.assertEqual(window._selected(window.pl_files), ["newest.csv"])
                 start_load.assert_called_once_with("PL")
@@ -118,7 +122,7 @@ class PlSourceWorkflowTests(unittest.TestCase):
             window._pl_export_source_was_processed = False
             with (
                 patch.object(window, "_refresh_file_lists"),
-                patch.object(window, "_auto_load_next_unprocessed_pl") as advance,
+                patch.object(PlController, "_auto_load_next_unprocessed_pl") as advance,
             ):
                 window._on_export_done(result)
             advance.assert_called_once_with("current.csv")
@@ -127,7 +131,7 @@ class PlSourceWorkflowTests(unittest.TestCase):
             window._pl_export_source_was_processed = True
             with (
                 patch.object(window, "_refresh_file_lists"),
-                patch.object(window, "_auto_load_next_unprocessed_pl") as advance,
+                patch.object(PlController, "_auto_load_next_unprocessed_pl") as advance,
             ):
                 window._on_export_done(result)
             advance.assert_not_called()
@@ -152,6 +156,41 @@ class PlSourceWorkflowTests(unittest.TestCase):
             event = WheelEvent()
             control.wheelEvent(event)
             self.assertTrue(event.ignored)
+
+    def test_pl_gate_helpers_set_gate_and_select_spectrum(self) -> None:
+        spin = QDoubleSpinBox()
+        spin.setRange(-10.0, 10.0)
+        owner = type("Owner", (), {"pl_spins": {"gate": spin}})()
+        controller = PlController(owner)
+        cube = DataCube(
+            np.array([1.0, 2.0]),
+            np.array([0.0, 1.0]),
+            np.array([[10.0, 11.0], [20.0, 21.0]]),
+            "Gate",
+            "PL",
+            "Intensity",
+        )
+
+        controller._set_pl_gate_spin_value(0.9)
+        gate_used, x, y = controller._current_pl_spectrum(cube)
+
+        self.assertEqual(gate_used, 1.0)
+        np.testing.assert_array_equal(x, [1.0, 2.0])
+        np.testing.assert_array_equal(y, [20.0, 21.0])
+
+    def test_failed_pl_load_advances_controller_queue(self) -> None:
+        window = self._window()
+        try:
+            window._active_load_mode = "PL"
+            window._active_load_succeeded = False
+            window._load_in_progress = True
+            window._pl_auto_next_active = True
+            window._pl_auto_next_queue = ["next.csv"]
+            with patch.object(PlController, "_load_next_pl_from_queue", return_value=True) as advance:
+                window._on_load_finished()
+            advance.assert_called_once_with()
+        finally:
+            window.close()
 
 
 if __name__ == "__main__":

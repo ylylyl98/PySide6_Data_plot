@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QApplication
 
 from ui_qt.main_window import MainWindow
 from ui_qt.mcd_organizer_window import McdOrganizerWindow
+from ui_qt.matplotlib_theme import ThemeAwareFigureCanvasQTAgg
 
 
 class McdOrganizerWindowTests(unittest.TestCase):
@@ -29,6 +30,16 @@ class McdOrganizerWindowTests(unittest.TestCase):
             if not window._scan_running:
                 return
         self.fail("MCD organizer scan worker did not finish")
+
+    def test_preview_canvases_use_theme_aware_qtagg_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_text:
+            window = McdOrganizerWindow(Path(folder_text), auto_scan=False)
+            try:
+                window._init_plot_widgets()
+                self.assertIsInstance(window.canvas, ThemeAwareFigureCanvasQTAgg)
+                self.assertIsInstance(window.slope_canvas, ThemeAwareFigureCanvasQTAgg)
+            finally:
+                window.close()
 
     def _write_result(
         self, root: Path, name: str, *, doping: float, efield: float, energy: float,

@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSplitter,
+    QStyle,
     QStyleOptionViewItem,
     QStyledItemDelegate,
     QToolButton,
@@ -47,6 +48,10 @@ from core.presentation import (
     powerpoint_integration_available,
     powerpoint_presentation_is_open,
 )
+from ui_qt.fluent_ui.style import apply_accessible_identity, set_fluent_property
+from ui_qt.status_badge import StatusBadge
+from ui_qt.theme import alias as theme_alias
+from ui_qt.theme import theme_manager
 
 
 class QComboBox(_QComboBox):
@@ -125,6 +130,9 @@ class SlidePreview(QWidget):
         self._thumbnail_workers: dict[str, _ThumbnailWorker] = {}
         self._thumbnail_pool = QThreadPool.globalInstance()
         self.setMinimumSize(280, 220)
+        manager = theme_manager()
+        if manager is not None:
+            manager.themeChanged.connect(self.update)
 
     def set_slide(self, paths: list[Path], title: str, caption_mode: str, panel_labels: bool) -> None:
         self._paths = list(paths)
@@ -166,20 +174,20 @@ class SlidePreview(QWidget):
     def paintEvent(self, _event) -> None:  # noqa: N802 - Qt API
         painter = QPainter(self)
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-        painter.fillRect(self.rect(), QColor("#ececf1"))
+        painter.fillRect(self.rect(), QColor(theme_alias("surface_secondary")))
         frame = self.rect().adjusted(12, 12, -12, -12)
         painter.fillRect(frame, Qt.white)
-        painter.setPen(QPen(QColor("#c7c7cc"), 1))
+        painter.setPen(QPen(QColor(theme_alias("border_subtle")), 1))
         painter.drawRect(frame)
         if not self._paths:
-            painter.setPen(QColor("#6e6e73"))
+            painter.setPen(QColor(theme_alias("text_secondary")))
             painter.drawText(frame, Qt.AlignCenter, "Add plots to preview the slide layout")
             return
 
         margin = 12
         title_height = 28 if self._title else 0
         if self._title:
-            painter.setPen(QColor("#1d1d1f"))
+            painter.setPen(QColor(theme_alias("text_primary")))
             painter.setFont(QFont(self.font().family(), 11, QFont.Bold))
             painter.drawText(
                 frame.adjusted(margin, 5, -margin, 0),
@@ -213,17 +221,17 @@ class SlidePreview(QWidget):
                 image_y = picture_box.y() + (picture_box.height() - scaled.height()) // 2
                 painter.drawPixmap(image_x, image_y, scaled)
             else:
-                painter.setPen(QColor("#d70015"))
+                painter.setPen(QColor(theme_alias("danger_foreground")))
                 painter.drawText(picture_box, Qt.AlignCenter, "Image unavailable")
             if self._panel_labels:
                 painter.setFont(QFont(self.font().family(), 8, QFont.Bold))
-                painter.setPen(QColor("#1d1d1f"))
+                painter.setPen(QColor(theme_alias("text_primary")))
                 painter.fillRect(int(x + 3), int(y + 3), 19, 16, QColor(255, 255, 255, 220))
                 painter.drawText(int(x + 3), int(y + 3), 19, 16, Qt.AlignCenter, panel_label(index))
             if caption_height:
                 caption = path.name if self._caption_mode == "full" else compact_caption(path, 40)
                 painter.setFont(QFont(self.font().family(), 7))
-                painter.setPen(QColor("#3a3a3c"))
+                painter.setPen(QColor(theme_alias("text_secondary")))
                 painter.drawText(
                     int(x),
                     int(y + cell_height - caption_height),
@@ -320,12 +328,12 @@ class PresentationBuilderWidget(QWidget):
         layout.setSpacing(5)
 
         heading = QLabel("Insert processed plots into PowerPoint")
-        heading.setStyleSheet("QLabel { font-size: 17px; font-weight: 600; color: #1d1d1f; }")
+        set_fluent_property(heading, "appRole", "pageHeading")
         layout.addWidget(heading)
         explanation = QLabel(
             "Choose the deck and processed-plot folder, then order the PNGs below. Images are fitted without cropping."
         )
-        explanation.setStyleSheet("QLabel { color: #6e6e73; }")
+        set_fluent_property(explanation, "appRole", "hintText")
         layout.addWidget(explanation)
 
         self.files_bar = QWidget()
@@ -357,9 +365,17 @@ class PresentationBuilderWidget(QWidget):
         root_buttons.addWidget(self.refresh_btn)
         setup.addLayout(root_buttons, 0, 5)
         self.advanced_btn = QToolButton()
-        self.advanced_btn.setText("Advanced options ▸")
+        self.advanced_btn.setIcon(self.style().standardIcon(QStyle.SP_ArrowRight))
+        self.advanced_btn.setText("Advanced options")
+        self.advanced_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.advanced_btn.setCheckable(True)
         self.advanced_btn.setAutoRaise(True)
+        self.advanced_btn.setToolTip("Advanced presentation options: show or hide optional settings")
+        apply_accessible_identity(
+            self.advanced_btn,
+            name="Advanced presentation options",
+            description="Show or hide optional presentation copy and recovery settings",
+        )
         setup.addWidget(self.advanced_btn, 0, 6)
         self.advanced_widget = QWidget()
         advanced = QHBoxLayout(self.advanced_widget)
@@ -453,7 +469,7 @@ class PresentationBuilderWidget(QWidget):
 
         build_row = QHBoxLayout()
         self.build_summary = QLabel("No plots queued")
-        self.build_summary.setStyleSheet("QLabel { color: #6e6e73; }")
+        set_fluent_property(self.build_summary, "appRole", "hintText")
         build_row.addWidget(self.build_summary, 1)
         self.build_progress = QProgressBar()
         self.build_progress.setRange(0, 0)
@@ -467,7 +483,7 @@ class PresentationBuilderWidget(QWidget):
         self.live_insert_btn.setToolTip("Insert into the selected presentation that is already open in PowerPoint, without saving it.")
         self.build_btn = QPushButton("Insert and save")
         self.build_btn.setDefault(True)
-        self.build_btn.setStyleSheet("QPushButton { font-weight: 600; padding: 7px 16px; }")
+        set_fluent_property(self.build_btn, "fluentAppearance", "primary")
         build_row.addWidget(self.open_output_btn)
         build_row.addWidget(self.build_copy_btn)
         build_row.addWidget(self.live_insert_btn)
@@ -500,7 +516,7 @@ class PresentationBuilderWidget(QWidget):
         layout.addLayout(plot_filters)
         selection_row = QHBoxLayout()
         self.available_selection_status = QLabel("No PNG selected")
-        self.available_selection_status.setStyleSheet("QLabel { color: #5f5f64; font-size: 10px; }")
+        set_fluent_property(self.available_selection_status, "appRole", "hintText")
         self.show_selected_btn = QPushButton("Show selected")
         self.show_selected_btn.setEnabled(False)
         self.show_selected_btn.setToolTip("Return to the most recently selected PNG without changing the selection.")
@@ -537,10 +553,9 @@ class PresentationBuilderWidget(QWidget):
         layout = QVBoxLayout(box)
         hint = QLabel("Drag plots to reorder. The selected layout splits this list into slides.")
         hint.setWordWrap(True)
-        hint.setStyleSheet("QLabel { color: #6e6e73; font-size: 10px; }")
+        set_fluent_property(hint, "appRole", "hintText")
         layout.addWidget(hint)
-        self.mcd_folder_status = QLabel()
-        self.mcd_folder_status.setWordWrap(True)
+        self.mcd_folder_status = StatusBadge()
         self.mcd_folder_status.hide()
         layout.addWidget(self.mcd_folder_status)
         self.queue_list = QListWidget()
@@ -555,8 +570,12 @@ class PresentationBuilderWidget(QWidget):
         self.queue_list.setItemDelegate(_CompleteFilenameDelegate(self.queue_list))
         layout.addWidget(self.queue_list, 1)
         buttons = QHBoxLayout()
-        self.up_btn = QPushButton("↑ Up")
-        self.down_btn = QPushButton("↓ Down")
+        self.up_btn = QPushButton("Up")
+        self.up_btn.setIcon(self.style().standardIcon(QStyle.SP_ArrowUp))
+        self.down_btn = QPushButton("Down")
+        self.down_btn.setIcon(self.style().standardIcon(QStyle.SP_ArrowDown))
+        apply_accessible_identity(self.up_btn, name="Move selected plot up")
+        apply_accessible_identity(self.down_btn, name="Move selected plot down")
         self.remove_btn = QPushButton("Remove")
         self.clear_btn = QPushButton("Clear")
         for button in (self.up_btn, self.down_btn, self.remove_btn, self.clear_btn):
@@ -574,7 +593,7 @@ class PresentationBuilderWidget(QWidget):
         layout.addWidget(self.preview, 1)
         self.preview_note = QLabel("Preview is approximate; the PowerPoint output keeps each PNG's aspect ratio.")
         self.preview_note.setWordWrap(True)
-        self.preview_note.setStyleSheet("QLabel { color: #6e6e73; font-size: 10px; }")
+        set_fluent_property(self.preview_note, "appRole", "hintText")
         layout.addWidget(self.preview_note)
         return box
 
@@ -623,7 +642,10 @@ class PresentationBuilderWidget(QWidget):
 
     def _toggle_advanced_options(self, shown: bool) -> None:
         self.advanced_widget.setVisible(shown)
-        self.advanced_btn.setText("Advanced options ▾" if shown else "Advanced options ▸")
+        self.advanced_btn.setIcon(
+            self.style().standardIcon(QStyle.SP_ArrowDown if shown else QStyle.SP_ArrowRight)
+        )
+        self.advanced_btn.setText("Advanced options")
 
     def _save_splitter_sizes(self, *_args) -> None:
         self._settings.setValue("slides/workspace_splitter_sizes", self.workspace_splitter.sizes())
@@ -917,27 +939,20 @@ class PresentationBuilderWidget(QWidget):
         labels = sorted({self._folder_badge(record.path)[0] for record in queued_mcd})
         self.mcd_folder_status.show()
         if {"mcd_combo", "mcd_b"}.issubset(kinds) and len(folders) == 1:
-            self.mcd_folder_status.setText(f"✓ MCD Combo and MCD(B) are from the same folder ({labels[0]}).")
-            self.mcd_folder_status.setStyleSheet(
-                "QLabel { color: #176b2c; background: #eaf7ed; border: 1px solid #9bd1a6; "
-                "border-radius: 5px; padding: 4px 6px; font-weight: 600; }"
+            self.mcd_folder_status.set_status(
+                f"✓ MCD Combo and MCD(B) are from the same folder ({labels[0]}).",
+                fluent_severity="success",
             )
         elif {"mcd_combo", "mcd_b"}.issubset(kinds):
-            self.mcd_folder_status.setText(
-                f"⚠ MCD plots are from different folders ({', '.join(labels)})."
-            )
-            self.mcd_folder_status.setStyleSheet(
-                "QLabel { color: #8a4b08; background: #fff4df; border: 1px solid #e8bd72; "
-                "border-radius: 5px; padding: 4px 6px; font-weight: 600; }"
+            self.mcd_folder_status.set_status(
+                f"⚠ MCD plots are from different folders ({', '.join(labels)}).",
+                fluent_severity="warning",
             )
         else:
             missing = "MCD(B)" if "mcd_combo" in kinds else "MCD Combo"
-            self.mcd_folder_status.setText(
-                f"MCD folder {', '.join(labels)} selected; add its matching {missing} plot to verify the pair."
-            )
-            self.mcd_folder_status.setStyleSheet(
-                "QLabel { color: #5f5f64; background: #f5f5f7; border: 1px solid #d2d2d7; "
-                "border-radius: 5px; padding: 4px 6px; }"
+            self.mcd_folder_status.set_status(
+                f"MCD folder {', '.join(labels)} selected; add its matching {missing} plot to verify the pair.",
+                fluent_severity="info",
             )
 
     def _add_selected(self) -> None:

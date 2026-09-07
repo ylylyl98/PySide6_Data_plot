@@ -47,6 +47,8 @@ from core.mcd_extract import (
     record_order_value,
 )
 from ui_qt.mcd_async import McdScanWorker
+from ui_qt.fluent_ui.style import set_fluent_property
+from ui_qt.theme import alias as theme_alias
 
 
 def _number(value: float | None) -> str:
@@ -158,14 +160,14 @@ class McdOrganizerWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 4, 0)
         title = QLabel("Processed condition series")
-        title.setStyleSheet("font-size: 14px; font-weight: 600;")
+        set_fluent_property(title, "appRole", "pageHeading")
         layout.addWidget(title)
         hint = QLabel(
             "Check the series to export. Click a series to preview it. "
             "Every result keeps its own processed energy."
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: #666;")
+        set_fluent_property(hint, "appRole", "hintText")
         layout.addWidget(hint)
         compare_row = QHBoxLayout()
         compare_row.addWidget(QLabel("Compare different:"))
@@ -242,7 +244,7 @@ class McdOrganizerWindow(QMainWindow):
         layout.setContentsMargins(4, 0, 0, 0)
         header = QHBoxLayout()
         self.preview_title = QLabel("Select a series to preview")
-        self.preview_title.setStyleSheet("font-size: 14px; font-weight: 600;")
+        set_fluent_property(self.preview_title, "appRole", "pageHeading")
         self.increasing_chk = QCheckBox("Increasing")
         self.decreasing_chk = QCheckBox("Decreasing")
         self.increasing_chk.setChecked(True)
@@ -293,7 +295,7 @@ class McdOrganizerWindow(QMainWindow):
         layout.addLayout(condition_row)
         layout.addWidget(self.condition_list)
         self.condition_summary = QLabel("0 of 0 conditions included")
-        self.condition_summary.setStyleSheet("color: #666; font-size: 11px;")
+        set_fluent_property(self.condition_summary, "appRole", "hintText")
         layout.addWidget(self.condition_summary)
 
         self.figure = None
@@ -332,12 +334,12 @@ class McdOrganizerWindow(QMainWindow):
             return
         # Import and construct matplotlib only after Qt has had a chance to paint
         # the organizer window, keeping startup responsive on cold launches.
-        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
         from matplotlib.figure import Figure
+        from ui_qt.matplotlib_theme import ThemeAwareFigureCanvasQTAgg
         self.figure = Figure(figsize=(9, 5), dpi=100, facecolor="white")
-        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.canvas = ThemeAwareFigureCanvasQTAgg(self.figure)
         self.slope_figure = Figure(figsize=(9, 5), dpi=100, facecolor="white")
-        self.slope_canvas = FigureCanvasQTAgg(self.slope_figure)
+        self.slope_canvas = ThemeAwareFigureCanvasQTAgg(self.slope_figure)
         self._mcd_plot_layout.replaceWidget(self._mcd_plot_layout.itemAt(0).widget(), self.canvas)
         self._slope_plot_layout.replaceWidget(self._slope_plot_layout.itemAt(0).widget(), self.slope_canvas)
         self._show_empty_preview("Loading processed MCD catalog…")
@@ -644,7 +646,9 @@ class McdOrganizerWindow(QMainWindow):
             item.setForeground(QColor(colors[record.record_id]))
             item.setData(Qt.UserRole + 1, colors[record.record_id])
             item.setBackground(
-                QColor("#e7f1ff") if record.record_id in selected else QColor("#f0f0f0")
+                QColor(theme_alias("selection_subtle_background"))
+                if record.record_id in selected
+                else QColor(theme_alias("surface_secondary"))
             )
             self.condition_list.addItem(item)
         self._list_refreshing = False
@@ -792,10 +796,14 @@ class McdOrganizerWindow(QMainWindow):
             series = self._current_series()
             included_ids = self._selected_record_ids.get(series.series_id, set()) if series else set()
             checked = str(item.data(Qt.UserRole)) in included_ids
-            item.setBackground(QColor("#e7f1ff") if checked else QColor("#f0f0f0"))
+            item.setBackground(
+                QColor(theme_alias("selection_subtle_background"))
+                if checked
+                else QColor(theme_alias("surface_secondary"))
+            )
             item.setForeground(
                 QColor(item.data(Qt.UserRole + 1)) if checked
-                else QColor("#888888")
+                else QColor(theme_alias("text_tertiary"))
             )
             font = item.font()
             font.setBold(checked)
