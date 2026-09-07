@@ -595,6 +595,28 @@ QFrame#workflowNavigation QFrame#workflowUtilitySeparator[fluentRole="divider"] 
     max-height: @{control_height_large};
 }
 
+QToolButton[appRole="sidebarToggle"] {
+    min-height: 28px;
+    padding: 3px 8px;
+    border-radius: @{radius_medium};
+    background-color: transparent;
+    border-color: transparent;
+}
+
+QToolButton[appRole="sidebarToggle"]:hover {
+    background-color: @{subtle_hover};
+    border-color: @{border_subtle};
+}
+
+QToolButton[appRole="sidebarToggle"]:checked {
+    background-color: @{brand_background_subtle};
+    border-color: @{brand_border};
+}
+
+QToolButton[appRole="sidebarToggle"]:focus {
+    border: @{stroke_thin} solid @{focus_border};
+}
+
 /* ---- Tabs ---- */
 QTabWidget::pane {
     background-color: @{canvas_background};
@@ -648,6 +670,15 @@ QListWidget::item, QListView::item {
 
 QListWidget::item:hover:!selected, QListView::item:hover:!selected {
     background-color: @{subtle_hover};
+}
+
+/* Pair the delegate's selected text with the same strong selection surface. */
+QListWidget::item:selected, QListView::item:selected,
+QTableWidget::item:selected, QTableView::item:selected,
+QListWidget::item:selected:hover, QListView::item:selected:hover,
+QTableWidget::item:selected:hover, QTableView::item:selected:hover {
+    background-color: @{selection_strong_background};
+    color: @{selection_strong_foreground};
 }
 
 QListWidget:focus, QListView:focus, QTableWidget:focus, QTableView:focus {
@@ -728,6 +759,10 @@ QToolBar#panelsToolbar QToolButton:hover {
 QToolBar#panelsToolbar QToolButton:checked {
     background-color: @{brand_background_subtle};
     border-color: @{brand_border};
+}
+
+QToolBar#panelsToolbar QToolButton[appRole="panelSelector"]:focus {
+    border: @{stroke_thin} solid @{focus_border};
 }
 
 QToolBar::separator {

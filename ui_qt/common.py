@@ -217,13 +217,16 @@ class WrappedFilenameDelegate(QStyledItemDelegate):
         super().__init__(parent)
         # Wrapped rows are queried repeatedly while QListView lays out and
         # repaints.  Bounding-rect calculation is surprisingly expensive for
-        # long paths, so keep the result for each viewport width/text pair.
-        self._size_hint_cache: dict[tuple[int, str], QSize] = {}
+        # long paths, so keep the result for each viewport width/text/font pair.
+        self._size_hint_cache: dict[tuple[int, str, str], QSize] = {}
 
     def _text_width(self, option: QStyleOptionViewItem) -> int:
         view = self.parent()
         if isinstance(view, QListWidget):
-            width = view.viewport().width()
+            # QListView reduces the paint rect by both spacing margins.  Use
+            # that same width for wrapping or a resize can add a line after
+            # sizeHint() has already fixed the row height.
+            width = view.viewport().width() - 2 * view.spacing()
         else:
             width = option.rect.width()
         return max(80, int(width) - 2 * self.HORIZONTAL_PADDING)
@@ -232,7 +235,7 @@ class WrappedFilenameDelegate(QStyledItemDelegate):
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
         text = str(index.data(Qt.DisplayRole) or "")
-        cache_key = (self._text_width(opt), text)
+        cache_key = (self._text_width(opt), text, opt.font.toString())
         cached = self._size_hint_cache.get(cache_key)
         if cached is not None:
             return QSize(cached)
@@ -242,7 +245,12 @@ class WrappedFilenameDelegate(QStyledItemDelegate):
             text,
         )
         base = super().sizeHint(opt, index)
-        row_width = self._text_width(opt) + 2 * self.HORIZONTAL_PADDING
+        view = self.parent()
+        row_width = (
+            view.viewport().width()
+            if isinstance(view, QListWidget)
+            else self._text_width(opt) + 2 * self.HORIZONTAL_PADDING
+        )
         result = QSize(
             row_width,
             max(base.height(), text_rect.height() + 2 * self.VERTICAL_PADDING),
@@ -263,6 +271,7 @@ class WrappedFilenameDelegate(QStyledItemDelegate):
         style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
 
         painter.save()
+        painter.setFont(opt.font)
         painter.setPen(
             opt.palette.highlightedText().color()
             if opt.state & QStyle.State_Selected

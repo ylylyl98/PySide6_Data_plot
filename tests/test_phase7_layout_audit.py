@@ -26,6 +26,10 @@ EXPECTED_WORKFLOWS = (
 class Phase7LayoutAuditTests(unittest.TestCase):
     """Parent process for the isolated, real-window layout audit probes."""
 
+    @unittest.skipUnless(
+        os.environ.get("RUN_UI_VISUAL_TESTS") == "1",
+        "requires RUN_UI_VISUAL_TESTS=1",
+    )
     def test_real_main_window_layout_audit_all_scales(self) -> None:
         repo = Path(__file__).resolve().parents[1]
         expected_python = repo / ".venv" / "Scripts" / "python.exe"
@@ -259,6 +263,10 @@ class Phase7LayoutAuditTests(unittest.TestCase):
                 )
             )
 
+    @unittest.skipUnless(
+        os.environ.get("RUN_UI_VISUAL_TESTS") == "1",
+        "requires RUN_UI_VISUAL_TESTS=1",
+    )
     def test_intentional_exemptions_are_structured_and_narrow(self) -> None:
         """Sentinel bounds and the nine compact MCD selectors are accounted separately."""
         repo = Path(__file__).resolve().parents[1]

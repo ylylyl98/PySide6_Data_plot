@@ -16,13 +16,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QLineEdit, QListWidget, QScrollArea, QSplitter, QStyle, QStyleOptionSpinBox, QToolButton, QWidget
+from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QLabel, QLineEdit, QListWidget, QMessageBox, QPushButton, QScrollArea, QSplitter, QStyle, QStyleOptionSpinBox, QToolButton, QWidget
 
 from core.loader import DataCube
 from core.drr_sources import DrrSource
 from ui_qt.main_window import LoadedState, MainWindow, UI_METRICS
 from ui_qt.theme import install_theme
 from tests.ui_test_helpers import wait_for_file_catalog
+from tests.profile_phases import profile_phase
 
 
 class SplitScaleControlTests(unittest.TestCase):
@@ -31,34 +32,40 @@ class SplitScaleControlTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
         # Match packaged startup: Fluent light theme is installed before any
         # real MainWindow is constructed so QSS-driven size hints are active.
-        install_theme(cls.app, mode="light")
+        with profile_phase("theme_installation"):
+            install_theme(cls.app, mode="light")
 
     def setUp(self) -> None:
-        with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
-            self.window = MainWindow()
-        self.window.resize(1180, 820)
-        self.window.show()
-        self.window.pl_split_scale_chk.setChecked(True)
-        self.app.processEvents()
+        with profile_phase("mainwindow_construction"):
+            with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
+                self.window = MainWindow()
+        with profile_phase("mainwindow_show_setup"):
+            self.window.resize(1180, 820)
+            self.window.show()
+            self.window.pl_split_scale_chk.setChecked(True)
+            self.app.processEvents()
 
     def tearDown(self) -> None:
-        self.window.close()
-        self.window.deleteLater()
-        self.app.processEvents()
+        with profile_phase("mainwindow_teardown"):
+            self.window.close()
+            self.window.deleteLater()
+            self.app.processEvents()
 
     def _wait_for_drr_catalog(self) -> None:
-        self._wait_for_file_catalog()
-        # File discovery is intentionally asynchronous and GitHub's Windows
-        # runners can be busy while the full Qt suite is running.
-        for _ in range(500):
-            self.app.processEvents()
-            if not self.window._drr_refresh_running:
-                return
-            QTest.qWait(10)
+        with profile_phase("drr_event_wait"):
+            self._wait_for_file_catalog()
+            # File discovery is intentionally asynchronous and GitHub's Windows
+            # runners can be busy while the full Qt suite is running.
+            for _ in range(500):
+                self.app.processEvents()
+                if not self.window._drr_refresh_running:
+                    return
+                QTest.qWait(10)
         self.fail("Timed out waiting for the DRR catalog refresh")
 
     def _wait_for_file_catalog(self) -> None:
-        wait_for_file_catalog(self.window)
+        with profile_phase("file_catalog_event_wait"):
+            wait_for_file_catalog(self.window)
 
     def test_split_controls_fit_at_minimum_sidebar_width(self) -> None:
         splitter = self.window.findChild(QSplitter)
@@ -79,6 +86,10 @@ class SplitScaleControlTests(unittest.TestCase):
         right_edge = max(child.geometry().right() for child in visible_children)
         self.assertLessEqual(right_edge, panel.contentsRect().right())
 
+    @unittest.skipUnless(
+        os.environ.get("RUN_UI_VISUAL_TESTS") == "1",
+        "requires RUN_UI_VISUAL_TESTS=1",
+    )
     def test_axis_range_rows_keep_fix_and_auto_controls_contained(self) -> None:
         """Real PL/DRR/Compare/Power rows stay contained on the production platform."""
         if QApplication.platformName() == "offscreen":
@@ -343,22 +354,24 @@ class SplitScaleControlTests(unittest.TestCase):
         )
 
     def test_drr_refresh_adds_new_file_to_a_fully_selected_group(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with profile_phase("drr_filesystem_setup"), tempfile.TemporaryDirectory() as tmp:
             initial = Path(tmp) / "Initial Data"
             initial.mkdir()
             first = initial / "sample_760nmc_rep1_1.csv"
             second = initial / "sample_760nmc_rep1_2.csv"
             self._write_drr_measurement(first)
 
-            self.window._set_current_folder(tmp, remember=False)
+            with profile_phase("drr_initial_refresh"):
+                self.window._set_current_folder(tmp, remember=False)
             self._wait_for_drr_catalog()
             self.assertEqual(self.window.drr_selected_files, [])
             self.window.drr_selected_files = [
                 "Initial Data/sample_760nmc_rep1_1.csv"
             ]
 
-            self._write_drr_measurement(second)
-            self.window._refresh_file_lists(auto=True)
+            with profile_phase("drr_new_file_refresh"):
+                self._write_drr_measurement(second)
+                self.window._refresh_file_lists(auto=True)
             self._wait_for_drr_catalog()
 
             self.assertEqual(
@@ -369,18 +382,226 @@ class SplitScaleControlTests(unittest.TestCase):
                 },
             )
 
-    def test_drr_source_search_is_debounced(self) -> None:
+    def test_drr_picker_shows_partial_group_and_hides_fully_processed_group(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             initial = Path(tmp) / "Initial Data"
             initial.mkdir()
-            self._write_drr_measurement(initial / "sample_760nmc_rep1.csv")
+            partial = [initial / f"partial_760nmc_3.6KREF_rep1_{index}.csv" for index in range(1, 8)]
+            complete = [initial / f"complete_760nmc_3.6KREF_rep1_{index}.csv" for index in range(1, 3)]
+            for path in partial + complete:
+                path.write_text(
+                    "Vbg,Vtg,740,760,780\n"
+                    + "\n".join(f"{index},0,1,2,3" for index in range(101))
+                    + "\n",
+                    encoding="utf-8",
+                )
+            processed = Path(tmp) / "Processed Data" / "DRR"
+            processed.mkdir(parents=True)
+            (processed / "status.metadata.json").write_text(
+                json.dumps({
+                    "operation": "DR/R",
+                    "sources": [
+                        {"role": "measurement", "source_path": str(path)}
+                        for path in partial[:5] + complete
+                    ],
+                }),
+                encoding="utf-8",
+            )
+
             self.window._set_current_folder(tmp, remember=False)
+            self._wait_for_drr_catalog()
+            observed = {}
+
+            def fake_exec(dialog: QDialog) -> int:
+                group_list = dialog.findChild(QListWidget, "drr_source_group_list")
+                self.assertEqual(group_list.count(), 1)
+                observed["text"] = group_list.item(0).text()
+                return QDialog.Rejected
+
+            with patch.object(QDialog, "exec", fake_exec):
+                self.window.drr_controller._open_drr_source_dialog(
+                    title="Choose DRR files", selected=[], baseline_mode=False
+                )
+
+            self.assertIn("PARTIAL 5/7", observed["text"])
+            self.assertIn("Modified ", observed["text"])
+            self.assertIn("partial_760nmc_3.6KREF", observed["text"])
+            self.assertNotIn("complete_760nmc_3.6KREF", observed["text"])
+
+    @staticmethod
+    def _known_grid(*, rows: int = 2) -> tuple[tuple[float, ...], ...]:
+        return tuple((float(index), 0.0) for index in range(rows))
+
+    def _manual_drr_source(self, name: str, *, background: bool = False, rows: int | None = None, linked_backgrounds=()):
+        return DrrSource(
+            source=name,
+            filename=Path(name).name,
+            group_key="manual_REF_760nmc",
+            session_date="2026-08-26",
+            modified_time=1.0,
+            is_background=background,
+            classification="background" if background else "measurement",
+            gate_grid=() if rows is None else self._known_grid(rows=rows),
+            spectral_grid=(740.0, 760.0, 780.0) if rows is not None else (),
+            gate_labels=("Vbg", "Vtg") if rows is not None else (),
+            gate_ranges=((0.0, float(rows - 1)), (0.0, 0.0)) if rows is not None else (),
+            grid_complete=rows is not None,
+            linked_backgrounds=tuple(linked_backgrounds),
+        )
+
+    def test_drr_add_compatible_repeats_keeps_only_same_grid_measurements(self) -> None:
+        self.window.drr_available_sources = [
+            self._manual_drr_source("manual_REF_760nmc_rep1_1.csv", rows=101),
+            self._manual_drr_source("manual_REF_760nmc_rep1_2.csv", rows=101),
+            self._manual_drr_source("manual_REF_760nmc_rep1_3.csv", rows=203),
+            self._manual_drr_source("manual_REF_760nmc_background.csv", background=True, rows=101),
+        ]
+        observed = {}
+
+        def fake_exec(dialog: QDialog) -> int:
+            group_list = dialog.findChild(QListWidget, "drr_source_group_list")
+            self.assertGreater(group_list.count(), 0)
+            group_list.setCurrentRow(0)
+            self.app.processEvents()
+            file_list = dialog.findChild(QListWidget, "drr_source_file_list")
+            chosen = dialog.findChild(QListWidget, "drr_source_chosen_list")
+            file_list.setCurrentRow(0)
+            self.assertEqual(file_list.currentItem().data(Qt.UserRole), "manual_REF_760nmc_rep1_1.csv")
+            button = next(button for button in dialog.findChildren(QPushButton) if button.text() == "Add Compatible Repeats")
+            button.click()
+            observed["chosen"] = [str(chosen.item(i).data(Qt.UserRole)) for i in range(chosen.count())]
+            return QDialog.Accepted
+
+        with patch.object(QDialog, "exec", fake_exec):
+            selected = self.window.drr_controller._open_drr_source_dialog(
+                title="Choose DRR files", selected=[], baseline_mode=False
+            )
+
+        self.assertEqual(selected, [
+            "manual_REF_760nmc_rep1_1.csv",
+            "manual_REF_760nmc_rep1_2.csv",
+        ])
+        self.assertEqual(observed["chosen"], selected)
+
+    def test_drr_unknown_multi_file_group_requires_confirmation(self) -> None:
+        self.window.drr_available_sources = [
+            self._manual_drr_source("manual_REF_760nmc_rep1_1.csv"),
+            self._manual_drr_source("manual_REF_760nmc_rep1_2.csv"),
+        ]
+        observed = {}
+
+        def run_dialog(answer):
+            def fake_exec(dialog: QDialog) -> int:
+                chosen = dialog.findChild(QListWidget, "drr_source_chosen_list")
+                button = next(button for button in dialog.findChildren(QPushButton) if button.text() == "Add Entire Group")
+                with patch("ui_qt.controllers_drr.QMessageBox.question", return_value=answer) as question:
+                    button.click()
+                observed["question_calls"] = question.call_count
+                observed["chosen"] = [str(chosen.item(i).data(Qt.UserRole)) for i in range(chosen.count())]
+                return QDialog.Accepted
+
+            with patch.object(QDialog, "exec", fake_exec):
+                return self.window.drr_controller._open_drr_source_dialog(
+                    title="Choose DRR files", selected=[], baseline_mode=False
+                )
+
+        self.assertEqual(run_dialog(QMessageBox.StandardButton.No), [])
+        self.assertEqual(observed["question_calls"], 1)
+        self.assertEqual(observed["chosen"], [])
+        self.assertEqual(run_dialog(QMessageBox.StandardButton.Yes), [
+            "manual_REF_760nmc_rep1_1.csv",
+            "manual_REF_760nmc_rep1_2.csv",
+        ])
+        self.assertEqual(observed["question_calls"], 1)
+
+    def test_drr_unknown_single_file_adds_without_confirmation(self) -> None:
+        self.window.drr_available_sources = [self._manual_drr_source("manual_REF_760nmc_single.csv")]
+        observed = {}
+
+        def fake_exec(dialog: QDialog) -> int:
+            chosen = dialog.findChild(QListWidget, "drr_source_chosen_list")
+            button = next(button for button in dialog.findChildren(QPushButton) if button.text() == "Add Entire Group")
+            with patch("ui_qt.controllers_drr.QMessageBox.question") as question:
+                button.click()
+            observed["question_calls"] = question.call_count
+            observed["chosen"] = [str(chosen.item(i).data(Qt.UserRole)) for i in range(chosen.count())]
+            return QDialog.Accepted
+
+        with patch.object(QDialog, "exec", fake_exec):
+            selected = self.window.drr_controller._open_drr_source_dialog(
+                title="Choose DRR files", selected=[], baseline_mode=False
+            )
+        self.assertEqual(selected, ["manual_REF_760nmc_single.csv"])
+        self.assertEqual(observed["chosen"], selected)
+        self.assertEqual(observed["question_calls"], 0)
+
+    def test_drr_linked_external_status_and_first_file_ranges_are_truthful(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as outside:
+            existing = Path(outside) / "external_background.csv"
+            existing.write_text("placeholder", encoding="utf-8")
+            missing = Path(outside) / "missing_background.csv"
+            source = self._manual_drr_source(
+                "manual_REF_760nmc_rep1_1.csv",
+                rows=2,
+                linked_backgrounds=(str(existing), str(missing)),
+            )
+            self.window.current_folder = tmp
+            self.window.drr_available_sources = [source]
+            observed = {}
+
+            def fake_exec(dialog: QDialog) -> int:
+                detail = dialog.findChild(QLabel, "drrSourceGroupDetail")
+                observed["detail"] = detail.text()
+                return QDialog.Rejected
+
+            with patch.object(QDialog, "exec", fake_exec):
+                self.window.drr_controller._open_drr_source_dialog(
+                    title="Choose DRR files", selected=[], baseline_mode=False
+                )
+
+            self.assertIn("(gate details unavailable)", observed["detail"])
+            self.assertIn("(missing)", observed["detail"])
+            self.assertIn("first file gate ranges", observed["detail"])
+            self.assertIn("per-file acquisition grids known", observed["detail"])
+
+    def test_drr_auto_refresh_does_not_append_incompatible_or_unknown_repeats(self) -> None:
+        for kind in ("incompatible", "unknown"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                initial = Path(tmp) / "Initial Data"
+                initial.mkdir()
+                first = initial / "sample_760nmc_3.6KREF_rep1_1.csv"
+                added = initial / "sample_760nmc_3.6KREF_rep1_2.csv"
+                self._write_drr_measurement(first)
+                self.window._set_current_folder(tmp, remember=False)
+                self._wait_for_drr_catalog()
+                self.assertFalse(next(source for source in self.window.drr_available_sources if source.filename == first.name).is_background)
+                self.window.drr_selected_files = ["Initial Data/sample_760nmc_3.6KREF_rep1_1.csv"]
+                if kind == "incompatible":
+                    added.write_text("Vbg,Vtg,740,761,780\n0,0,1,2,3\n1,0,2,3,4\n", encoding="utf-8")
+                else:
+                    added.write_text("not a DRR table\n", encoding="utf-8")
+                self.window._refresh_file_lists(auto=True)
+                self._wait_for_drr_catalog()
+                self.assertFalse(next(source for source in self.window.drr_available_sources if source.filename == added.name).is_background)
+                self.assertEqual(self.window.drr_selected_files, ["Initial Data/sample_760nmc_3.6KREF_rep1_1.csv"])
+
+
+    def test_drr_source_search_is_debounced(self) -> None:
+        with profile_phase("drr_filesystem_setup"), tempfile.TemporaryDirectory() as tmp:
+            initial = Path(tmp) / "Initial Data"
+            initial.mkdir()
+            self._write_drr_measurement(initial / "sample_760nmc_rep1.csv")
+            with profile_phase("drr_initial_refresh"):
+                self.window._set_current_folder(tmp, remember=False)
             self._wait_for_drr_catalog()
 
             observed: dict[str, int] = {}
 
             def fake_exec(dialog: QDialog) -> int:
                 filter_edit = dialog.findChild(QLineEdit)
+                type_combo = dialog.findChild(QComboBox, "drr_source_type_combo")
+                self.assertIsNotNone(type_combo)
+                type_combo.setCurrentText("All data")
                 group_list = next(
                     widget for widget in dialog.findChildren(QListWidget) if widget.count()
                 )
@@ -389,7 +610,8 @@ class SplitScaleControlTests(unittest.TestCase):
                 filter_edit.setText("query-that-does-not-match")
                 self.app.processEvents()
                 observed["before"] = group_list.count()
-                QTest.qWait(230)
+                with profile_phase("debounce_fixed_event_wait"):
+                    QTest.qWait(230)
                 self.app.processEvents()
                 observed["after"] = group_list.count()
                 return QDialog.Rejected
@@ -401,6 +623,76 @@ class SplitScaleControlTests(unittest.TestCase):
 
             self.assertGreater(observed["before"], 0)
             self.assertEqual(observed["after"], 0)
+
+    def test_drr_picker_type_filter_defaults_ref_and_all_labels_sources(self) -> None:
+        sources = [
+            DrrSource("pl_760nmc.csv", "pl_760nmc.csv", "session", "2026-08-26", 3.0, False),
+            DrrSource("ref_760nmc.csv", "ref_760nmc.csv", "session", "2026-08-26", 2.0, False),
+            DrrSource("mystery_760nmc.csv", "mystery_760nmc.csv", "session", "2026-08-26", 1.0, False),
+        ]
+        self.window.drr_available_sources = sources
+        observed = {}
+
+        def fake_exec(dialog: QDialog) -> int:
+            combo = dialog.findChild(QComboBox, "drr_source_type_combo")
+            self.assertEqual(combo.currentText(), "REF")
+            group_list = dialog.findChild(QListWidget, "drr_source_group_list")
+            file_list = dialog.findChild(QListWidget, "drr_source_file_list")
+            chosen_list = dialog.findChild(QListWidget, "drr_source_chosen_list")
+            self.assertEqual(group_list.count(), 1)
+            combo.setCurrentText("All data")
+            self.app.processEvents()
+            self.assertEqual(file_list.count(), 3)
+            combo.setCurrentText("REF")
+            self.app.processEvents()
+            self.assertEqual(file_list.count(), 1)
+            self.assertIn("ref_760nmc.csv", str(file_list.item(0).data(Qt.UserRole)))
+            combo.setCurrentText("All data")
+            self.app.processEvents()
+            with patch(
+                "ui_qt.controllers_drr.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ):
+                next(button for button in dialog.findChildren(QPushButton) if button.text() == "Add Entire Group").click()
+            self.assertEqual(chosen_list.count(), 3)
+            observed["rows"] = [group_list.item(0).text(), *(file_list.item(i).text() for i in range(file_list.count()))]
+            return QDialog.Rejected
+
+        with patch.object(QDialog, "exec", fake_exec):
+            self.window.drr_controller._open_drr_source_dialog(
+                title="Choose DRR files", selected=["pl_760nmc.csv"], baseline_mode=False
+            )
+        self.assertTrue(any("PL" in row for row in observed["rows"]))
+        self.assertTrue(any("REF" in row for row in observed["rows"]))
+        self.assertTrue(any("Unknown" in row for row in observed["rows"]))
+
+    def test_drr_baseline_picker_keeps_chosen_when_type_filter_changes(self) -> None:
+        self.window.drr_available_sources = [
+            DrrSource("ref_back_760nmc.csv", "ref_back_760nmc.csv", "back", "2026-08-26", 2.0, True),
+            DrrSource("odd_back_760nmc.csv", "odd_back_760nmc.csv", "back", "2026-08-26", 1.0, True),
+        ]
+        observed = {}
+
+        def fake_exec(dialog: QDialog) -> int:
+            combo = dialog.findChild(QComboBox, "drr_source_type_combo")
+            chosen = dialog.findChild(QListWidget, "drr_source_chosen_list")
+            self.assertEqual(combo.currentText(), "REF")
+            self.assertEqual(chosen.count(), 1)
+            self.assertIn("PL", chosen.item(0).text())
+            combo.setCurrentText("All data")
+            self.app.processEvents()
+            observed["files"] = dialog.findChild(QListWidget, "drr_source_file_list").count()
+            observed["chosen"] = chosen.count()
+            return QDialog.Rejected
+
+        with patch.object(QDialog, "exec", fake_exec):
+            self.window.drr_controller._open_drr_source_dialog(
+                title="Choose Historical or External Baseline",
+                selected=["pl_back_760nmc.csv"],
+                baseline_mode=True,
+            )
+        self.assertEqual(observed["files"], 2)
+        self.assertEqual(observed["chosen"], 1)
 
     def test_drr_catalog_discovery_runs_off_the_gui_thread(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -440,7 +732,7 @@ class SplitScaleControlTests(unittest.TestCase):
             self.assertEqual(self.window.drr_available_sources, [source])
 
     def test_drr_refresh_preserves_a_deliberately_selected_subset(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with profile_phase("drr_filesystem_setup"), tempfile.TemporaryDirectory() as tmp:
             initial = Path(tmp) / "Initial Data"
             initial.mkdir()
             first = initial / "sample_760nmc_rep1_1.csv"
@@ -449,13 +741,15 @@ class SplitScaleControlTests(unittest.TestCase):
             self._write_drr_measurement(first)
             self._write_drr_measurement(second)
 
-            self.window._set_current_folder(tmp, remember=False)
+            with profile_phase("drr_initial_refresh"):
+                self.window._set_current_folder(tmp, remember=False)
             self._wait_for_drr_catalog()
             chosen = "Initial Data/sample_760nmc_rep1_1.csv"
             self.window.drr_selected_files = [chosen]
             self._write_drr_measurement(third)
 
-            self.window._refresh_file_lists(auto=True)
+            with profile_phase("drr_new_file_refresh"):
+                self.window._refresh_file_lists(auto=True)
             self._wait_for_drr_catalog()
 
             self.assertEqual(self.window.drr_selected_files, [chosen])
@@ -910,7 +1204,7 @@ class SplitScaleControlTests(unittest.TestCase):
             start_load.assert_called_once_with("DRR")
 
     def test_constant_gate_background_selection_defaults_to_all_frames(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with profile_phase("drr_filesystem_setup"), tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             first = root / "back_1.csv"
             second = root / "back_2.csv"
@@ -919,14 +1213,16 @@ class SplitScaleControlTests(unittest.TestCase):
                     "Vbg,Vtg,740,760,780\n0,0,1,2,3\n0,0,2,3,4\n",
                     encoding="utf-8",
                 )
-            self.window._set_current_folder(tmp, remember=False)
+            with profile_phase("drr_initial_refresh"):
+                self.window._set_current_folder(tmp, remember=False)
             self._wait_for_file_catalog()
             self.window.drr_baseline_files_manual = [first.name, second.name]
             self.window.drr_baseline_combine_combo.setCurrentText(
                 "Last frame from each file, then average"
             )
 
-            accepted = self.window.drr_controller._apply_drr_background_gate_default()
+            with profile_phase("background_selection_controller"):
+                accepted = self.window.drr_controller._apply_drr_background_gate_default()
 
             self.assertTrue(accepted)
             self.assertEqual(

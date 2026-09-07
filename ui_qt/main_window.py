@@ -62,6 +62,7 @@ from core.drr_sources import (
     DrrMeasurementAssignment,
     DrrSourceCache,
     assess_background_gate_files,
+    compatible_drr_repeats,
     discover_drr_sources,
     extract_wavelength_center_nm,
     find_saved_drr_recipe,
@@ -202,7 +203,9 @@ from core.shg_fit import (
     fit_shg_angular_result,
     fit_shg_twist_comparison,
 )
-from core.mcd_peak_shift import analyze_peak_shift, valley_quantities
+from core.mcd_peak_shift import BOUNDARY_UNRELIABLE, analyze_peak_shift, format_mcd_angle, spectrum_energy_order, valley_quantities
+from core.mcd_valley_split import compute_valley_splitting
+from core.mcd_peak_display import second_derivative_map
 
 class _PlotToolbar(NavigationToolbar2QT):
     """Toolbar that temporarily disables animated MCD axes for file saving."""
@@ -406,6 +409,18 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._mcd_window_drag_moved = False
         self._mcd_window_drag_offset = 0.0
         self._mcd_window_drag_center: float | None = None
+        # Peak-shift dragging stores the semantic target only.  Plot redraws
+        # replace every Matplotlib artist and axis, so retaining artist
+        # objects here would make a drag stop as soon as selection changes.
+        self._mcd_peak_drag: dict[str, Any] | None = None
+        # A manually dragged center is a display cursor, independent of the
+        # tracked feature point.  It is kept as a scalar so a redraw cannot
+        # quantize it back to the nearest sampled/tracked energy.
+        self._mcd_peak_manual_center_ev: float | None = None
+        self._mcd_peak_manual_center_channel: str | None = None
+        self._mcd_peak_manual_center_field_index: int | None = None
+        self._mcd_peak_manual_center_artists: dict[str, Any] = {}
+        self._mcd_peak_manual_center_blit_backgrounds: dict[Any, Any] = {}
         self._mcd_center_candidates: tuple[McdCenterCandidate, ...] = ()
         self._mcd_candidate_active_index: int | None = None
         self._mcd_manual_center_before_suggestions: float | None = None
@@ -443,6 +458,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._last_export_request_key = ""
         self._active_load_mode: str | None = None
         self._active_load_succeeded = False
+        self._mcd_source_generation = 0
+        self._mcd_reload_pending = False
         self.mcd_controller = McdController(self)
         self.pl_controller = PlController(self)
         self.drr_controller = DrrController(self)
@@ -888,6 +905,24 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         presentation_widget = PresentationBuilderWidget()
         presentation_widget.status_message.connect(self._status)
         presentation_widget.log_message.connect(self._append_log)
+        self._tools_tab_index = next(
+            (index for index in range(self.tabs.count()) if self.tabs.tabText(index) == "Tools"),
+            -1,
+        )
+        self._tools_tab_widget = (
+            self.tabs.widget(self._tools_tab_index) if self._tools_tab_index >= 0 else None
+        )
+        self._tools_tab_placeholder = QWidget(self)
+        self._tools_tab_placeholder.setObjectName("toolsTabPlaceholder")
+        self._tools_tab_placeholder.hide()
+        self.tools_workspace = QWidget()
+        self.tools_workspace.setObjectName("toolsWorkspace")
+        tools_layout = QVBoxLayout(self.tools_workspace)
+        tools_layout.setContentsMargins(0, 0, 0, 0)
+        tools_layout.setSpacing(0)
+        self._tools_workspace_layout = tools_layout
+        self._tools_in_workspace = False
+        self._tools_transitioning = False
         self.workflow_navigation = WorkflowNavigation(self.tabs, self)
         # Compatibility aliases remain owned by MainWindow for existing callers.
         self.sidebar_toggle_btn = self.workflow_navigation.sidebar_toggle_btn
@@ -902,6 +937,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             left_panel=left,
             plot_panel=right,
             presentation_widget=presentation_widget,
+            tools_widget=self.tools_workspace,
         )
         # Compatibility aliases remain owned by MainWindow for existing callers.
         self.central_widget = self.workspace_shell.central_widget
@@ -1230,7 +1266,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         return grid, spins, log_chk, clip_chk, cmap, fix_checks
 
     def _build_split_scale_controls(self, prefix: str) -> None:
-        toggle = QCheckBox("Use split color scale")
+        toggle = QCheckBox(
+            "Use split color scale", self if prefix == "mcd" else None
+        )
+        if prefix == "mcd":
+            toggle.hide()
         toggle.setToolTip("Use independent color limits on the two sides of x0.")
 
         def split_spin() -> QDoubleSpinBox:
@@ -1271,7 +1311,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 f"Keep the {region}-region color {bound} when {region.title()} Auto is used."
             )
 
-        panel = QGroupBox("Two X-Region Color Limits")
+        panel = QGroupBox(
+            "Two X-Region Color Limits", self if prefix == "mcd" else None
+        )
         grid = QGridLayout(panel)
         grid.setContentsMargins(6, 8, 6, 6)
         grid.setHorizontalSpacing(5)
@@ -1325,7 +1367,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         setattr(self, f"{prefix}_split_auto_right_btn", auto_right)
 
     def _build_y_axis_controls(self, prefix: str) -> QWidget:
-        host = QWidget()
+        host = QWidget(self)
+        host.hide()
         layout = QVBoxLayout(host)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
@@ -1862,6 +1905,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 and self.loaded.mode == "MCD"
                 and self.loaded.mcd_result is not None
             )
+        if hasattr(self, "mcd_peak_candidate_bar"):
+            peak_active = self.tabs.tabText(self.tabs.currentIndex()) == "MCD Peak Shift"
+            self.mcd_peak_candidate_bar.setVisible(peak_active)
+            if hasattr(self, "_update_mcd_peak_candidate_buttons"):
+                self._update_mcd_peak_candidate_buttons()
 
     def apply_ui_metrics(self) -> None:
         h = UI_METRICS["input_h"]
@@ -1992,6 +2040,36 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         mcd_candidate_layout.addWidget(self.mcd_clear_candidates_btn)
         mcd_candidate_layout.addStretch(1)
         layout.addWidget(self.mcd_candidate_bar)
+        self.mcd_peak_candidate_bar = QFrame()
+        self.mcd_peak_candidate_bar.setFrameShape(QFrame.NoFrame)
+        self.mcd_peak_candidate_bar.setVisible(False)
+        set_fluent_property(self.mcd_peak_candidate_bar, "fluentRole", "panel")
+        peak_candidate_layout = QHBoxLayout(self.mcd_peak_candidate_bar)
+        peak_candidate_layout.setContentsMargins(8, 4, 8, 4)
+        peak_candidate_layout.setSpacing(4)
+        peak_candidate_layout.addWidget(QLabel("Peak center · E0:"))
+        for widget in (
+            self.mcd_peak_selector_combo,
+            self.mcd_peak_prev_btn,
+            self.mcd_peak_next_btn,
+            *self.mcd_peak_candidate_buttons,
+        ):
+            widget.setParent(self.mcd_peak_candidate_bar)
+        self.mcd_peak_selector_combo.setVisible(True)
+        self.mcd_peak_selector_combo.setMinimumWidth(180)
+        self.mcd_peak_selector_combo.setToolTip("Select any tracked peak center; nearby E0 candidates are shown as buttons.")
+        peak_candidate_layout.addWidget(self.mcd_peak_selector_combo, 1)
+        for button in self.mcd_peak_candidate_buttons:
+            button.setVisible(False)
+            peak_candidate_layout.addWidget(button)
+        self.mcd_peak_prev_btn.setVisible(True)
+        self.mcd_peak_next_btn.setVisible(True)
+        self.mcd_peak_prev_btn.setToolTip("Select previous tracked peak center")
+        self.mcd_peak_next_btn.setToolTip("Select next tracked peak center")
+        peak_candidate_layout.addWidget(self.mcd_peak_prev_btn)
+        peak_candidate_layout.addWidget(self.mcd_peak_next_btn)
+        peak_candidate_layout.addStretch(1)
+        layout.addWidget(self.mcd_peak_candidate_bar)
         canvas_host = QWidget()
         canvas_host.setObjectName("plotCanvasHost")
         canvas_layout = QGridLayout(canvas_host)
@@ -2101,6 +2179,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.cmp_angle_tolerance_spin.valueChanged.connect(self.compare_controller._on_cmp_auto_assign_requested)
         self.cmp_infer_angles_btn.clicked.connect(self.compare_controller._on_cmp_infer_angles_requested)
         self.cmp_auto_assign_btn.clicked.connect(self.compare_controller._on_cmp_auto_assign_requested)
+        self.cmp_source_filter_combo.currentTextChanged.connect(self.compare_controller._on_cmp_source_filter_changed)
         self.cmp_view_intensity_btn.clicked.connect(lambda: self.compare_controller._on_cmp_plot_view_button_clicked("Intensity Compare"))
         self.cmp_view_vp_btn.clicked.connect(lambda: self.compare_controller._on_cmp_plot_view_button_clicked("Valley Polarization"))
         self.cmp_vp_background_spin.valueChanged.connect(lambda _value: self.compare_controller._on_cmp_plot_param_changed(self.cmp_vp_background_spin))
@@ -2288,7 +2367,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.clear_log_btn.clicked.connect(self._clear_log)
         self._gate_motion_cid = self.canvas.mpl_connect("motion_notify_event", self._on_canvas_motion)
         self._gate_click_cid = self.canvas.mpl_connect("button_press_event", self._on_canvas_click)
-        self._mcd_window_release_cid = self.canvas.mpl_connect("button_release_event", self.mcd_controller._on_canvas_release)
+        self._mcd_window_release_cid = self.canvas.mpl_connect("button_release_event", self._on_canvas_release)
         self._mcd_blit_draw_cid = self.canvas.mpl_connect("draw_event", self.mcd_controller._on_canvas_draw)
         for prefix in ("pl", "drr", "cmp"):
             self._update_y_axis_controls(prefix)
@@ -2384,11 +2463,18 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             if mode == "DRR":
                 self._refresh_file_lists(auto=True)
             self._start_load(mode)
+        elif self.tabs.tabText(self.tabs.currentIndex()) == "MCD Peak Shift":
+            self._start_load("MCD")
 
     def _toolbar_plot(self) -> None:
         mode = self._active_mode()
         if mode:
             self._plot_mode(mode)
+        elif self.tabs.tabText(self.tabs.currentIndex()) == "MCD Peak Shift":
+            if self.loaded is not None and self.loaded.mode == "MCD":
+                self._analyze_mcd_peak_shift()
+            else:
+                self._plot_mode("MCD Peak Shift")
 
     def _toolbar_save(self) -> None:
         mode = self._active_mode()
@@ -2449,20 +2535,34 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
 
     def _on_tab_changed(self, _index: int) -> None:
+        if self._tools_transitioning:
+            return
         self._invalidate_export_move_sources()
-        slides_active = self.tabs.tabText(self.tabs.currentIndex()) == "Slides"
+        current_label = self.tabs.tabText(self.tabs.currentIndex())
+        slides_active = current_label == "Slides"
+        tools_active = current_label == "Tools"
+        if tools_active and not self._tools_in_workspace:
+            self._enter_tools_workspace()
+        elif not tools_active and self._tools_in_workspace:
+            self._leave_tools_workspace()
+            # Reinsert the utility tab without stealing the requested target
+            # index (removing the current tab temporarily shifts Qt's index).
+            if int(_index) != self.tabs.currentIndex():
+                self.tabs.setCurrentIndex(int(_index))
         if hasattr(self, "workspace_stack"):
-            self.workspace_stack.setCurrentIndex(1 if slides_active else 0)
+            self.workspace_stack.setCurrentIndex(1 if slides_active else 2 if tools_active else 0)
         if hasattr(self, "menu_toolbar_host"):
             self.menu_toolbar_host.source_widget_action.setVisible(not slides_active)
             self.menu_toolbar_host.source_separator_action.setVisible(not slides_active)
         if hasattr(self, "sidebar_toggle_btn"):
-            self.sidebar_toggle_btn.setEnabled(not slides_active)
+            self.sidebar_toggle_btn.setEnabled(not slides_active and not tools_active)
         if hasattr(self, "show_sidebar_action"):
-            self.show_sidebar_action.setEnabled(not slides_active)
+            self.show_sidebar_action.setEnabled(not slides_active and not tools_active)
         if slides_active:
             self.left_panel.setVisible(False)
             self.presentation_widget.set_experiment_folder(self.current_folder or None)
+        elif tools_active:
+            self.left_panel.setVisible(False)
         elif hasattr(self, "left_panel"):
             self._set_sidebar_visible(self.sidebar_toggle_btn.isChecked())
         self._update_action_states()
@@ -2479,6 +2579,47 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             and (not self.loaded or self.loaded.mode != "DRR")
         ):
             QTimer.singleShot(0, lambda: self._start_load("DRR"))
+
+    def _enter_tools_workspace(self) -> None:
+        """Move the existing Tools page into the full-width utility workspace."""
+        if self._tools_tab_widget is None or self._tools_in_workspace:
+            return
+        index = self._tools_tab_index
+        if index < 0 or self.tabs.widget(index) is not self._tools_tab_widget:
+            return
+        self._tools_transitioning = True
+        try:
+            self.tabs.removeTab(index)
+            self.tabs.insertTab(index, self._tools_tab_placeholder, "Tools")
+            self.tabs.setTabToolTip(index, "Log / Tools")
+            self.tabs.setCurrentIndex(index)
+            self._tools_tab_placeholder.show()
+            self._tools_workspace_layout.addWidget(self._tools_tab_widget)
+            self._tools_tab_widget.show()
+            self._tools_in_workspace = True
+            self._tools_tab_placeholder.isAncestorOf = self._tools_tab_widget.isAncestorOf
+        finally:
+            self._tools_transitioning = False
+
+    def _leave_tools_workspace(self) -> None:
+        """Restore the Tools page to its original tab without recreating controls."""
+        if self._tools_tab_widget is None or not self._tools_in_workspace:
+            return
+        self._tools_transitioning = True
+        try:
+            self._tools_workspace_layout.removeWidget(self._tools_tab_widget)
+            self._tools_tab_widget.setParent(None)
+            index = self._tools_tab_index
+            if self.tabs.widget(index) is self._tools_tab_placeholder:
+                self.tabs.removeTab(index)
+                self._tools_tab_placeholder.hide()
+                self.tabs.insertTab(index, self._tools_tab_widget, "Tools")
+                self.tabs.setTabToolTip(index, "Log / Tools")
+                self.tabs.setCurrentIndex(index)
+            self._tools_tab_widget.show()
+            self._tools_in_workspace = False
+        finally:
+            self._tools_transitioning = False
 
 
     def _show_error(self, message: str) -> None:
@@ -2515,8 +2656,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         path = Path(file_path)
         if not self._set_current_folder(str(path.parent)):
             return
+        try:
+            pending_name = path.relative_to(Path(self.current_folder)).as_posix()
+        except ValueError:
+            pending_name = path.name
         if self._file_refresh_running:
-            self._pending_open_file = path.name
+            self._pending_open_file = pending_name
             self._status(f"Selected {path.name}; waiting for data catalog…")
             return
         matches = self.pl_files.findItems(path.name, Qt.MatchExactly)
@@ -2529,6 +2674,17 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.mcd_controller._mcd_refresh_sources()
         self.shg_controller._shg_refresh_sources()
         self._restore_list_selection(self.shg_files, [path.name])
+        mcd_name = next(
+            (
+                candidate
+                for candidate in self.mcd_available_files
+                if candidate.casefold() == pending_name.casefold()
+                or Path(candidate).name.casefold() == path.name.casefold()
+            ),
+            "",
+        )
+        if mcd_name:
+            self._restore_list_selection(self.mcd_files, [mcd_name])
         self._status(f"Selected {path.name}")
 
     def _restore_list_selection(self, widget: QListWidget, names: List[str]) -> None:
@@ -2628,9 +2784,25 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if self._pending_open_file:
             pending = self._pending_open_file
             self._pending_open_file = ""
-            self._restore_list_selection(self.pl_files, [pending])
+            pending_basename = Path(pending).name
+            pl_name = pending if pending in self.pl_available_files else pending_basename
+            self._restore_list_selection(self.pl_files, [pl_name])
+            mcd_name = next(
+                (
+                    candidate
+                    for candidate in self.mcd_available_files
+                    if candidate.casefold() == pending.casefold()
+                    or Path(candidate).name.casefold() == pending_basename.casefold()
+                ),
+                "",
+            )
+            if mcd_name:
+                self._restore_list_selection(self.mcd_files, [mcd_name])
             if pending in self.available_files:
                 self.drr_selected_files = [pending]
+                self.drr_controller._update_drr_selection_labels()
+            elif pending_basename in self.available_files:
+                self.drr_selected_files = [pending_basename]
                 self.drr_controller._update_drr_selection_labels()
         old_source_files |= old_pl_files | old_mcd_files
         self._status(f"Data source catalog ready: {len(self.available_files)} CSV files.")
@@ -2733,8 +2905,18 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             for group in group_drr_sources(sources):
                 if group.key not in selected_complete_group_keys:
                     continue
+                if group.is_background:
+                    continue
+                selected_members = [
+                    source for source in group.files if source.source in selected_now
+                ]
+                if not selected_members:
+                    continue
+                compatible = set(
+                    compatible_drr_repeats(sources, selected_members[0].source)
+                )
                 for source in group.files:
-                    if source.source not in selected_now:
+                    if source.source not in selected_now and source.source in compatible:
                         self.drr_selected_files.append(source.source)
                         selected_now.add(source.source)
         if not self._drr_assignments_automatic:
@@ -2819,6 +3001,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
     def _reset_workflow_state_for_folder_change(self) -> None:
         """Prevent selections and plots from one experiment leaking into another."""
+        self.mcd_controller._invalidate_mcd_peak_shift(queue_reload=False)
         self.loaded = None
         self.last_plotted_mode = None
         self._last_plot_cube = None
@@ -3053,8 +3236,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         active_mode = self._active_mode()
         loaded_mode = self.loaded.mode if self.loaded else None
         plotted_mode = self.last_plotted_mode
-        self.load_action.setEnabled(active_mode is not None)
-        self.plot_action.setEnabled(active_mode is not None and loaded_mode == active_mode)
+        peak_shift_active = self.tabs.tabText(self.tabs.currentIndex()) == "MCD Peak Shift"
+        self.load_action.setEnabled(active_mode is not None or peak_shift_active)
+        self.plot_action.setEnabled(
+            (active_mode is not None and loaded_mode == active_mode)
+            or (peak_shift_active and loaded_mode == "MCD")
+        )
         self.save_action.setEnabled(
             active_mode is not None
             and plotted_mode == active_mode
@@ -3367,6 +3554,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._active_load_succeeded = False
         worker = Worker(self._load_task, options)
         worker.signals.log.connect(self._append_log)
+        load_generation = self._mcd_source_generation if mode == "MCD" else None
+        if load_generation is not None:
+            worker.signals.setProperty("mcd_source_generation", load_generation)
         worker.signals.result.connect(self._on_loaded)
         worker.signals.error.connect(self._show_error)
         worker.signals.finished.connect(self._on_load_finished)
@@ -3678,7 +3868,19 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             provenance_records=provenance_records,
         )
 
-    def _on_loaded(self, loaded: LoadedState) -> None:
+    def _on_loaded(self, loaded: LoadedState, load_generation: int | None = None) -> None:
+        if loaded.mode == "MCD" and load_generation is None:
+            sender = self.sender()
+            if sender is not None:
+                sender_generation = sender.property("mcd_source_generation")
+                if sender_generation is not None:
+                    load_generation = int(sender_generation)
+        if (
+            loaded.mode == "MCD"
+            and load_generation is not None
+            and load_generation != self._mcd_source_generation
+        ):
+            return
         if loaded.mode == self._active_load_mode:
             self._active_load_succeeded = True
         self.loaded = loaded
@@ -3746,8 +3948,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             else:
                 reference_text = f"median reference: {loaded.mcd_result.summary['zero_pairs']} near-zero pairs (median Bpair = {reference_b:.4g} T)"
             source_summary = (
-                f"{loaded.mcd_result.summary['pairs']} angle pairs; sigma+ {loaded.mcd_result.pos_angle:g} deg; "
-                f"sigma- {loaded.mcd_result.neg_angle:g} deg; {reference_text}."
+                f"{loaded.mcd_result.summary['pairs']} angle pairs; sigma+ {format_mcd_angle(loaded.mcd_result.pos_angle)} deg; "
+                f"sigma- {format_mcd_angle(loaded.mcd_result.neg_angle)} deg; {reference_text}."
             )
             self.mcd_source_summary.setText(source_summary)
             self.mcd_source_summary.setToolTip(source_summary)
@@ -3840,13 +4042,21 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._update_action_states()
         self._update_plot_view_bar_visibility()
         self._status(f"Loaded {loaded.mode}.")
-        self._plot_mode(loaded.mode, auto=True)
-        if loaded.mode == "MCD" and loaded.mcd_result is not None:
+        current_tab = self.tabs.tabText(self.tabs.currentIndex())
+        plot_mode = "MCD Peak Shift" if loaded.mode == "MCD" and current_tab == "MCD Peak Shift" else loaded.mode
+        self._plot_mode(plot_mode, auto=True)
+        if plot_mode == "MCD Peak Shift" and loaded.mcd_result is not None:
+            self._analyze_mcd_peak_shift()
+        if (
+            loaded.mode == "MCD"
+            and loaded.mcd_result is not None
+            and self.last_plotted_mode == "MCD"
+        ):
             # Give the freshly rendered MCD view a short settling window so
             # the first center trace refresh is not consumed during plotting.
             self.mcd_controller._mcd_center_refresh_timer.start(200)
 
-    def _on_load_finished(self) -> None:
+    def _on_load_finished(self, load_generation: int | None = None) -> None:
         finished_mode = self._active_load_mode
         succeeded = self._active_load_succeeded
         self._load_in_progress = False
@@ -3873,6 +4083,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self.mcd_apply_correction_btn.setText("Up to date")
             else:
                 self.mcd_apply_correction_btn.setText("Recalculate now")
+            if self._mcd_reload_pending:
+                self._mcd_reload_pending = False
+                self._status("Loading the newly selected MCD source...")
+                self.mcd_controller._request_mcd_load()
 
     def _split_prefix_mode(self, prefix: str) -> str:
         return {
@@ -5025,36 +5239,851 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 colorbar.ax.xaxis.set_label_position("top")
 
     def _plot_mcd_peak_shift(self) -> None:
+        """Render the compact spectrum/derivative inspection and result view."""
+        self.last_plotted_mode = "MCD Peak Shift"
         self.mcd_controller._disable_mcd_blitting()
         self.figure.clear()
-        axes = self.figure.subplots(1, 2, squeeze=False)[0]
-        main_ax, valley_ax = axes
+        show_maps = bool(self.mcd_peak_show_maps_chk.isChecked())
+        show_derivative = bool(self.mcd_peak_show_derivative_chk.isChecked())
+        if show_maps:
+            gs = self.figure.add_gridspec(2, 2, width_ratios=[1.0, 2.0], height_ratios=[1.0, 1.0], hspace=0.30, wspace=0.22)
+            raw_ax = deriv_ax = None
+            map_axes = [self.figure.add_subplot(gs[0, 0]), self.figure.add_subplot(gs[1, 0])]
+            result_ax = self.figure.add_subplot(gs[:, 1])
+        elif show_derivative:
+            gs = self.figure.add_gridspec(2, 2, width_ratios=[1.0, 2.0], height_ratios=[2.0, 1.0], hspace=0.30, wspace=0.22)
+            raw_ax = self.figure.add_subplot(gs[0, 0])
+            deriv_ax = self.figure.add_subplot(gs[1, 0], sharex=raw_ax)
+            map_axes = []
+            result_ax = self.figure.add_subplot(gs[:, 1])
+        else:
+            gs = self.figure.add_gridspec(1, 2, width_ratios=[1.0, 2.0], wspace=0.22)
+            raw_ax = self.figure.add_subplot(gs[0, 0])
+            deriv_ax = None
+            map_axes = []
+            result_ax = self.figure.add_subplot(gs[0, 1])
+        self.mcd_peak_spectrum_ax = raw_ax
+        self.mcd_peak_derivative_ax = deriv_ax
+        self.mcd_peak_shift_ax = result_ax
+        self.mcd_peak_map_axes = map_axes
+        self._mcd_peak_track_lines = []
+        self._mcd_peak_candidate_artists = {}
+        self._mcd_peak_manual_center_artists = {}
+        self._mcd_peak_manual_center_blit_backgrounds = {}
         result = getattr(self, "mcd_peak_result", None)
-        if result is None:
-            main_ax.axis("off")
-            main_ax.text(0.5, 0.5, "No peak-shift analysis yet.\nLoad an MCD result and click Analyze.", ha="center", va="center")
-            valley_ax.axis("off")
+        locator_catalog = getattr(self, "_mcd_peak_locator_results", {})
+        if result is None and self.loaded is not None and self.loaded.mcd_result is not None and locator_catalog:
+            # Locator results are available immediately, while the selected
+            # local fit may still be running.  Keep the measured spectrum and
+            # field controls visible instead of leaving the whole canvas blank.
+            source = self.loaded.mcd_result
+            energy_order = spectrum_energy_order(source)
+            energy = np.sort(np.asarray(source.energy_ev, float))
+            source_choice = str(self.mcd_peak_source_combo.currentText())
+            source_prefix = "pair_corrected" if source_choice.casefold().startswith("mcd-corrected") else "pair_raw"
+            spectra = {
+                channel: np.asarray(getattr(source, f"{source_prefix}_{channel}"), float)[:, energy_order]
+                for channel in ("pos", "neg")
+            }
+            source_label = "MCD-corrected R" if source_prefix == "pair_corrected" else "Raw R"
+            angles = {"pos": float(getattr(source, "pos_angle", np.nan)), "neg": float(getattr(source, "neg_angle", np.nan))}
+            fields = {}
+            for channel in ("pos", "neg"):
+                field = np.asarray(getattr(source, f"pair_b_{channel}", source.pair_b), float)
+                interp = np.asarray(getattr(source, f"pair_interpolated_{channel}", np.zeros(field.size, dtype=bool)), bool)
+                fields[channel] = np.where(interp, np.asarray(source.pair_b, float), field)
+            if raw_ax is not None:
+                index = self.mcd_peak_field_combo.currentData()
+                index = 0 if index is None else int(index)
+                index = max(0, min(index, int(np.asarray(source.pair_b).size) - 1))
+                for channel, color in (("pos", "#1769aa"), ("neg", "#d1495b")):
+                    raw_ax.plot(energy, spectra[channel][index], color=color, lw=0.9,
+                                label=f"{format_mcd_angle(angles[channel])}° · B={fields[channel][index]:.4g} T")
+                    if deriv_ax is not None:
+                        grid, d2, _ = second_derivative_map(
+                            energy, spectra[channel][index][None, :], int(self.mcd_peak_deriv_window_spin.value())
+                        )
+                        deriv_ax.plot(grid, -d2[0], color=color, lw=0.9)
+                raw_ax.set_title(f"Selected field · {source_label}")
+                raw_ax.set_xlabel("Energy (eV)"); raw_ax.set_ylabel(f"{source_label} intensity (a.u.)")
+                raw_ax.grid(alpha=0.2); raw_ax.legend(fontsize=7, loc="upper left")
+                raw_ax.set_xlim(float(np.nanmin(energy)), float(np.nanmax(energy)))
+            if deriv_ax is not None:
+                deriv_ax.set_title("−d²R/dE² · both channels", fontsize=9, pad=8)
+                deriv_ax.set_xlabel("Energy (eV)"); deriv_ax.set_ylabel("−d²R/dE²")
+                deriv_ax.grid(alpha=0.2); deriv_ax.set_xlim(float(np.nanmin(energy)), float(np.nanmax(energy)))
+            for axis in map_axes:
+                axis.axis("off")
+            result_ax.axis("off")
+            result_ax.text(0.05, 0.95, "Computing local mixed fit…\nLocator candidates are ready.", transform=result_ax.transAxes, va="top")
             self.canvas.draw_idle()
             return
-        display_delta = self.mcd_peak_display_combo.currentText() == "Delta E"
-        main_ax.set_title("Reflection peak shift" if display_delta else "Reflection peak energy")
-        main_ax.set_xlabel("B (T)"); main_ax.set_ylabel("Delta E (eV)" if display_delta else "E (eV)")
-        for track in result.tracks:
-            b = np.asarray([point.field_t for point in track.points], float)
-            y = np.asarray([(np.nan if (point.delta_energy_ev if display_delta else point.energy_ev) is None else (point.delta_energy_ev if display_delta else point.energy_ev)) for point in track.points], float)
-            main_ax.plot(b, y, marker=".", linestyle="-" if "increasing" in track.branch.casefold() else "--", label=f"Peak {track.peak_id} ({track.branch})")
-        main_ax.legend(fontsize=7)
-        valley_ax.set_title("Selected valley pair")
-        valley_ax.set_xlabel("B (T)"); valley_ax.set_ylabel("Energy (eV)")
-        selected = (self.mcd_peak_k_combo.currentData(), self.mcd_peak_kp_combo.currentData())
-        valley_rows = valley_quantities(result, selected) if all(value is not None for value in selected) else ()
-        for label, key, style in (("E_Kp-E_K", "splitting_E_Kp_minus_E_K", "-"),):
-            for branch in dict.fromkeys(row["branch"] for row in valley_rows):
-                rows = [row for row in valley_rows if row["branch"] == branch and row.get(key) is not None]
-                if rows:
-                    valley_ax.plot([row["B_T"] for row in rows], [row[key] for row in rows], style, label=f"{label} ({branch})")
-        if valley_rows: valley_ax.legend(fontsize=7)
-        self.figure.tight_layout(); self.canvas.draw_idle()
+        if result is None or self.loaded is None or self.loaded.mcd_result is None:
+            self._mcd_peak_drag = None
+            self.canvas.unsetCursor()
+            empty_ax = raw_ax if raw_ax is not None else result_ax
+            if raw_ax is not None:
+                raw_ax.axis("off")
+            if deriv_ax is not None:
+                deriv_ax.axis("off")
+            result_ax.axis("off")
+            empty_ax.text(0.5, 0.5, "No peak-shift analysis yet.\nLoad an MCD result and click Analyze.", ha="center", va="center")
+            self.canvas.draw_idle(); return
+        source = self.loaded.mcd_result
+        energy_order = spectrum_energy_order(source)
+        energy = np.sort(np.asarray(source.energy_ev, float))
+        source_choice = str(self.mcd_peak_source_combo.currentText())
+        source_prefix = "pair_corrected" if source_choice.casefold().startswith("mcd-corrected") else "pair_raw"
+        spectra = {
+            channel: np.asarray(getattr(source, f"{source_prefix}_{channel}"), float)[:, energy_order]
+            for channel in ("pos", "neg")
+        }
+        source_label = "MCD-corrected R" if source_prefix == "pair_corrected" else "Raw R"
+        angles = {"pos": float(getattr(source, "pos_angle", np.nan)), "neg": float(getattr(source, "neg_angle", np.nan))}
+        fields = {}
+        for channel in ("pos", "neg"):
+            field = np.asarray(getattr(source, f"pair_b_{channel}", source.pair_b), float)
+            interp = np.asarray(getattr(source, f"pair_interpolated_{channel}", np.zeros(field.size, dtype=bool)), bool)
+            fields[channel] = np.where(interp, np.asarray(source.pair_b, float), field)
+        current_index = self.mcd_peak_field_combo.currentData()
+        pair_exact_valid = False
+        if current_index is not None:
+            current_index = int(current_index)
+            pair_exact_valid = all(
+                np.isfinite(np.asarray(getattr(source, f"pair_b_{channel}", source.pair_b), float)[current_index])
+                and not bool(np.asarray(getattr(source, f"pair_interpolated_{channel}", np.zeros(len(source.pair_b), dtype=bool)), bool)[current_index])
+                for channel in ("pos", "neg")
+            )
+        selected_key = self.mcd_peak_selector_combo.currentData()
+        selected_channel = selected_key[0] if selected_key else "pos"
+        selected_branch = selected_key[2] if selected_key else self.mcd_peak_branch_combo.currentText()
+        selected_kind = selected_key[3] if selected_key and len(selected_key) > 3 else "peak"
+        selected_track = None
+        if selected_key:
+            selected_track = next((track for track in self.mcd_peak_channel_results.get(selected_channel, {}).tracks if track.peak_id == selected_key[1] and track.branch == selected_branch and track.feature_kind == selected_kind), None)
+        derivative_lines = {}
+        if raw_ax is not None:
+            raw_ax.set_title("Selected field spectrum")
+            if deriv_ax is not None:
+                deriv_ax.set_title("−d²R/dE² · both channels", fontsize=9, pad=8)
+            for channel, color in (("pos", "#1769aa"), ("neg", "#d1495b")):
+                idx = int(self.mcd_peak_field_combo.currentData() or 0)
+                raw_ax.plot(energy, spectra[channel][idx], color=color, lw=0.9, label=f"{format_mcd_angle(angles[channel])}° · B={fields[channel][idx]:.4g} T")
+                grid, d2, actual_window = second_derivative_map(energy, spectra[channel][idx][None, :], int(self.mcd_peak_deriv_window_spin.value()))
+                derivative_lines[channel] = (grid, -d2[0])
+                if deriv_ax is not None:
+                    deriv_ax.plot(grid, -d2[0], color=color, lw=0.9, label=f"{format_mcd_angle(angles[channel])}° · B={fields[channel][idx]:.4g} T")
+            raw_ax.set_ylabel(f"{source_label} intensity (a.u.)"); raw_ax.set_xlabel("Energy (eV)")
+            raw_ax.tick_params(labelbottom=False, bottom=False)
+            raw_ax.legend(fontsize=7, loc="upper left")
+            raw_ax.grid(alpha=0.2); raw_ax.set_xlim(float(np.nanmin(energy)), float(np.nanmax(energy)))
+            if deriv_ax is not None:
+                deriv_ax.set_ylabel("−d²R/dE²"); deriv_ax.set_xlabel("Energy (eV)")
+                deriv_ax.legend(fontsize=7, loc="best")
+                deriv_ax.grid(alpha=0.2); deriv_ax.set_xlim(float(np.nanmin(energy)), float(np.nanmax(energy)))
+        selected_index = self.mcd_peak_field_combo.currentData()
+        if selected_index is not None and selected_track is not None:
+            idx = int(selected_index)
+            selected_method = self.mcd_peak_tracker_method_combo.currentText()
+            selected_e0 = selected_track.reference_energy_ev
+            for channel, color in (("pos", "#1769aa"), ("neg", "#d1495b")):
+                analysis = self.mcd_peak_method_results.get(selected_method, {}).get(channel)
+                if analysis is None:
+                    continue
+                if channel == selected_channel:
+                    track = selected_track
+                else:
+                    candidates = [item for item in analysis.tracks if item.branch == selected_branch and item.feature_kind == selected_kind and item.quality != BOUNDARY_UNRELIABLE and selected_e0 is not None and item.reference_energy_ev is not None and abs(float(item.reference_energy_ev) - float(selected_e0)) <= 0.005]
+                    track = candidates[0] if len(candidates) == 1 else None
+                if track is None:
+                    continue
+                target_field = float(fields[channel][idx])
+                point = next((item for item in track.points if item.status == "tracked" and item.energy_ev is not None and abs(float(item.field_t) - target_field) <= 1e-9), None)
+                if point is None:
+                    continue
+                energy_point = float(point.energy_ev)
+                if raw_ax is not None:
+                    y_point = float(np.interp(energy_point, energy, spectra[channel][idx]))
+                    feature_line = raw_ax.axvline(energy_point, color=color, ls="--", lw=1.1)
+                    feature_line._mcd_peak_drag_kind = "feature"
+                    feature_line._mcd_peak_drag_channel = channel
+                    if pair_exact_valid:
+                        raw_ax.plot([energy_point], [y_point], "o", color=color, mec="white", zorder=8, label="_mcd_selection_marker")
+                if deriv_ax is not None and channel in derivative_lines:
+                    dgrid, dvalues = derivative_lines[channel]
+                    feature_line = deriv_ax.axvline(energy_point, color=color, ls="--", lw=1.1)
+                    feature_line._mcd_peak_drag_kind = "feature"
+                    feature_line._mcd_peak_drag_channel = channel
+                    deriv_ax.plot([energy_point], [float(np.interp(energy_point, dgrid, dvalues))], "o", color=color, mec="white", zorder=8, label="_mcd_selection_marker")
+        manual_channel = getattr(self, "_mcd_peak_manual_center_channel", None)
+        manual_center = getattr(self, "_mcd_peak_manual_center_ev", None)
+        manual_index = getattr(self, "_mcd_peak_manual_center_field_index", None)
+        if (
+            manual_channel in {"pos", "neg"}
+            and manual_center is not None
+            and np.isfinite(manual_center)
+            and manual_index is not None
+            and selected_index is not None
+            and int(manual_index) == int(selected_index)
+        ):
+            self._draw_mcd_peak_manual_center(
+                raw_ax,
+                deriv_ax,
+                str(manual_channel),
+                float(manual_center),
+            )
+        if raw_ax is not None:
+            self._draw_mcd_peak_candidate_markers(raw_ax, fields, source)
+        if show_maps:
+            labels = np.asarray(getattr(source, "pair_labels", np.full(len(source.pair_b), "")), str)
+            for axis, channel in zip(self.mcd_peak_map_axes, ("pos", "neg")):
+                field = fields[channel]
+                mask = np.ones(field.size, dtype=bool) if selected_branch in {"", "All sweep directions"} else labels == selected_branch
+                order = np.argsort(field[mask])
+                if self.mcd_peak_show_tracks_chk.isChecked():
+                    analysis = self.mcd_peak_channel_results.get(channel)
+                    for track in analysis.tracks if analysis is not None else ():
+                        if track.quality == BOUNDARY_UNRELIABLE or (selected_branch not in {"", "All sweep directions"} and track.branch != selected_branch):
+                            continue
+                        xs = [point.energy_ev if point.status in {"tracked", "ambiguous"} and point.energy_ev is not None else np.nan for point in track.points]
+                        ys = [point.field_t for point in track.points]
+                        is_selected = selected_key is not None and channel == selected_key[0] and track.peak_id == selected_key[1] and track.branch == selected_key[2] and track.feature_kind == selected_key[3]
+                        line = axis.plot(xs, ys, color="#ffffff", lw=1.8 if is_selected else 0.8, alpha=0.95 if is_selected else 0.35, marker=None, label=f"{channel} {track.feature_kind} {track.peak_id}")[0]
+                        line._mcd_peak_branch = track.branch
+                        line._mcd_peak_channel = channel
+                        line._mcd_peak_track = track
+                        if is_selected:
+                            self._mcd_peak_track_lines.append(line)
+                            if pair_exact_valid and current_index is not None:
+                                target_field = float(fields[channel][current_index])
+                                point = next((item for item in track.points if item.status == "tracked" and item.energy_ev is not None and abs(float(item.field_t) - target_field) <= 1e-9), None)
+                                if point is not None:
+                                    axis.plot([float(point.energy_ev)], [float(point.field_t)], "o", color="#f4a261", mec="white", ms=4, label="_mcd_selection_marker")
+                if self.mcd_peak_selected_field is not None:
+                    axis.axhline(float(self.mcd_peak_selected_field), color="#f4a261", lw=1.1, ls="--")
+                if self.mcd_peak_map_mode_combo.currentText() == "Raw R":
+                    grid = energy; values = spectra[channel][mask][order]
+                    finite = np.abs(values[np.isfinite(values)]); limit = float(np.nanpercentile(finite, 98)) if finite.size else 1.0; limit = max(limit, np.finfo(float).eps)
+                    axis.pcolormesh(grid, field[mask][order], values, shading="auto", cmap="viridis", vmin=float(np.nanmin(values)), vmax=float(np.nanmax(values)))
+                    axis.set_title(f"{channel} · {source_label} · full E")
+                    axis.set_xlabel("Energy (eV)"); axis.set_ylabel("B (T)")
+                    continue
+                grid, values, actual_window = second_derivative_map(energy, spectra[channel][mask][order], int(self.mcd_peak_deriv_window_spin.value()))
+                finite = np.abs(values[np.isfinite(values)]); limit = float(np.nanpercentile(finite, 98)) if finite.size else 1.0; limit = max(limit, np.finfo(float).eps)
+                axis.pcolormesh(grid, field[mask][order], -values, shading="auto", cmap="RdBu_r", vmin=-limit, vmax=limit)
+                axis.set_title(f"{channel} · −d²R/dE² · full E"); axis.set_xlabel("Energy (eV)"); axis.set_ylabel("B (T)")
+        self._plot_mcd_peak_result(result_ax, source, selected_key, selected_track)
+        self.figure.subplots_adjust(left=0.10, right=0.98, bottom=0.16 if not show_maps else 0.13, top=0.95)
+        self.canvas.setToolTip(
+            "MCD Peak Shift: drag the right B cursor to choose a measured field; "
+            "drag a left spectrum/derivative feature line to choose a nearby reliable feature."
+        )
+        self.canvas.draw_idle()
+
+    def _draw_mcd_peak_manual_center(
+        self,
+        raw_ax: Any,
+        derivative_ax: Any,
+        channel: str,
+        center_ev: float,
+    ) -> None:
+        """Draw the free center cursor without changing tracked artists."""
+        self._mcd_peak_manual_center_artists = {}
+        color = "#1769aa" if channel == "pos" else "#d1495b"
+        for name, axis in (("raw", raw_ax), ("derivative", derivative_ax)):
+            if axis is None:
+                continue
+            line = axis.axvline(
+                float(center_ev),
+                color=color,
+                ls="-",
+                lw=1.6,
+                alpha=0.95,
+                zorder=10,
+                label="_mcd_manual_center",
+            )
+            line._mcd_peak_drag_kind = "feature"
+            line._mcd_peak_drag_channel = channel
+            line._mcd_peak_manual_center = True
+            self._mcd_peak_manual_center_artists[name] = line
+
+    def _draw_mcd_peak_candidate_markers(self, axis: Any, fields: dict[str, np.ndarray], source: Any) -> None:
+        """Place compact numbered feature markers at the selected field centers."""
+        self._mcd_peak_candidate_artists = {}
+        keys = list(getattr(self, "_mcd_peak_candidate_keys", ()))
+        selected = self.mcd_peak_selector_combo.currentData()
+        if axis is None or not keys or selected is None:
+            return
+        selected = tuple(selected)
+        current_index = self.mcd_peak_field_combo.currentData()
+        if current_index is None:
+            return
+        current_index = int(current_index)
+        branch = self.mcd_peak_branch_combo.currentText()
+        markers: list[tuple[int, tuple, float]] = []
+        for index, key in enumerate(keys):
+            track = self._mcd_peak_candidate_track(tuple(key))
+            if track is None or str(track.branch) != str(branch):
+                continue
+            channel = str(key[0])
+            channel_fields = np.asarray(fields.get(channel, source.pair_b), float)
+            if current_index < 0 or current_index >= channel_fields.size or not np.isfinite(channel_fields[current_index]):
+                continue
+            target_field = float(channel_fields[current_index])
+            point = next(
+                (item for item in track.points if item.status == "tracked" and item.energy_ev is not None and abs(float(item.field_t) - target_field) <= 1e-9),
+                None,
+            )
+            if point is not None and np.isfinite(point.energy_ev):
+                markers.append((index, tuple(key), float(point.energy_ev)))
+        if not markers:
+            return
+        markers.sort(key=lambda item: item[2])
+        x_span = max(abs(float(np.diff(axis.get_xlim())[0])), 1e-12)
+        last_x_by_row = [-np.inf, -np.inf, -np.inf]
+        marker_rows: dict[int, int] = {}
+        for index, _key, energy_point in markers:
+            row = next((row_index for row_index, last_x in enumerate(last_x_by_row) if energy_point - last_x >= 0.065 * x_span), len(last_x_by_row) - 1)
+            marker_rows[index] = row
+            last_x_by_row[row] = energy_point
+        for index, key, energy_point in markers:
+            track = self._mcd_peak_candidate_track(key)
+            kind_label = "P" if track is not None and track.feature_kind == "peak" else "D"
+            active = tuple(selected) == key
+            artist = axis.text(
+                energy_point,
+                0.965 - 0.068 * marker_rows[index],
+                f"{kind_label}{key[1]}",
+                transform=axis.get_xaxis_transform(),
+                ha="center",
+                va="top",
+                fontsize=6.6,
+                fontweight="bold",
+                color="white",
+                zorder=28,
+                bbox={
+                    "boxstyle": "circle,pad=0.22",
+                    "facecolor": "#0078d4" if active else "#f0a202",
+                    "edgecolor": "white",
+                    "linewidth": 0.8,
+                    "alpha": 0.96,
+                },
+            )
+            artist._mcd_peak_candidate_key = key
+            artist._mcd_peak_candidate_energy = energy_point
+            self._mcd_peak_candidate_artists[index] = artist
+
+    def _mcd_peak_candidate_marker_hit(self, event: Any) -> Any | None:
+        axis = getattr(self, "mcd_peak_spectrum_ax", None)
+        if event.inaxes is not axis or getattr(event, "x", None) is None or getattr(event, "y", None) is None:
+            return None
+        try:
+            renderer = self.figure.canvas.get_renderer()
+        except Exception:
+            return None
+        for artist in getattr(self, "_mcd_peak_candidate_artists", {}).values():
+            if artist.get_visible() and artist.get_window_extent(renderer=renderer).contains(float(event.x), float(event.y)):
+                return artist
+        return None
+
+    def _on_mcd_peak_candidate_marker_click(self, event: Any) -> bool:
+        artist = self._mcd_peak_candidate_marker_hit(event)
+        if artist is None:
+            return False
+        key = tuple(getattr(artist, "_mcd_peak_candidate_key", ()))
+        if len(key) != 4:
+            return True
+        combo = self.mcd_peak_selector_combo
+        for index in range(combo.count()):
+            value = combo.itemData(index)
+            if value is None or len(value) != 4:
+                continue
+            normalized = (str(value[0]), int(value[1]), str(value[2]), str(value[3]))
+            if normalized == key:
+                combo.setCurrentIndex(index)
+                return True
+        return True
+
+    def _plot_mcd_peak_result(self, axis, source, selected_key, selected_track) -> None:
+        axis.clear()
+        zero_line = axis.axhline(0.0, color="#777", lw=0.7)
+        zero_line._mcd_ignore_click = True
+        axis.set_xlabel("B (T)")
+        axis.set_ylabel("Kp−K (meV)" if self.mcd_peak_result_mode_combo.currentText() == "Valley splitting" else "ΔE (meV)")
+        if selected_key is None:
+            axis.set_title("Result"); return
+        channel, peak_id, branch, feature_kind = selected_key
+        selected_result_method = getattr(self, "_mcd_peak_selected_result_method", self.mcd_peak_tracker_method_combo.currentText())
+        available_methods = tuple(self.mcd_peak_method_results.keys())
+        methods = ("Local mixed fit",) if selected_result_method == "Local mixed fit" and "Local mixed fit" in available_methods else tuple(method for method in ("Raw spectrum", "Second derivative") if method in available_methods)
+        method_colors = {"Local mixed fit": "#0078d4", "Raw spectrum": "#1769aa", "Second derivative": "#d1495b"}
+        branches = [str(value) for value in dict.fromkeys(np.asarray(source.pair_labels, str).tolist())]
+        selected_result_branch = self.mcd_peak_branch_combo.currentText() or branch
+        selected_field_index = self.mcd_peak_field_combo.currentData()
+        selected_field = float(source.pair_b[int(selected_field_index)]) if selected_field_index is not None else None
+
+        def highlight_selected_result(line, xs, ys) -> None:
+            if getattr(line, "_mcd_peak_method", None) != selected_result_method or getattr(line, "_mcd_peak_branch", None) != selected_result_branch:
+                return
+            x_values = np.asarray(xs, float)
+            y_values = np.asarray(ys, float)
+            valid_x = np.isfinite(x_values)
+            if not np.any(valid_x):
+                return
+            target = float(selected_field) if selected_field is not None else float(x_values[np.flatnonzero(valid_x)[0]])
+            selected_point = int(np.flatnonzero(valid_x)[np.argmin(np.abs(x_values[valid_x] - target))])
+            cursor = axis.axvline(target, color="#111111", lw=0.8, alpha=0.8)
+            cursor._mcd_ignore_click = True
+            if not np.isfinite(y_values[selected_point]):
+                return
+            marker = axis.plot(
+                [float(x_values[selected_point])], [float(y_values[selected_point])],
+                marker="o", ms=7, mfc="none", mec="#111111", mew=1.2,
+                linestyle="None", label="_mcd_selected_result_marker",
+            )[0]
+            marker._mcd_ignore_click = True
+        e0 = selected_track.reference_energy_ev if selected_track is not None and selected_track.reference_method != "unavailable" else None
+        mode = self.mcd_peak_result_mode_combo.currentText()
+        if e0 is None and mode != "Valley splitting":
+            axis.set_title(f"Result · E0 unavailable for {channel} {feature_kind} {peak_id}")
+            notes = []
+            for method in methods:
+                analysis = self.mcd_peak_method_results.get(method, {}).get(channel)
+                if analysis is None or not analysis.tracks:
+                    notes.append(f"{method}: unmatched")
+            notes.append("No exact or bracketed E0 reference; shifts unavailable.")
+            axis.text(0.03, 0.95, "\n".join(notes), transform=axis.transAxes, va="top", fontsize=8)
+            return
+        target_energy = float(e0) if e0 is not None else float(np.median([point.energy_ev for point in selected_track.points if point.energy_ev is not None])) if selected_track is not None and any(point.energy_ev is not None for point in selected_track.points) else float("nan")
+        if mode == "Valley splitting":
+            split_by_method = {}
+            fixed_k = None
+            valley_notes = []
+            directions = branches if e0 is not None else [branch]
+            if e0 is None:
+                for method in methods:
+                    for direction in branches:
+                        if direction != branch:
+                            valley_notes.append(f"{method} · {direction}: E0 unavailable; branch not matched")
+            for method in methods:
+                split_by_method[method] = {}
+                for direction in directions:
+                    split = compute_valley_splitting(self.mcd_peak_method_results, method=method, selected_channel=channel, branch=direction, target_energy_ev=target_energy, tolerance_ev=0.005, feature_kind=feature_kind, allow_energy_fallback=e0 is None)
+                    split_by_method[method][direction] = split
+                    if split.status != "ok":
+                        valley_notes.append(f"{method} · {direction}: {split.status}")
+            # Determine K/K' once, preferring the raw-spectrum mapping across
+            # every available branch, then apply it to both methods/branches.
+            for method in methods:
+                if fixed_k is not None:
+                    break
+                fixed_k = next((split.k_channel for split in split_by_method[method].values() if split.k_channel in {"pos", "neg"}), None)
+            for method in split_by_method:
+                for direction in directions:
+                    split = split_by_method[method][direction]
+                    if fixed_k:
+                        split = compute_valley_splitting(self.mcd_peak_method_results, method=method, selected_channel=channel, branch=direction, target_energy_ev=target_energy, tolerance_ev=0.005, fixed_k_channel=fixed_k, feature_kind=feature_kind, allow_energy_fallback=e0 is None)
+                    xs = [point.field_t for point in split.points]
+                    ys = [np.nan if point.splitting_ev is None else 1000.0 * point.splitting_ev for point in split.points]
+                    if any(np.isfinite(ys)):
+                        line = axis.plot(xs, ys, color=method_colors[method], ls="-" if "increasing" in direction.casefold() else "--", label=f"{method} · {direction}")[0]
+                        line._mcd_peak_branch = direction
+                        line._mcd_peak_method = method
+                        line._mcd_peak_channel = channel
+                        line._mcd_peak_track = None
+                        marker_x = [x for x, y in zip(xs, ys) if np.isfinite(x) and np.isfinite(y)]
+                        marker_y = [y for x, y in zip(xs, ys) if np.isfinite(x) and np.isfinite(y)]
+                        if marker_x:
+                            marker = axis.plot(marker_x, marker_y, "o", color=method_colors[method], ms=3, label="_mcd_result_marker")[0]
+                            marker._mcd_ignore_click = True
+                        highlight_selected_result(line, xs, ys)
+            if selected_result_method == "Local mixed fit" and selected_track is not None:
+                reference_label = "exact" if selected_track.reference_method == "exact 0 T" else "interpolated"
+                title_e0 = f"Fit E0={float(e0):.4f} eV ({reference_label})" if e0 is not None else "Fit E0 unavailable; conservative match"
+            else:
+                title_e0 = f"E0={float(e0):.4f} eV ({'exact' if selected_track is not None and selected_track.reference_method == 'exact 0 T' else 'interpolated'})" if e0 is not None else "E0 unavailable; conservative match"
+            axis.set_title(
+                f"K′−K · {title_e0}" if selected_result_method == "Local mixed fit"
+                else f"Valley splitting · both sweep directions · {title_e0}"
+            )
+            if valley_notes:
+                axis.text(0.03, 0.95, "\n".join(dict.fromkeys(valley_notes)), transform=axis.transAxes, va="top", fontsize=8)
+        else:
+            for method in methods:
+                color = method_colors[method]
+                analyses = self.mcd_peak_method_results.get(method, {})
+                for direction in branches:
+                    analysis = analyses.get(channel)
+                    if analysis is None: continue
+                    candidates = [track for track in analysis.tracks if track.branch == direction and track.feature_kind == feature_kind and track.quality != BOUNDARY_UNRELIABLE and track.reference_energy_ev is not None and abs(track.reference_energy_ev - float(e0)) <= 0.005]
+                    if len(candidates) != 1: continue
+                    track = candidates[0]
+                    xs = [point.field_t for point in track.points]
+                    ys = [np.nan if point.delta_energy_ev is None else 1000.0 * point.delta_energy_ev for point in track.points]
+                    line = axis.plot(xs, ys, color=color, ls="-" if "increasing" in direction.casefold() else "--", label=f"{method} · {direction}")[0]
+                    line._mcd_peak_branch = direction
+                    line._mcd_peak_method = method
+                    line._mcd_peak_channel = channel
+                    line._mcd_peak_track = track
+                    marker_x = [x for x, y in zip(xs, ys) if np.isfinite(x) and np.isfinite(y)]
+                    marker_y = [y for x, y in zip(xs, ys) if np.isfinite(x) and np.isfinite(y)]
+                    if marker_x:
+                        marker = axis.plot(marker_x, marker_y, "o", color=color, ms=3, label="_mcd_result_marker")[0]
+                        marker._mcd_ignore_click = True
+                    highlight_selected_result(line, xs, ys)
+            reference_label = "exact" if selected_track is not None and selected_track.reference_method == "exact 0 T" else "interpolated"
+            if selected_result_method == "Local mixed fit" and selected_track is not None and selected_track.locator_energy_ev is not None:
+                axis.set_title(
+                    f"ΔE(B) · {channel} {feature_kind} {peak_id} · "
+                    f"Fit E0={float(e0):.4f} eV ({reference_label})"
+                )
+            else:
+                axis.set_title(f"Selected ΔE(B) · {channel} {feature_kind} {peak_id} · E0={float(e0):.4f} eV ({reference_label})")
+        if axis.get_legend_handles_labels()[1]: axis.legend(fontsize=7, loc="best")
+
+    def _on_mcd_peak_map_click(self, event: Any) -> None:
+        if event.inaxes not in getattr(self, "mcd_peak_map_axes", ()) or self.loaded is None or self.loaded.mcd_result is None or event.ydata is None:
+            return
+        source = self.loaded.mcd_result
+        channel = "pos" if event.inaxes is self.mcd_peak_map_axes[0] else "neg"
+        field = np.asarray(getattr(source, f"pair_b_{channel}", source.pair_b), float)
+        interpolated = np.asarray(getattr(source, f"pair_interpolated_{channel}", np.zeros(field.size, dtype=bool)), bool)
+        field = np.where(interpolated, np.asarray(source.pair_b, float), field)
+        branch = self.mcd_peak_branch_combo.currentText()
+        labels = np.asarray(getattr(source, "pair_labels", np.full(field.size, branch)), str)
+        candidates = np.flatnonzero(labels == branch) if branch and branch != "All sweep directions" else np.arange(field.size)
+        if candidates.size == 0:
+            return
+        index = int(candidates[np.nanargmin(np.abs(field[candidates] - float(event.ydata)))])
+        click_xy = event.inaxes.transData.transform((float(event.xdata), float(event.ydata))) if event.xdata is not None else None
+        nearest_feature = None
+        nearest_distance = float("inf")
+        analysis = self.mcd_peak_channel_results.get(channel)
+        for track in analysis.tracks if analysis is not None else ():
+            if track.quality == BOUNDARY_UNRELIABLE or (branch and branch != "All sweep directions" and track.branch != branch):
+                continue
+            points = [point for point in track.points if point.status == "tracked" and point.energy_ev is not None]
+            if not points or click_xy is None:
+                continue
+            pixels = event.inaxes.transData.transform(np.asarray([[point.energy_ev, point.field_t] for point in points], float))
+            distance = float(np.min(np.hypot(pixels[:, 0] - click_xy[0], pixels[:, 1] - click_xy[1])))
+            if distance < nearest_distance:
+                nearest_distance = distance
+                nearest_feature = track
+        if nearest_feature is not None and nearest_distance <= 24.0:
+            branch_index = self.mcd_peak_branch_combo.findText(nearest_feature.branch)
+            if branch_index >= 0:
+                self.mcd_peak_branch_combo.setCurrentIndex(branch_index)
+            key = (channel, nearest_feature.peak_id, nearest_feature.branch, nearest_feature.feature_kind)
+            selector_index = self.mcd_peak_selector_combo.findData(key)
+            if selector_index >= 0:
+                self.mcd_peak_selector_combo.setCurrentIndex(selector_index)
+        combo_index = self.mcd_peak_field_combo.findData(index)
+        if combo_index >= 0:
+            self.mcd_peak_field_combo.setCurrentIndex(combo_index)
+
+    def _on_mcd_peak_spectrum_click(self, event: Any) -> None:
+        if event.inaxes is not getattr(self, "mcd_peak_spectrum_ax", None) or event.xdata is None or event.ydata is None or self.loaded is None or self.loaded.mcd_result is None:
+            return
+        source = self.loaded.mcd_result
+        index = self.mcd_peak_field_combo.currentData()
+        if index is None:
+            return
+        energy = np.sort(np.asarray(source.energy_ev, float))
+        energy_order = spectrum_energy_order(source)
+        best = None
+        for channel, color, values_name in (("pos", "#1769aa", "pair_raw_pos"), ("neg", "#d1495b", "pair_raw_neg")):
+            raw = np.asarray(getattr(source, values_name), float)[int(index), energy_order]
+            field = np.asarray(getattr(source, f"pair_b_{channel}", source.pair_b), float)
+            interpolated = np.asarray(getattr(source, f"pair_interpolated_{channel}", np.zeros(len(field), dtype=bool)), bool)
+            target_field = float(source.pair_b[int(index)]) if interpolated[int(index)] else float(field[int(index)])
+            selected_branch = self.mcd_peak_branch_combo.currentText()
+            analysis = self.mcd_peak_channel_results.get(channel)
+            for track in analysis.tracks if analysis is not None else ():
+                if track.quality == BOUNDARY_UNRELIABLE or (selected_branch and selected_branch != "All sweep directions" and track.branch != selected_branch):
+                    continue
+                points = [point for point in track.points if point.status == "tracked" and point.energy_ev is not None and abs(float(point.field_t) - target_field) <= 1e-9]
+                for point in points:
+                    y = float(np.interp(float(point.energy_ev), energy, raw))
+                    pixel = event.inaxes.transData.transform((float(point.energy_ev), y))
+                    click = event.inaxes.transData.transform((float(event.xdata), float(event.ydata)))
+                    distance = float(np.hypot(pixel[0] - click[0], pixel[1] - click[1]))
+                    if best is None or distance < best[0]:
+                        best = (distance, channel, track)
+        if best is None or best[0] > 24.0:
+            return
+        _, channel, track = best
+        branch_index = self.mcd_peak_branch_combo.findText(track.branch)
+        if branch_index >= 0:
+            self.mcd_peak_branch_combo.setCurrentIndex(branch_index)
+        selector_index = self.mcd_peak_selector_combo.findData((channel, track.peak_id, track.branch, track.feature_kind))
+        if selector_index >= 0:
+            self.mcd_peak_selector_combo.setCurrentIndex(selector_index)
+
+    def _on_mcd_peak_result_click(self, event: Any) -> None:
+        if event.inaxes is not getattr(self, "mcd_peak_shift_ax", None) or event.xdata is None or event.ydata is None:
+            return
+        if self.loaded is None or self.loaded.mcd_result is None:
+            return
+        click_xy = event.inaxes.transData.transform((float(event.xdata), float(event.ydata)))
+        best_distance = float("inf")
+        selected_line = None
+        for line in event.inaxes.lines:
+            if getattr(line, "_mcd_ignore_click", False):
+                continue
+            method = getattr(line, "_mcd_peak_method", None)
+            branch = getattr(line, "_mcd_peak_branch", None)
+            if method is None or branch is None:
+                continue
+            xs = np.asarray(line.get_xdata(), float)
+            ys = np.asarray(line.get_ydata(), float)
+            valid = np.isfinite(xs) & np.isfinite(ys)
+            if not np.any(valid):
+                continue
+            pixels = event.inaxes.transData.transform(np.column_stack((xs[valid], ys[valid])))
+            distance = float(np.min(np.hypot(pixels[:, 0] - click_xy[0], pixels[:, 1] - click_xy[1])))
+            if distance < best_distance:
+                best_distance = distance
+                selected_line = line
+        if selected_line is None or best_distance > 24.0:
+            return
+        source = self.loaded.mcd_result
+        fields = np.asarray(source.pair_b, float)
+        finite = np.flatnonzero(np.isfinite(fields))
+        if finite.size == 0:
+            return
+        selected_branch = str(getattr(selected_line, "_mcd_peak_branch"))
+        selected_method = str(getattr(selected_line, "_mcd_peak_method"))
+        self._mcd_peak_selected_result_method = selected_method
+        self._mcd_peak_selected_result_branch = selected_branch
+        if selected_branch and hasattr(self, "mcd_peak_branch_combo"):
+            branch_index = self.mcd_peak_branch_combo.findText(selected_branch)
+            if branch_index >= 0:
+                self.mcd_peak_branch_combo.setCurrentIndex(branch_index)
+        labels = np.asarray(getattr(source, "pair_labels", np.full(fields.size, selected_branch)), str)
+        branch_fields = finite[labels[finite] == selected_branch]
+        if branch_fields.size == 0:
+            branch_fields = finite
+        nearest = int(branch_fields[np.argmin(np.abs(fields[branch_fields] - float(event.xdata)))])
+        combo_index = self.mcd_peak_field_combo.findData(nearest)
+        if combo_index >= 0:
+            self.mcd_peak_field_combo.setCurrentIndex(combo_index)
+            self.mcd_peak_status.setText(f"{selected_method} · {selected_branch}; nearest measured field selected: B = {fields[nearest]:.6g} T")
+
+    def _mcd_peak_toolbar_navigation_active(self) -> bool:
+        mode = getattr(self.toolbar, "mode", None)
+        return bool(getattr(mode, "_navigate_mode", None))
+
+    def _mcd_peak_line_hit(self, event: Any, axis: Any, *, kind: str | None = None) -> Any | None:
+        if event.inaxes is not axis or getattr(event, "x", None) is None:
+            return None
+        best = None
+        best_distance = 8.0
+        for line in axis.lines:
+            if kind is not None and getattr(line, "_mcd_peak_drag_kind", None) != kind:
+                continue
+            values = np.asarray(line.get_xdata(), float).ravel()
+            values = values[np.isfinite(values)]
+            if values.size == 0:
+                continue
+            pixel_x = float(axis.transData.transform((float(values[0]), float(axis.get_ylim()[0])))[0])
+            distance = abs(pixel_x - float(event.x))
+            if distance <= best_distance:
+                best = line
+                best_distance = distance
+        return best
+
+    def _mcd_peak_result_cursor_hit(self, event: Any) -> bool:
+        if event.inaxes is not getattr(self, "mcd_peak_shift_ax", None) or getattr(event, "x", None) is None:
+            return False
+        source = getattr(self.loaded, "mcd_result", None) if self.loaded is not None else None
+        index = self.mcd_peak_field_combo.currentData() if hasattr(self, "mcd_peak_field_combo") else None
+        if source is None or index is None:
+            return False
+        fields = np.asarray(source.pair_b, float)
+        index = int(index)
+        if index < 0 or index >= fields.size or not np.isfinite(fields[index]):
+            return False
+        axis = self.mcd_peak_shift_ax
+        pixel_x = float(axis.transData.transform((float(fields[index]), float(axis.get_ylim()[0])))[0])
+        return abs(pixel_x - float(event.x)) <= 8.0
+
+    def _begin_mcd_peak_drag(self, event: Any) -> bool:
+        if event.button != 1 or self._mcd_peak_toolbar_navigation_active():
+            return False
+        if self._mcd_peak_result_cursor_hit(event):
+            self._mcd_peak_drag = {"kind": "field"}
+            self.canvas.setCursor(Qt.SizeHorCursor)
+            self.mcd_peak_status.setText("Drag B cursor to choose a measured field; release anywhere to finish.")
+            return True
+        for axis in (getattr(self, "mcd_peak_spectrum_ax", None), getattr(self, "mcd_peak_derivative_ax", None)):
+            line = self._mcd_peak_line_hit(event, axis, kind="feature") if axis is not None else None
+            if line is not None:
+                xdata = np.asarray(line.get_xdata(), float).ravel()
+                line_center = float(xdata[0]) if xdata.size and np.isfinite(xdata[0]) else None
+                channel = str(getattr(line, "_mcd_peak_drag_channel"))
+                current_center = getattr(self, "_mcd_peak_manual_center_ev", None)
+                if (
+                    getattr(self, "_mcd_peak_manual_center_channel", None) == channel
+                    and current_center is not None
+                    and np.isfinite(current_center)
+                ):
+                    line_center = float(current_center)
+                self._mcd_peak_drag = {
+                    "kind": "feature",
+                    "channel": channel,
+                    "offset": 0.0 if line_center is None or event.xdata is None else float(event.xdata) - line_center,
+                    "center": line_center,
+                }
+                if line_center is not None:
+                    self._mcd_peak_manual_center_ev = line_center
+                    self._mcd_peak_manual_center_channel = channel
+                    self._mcd_peak_manual_center_field_index = (
+                        None if self.mcd_peak_field_combo.currentData() is None
+                        else int(self.mcd_peak_field_combo.currentData())
+                    )
+                    self._ensure_mcd_peak_manual_center_artists(channel, line_center)
+                    self._start_mcd_peak_manual_center_blit()
+                self.canvas.setCursor(Qt.SizeHorCursor)
+                self.mcd_peak_status.setText("Drag center freely; release to search and track a nearby reflection.")
+                return True
+        return False
+
+    def _mcd_peak_field_indices_for_branch(self) -> list[int]:
+        combo = getattr(self, "mcd_peak_field_combo", None)
+        if combo is None:
+            return []
+        return [int(combo.itemData(index)) for index in range(combo.count()) if combo.itemData(index) is not None]
+
+    def _update_mcd_peak_field_drag(self, event: Any) -> None:
+        if event.xdata is None or self.loaded is None or self.loaded.mcd_result is None:
+            return
+        source = self.loaded.mcd_result
+        candidates = self._mcd_peak_field_indices_for_branch()
+        fields = np.asarray(source.pair_b, float)
+        candidates = [index for index in candidates if 0 <= index < fields.size and np.isfinite(fields[index])]
+        if not candidates:
+            return
+        index = min(candidates, key=lambda item: abs(float(fields[item]) - float(event.xdata)))
+        if self.mcd_peak_field_combo.currentData() != index:
+            combo_index = self.mcd_peak_field_combo.findData(index)
+            if combo_index >= 0:
+                self.mcd_peak_field_combo.setCurrentIndex(combo_index)
+        self.status_bar_view.set_cursor_readback(f"Drag B cursor: measured B = {fields[index]:.6g} T")
+
+    def _update_mcd_peak_feature_drag(self, event: Any) -> None:
+        if event.xdata is None or self.loaded is None or self.loaded.mcd_result is None:
+            return
+        channel = str(self._mcd_peak_drag.get("channel"))
+        offset = float(self._mcd_peak_drag.get("offset", 0.0))
+        energy = np.asarray(self.loaded.mcd_result.energy_ev, float).ravel()
+        finite = energy[np.isfinite(energy)]
+        if finite.size == 0:
+            return
+        center = float(np.clip(float(event.xdata) - offset, np.nanmin(finite), np.nanmax(finite)))
+        self._mcd_peak_manual_center_ev = center
+        self._mcd_peak_manual_center_channel = channel
+        index = self.mcd_peak_field_combo.currentData()
+        self._mcd_peak_manual_center_field_index = None if index is None else int(index)
+        self._ensure_mcd_peak_manual_center_artists(channel, center)
+        for artist in getattr(self, "_mcd_peak_manual_center_artists", {}).values():
+            artist.set_xdata([center, center])
+        self.status_bar_view.set_cursor_readback(
+            f"Center E = {center:.6g} eV · release to search ±5 meV"
+        )
+        if not self._blit_mcd_peak_manual_center():
+            self.canvas.draw_idle()
+
+    def _start_mcd_peak_manual_center_blit(self) -> None:
+        """Cache the static raw/derivative axes once for a drag gesture."""
+        self._mcd_peak_manual_center_blit_backgrounds = {}
+        lines = tuple(getattr(self, "_mcd_peak_manual_center_artists", {}).items())
+        if not lines:
+            return
+        try:
+            for line in self._mcd_peak_manual_center_artists.values():
+                line.set_animated(True)
+            self.canvas.draw()
+            for name, line in lines:
+                axis = getattr(line, "axes", None)
+                if axis is not None:
+                    self._mcd_peak_manual_center_blit_backgrounds[name] = self.canvas.copy_from_bbox(axis.bbox)
+        except Exception:
+            for line in self._mcd_peak_manual_center_artists.values():
+                line.set_animated(False)
+            self._mcd_peak_manual_center_blit_backgrounds = {}
+
+    def _blit_mcd_peak_manual_center(self) -> bool:
+        backgrounds = getattr(self, "_mcd_peak_manual_center_blit_backgrounds", {})
+        artists = getattr(self, "_mcd_peak_manual_center_artists", {})
+        if not backgrounds or not artists:
+            return False
+        try:
+            for name, background in backgrounds.items():
+                line = artists.get(name)
+                axis = getattr(line, "axes", None)
+                if line is None or axis is None:
+                    return False
+                self.canvas.restore_region(background)
+                axis.draw_artist(line)
+                self.canvas.blit(axis.bbox)
+            return True
+        except Exception:
+            return False
+
+    def _stop_mcd_peak_manual_center_blit(self) -> None:
+        for line in getattr(self, "_mcd_peak_manual_center_artists", {}).values():
+            try:
+                line.set_animated(False)
+            except AttributeError:
+                pass
+        self._mcd_peak_manual_center_blit_backgrounds = {}
+
+    def _ensure_mcd_peak_manual_center_artists(self, channel: str, center_ev: float) -> None:
+        """Create the paired raw/−d² artists once, then move them in place."""
+        artists = getattr(self, "_mcd_peak_manual_center_artists", {})
+        if artists and all(getattr(line, "axes", None) is not None for line in artists.values()):
+            for line in artists.values():
+                line.set_xdata([float(center_ev), float(center_ev)])
+            return
+        self._draw_mcd_peak_manual_center(
+            getattr(self, "mcd_peak_spectrum_ax", None),
+            getattr(self, "mcd_peak_derivative_ax", None),
+            str(channel),
+            float(center_ev),
+        )
+
+    def _update_mcd_peak_drag(self, event: Any) -> bool:
+        if self._mcd_peak_drag is None:
+            return False
+        if event.inaxes is None:
+            return True
+        if self._mcd_peak_drag["kind"] == "field":
+            if event.inaxes is getattr(self, "mcd_peak_shift_ax", None):
+                self._update_mcd_peak_field_drag(event)
+        elif event.inaxes in {
+            getattr(self, "mcd_peak_spectrum_ax", None),
+            getattr(self, "mcd_peak_derivative_ax", None),
+        }:
+            self._update_mcd_peak_feature_drag(event)
+        return True
+
+    def _on_canvas_release(self, event: Any) -> None:
+        if self._mcd_peak_drag is not None:
+            kind = self._mcd_peak_drag["kind"]
+            drag = self._mcd_peak_drag
+            self._mcd_peak_drag = None
+            self.canvas.unsetCursor()
+            if kind == "feature":
+                self._stop_mcd_peak_manual_center_blit()
+                self._commit_mcd_peak_feature_center(drag)
+                return
+            self.status_bar_view.set_cursor_readback(
+                "MCD Peak Shift selection updated." if kind == "field" else "MCD Peak Shift feature selection updated."
+            )
+            return
+        self.mcd_controller._on_canvas_release(event)
+
 
     def _plot_mode(self, mode: str, *, auto: bool = False) -> None:
         if mode == "MCD Peak Shift":
@@ -5919,6 +6948,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         return False
 
     def _on_canvas_motion(self, event: Any) -> None:
+        if self.last_plotted_mode == "MCD Peak Shift":
+            self._update_mcd_peak_drag(event)
+            return
         if self.last_plotted_mode == "MCD":
             self.mcd_controller._on_mcd_canvas_motion(event)
             return
@@ -5967,6 +6999,21 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
     def _on_canvas_click(self, event: Any) -> None:
         if event.button != 1:
+            return
+        if self.last_plotted_mode == "MCD Peak Shift" and self._mcd_peak_toolbar_navigation_active():
+            return
+        if self.last_plotted_mode == "MCD Peak Shift" and self._on_mcd_peak_candidate_marker_click(event):
+            return
+        if self.last_plotted_mode == "MCD Peak Shift" and self._begin_mcd_peak_drag(event):
+            return
+        if self.last_plotted_mode == "MCD Peak Shift" and event.inaxes in getattr(self, "mcd_peak_map_axes", ()):
+            self._on_mcd_peak_map_click(event)
+            return
+        if self.last_plotted_mode == "MCD Peak Shift" and event.inaxes is getattr(self, "mcd_peak_shift_ax", None):
+            self._on_mcd_peak_result_click(event)
+            return
+        if self.last_plotted_mode == "MCD Peak Shift" and event.inaxes is getattr(self, "mcd_peak_spectrum_ax", None):
+            self._on_mcd_peak_spectrum_click(event)
             return
         if (
             self.last_plotted_mode == "SHG Processing"
@@ -7009,4 +8056,3 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
     def _show_about(self) -> None:
         QMessageBox.about(self, 'About DPTK Desktop', f'DPTK Desktop - Version {__version__}')
-
