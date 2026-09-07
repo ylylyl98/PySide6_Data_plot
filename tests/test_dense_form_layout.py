@@ -12,13 +12,15 @@ from PySide6.QtWidgets import QApplication, QCheckBox, QDoubleSpinBox, QLabel, Q
 
 from ui_qt.main_window import MainWindow, UI_METRICS
 from ui_qt.theme import install_theme
+from tests.profile_phases import profile_phase
 
 
 class DenseFormRowLayoutTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
-        install_theme(cls.app, mode="light")
+        with profile_phase("theme_installation"):
+            install_theme(cls.app, mode="light")
 
     def test_layout_uses_only_single_row_and_wrapped_modes(self) -> None:
         from ui_qt.dense_form_layout import DenseFormRowLayout
@@ -255,9 +257,11 @@ class DenseFormRowLayoutTests(unittest.TestCase):
     def test_real_widget_ownership_roots_and_mcd_descendants_teardown(self) -> None:
         import shiboken6
 
-        install_theme(self.app, mode="light")
-        with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
-            window = MainWindow()
+        with profile_phase("theme_installation"):
+            install_theme(self.app, mode="light")
+        with profile_phase("mainwindow_construction"):
+            with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
+                window = MainWindow()
 
         roots = [
             window.pl_yaxis_controls,
@@ -286,34 +290,37 @@ class DenseFormRowLayoutTests(unittest.TestCase):
             return False
 
         try:
-            for root in roots:
-                self.assertTrue(lifetime_descends(root, window), root.objectName())
-            self.assertTrue(lifetime_descends(window.mcd_split_scale_panel, window))
-            for descendant in mcd_descendants:
-                self.assertTrue(lifetime_descends(descendant, window), type(descendant).__name__)
+            with profile_phase("ownership_assertions"):
+                for root in roots:
+                    self.assertTrue(lifetime_descends(root, window), root.objectName())
+                self.assertTrue(lifetime_descends(window.mcd_split_scale_panel, window))
+                for descendant in mcd_descendants:
+                    self.assertTrue(lifetime_descends(descendant, window), type(descendant).__name__)
 
-            window.resize(1180, 820)
-            window.show()
-            self.app.processEvents()
-            for label in ("PL", "DRR", "Compare", "Power", "MCD", "MCD Peak Shift", "SHG", "Tools", "PL"):
-                index = next(i for i in range(window.tabs.count()) if window.tabs.tabText(i) == label)
-                window.tabs.setCurrentIndex(index)
+            with profile_phase("ownership_event_switch_assertions"):
+                window.resize(1180, 820)
+                window.show()
                 self.app.processEvents()
-                for prefix in ("pl", "drr", "cmp"):
-                    self.assertFalse(getattr(window, f"{prefix}_yaxis_controls").isVisible())
-                    self.assertFalse(getattr(window, f"{prefix}_yaxis_advanced_box").isVisible())
-                self.assertFalse(window.mcd_split_scale_panel.isVisible())
-                self.assertFalse(window.mcd_split_scale_chk.isVisible())
-                if label != "Tools":
-                    self.assertFalse(window._tools_tab_placeholder.isVisible())
+                for label in ("PL", "DRR", "Compare", "Power", "MCD", "MCD Peak Shift", "SHG", "Tools", "PL"):
+                    index = next(i for i in range(window.tabs.count()) if window.tabs.tabText(i) == label)
+                    window.tabs.setCurrentIndex(index)
+                    self.app.processEvents()
+                    for prefix in ("pl", "drr", "cmp"):
+                        self.assertFalse(getattr(window, f"{prefix}_yaxis_controls").isVisible())
+                        self.assertFalse(getattr(window, f"{prefix}_yaxis_advanced_box").isVisible())
+                    self.assertFalse(window.mcd_split_scale_panel.isVisible())
+                    self.assertFalse(window.mcd_split_scale_chk.isVisible())
+                    if label != "Tools":
+                        self.assertFalse(window._tools_tab_placeholder.isVisible())
         finally:
-            window.close()
-            window.deleteLater()
-            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-            self.app.processEvents()
-            for widget, spy in destroyed_spies:
-                self.assertFalse(shiboken6.isValid(widget), type(widget).__name__)
-                self.assertGreaterEqual(spy.count(), 1, type(widget).__name__)
+            with profile_phase("ownership_teardown"):
+                window.close()
+                window.deleteLater()
+                QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+                self.app.processEvents()
+                for widget, spy in destroyed_spies:
+                    self.assertFalse(shiboken6.isValid(widget), type(widget).__name__)
+                    self.assertGreaterEqual(spy.count(), 1, type(widget).__name__)
 
     def test_real_power_axis_rows_use_dense_layout_at_sidebar_width(self) -> None:
         self._assert_real_axis_rows_use_dense_layout("Power", "power")

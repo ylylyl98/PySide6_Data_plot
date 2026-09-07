@@ -8,6 +8,9 @@ refactoring stage.
 from __future__ import annotations
 
 import csv
+import copy
+import threading
+from dataclasses import replace
 from typing import Dict
 
 import numpy as np
@@ -36,12 +39,65 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.mcd_peak_shift import analyze_peak_shift, valley_quantities
+from core.mcd_local_fit import FIT_OK, local_fit_cache_key
+from core.mcd_peak_shift import BOUNDARY_UNRELIABLE, analyze_local_peak_shift, analyze_peak_shift, format_mcd_angle, spectrum_energy_order, valley_quantities
+from core.mcd_valley_split import compute_valley_splitting
 from core.plotting import COMPARE_PANEL_ORDER
-from ui_qt.common import UI_METRICS, QComboBox, QDoubleSpinBox, QSpinBox
+from ui_qt.common import UI_METRICS, QComboBox, QDoubleSpinBox, QSpinBox, Worker
 from ui_qt.fluent_ui.style import set_fluent_property
 from ui_qt.status_badge import StatusBadge
 from ui_qt.dense_form_layout import DenseFormRowLayout
+
+
+def _mcd_local_fit_worker(
+    source,
+    *,
+    seed_energy_ev: float,
+    locator_energy_ev: float,
+    feature_kind: str,
+    peak_id: int,
+    spectrum_source: str,
+    background_model: str,
+    window_ev: tuple[float, float],
+    max_starts: int = 150,
+    cancel_event=None,
+    progress=None,
+    log=None,
+):
+    """Fit the selected local resonance away from the Qt GUI thread."""
+    output = {}
+    pair_fields = np.asarray(source.pair_b, dtype=float)
+    for number, channel in enumerate(("pos", "neg"), start=1):
+        if cancel_event is not None and cancel_event.is_set():
+            return {}
+        field = np.asarray(getattr(source, f"pair_b_{channel}", source.pair_b), dtype=float)
+        interpolated = np.asarray(getattr(source, f"pair_interpolated_{channel}", np.zeros(field.size, dtype=bool)), bool)
+        effective = np.where(interpolated, pair_fields, field) if interpolated.size == field.size else field
+        adapted = copy.copy(source)
+        adapted.pair_b = effective
+        fit_source = _mcd_fit_source_for_channel(spectrum_source, channel)
+        output[channel] = analyze_local_peak_shift(
+            adapted,
+            source=fit_source,
+            seed_energy_ev=float(seed_energy_ev),
+            locator_energy_ev=float(locator_energy_ev),
+            feature_kind=str(feature_kind),
+            peak_id=int(peak_id),
+            window_ev=window_ev,
+            background_model=str(background_model),
+            max_starts=int(max_starts),
+            cancel_check=(cancel_event.is_set if cancel_event is not None else None),
+        )
+        if progress is not None:
+            progress.emit(int(number * 50))
+    return output
+
+
+def _mcd_fit_source_for_channel(spectrum_source: str, channel: str) -> str:
+    """Map the shared selector to one physical channel per local fit."""
+    normalized = str(spectrum_source).casefold().strip()
+    base = "corrected" if normalized.startswith(("corrected", "mcd-corrected")) else "raw"
+    return f"{base} {str(channel).casefold()}"
 
 
 class FeatureTabsMixin:
@@ -1131,20 +1187,116 @@ class FeatureTabsMixin:
         source = QGroupBox("Reflection peak source")
         form = QFormLayout(source)
         form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        source_row = QWidget()
+        source_layout = QHBoxLayout(source_row)
+        source_layout.setContentsMargins(0, 0, 0, 0)
+        source_layout.setSpacing(4)
+        self.mcd_peak_source_selection_summary = StatusBadge("No MCD CSV selected.", app_role=None)
+        self.mcd_peak_source_selection_summary.setMinimumWidth(0)
+        self.mcd_peak_source_selection_summary.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.mcd_peak_select_source_btn = QPushButton("Select...")
+        self.mcd_peak_select_source_btn.setMinimumWidth(88)
+        self.mcd_peak_clear_source_btn = QPushButton("Clear")
+        self.mcd_peak_clear_source_btn.setMaximumWidth(64)
+        source_layout.addWidget(self.mcd_peak_source_selection_summary, 1)
+        source_layout.addWidget(self.mcd_peak_select_source_btn)
+        source_layout.addWidget(self.mcd_peak_clear_source_btn)
+        form.addRow("MCD CSV", source_row)
         self.mcd_peak_source_summary = QLabel("No MCD result loaded. Load an MCD sweep to begin.")
         self.mcd_peak_source_summary.setWordWrap(True)
         self.mcd_peak_source_combo = QComboBox()
-        self.mcd_peak_source_combo.addItems(["Corrected average", "Corrected pos", "Corrected neg", "Raw average", "Raw pos", "Raw neg"])
+        self.mcd_peak_source_combo.addItems(["Raw R", "MCD-corrected R"])
         self.mcd_peak_source_combo.setMinimumWidth(210)
         self.mcd_peak_source_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.mcd_peak_source_combo.setToolTip("Reflection spectrum used for peak detection; this is not the raw K-K' intensity difference.")
+        self.mcd_peak_source_combo.setToolTip("Reflection source for the local fit. Both physical channels are fitted separately; this is not the K-K' intensity difference.")
         self.mcd_peak_display_combo = QComboBox()
-        self.mcd_peak_display_combo.addItems(["Delta E", "Absolute E"])
+        self.mcd_peak_display_combo.addItems(["Absolute E", "Delta E"])
         self.mcd_peak_display_combo.setToolTip("Choose zero-field-referenced energy shift or absolute peak energy.")
         form.addRow("Loaded MCD", self.mcd_peak_source_summary)
-        form.addRow("Spectrum", self.mcd_peak_source_combo)
         form.addRow("Display", self.mcd_peak_display_combo)
+        self.mcd_peak_display_combo.hide()
+        for hidden_combo in (self.mcd_peak_display_combo,):
+            label = form.labelForField(hidden_combo)
+            if label is not None:
+                label.hide()
         layout.addWidget(source)
+        self.mcd_peak_select_source_btn.clicked.connect(self.mcd_controller._edit_mcd_source)
+        self.mcd_peak_clear_source_btn.clicked.connect(self.mcd_controller._clear_mcd_source)
+        preview_controls = QGroupBox("Peak inspection")
+        preview_form = QFormLayout(preview_controls)
+        self.mcd_peak_branch_combo = QComboBox()
+        self.mcd_peak_branch_combo.addItem("All sweep directions")
+        self.mcd_peak_selector_combo = QComboBox()
+        self.mcd_peak_field_combo = QComboBox()
+        self.mcd_peak_field_combo.setToolTip("Selected actual raw field; map clicks choose the nearest measured field.")
+        self.mcd_peak_field_prev_btn = QToolButton(); self.mcd_peak_field_prev_btn.setText("‹"); self.mcd_peak_field_prev_btn.setToolTip("Select previous measured field")
+        self.mcd_peak_field_next_btn = QToolButton(); self.mcd_peak_field_next_btn.setText("›"); self.mcd_peak_field_next_btn.setToolTip("Select next measured field")
+        self.mcd_peak_field_prev_btn.setAutoRaise(True); self.mcd_peak_field_next_btn.setAutoRaise(True)
+        self.mcd_peak_prev_btn = QToolButton(); self.mcd_peak_prev_btn.setText("‹"); self.mcd_peak_prev_btn.setToolTip("Select previous reliable feature")
+        self.mcd_peak_next_btn = QToolButton(); self.mcd_peak_next_btn.setText("›"); self.mcd_peak_next_btn.setToolTip("Select next reliable feature")
+        self.mcd_peak_prev_btn.setAutoRaise(True); self.mcd_peak_next_btn.setAutoRaise(True)
+        feature_row = QWidget(); feature_layout = QHBoxLayout(feature_row); feature_layout.setContentsMargins(0, 0, 0, 0); feature_layout.setSpacing(2)
+        feature_layout.addWidget(self.mcd_peak_selector_combo, 1); feature_layout.addWidget(self.mcd_peak_prev_btn); feature_layout.addWidget(self.mcd_peak_next_btn)
+        field_row = QWidget(); field_layout = QHBoxLayout(field_row); field_layout.setContentsMargins(0, 0, 0, 0); field_layout.setSpacing(4)
+        field_layout.addWidget(self.mcd_peak_field_combo, 1); field_layout.addWidget(self.mcd_peak_field_prev_btn); field_layout.addWidget(self.mcd_peak_field_next_btn)
+        candidate_row = QWidget()
+        candidate_grid = QGridLayout(candidate_row)
+        candidate_grid.setContentsMargins(0, 0, 0, 0)
+        candidate_grid.setHorizontalSpacing(3)
+        candidate_grid.setVerticalSpacing(2)
+        self.mcd_peak_candidate_buttons: list[QToolButton] = []
+        self._mcd_peak_candidate_keys: list[tuple] = []
+        for candidate_index in range(5):
+            button = QToolButton()
+            button.setCheckable(True)
+            button.setAutoRaise(True)
+            button.setVisible(False)
+            button.clicked.connect(
+                lambda _checked=False, index=candidate_index: self._on_mcd_peak_candidate_clicked(index)
+            )
+            self.mcd_peak_candidate_buttons.append(button)
+            candidate_grid.addWidget(button, candidate_index // 2, candidate_index % 2)
+        preview_form.addRow("Sweep direction", self.mcd_peak_branch_combo)
+        preview_form.addRow("Selected feature", feature_row)
+        preview_form.addRow("Nearby features", candidate_row)
+        # Feature selection is rendered in the plot panel's MCD-style bar.
+        # Keep the combo/buttons as the authoritative model and for keyboard/
+        # workflow compatibility, but remove their sidebar rows.
+        for hidden_widget in (
+            feature_row,
+            candidate_row,
+            preview_form.labelForField(feature_row),
+            preview_form.labelForField(candidate_row),
+        ):
+            if hidden_widget is not None:
+                hidden_widget.hide()
+        self.mcd_peak_selector_combo.hide()
+        self.mcd_peak_prev_btn.hide()
+        self.mcd_peak_next_btn.hide()
+        for candidate_button in self.mcd_peak_candidate_buttons:
+            candidate_button.hide()
+        preview_form.addRow("Selected field", field_row)
+        self.mcd_peak_map_mode_combo = QComboBox(); self.mcd_peak_map_mode_combo.addItems(["Raw R", "Second derivative"])
+        self.mcd_peak_tracker_method_combo = QComboBox(); self.mcd_peak_tracker_method_combo.addItems(["Local mixed fit", "Raw spectrum", "Second derivative"])
+        self.mcd_peak_tracker_method_combo.setToolTip("Default fits one selected raw-R resonance locally. Raw and second derivative remain available for locator inspection.")
+        self.mcd_peak_result_mode_combo = QComboBox(); self.mcd_peak_result_mode_combo.addItems(["Valley splitting", "Single peak shift"])
+        self.mcd_peak_result_mode_combo.setToolTip("Choose absolute Kp−K valley splitting or the selected per-channel peak shift.")
+        self.mcd_peak_deriv_window_spin = QSpinBox(); self.mcd_peak_deriv_window_spin.setRange(7, 101); self.mcd_peak_deriv_window_spin.setSingleStep(2); self.mcd_peak_deriv_window_spin.setValue(35)
+        self.mcd_peak_show_tracks_chk = QCheckBox("Show peak tracks"); self.mcd_peak_show_tracks_chk.setChecked(True)
+        self.mcd_peak_show_maps_chk = QCheckBox("Inspect tracking maps"); self.mcd_peak_show_maps_chk.setChecked(False)
+        self.mcd_peak_show_derivative_chk = QCheckBox("Show derivative panel"); self.mcd_peak_show_derivative_chk.setChecked(True)
+        preview_form.addRow("Map display", self.mcd_peak_map_mode_combo)
+        self._mcd_peak_map_mode_label = preview_form.labelForField(self.mcd_peak_map_mode_combo)
+        preview_form.addRow("Peak tracker", self.mcd_peak_tracker_method_combo)
+        preview_form.addRow("Result", self.mcd_peak_result_mode_combo)
+        preview_form.addRow("Derivative SG window", self.mcd_peak_deriv_window_spin)
+        preview_form.addRow(self.mcd_peak_show_tracks_chk)
+        preview_form.addRow(self.mcd_peak_show_maps_chk)
+        preview_form.addRow(self.mcd_peak_show_derivative_chk)
+        self.mcd_peak_note = QLabel("Displayed spectra and SG second derivative use the selected reflection source. Positive B assigns K to the lower-energy member.")
+        self.mcd_peak_note.setWordWrap(True)
+        preview_form.addRow(self.mcd_peak_note)
+        layout.addWidget(preview_controls)
         controls = QGroupBox("Detection and tracking")
         cform = QFormLayout(controls)
         cform.setHorizontalSpacing(6)
@@ -1176,6 +1328,10 @@ class FeatureTabsMixin:
         cform.addRow(_peak_control_row("Smoothing points", self.mcd_peak_smooth_spin))
         cform.addRow(_peak_control_row("Maximum jump", self.mcd_peak_jump_spin))
         cform.addRow(_peak_control_row("Maximum peaks", self.mcd_peak_max_spin))
+        self.mcd_peak_background_combo = QComboBox(); self.mcd_peak_background_combo.addItems(["Linear background", "Quadratic background"])
+        self.mcd_peak_background_combo.setToolTip("Local mixed fit background. Quadratic is an optional comparison model.")
+        cform.addRow("Reflection source", self.mcd_peak_source_combo)
+        cform.addRow("Local background", self.mcd_peak_background_combo)
         row = QHBoxLayout()
         self.mcd_peak_analyze_btn = QPushButton("Analyze")
         self.mcd_peak_analyze_btn.setAccessibleName("Analyze MCD reflection peak shifts")
@@ -1184,8 +1340,9 @@ class FeatureTabsMixin:
         self.mcd_peak_export_btn.setAccessibleName("Export MCD peak shift CSV")
         self.mcd_peak_export_btn.setEnabled(False)
         row.addWidget(self.mcd_peak_analyze_btn); row.addWidget(self.mcd_peak_export_btn); row.addStretch(1)
-        cform.addRow(row)
-        layout.addWidget(controls)
+        self.mcd_peak_controls_expander = self._make_expander("Advanced detection", controls, expanded=False)
+        layout.addWidget(self.mcd_peak_controls_expander)
+        layout.addLayout(row)
         self.mcd_peak_status = QLabel("Ready when an MCD result is loaded.")
         self.mcd_peak_status.setWordWrap(True)
         layout.addWidget(self.mcd_peak_status)
@@ -1203,6 +1360,8 @@ class FeatureTabsMixin:
         self.mcd_valley_table.setToolTip("K/K' labels use the documented energy-order convention, not waveplate-angle calibration.")
         self.mcd_valley_table.setAccessibleName("MCD valley quantities")
         layout.addWidget(self.mcd_valley_table, 1)
+        self.mcd_peak_table.hide()
+        self.mcd_valley_table.hide()
         pair_row = QWidget(); pair_form = QHBoxLayout(pair_row); pair_form.setContentsMargins(0, 0, 0, 0)
         pair_form.addWidget(QLabel("Valley pair"))
         self.mcd_peak_k_combo = QComboBox(); self.mcd_peak_kp_combo = QComboBox()
@@ -1210,55 +1369,549 @@ class FeatureTabsMixin:
             combo.setToolTip("Select two tracked optical peak IDs for derived K/K' quantities; labels use energy ordering, not waveplate angles.")
             pair_form.addWidget(combo)
         pair_form.addStretch(1); cform.addRow(pair_row)
+        pair_row.hide()
         self.mcd_peak_result = None
+        self.mcd_peak_channel_results = {}
+        self._mcd_peak_local_fit_cache = {}
+        self._mcd_peak_fit_generation = 0
+        self._mcd_peak_fit_worker = None
+        self.mcd_peak_map_axes = []
+        self.mcd_peak_spectrum_ax = None
+        self._mcd_peak_track_lines = []
+        self._mcd_peak_candidate_artists = {}
+        self._mcd_peak_manual_center_ev: float | None = None
+        self._mcd_peak_manual_center_channel: str | None = None
+        self._mcd_peak_manual_center_field_index: int | None = None
+        self.mcd_peak_selected_field = None
         self.mcd_peak_analyze_btn.setEnabled(False)
         self.mcd_peak_analyze_btn.clicked.connect(self._analyze_mcd_peak_shift)
         self.mcd_peak_export_btn.clicked.connect(self._export_mcd_peak_shift)
+        self.mcd_peak_export_btn.hide()
         self.mcd_peak_display_combo.currentTextChanged.connect(self._refresh_mcd_peak_plot)
+        self.mcd_peak_source_combo.currentTextChanged.connect(self._on_mcd_peak_source_changed)
+        self.mcd_peak_map_mode_combo.currentTextChanged.connect(self._refresh_mcd_peak_plot)
+        self.mcd_peak_tracker_method_combo.currentTextChanged.connect(self._reanalyze_mcd_peak_shift)
+        self.mcd_peak_background_combo.currentTextChanged.connect(self._reanalyze_mcd_peak_shift)
+        self.mcd_peak_result_mode_combo.currentTextChanged.connect(self._refresh_mcd_peak_plot)
+        self.mcd_peak_deriv_window_spin.valueChanged.connect(self._on_mcd_peak_deriv_window_changed)
+        self.mcd_peak_show_tracks_chk.toggled.connect(self._refresh_mcd_peak_plot)
+        self.mcd_peak_branch_combo.currentTextChanged.connect(self._on_mcd_peak_branch_changed)
+        self.mcd_peak_selector_combo.currentIndexChanged.connect(self._refresh_mcd_peak_plot)
+        self.mcd_peak_selector_combo.currentIndexChanged.connect(self._on_mcd_local_selection_changed)
+        self.mcd_peak_field_combo.currentIndexChanged.connect(self._on_mcd_peak_field_changed)
+        self.mcd_peak_prev_btn.clicked.connect(lambda: self._step_mcd_peak_feature(-1))
+        self.mcd_peak_next_btn.clicked.connect(lambda: self._step_mcd_peak_feature(1))
+        self.mcd_peak_field_prev_btn.clicked.connect(lambda: self._step_mcd_peak_field(-1))
+        self.mcd_peak_field_next_btn.clicked.connect(lambda: self._step_mcd_peak_field(1))
+        self.mcd_peak_show_maps_chk.toggled.connect(self._refresh_mcd_peak_plot)
+        self.mcd_peak_show_maps_chk.toggled.connect(self._set_mcd_inspect_controls)
+        self.mcd_peak_show_derivative_chk.toggled.connect(self._refresh_mcd_peak_plot)
+        self._set_mcd_inspect_controls(False)
         self.mcd_peak_k_combo.currentIndexChanged.connect(self._on_mcd_valley_pair_changed)
         self.mcd_peak_kp_combo.currentIndexChanged.connect(self._on_mcd_valley_pair_changed)
         return tab
 
+    def _set_mcd_inspect_controls(self, visible: bool) -> None:
+        self.mcd_peak_map_mode_combo.setVisible(bool(visible))
+        if getattr(self, "_mcd_peak_map_mode_label", None) is not None:
+            self._mcd_peak_map_mode_label.setVisible(bool(visible))
+        self.mcd_peak_show_tracks_chk.setVisible(bool(visible))
+
+    def _step_mcd_peak_feature(self, delta: int) -> None:
+        combo = getattr(self, "mcd_peak_selector_combo", None)
+        if combo is None or combo.count() == 0:
+            return
+        index = combo.currentIndex()
+        combo.setCurrentIndex((index + int(delta)) % combo.count())
+
+    def _step_mcd_peak_field(self, delta: int) -> None:
+        combo = getattr(self, "mcd_peak_field_combo", None)
+        if combo is None or combo.count() == 0:
+            return
+        index = combo.currentIndex()
+        combo.setCurrentIndex((index + int(delta)) % combo.count())
+
     def _update_mcd_peak_shift_source(self, result) -> None:
         if not hasattr(self, "mcd_peak_source_summary"):
             return
+        self._mcd_peak_fit_generation = int(getattr(self, "_mcd_peak_fit_generation", 0)) + 1
+        self._mcd_peak_local_fit_cache = {}
+        self._mcd_peak_locator_results = {}
         if result is None:
+            self.mcd_peak_result = None
             self.mcd_peak_source_summary.setText("No MCD result loaded. Load an MCD sweep to begin.")
             self.mcd_peak_analyze_btn.setEnabled(False)
             self.mcd_peak_export_btn.setEnabled(False)
             self.mcd_peak_status.setText("Empty: load an MCD result first.")
+            self.mcd_peak_channel_results = {}
+            self.mcd_peak_method_results = {}
+            self.mcd_peak_map_axes = []
+            self._mcd_peak_candidate_artists = {}
+            self._clear_mcd_peak_manual_center()
+            self.mcd_peak_selected_field = None
+            self.mcd_peak_selector_combo.clear()
+            self.mcd_peak_field_combo.clear()
+            self.mcd_peak_table.setRowCount(0)
+            self.mcd_valley_table.setRowCount(0)
             return
         n = int(np.asarray(result.pair_b).size)
         self.mcd_peak_source_summary.setText(f"{n} paired spectra; {result.source_file}. K/K' labels follow energy ordering: lower branch is K for B > 0; labels are not waveplate-angle calibration.")
         self.mcd_peak_analyze_btn.setEnabled(True)
         self.mcd_peak_status.setText("Loaded. Choose a reflection source and analyze.")
         self.mcd_peak_result = None
+        self.mcd_peak_channel_results = {}
+        self.mcd_peak_method_results = {}
+        self.mcd_peak_map_axes = []
+        self._mcd_peak_candidate_artists = {}
+        self._clear_mcd_peak_manual_center()
+        self.mcd_peak_selected_field = None
+        self.mcd_peak_selector_combo.clear()
+        self.mcd_peak_field_combo.clear()
         self.mcd_peak_export_btn.setEnabled(False)
         self.mcd_peak_table.setRowCount(0)
         self.mcd_valley_table.setRowCount(0)
 
     def _analyze_mcd_peak_shift(self) -> None:
+        if self.mcd_peak_tracker_method_combo.currentText() == "Local mixed fit":
+            self._request_mcd_local_fit()
+            return
+        self._mcd_peak_fit_generation = int(getattr(self, "_mcd_peak_fit_generation", 0)) + 1
+        self._analyze_mcd_peak_shift_legacy()
+
+    def _on_mcd_peak_source_changed(self, _source_text: str = "") -> None:
+        """Invalidate source-dependent locators while retaining reusable fits."""
+        if getattr(self, "_mcd_peak_source_change_guard", False):
+            return
+        self._mcd_peak_source_change_guard = True
+        try:
+            self._mcd_peak_fit_generation = int(getattr(self, "_mcd_peak_fit_generation", 0)) + 1
+            cancel_event = getattr(self, "_mcd_peak_fit_cancel_event", None)
+            if cancel_event is not None:
+                cancel_event.set()
+            # Locator candidates belong to the selected reflection source;
+            # cached local model results are keyed by source and can be reused
+            # when the user returns to a prior source.
+            self._mcd_peak_locator_results = {}
+            self._mcd_peak_local_requested_key = None
+            self.mcd_peak_result = None
+            self.mcd_peak_channel_results = {}
+            self.mcd_peak_method_results = {}
+            self.mcd_peak_export_btn.setEnabled(False)
+            self.mcd_peak_table.setRowCount(0)
+            self.mcd_valley_table.setRowCount(0)
+            self.mcd_peak_selector_combo.blockSignals(True)
+            self.mcd_peak_selector_combo.clear()
+            self.mcd_peak_selector_combo.blockSignals(False)
+            self._mcd_peak_candidate_keys = []
+            for button in getattr(self, "mcd_peak_candidate_buttons", ()):
+                button.setVisible(False)
+            self._refresh_mcd_peak_plot()
+            if self.loaded is not None and self.loaded.mcd_result is not None:
+                self._analyze_mcd_peak_shift()
+        finally:
+            self._mcd_peak_source_change_guard = False
+
+    def _request_mcd_local_fit(
+        self,
+        *,
+        seed_energy_ev: float | None = None,
+        locator_energy_ev: float | None = None,
+        feature_kind: str | None = None,
+        selection_key: tuple | None = None,
+    ) -> None:
+        """Queue one selected raw-R local fit and ignore stale completions."""
+        if not self.loaded or self.loaded.mode != "MCD" or self.loaded.mcd_result is None:
+            self.mcd_peak_status.setText("Error: no MCD result is loaded.")
+            return
+        source = self.loaded.mcd_result
+        self._mcd_peak_fit_generation = int(getattr(self, "_mcd_peak_fit_generation", 0)) + 1
+        generation = self._mcd_peak_fit_generation
+        previous_cancel = getattr(self, "_mcd_peak_fit_cancel_event", None)
+        if previous_cancel is not None:
+            previous_cancel.set()
+        cancel_event = threading.Event()
+        self._mcd_peak_fit_cancel_event = cancel_event
+        selected = selection_key if selection_key is not None else self.mcd_peak_selector_combo.currentData()
+        selected_track = None
+        locator_results = getattr(self, "_mcd_peak_locator_results", {})
+        if selected is not None and len(selected) == 4:
+            selected_channel, selected_id, selected_branch, selected_kind = selected
+            current_analysis = locator_results.get(str(selected_channel)) or self.mcd_peak_channel_results.get(str(selected_channel))
+            if current_analysis is not None:
+                selected_track = next((track for track in current_analysis.tracks if int(track.peak_id) == int(selected_id) and str(track.branch) == str(selected_branch) and str(track.feature_kind) == str(selected_kind)), None)
+        if seed_energy_ev is None and selected_track is not None:
+            seed_energy_ev = selected_track.locator_energy_ev or selected_track.reference_energy_ev
+        if seed_energy_ev is None:
+            # The raw detector supplies a locator only; no raw/D2 centre is
+            # promoted into the local model result.
+            field = np.asarray(getattr(source, "pair_b_pos", source.pair_b), dtype=float)
+            effective = np.where(np.asarray(getattr(source, "pair_interpolated_pos", np.zeros(field.size, dtype=bool)), bool), np.asarray(source.pair_b, dtype=float), field)
+            adapted = copy.copy(source); adapted.pair_b = effective
+            locator = analyze_peak_shift(
+                adapted, source=_mcd_fit_source_for_channel(self.mcd_peak_source_combo.currentText(), "pos"), prominence_fraction=self.mcd_peak_prom_spin.value(), min_distance_points=self.mcd_peak_dist_spin.value(),
+                smoothing_points=self.mcd_peak_smooth_spin.value(), max_jump_ev=self.mcd_peak_jump_spin.value(), max_peaks=self.mcd_peak_max_spin.value(), tracking_method="Raw spectrum",
+            )
+            locator_results = {"pos": locator}
+            for locator_channel in ("neg",):
+                locator_field = np.asarray(getattr(source, f"pair_b_{locator_channel}", source.pair_b), dtype=float)
+                locator_interp = np.asarray(getattr(source, f"pair_interpolated_{locator_channel}", np.zeros(locator_field.size, dtype=bool)), bool)
+                locator_adapted = copy.copy(source)
+                locator_adapted.pair_b = np.where(locator_interp, np.asarray(source.pair_b, dtype=float), locator_field)
+                locator_results[locator_channel] = analyze_peak_shift(
+                    locator_adapted, source=_mcd_fit_source_for_channel(self.mcd_peak_source_combo.currentText(), locator_channel), prominence_fraction=self.mcd_peak_prom_spin.value(), min_distance_points=self.mcd_peak_dist_spin.value(),
+                    smoothing_points=self.mcd_peak_smooth_spin.value(), max_jump_ev=self.mcd_peak_jump_spin.value(), max_peaks=self.mcd_peak_max_spin.value(), tracking_method="Raw spectrum",
+                )
+            self._mcd_peak_locator_results = locator_results
+            usable = [track for track in locator.tracks if track.quality != BOUNDARY_UNRELIABLE and track.reference_energy_ev is not None]
+            if not usable:
+                self.mcd_peak_status.setText(
+                    f"No reliable {self.mcd_peak_source_combo.currentText()} locator was found for a local fit."
+                )
+                return
+            floor = float(np.nanmin(np.asarray(source.energy_ev, dtype=float))) + 0.01
+            candidates = [track for track in usable if float(track.reference_energy_ev) > floor] or usable
+            selected_track = min(candidates, key=lambda track: float(track.reference_energy_ev))
+            seed_energy_ev = float(selected_track.reference_energy_ev)
+            locator_energy_ev = seed_energy_ev
+            feature_kind = selected_track.feature_kind
+        if selected is not None and len(selected) == 4:
+            requested_channel = str(selected_channel)
+            requested_id = int(selected_id)
+            requested_branch = str(selected_branch)
+            requested_kind = str(selected_kind)
+        elif selected_track is not None:
+            requested_channel = "pos"
+            requested_id = int(selected_track.peak_id)
+            requested_branch = str(selected_track.branch)
+            requested_kind = str(selected_track.feature_kind)
+        else:
+            requested_channel = "pos"
+            requested_id = 1
+            requested_branch = str(np.asarray(source.pair_labels, dtype=str)[0])
+            requested_kind = feature_kind
+        self._mcd_peak_local_requested_key = (requested_channel, requested_id, requested_branch, requested_kind)
+        seed_energy_ev = float(seed_energy_ev)
+        locator_energy_ev = float(locator_energy_ev if locator_energy_ev is not None else seed_energy_ev)
+        feature_kind = str(feature_kind or (selected_track.feature_kind if selected_track is not None else "peak"))
+        background_model = "quadratic" if self.mcd_peak_background_combo.currentText().startswith("Quadratic") else "linear"
+        window_ev = (seed_energy_ev - 0.0136, seed_energy_ev + 0.0164)
+        spectrum_source = str(self.mcd_peak_source_combo.currentText())
+        settings = (
+            self.mcd_peak_prom_spin.value(), self.mcd_peak_dist_spin.value(),
+            self.mcd_peak_smooth_spin.value(), self.mcd_peak_jump_spin.value(),
+            self.mcd_peak_deriv_window_spin.value(), feature_kind,
+            requested_id, requested_branch,
+        )
+        cache_key = local_fit_cache_key(source, source=spectrum_source, background_model=background_model, window_ev=window_ev, seed_energy_ev=seed_energy_ev, settings=settings)
+        cache = getattr(self, "_mcd_peak_local_fit_cache", {})
+        cached = cache.get(cache_key)
+        if cached is not None:
+            self._mcd_peak_fit_cancel_event = None
+            self.mcd_peak_analyze_btn.setEnabled(True)
+            self._apply_mcd_local_fit(cached, source=source, seed_energy_ev=seed_energy_ev, locator_energy_ev=locator_energy_ev, feature_kind=feature_kind, cache_key=cache_key)
+            return
+        # Keep the detector catalog and measured-field controls available while
+        # the selected local model runs.  The fitted result itself is cleared
+        # so the result pane cannot present stale centers as current values.
+        self.mcd_peak_result = None
+        self.mcd_peak_channel_results = {}
+        self.mcd_peak_method_results = {}
+        self.mcd_peak_export_btn.setEnabled(False)
+        self._populate_mcd_peak_preview_controls()
+        self._select_mcd_peak_key_blocked(self._mcd_peak_local_requested_key)
+        self._refresh_mcd_peak_plot()
+        self.mcd_peak_analyze_btn.setEnabled(False)
+        self.mcd_peak_status.setText(f"Fitting local mixed line shape near E = {seed_energy_ev:.6g} eV…")
+        worker = Worker(
+            _mcd_local_fit_worker,
+            source,
+            seed_energy_ev=seed_energy_ev,
+            locator_energy_ev=locator_energy_ev,
+            feature_kind=feature_kind,
+            peak_id=int(self._mcd_peak_local_requested_key[1]),
+            spectrum_source=spectrum_source,
+            background_model=background_model,
+            window_ev=window_ev,
+            max_starts=150,
+            cancel_event=cancel_event,
+        )
+        self._mcd_peak_fit_worker = worker
+        worker.signals.result.connect(lambda results, w=worker, g=generation, key=cache_key: self._finish_mcd_local_fit(w, g, results, source, seed_energy_ev, locator_energy_ev, feature_kind, key))
+        worker.signals.error.connect(lambda message, g=generation: self._mcd_local_fit_error(g, message))
+        worker.signals.finished.connect(lambda w=worker, g=generation: self._mcd_local_fit_finished(w, g))
+        self.thread_pool.start(worker)
+
+    def _finish_mcd_local_fit(self, worker, generation, results, source, seed_energy_ev, locator_energy_ev, feature_kind, cache_key) -> None:
+        if generation != int(getattr(self, "_mcd_peak_fit_generation", -1)) or self.loaded is None or self.loaded.mcd_result is not source:
+            return
+        self._mcd_peak_local_fit_cache = getattr(self, "_mcd_peak_local_fit_cache", {})
+        self._mcd_peak_local_fit_cache[cache_key] = results
+        self._apply_mcd_local_fit(results, source=source, seed_energy_ev=seed_energy_ev, locator_energy_ev=locator_energy_ev, feature_kind=feature_kind, cache_key=cache_key)
+
+    def _mcd_local_fit_error(self, generation: int, message: str) -> None:
+        if generation != int(getattr(self, "_mcd_peak_fit_generation", -1)):
+            return
+        self.mcd_peak_status.setText(f"Local fit error: {str(message).splitlines()[0]}")
+
+    def _mcd_local_fit_finished(self, worker, generation: int) -> None:
+        if generation == int(getattr(self, "_mcd_peak_fit_generation", -1)):
+            self.mcd_peak_analyze_btn.setEnabled(True)
+
+    def _select_mcd_peak_key_blocked(self, key: tuple | None) -> None:
+        if key is None or len(key) != 4:
+            return
+        combo = self.mcd_peak_selector_combo
+        self._mcd_peak_local_applying = True
+        blocked = combo.blockSignals(True)
+        try:
+            wanted = (str(key[0]), int(key[1]), str(key[2]), str(key[3]))
+            for index in range(combo.count()):
+                value = combo.itemData(index)
+                if value is not None and (str(value[0]), int(value[1]), str(value[2]), str(value[3])) == wanted:
+                    combo.setCurrentIndex(index)
+                    break
+        finally:
+            combo.blockSignals(blocked)
+            self._mcd_peak_local_applying = False
+
+    def _apply_mcd_local_fit(self, results, *, source, seed_energy_ev: float, locator_energy_ev: float, feature_kind: str, cache_key) -> None:
+        self.mcd_peak_method_results = {"Local mixed fit": dict(results)}
+        self.mcd_peak_channel_results = dict(results)
+        self.mcd_peak_result = self.mcd_peak_channel_results.get("pos")
+        self._mcd_peak_selected_result_method = "Local mixed fit"
+        self._mcd_peak_local_fit_key = cache_key
+        self._mcd_peak_preferred_selection = None
+        self._mcd_peak_local_pending_selection = getattr(self, "_mcd_peak_local_requested_key", None)
+        self._populate_mcd_peak_preview_controls()
+        pending = getattr(self, "_mcd_peak_local_pending_selection", None)
+        if pending is not None:
+            self._select_mcd_peak_key_blocked(pending)
+            self._mcd_peak_local_pending_selection = None
+        self._populate_mcd_peak_table()
+        self._refresh_mcd_peak_plot()
+        # A branch can contain a few unavailable rows while still providing a
+        # useful fitted segment.  Keep those gaps in the result, but count a
+        # track as usable when it has at least one tracked point.
+        valid_count = sum(
+            1 for analysis in results.values()
+            for track in analysis.tracks
+            if any(point.status == "tracked" and point.energy_ev is not None for point in track.points)
+        )
+        self.mcd_peak_export_btn.setEnabled(valid_count > 0)
+        self.mcd_peak_status.setText(
+            f"Complete: local mixed fit; Locator E0 = {locator_energy_ev:.6g} eV; "
+            f"{valid_count} usable branch track(s). Fit centres are model values; raw/D2 remain locator diagnostics."
+        )
+
+    def _analyze_mcd_peak_shift_legacy(self) -> None:
         if not self.loaded or self.loaded.mode != "MCD" or self.loaded.mcd_result is None:
             self.mcd_peak_status.setText("Error: no MCD result is loaded."); return
         self.mcd_peak_analyze_btn.setEnabled(False); self.mcd_peak_status.setText("Analyzing reflection peaks…")
         try:
-            self.mcd_peak_result = analyze_peak_shift(self.loaded.mcd_result, source=self.mcd_peak_source_combo.currentText().casefold(), prominence_fraction=self.mcd_peak_prom_spin.value(), min_distance_points=self.mcd_peak_dist_spin.value(), smoothing_points=self.mcd_peak_smooth_spin.value(), max_jump_ev=self.mcd_peak_jump_spin.value(), max_peaks=self.mcd_peak_max_spin.value())
+            source = self.loaded.mcd_result
+            previous_selection = self.mcd_peak_selector_combo.currentData()
+            preferred = None
+            if previous_selection is not None:
+                old_channel, old_peak_id, old_branch, old_kind = previous_selection if len(previous_selection) == 4 else (*previous_selection, "peak")
+                old_analysis = self.mcd_peak_channel_results.get(old_channel)
+                old_track = next((track for track in old_analysis.tracks if track.peak_id == old_peak_id and track.branch == old_branch and track.feature_kind == old_kind), None) if old_analysis else None
+                if old_track is not None:
+                    preferred = (
+                        old_channel,
+                        old_branch,
+                        old_kind,
+                        None if old_track.reference_energy_ev is None else float(old_track.reference_energy_ev),
+                    )
+            analyses = {}
+            method_analyses = {}
+            selected_method = self.mcd_peak_tracker_method_combo.currentText()
+            for method in ("Raw spectrum", "Second derivative"):
+                method_analyses[method] = {}
+            for channel, field_name in (("pos", "pair_b_pos"), ("neg", "pair_b_neg")):
+                field = np.asarray(getattr(source, field_name, source.pair_b), float)
+                interpolated = np.asarray(getattr(source, f"pair_interpolated_{channel}", np.zeros(field.size, dtype=bool)), bool)
+                effective = np.where(interpolated, np.asarray(source.pair_b, float), field)
+                adapted = copy.copy(source); adapted.pair_b = effective
+                for method in method_analyses:
+                    method_analyses[method][channel] = analyze_peak_shift(
+                        adapted, source=_mcd_fit_source_for_channel(self.mcd_peak_source_combo.currentText(), channel),
+                        prominence_fraction=self.mcd_peak_prom_spin.value(), min_distance_points=self.mcd_peak_dist_spin.value(),
+                        smoothing_points=self.mcd_peak_smooth_spin.value(), max_jump_ev=self.mcd_peak_jump_spin.value(), max_peaks=self.mcd_peak_max_spin.value(),
+                        tracking_method=method, derivative_window_points=self.mcd_peak_deriv_window_spin.value())
+            analyses = method_analyses[selected_method]
+            self.mcd_peak_method_results = method_analyses
+            self.mcd_peak_channel_results = analyses
+            self.mcd_peak_result = analyses["pos"]
+            self._mcd_peak_preferred_selection = preferred
+            self._populate_mcd_peak_preview_controls()
             self._populate_mcd_peak_table()
             self._refresh_mcd_peak_plot()
-            self.mcd_peak_export_btn.setEnabled(bool(self.mcd_peak_result.tracks))
-            refs = ", ".join(dict.fromkeys(t.reference_method for t in self.mcd_peak_result.tracks)) or "none"
-            self.mcd_peak_status.setText(f"Complete: {len(self.mcd_peak_result.tracks)} branch-local peak track(s). Valley pair IDs: {self.mcd_peak_k_combo.currentText()} / {self.mcd_peak_kp_combo.currentText()}. Zero-field reference: {refs}. Missing/ambiguous points are retained.")
+            self.mcd_peak_export_btn.setEnabled(any(track.quality != BOUNDARY_UNRELIABLE for analysis in analyses.values() for track in analysis.tracks))
+            refs = ", ".join(dict.fromkeys(t.reference_method for t in self.mcd_peak_result.tracks if t.quality != BOUNDARY_UNRELIABLE)) or "none"
+            valid_count = sum(t.quality != BOUNDARY_UNRELIABLE for analysis in analyses.values() for t in analysis.tracks)
+            method = self.mcd_peak_tracker_method_combo.currentText()
+            source_label = self.mcd_peak_source_combo.currentText()
+            if self.mcd_peak_result_mode_combo.currentText() == "Valley splitting":
+                status = f"Complete: {valid_count} usable {method.casefold()} feature tracks from {source_label}. Valley splitting uses absolute energies."
+            else:
+                status = f"Complete: {valid_count} usable {method.casefold()} feature tracks from {source_label}. Reference: {refs}."
+            if getattr(self, "_mcd_peak_selection_unavailable", False):
+                status += " Previous selected energy was not found within 5 meV; choose a peak."
+            self.mcd_peak_status.setText(status)
         except Exception as exc:
-            self.mcd_peak_result = None; self.mcd_peak_export_btn.setEnabled(False); self.mcd_peak_status.setText(f"Error: {exc}")
+            self.mcd_peak_result = None; self.mcd_peak_channel_results = {}; self.mcd_peak_method_results = {}; self.mcd_peak_export_btn.setEnabled(False)
+            self.mcd_peak_selector_combo.clear(); self.mcd_peak_field_combo.clear(); self.mcd_peak_k_combo.clear(); self.mcd_peak_kp_combo.clear()
+            self.mcd_peak_table.setRowCount(0); self.mcd_valley_table.setRowCount(0)
+            self.mcd_peak_status.setText(f"Error: {exc}")
+            self._refresh_mcd_peak_plot()
         finally:
             self.mcd_peak_analyze_btn.setEnabled(True)
+
+    def _reanalyze_mcd_peak_shift(self) -> None:
+        if self.loaded is not None and self.loaded.mcd_result is not None:
+            self._analyze_mcd_peak_shift()
+
+    def _on_mcd_local_selection_changed(self, index: int) -> None:
+        if getattr(self, "_mcd_peak_local_applying", False) or int(index) < 0 or self.mcd_peak_tracker_method_combo.currentText() != "Local mixed fit":
+            return
+        selected = self.mcd_peak_selector_combo.itemData(int(index))
+        catalog = getattr(self, "_mcd_peak_locator_results", {})
+        if selected is None or len(selected) != 4 or not catalog:
+            return
+        channel, peak_id, branch, feature_kind = selected
+        analysis = catalog.get(str(channel))
+        track = next((item for item in analysis.tracks if int(item.peak_id) == int(peak_id) and str(item.branch) == str(branch) and str(item.feature_kind) == str(feature_kind)), None) if analysis is not None else None
+        if track is not None and track.reference_energy_ev is not None:
+            self._mcd_peak_local_requested_key = (str(channel), int(peak_id), str(branch), str(feature_kind))
+            self._request_mcd_local_fit(seed_energy_ev=float(track.reference_energy_ev), locator_energy_ev=float(track.reference_energy_ev), feature_kind=str(feature_kind))
+
+    def _on_mcd_peak_deriv_window_changed(self) -> None:
+        self._reanalyze_mcd_peak_shift()
+
+    def _populate_mcd_peak_preview_controls(self) -> None:
+        result = self.mcd_peak_result
+        catalog = getattr(self, "_mcd_peak_locator_results", {}) if self.mcd_peak_tracker_method_combo.currentText() == "Local mixed fit" else self.mcd_peak_channel_results
+        if not catalog:
+            catalog = self.mcd_peak_channel_results
+        self.mcd_peak_branch_combo.blockSignals(True)
+        current = self.mcd_peak_branch_combo.currentText()
+        self.mcd_peak_branch_combo.clear()
+        source_labels = np.asarray(getattr(self.loaded.mcd_result, "pair_labels", []), str) if self.loaded and self.loaded.mcd_result is not None else np.array([], str)
+        branches = sorted(set(source_labels.tolist())) if source_labels.size else sorted({str(point.branch) for track in result.tracks for point in track.points}) if result else []
+        self.mcd_peak_branch_combo.addItems(branches)
+        self.mcd_peak_branch_combo.setCurrentText(current if current in branches else (branches[0] if branches else ""))
+        self.mcd_peak_branch_combo.blockSignals(False)
+        self.mcd_peak_selector_combo.blockSignals(True); self.mcd_peak_selector_combo.clear()
+        branch = self.mcd_peak_branch_combo.currentText()
+        entries = []
+        for channel, analysis in catalog.items():
+            angle = float(getattr(self.loaded.mcd_result, "pos_angle" if channel == "pos" else "neg_angle", np.nan))
+            for track in analysis.tracks:
+                if track.branch == branch and track.quality != BOUNDARY_UNRELIABLE:
+                    quality = f"{track.quality} · " if track.quality != "OK" else ""
+                    kind_label = "P" if track.feature_kind == "peak" else "D"
+                    if track.reference_energy_ev is None or track.reference_method == "unavailable":
+                        reference = "E0 unavailable"
+                        sort_energy = float("inf")
+                    else:
+                        method_label = "exact" if track.reference_method == "exact 0 T" else "interpolated"
+                        reference = f"E0={track.reference_energy_ev:.4f} eV ({method_label})"
+                        sort_energy = float(track.reference_energy_ev)
+                    label = f"{quality}{format_mcd_angle(angle)}° · {kind_label}{track.peak_id} · {reference}"
+                    entries.append((sort_energy, channel, track.peak_id, track.feature_kind, label, track))
+        entries.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+        for _, channel, peak_id, feature_kind, label, _track in entries:
+            item_index = self.mcd_peak_selector_combo.count()
+            self.mcd_peak_selector_combo.addItem(label, (channel, peak_id, branch, feature_kind))
+            self.mcd_peak_selector_combo.setItemData(item_index, label, Qt.ToolTipRole)
+        preferred = getattr(self, "_mcd_peak_preferred_selection", None)
+        self._mcd_peak_selection_unavailable = False
+        if preferred is not None and self.mcd_peak_selector_combo.count():
+            channel, preferred_branch, preferred_kind, preferred_energy = preferred
+            matches = []
+            if preferred_energy is not None and np.isfinite(preferred_energy):
+                for index in range(self.mcd_peak_selector_combo.count()):
+                    item_channel, _, item_branch, item_kind = self.mcd_peak_selector_combo.itemData(index)
+                    if item_channel != channel or item_branch != preferred_branch or item_kind != preferred_kind:
+                        continue
+                    track = next((item for item in catalog[channel].tracks if item.peak_id == self.mcd_peak_selector_combo.itemData(index)[1] and item.branch == item_branch and item.feature_kind == item_kind), None)
+                    if track is not None and track.reference_energy_ev is not None and abs(float(track.reference_energy_ev) - preferred_energy) <= 0.005:
+                        matches.append(index)
+            if len(matches) == 1:
+                self.mcd_peak_selector_combo.setCurrentIndex(matches[0])
+            else:
+                self.mcd_peak_selector_combo.setCurrentIndex(-1)
+                self._mcd_peak_selection_unavailable = True
+        elif self.mcd_peak_selector_combo.count() and self.loaded and self.loaded.mcd_result is not None:
+            floor = float(np.nanmin(np.asarray(self.loaded.mcd_result.energy_ev, float))) + 0.01
+            for index in range(self.mcd_peak_selector_combo.count()):
+                channel, peak_id, peak_branch, peak_kind = self.mcd_peak_selector_combo.itemData(index)
+                track = next((item for item in catalog[channel].tracks if item.peak_id == peak_id and item.branch == peak_branch and item.feature_kind == peak_kind), None)
+                if track is not None and track.quality == "OK" and track.reference_energy_ev is not None and float(track.reference_energy_ev) > floor:
+                    self.mcd_peak_selector_combo.setCurrentIndex(index)
+                    break
+        self._mcd_peak_preferred_selection = None
+        self.mcd_peak_selector_combo.blockSignals(False)
+        previous_field = self.mcd_peak_selected_field
+        self.mcd_peak_field_combo.blockSignals(True); self.mcd_peak_field_combo.clear()
+        source = self.loaded.mcd_result
+        bpos_all = np.asarray(getattr(source, "pair_b_pos", source.pair_b), float)
+        bneg_all = np.asarray(getattr(source, "pair_b_neg", source.pair_b), float)
+        ipos_all = np.asarray(getattr(source, "pair_interpolated_pos", np.zeros(len(bpos_all), dtype=bool)), bool)
+        ineg_all = np.asarray(getattr(source, "pair_interpolated_neg", np.zeros(len(bneg_all), dtype=bool)), bool)
+        branch = self.mcd_peak_branch_combo.currentText()
+        labels = np.asarray(getattr(source, "pair_labels", np.full(len(bpos_all), branch)), str)
+        for index, (bpos, bneg) in enumerate(zip(bpos_all, bneg_all)):
+            if branch and branch != "All sweep directions" and labels[index] != branch:
+                continue
+            pos_label = f"B+ {bpos:.6g} T" + (" (interpolated)" if ipos_all[index] else "")
+            neg_label = f"B− {bneg:.6g} T" + (" (interpolated)" if ineg_all[index] else "")
+            self.mcd_peak_field_combo.addItem(f"{pos_label} / {neg_label}", index)
+        self.mcd_peak_field_combo.blockSignals(False)
+        if self.mcd_peak_field_combo.count():
+            field_values = np.asarray(source.pair_b, float)
+            target = float(previous_field) if previous_field is not None and np.isfinite(previous_field) else 0.0
+            candidates = [self.mcd_peak_field_combo.itemData(i) for i in range(self.mcd_peak_field_combo.count())]
+            selected = min(candidates, key=lambda idx: abs(float(field_values[int(idx)]) - target))
+            self.mcd_peak_field_combo.setCurrentIndex(self.mcd_peak_field_combo.findData(selected))
+            self.mcd_peak_selected_field = float(source.pair_b[self.mcd_peak_field_combo.currentData()])
+
+    def _on_mcd_peak_field_changed(self) -> None:
+        index = self.mcd_peak_field_combo.currentData()
+        if index is not None and self.loaded and self.loaded.mcd_result is not None:
+            manual_index = getattr(self, "_mcd_peak_manual_center_field_index", None)
+            if manual_index is None or int(manual_index) != int(index):
+                self._clear_mcd_peak_manual_center()
+            self.mcd_peak_selected_field = float(np.asarray(self.loaded.mcd_result.pair_b)[int(index)])
+            self._refresh_mcd_peak_plot()
+
+    def _on_mcd_peak_branch_changed(self) -> None:
+        if self.mcd_peak_channel_results:
+            self._clear_mcd_peak_manual_center()
+            selected = self.mcd_peak_selector_combo.currentData()
+            target_branch = self.mcd_peak_branch_combo.currentText()
+            if selected is not None:
+                channel, peak_id, old_branch, feature_kind = selected if len(selected) == 4 else (*selected, "peak")
+                analysis = self.mcd_peak_channel_results.get(channel)
+                track = next((item for item in analysis.tracks if item.peak_id == peak_id and item.branch == old_branch and item.feature_kind == feature_kind), None) if analysis else None
+                self._mcd_peak_preferred_selection = (
+                    channel,
+                    target_branch,
+                    feature_kind,
+                    None if track is None or track.reference_energy_ev is None else float(track.reference_energy_ev),
+                )
+            self._populate_mcd_peak_preview_controls()
+            self._refresh_mcd_peak_plot()
 
     def _populate_mcd_peak_table(self) -> None:
         result = self.mcd_peak_result
         self.mcd_peak_table.setRowCount(0)
         self.mcd_valley_table.setRowCount(0)
         if result is None: return
-        ids = sorted({track.peak_id for track in result.tracks})
+        visible_tracks = tuple(track for track in result.tracks if track.quality != BOUNDARY_UNRELIABLE)
+        peak_tracks = tuple(track for track in visible_tracks if track.feature_kind == "peak")
+        visible_result = replace(result, tracks=peak_tracks)
+        ids = sorted({track.peak_id for track in peak_tracks})
         for combo in (self.mcd_peak_k_combo, self.mcd_peak_kp_combo):
             previous = combo.currentData(); combo.blockSignals(True); combo.clear()
             for value in ids: combo.addItem(f"Peak {value}", value)
@@ -1267,7 +1920,7 @@ class FeatureTabsMixin:
             elif len(ids) >= 2:
                 combo.setCurrentIndex(0 if combo is self.mcd_peak_k_combo else 1)
             combo.blockSignals(False)
-        for track in result.tracks:
+        for track in visible_tracks:
             for point in track.points:
                 row = self.mcd_peak_table.rowCount(); self.mcd_peak_table.insertRow(row)
                 reference = track.reference_method
@@ -1276,14 +1929,16 @@ class FeatureTabsMixin:
                 if track.reference_field_t is not None:
                     reference += f" at {track.reference_field_t:.6g} T"
                 values = [
-                    track.peak_id, f"{point.field_t:.6g}", point.branch,
+                    f"{'P' if track.feature_kind == 'peak' else 'D'}{track.peak_id}", f"{point.field_t:.6g}", point.branch,
                     "" if point.energy_ev is None else f"{point.energy_ev:.8g}",
                     "" if point.delta_energy_ev is None else f"{point.delta_energy_ev:.8g}",
                     point.status, reference,
                 ]
                 for col, value in enumerate(values): self.mcd_peak_table.setItem(row, col, QTableWidgetItem(str(value)))
         self.mcd_peak_table.resizeColumnsToContents()
-        for value in valley_quantities(result, (self.mcd_peak_k_combo.currentData(), self.mcd_peak_kp_combo.currentData())):
+        selected_ids = (self.mcd_peak_k_combo.currentData(), self.mcd_peak_kp_combo.currentData())
+        valley_rows = valley_quantities(visible_result, selected_ids) if len(ids) >= 2 else ()
+        for value in valley_rows:
             row = self.mcd_valley_table.rowCount(); self.mcd_valley_table.insertRow(row)
             b = float(value["B_T"])
             fields = [
@@ -1300,7 +1955,312 @@ class FeatureTabsMixin:
         self.mcd_valley_table.resizeColumnsToContents()
 
     def _refresh_mcd_peak_plot(self) -> None:
+        self._update_mcd_peak_candidate_buttons()
         self._plot_mode("MCD Peak Shift")
+
+    def _mcd_peak_candidate_track(self, key: tuple):
+        if len(key) != 4:
+            return None
+        channel, peak_id, branch, feature_kind = key
+        catalog = getattr(self, "_mcd_peak_locator_results", {}) if self.mcd_peak_tracker_method_combo.currentText() == "Local mixed fit" else self.mcd_peak_channel_results
+        if not catalog:
+            catalog = self.mcd_peak_channel_results
+        analysis = catalog.get(str(channel))
+        if analysis is None:
+            return None
+        return next(
+            (
+                track for track in analysis.tracks
+                if int(track.peak_id) == int(peak_id)
+                and str(track.branch) == str(branch)
+                and str(track.feature_kind) == str(feature_kind)
+                and track.quality != BOUNDARY_UNRELIABLE
+            ),
+            None,
+        )
+
+    def _update_mcd_peak_candidate_buttons(self) -> None:
+        buttons = getattr(self, "mcd_peak_candidate_buttons", ())
+        if not buttons:
+            return
+        for button in buttons:
+            button.setVisible(False)
+            button.setChecked(False)
+        self._mcd_peak_candidate_keys = []
+        selected = self.mcd_peak_selector_combo.currentData() if hasattr(self, "mcd_peak_selector_combo") else None
+        catalog = getattr(self, "_mcd_peak_locator_results", {}) if self.mcd_peak_tracker_method_combo.currentText() == "Local mixed fit" else self.mcd_peak_channel_results
+        if not catalog:
+            catalog = self.mcd_peak_channel_results
+        if selected is None or not catalog:
+            return
+        selected = tuple(selected)
+        channel, _peak_id, branch, _feature_kind = selected
+        analysis = catalog.get(str(channel))
+        if analysis is None:
+            return
+        selected_track = self._mcd_peak_candidate_track(selected)
+        selected_energy = (
+            float(selected_track.reference_energy_ev)
+            if selected_track is not None and selected_track.reference_energy_ev is not None and np.isfinite(selected_track.reference_energy_ev)
+            else None
+        )
+        candidates = []
+        for track in analysis.tracks:
+            if str(track.branch) != str(branch) or track.quality == BOUNDARY_UNRELIABLE:
+                continue
+            key = (str(channel), int(track.peak_id), str(track.branch), str(track.feature_kind))
+            energy = track.reference_energy_ev
+            finite_energy = energy is not None and np.isfinite(energy)
+            distance = abs(float(energy) - selected_energy) if finite_energy and selected_energy is not None else float("inf")
+            candidates.append((0 if finite_energy else 1, distance, float(energy) if finite_energy else float("inf"), key, track))
+        if len(candidates) > len(buttons) and selected_energy is not None:
+            candidates.sort(key=lambda item: item[:3])
+            candidates = candidates[: len(buttons)]
+        candidates.sort(key=lambda item: (item[0], item[2], item[3]))
+        for index, (_available, _distance, _energy, key, track) in enumerate(candidates[: len(buttons)]):
+            button = buttons[index]
+            kind_label = "P" if track.feature_kind == "peak" else "D"
+            full_kind_label = "Peak" if track.feature_kind == "peak" else "Dip"
+            if track.reference_energy_ev is None or track.reference_method == "unavailable":
+                label = f"{kind_label}{track.peak_id} · E0 unavailable"
+                tooltip = f"{full_kind_label} {track.peak_id}; E0 unavailable"
+            else:
+                label = f"{kind_label}{track.peak_id} · {float(track.reference_energy_ev):.4f} eV"
+                method_label = "exact 0 T" if track.reference_method == "exact 0 T" else "interpolated"
+                tooltip = f"{full_kind_label} {track.peak_id}; E0 = {float(track.reference_energy_ev):.4f} eV ({method_label})"
+            button.setText(label)
+            button.setToolTip(f"{tooltip}. Select this tracked reflection feature.")
+            button.setVisible(True)
+            button.setChecked(tuple(selected) == key)
+            self._mcd_peak_candidate_keys.append(key)
+
+    def _on_mcd_peak_candidate_clicked(self, index: int) -> None:
+        if index < 0 or index >= len(getattr(self, "_mcd_peak_candidate_keys", ())):
+            return
+        key = self._mcd_peak_candidate_keys[index]
+        self._clear_mcd_peak_manual_center()
+        combo = self.mcd_peak_selector_combo
+        for item_index in range(combo.count()):
+            value = combo.itemData(item_index)
+            if value is None or len(value) != 4:
+                continue
+            if (str(value[0]), int(value[1]), str(value[2]), str(value[3])) == tuple(key):
+                combo.setCurrentIndex(item_index)
+                self._update_mcd_peak_candidate_buttons()
+                return
+
+    def _clear_mcd_peak_manual_center(self) -> None:
+        """Forget the free energy cursor and remove its transient artists."""
+        self._mcd_peak_manual_center_ev = None
+        self._mcd_peak_manual_center_channel = None
+        self._mcd_peak_manual_center_field_index = None
+        if hasattr(self, "_stop_mcd_peak_manual_center_blit"):
+            self._stop_mcd_peak_manual_center_blit()
+        for artist in getattr(self, "_mcd_peak_manual_center_artists", {}).values():
+            try:
+                artist.remove()
+            except (AttributeError, ValueError):
+                pass
+        self._mcd_peak_manual_center_artists = {}
+
+    def _commit_mcd_peak_feature_center(self, drag: dict) -> None:
+        """Reseek once at release and merge local tracks into the view."""
+        center = getattr(self, "_mcd_peak_manual_center_ev", None)
+        channel = str(getattr(self, "_mcd_peak_manual_center_channel", None) or drag.get("channel", ""))
+        index = getattr(self, "_mcd_peak_manual_center_field_index", None)
+        source = self.loaded.mcd_result if self.loaded is not None else None
+        if source is None or center is None or channel not in {"pos", "neg"} or index is None:
+            return
+        selected_method = self.mcd_peak_tracker_method_combo.currentText()
+        branch = self.mcd_peak_branch_combo.currentText()
+        selected = self.mcd_peak_selector_combo.currentData()
+        selected_kind = str(selected[3]) if selected is not None and len(selected) == 4 else "peak"
+        index = int(index)
+        source_fields = np.asarray(source.pair_b, float)
+        self.mcd_peak_status.setText(f"Searching near E = {float(center):.6g} eV…")
+        if selected_method == "Local mixed fit":
+            selected_id = int(selected[1]) if selected is not None and len(selected) == 4 else 1
+            pending = (channel, selected_id, branch, selected_kind)
+            self._mcd_peak_local_pending_selection = pending
+            self._clear_mcd_peak_manual_center()
+            self._request_mcd_local_fit(
+                seed_energy_ev=float(center), locator_energy_ev=float(center),
+                feature_kind=selected_kind, selection_key=pending,
+            )
+            return
+        def effective_fields(target_channel: str) -> np.ndarray:
+            values = np.asarray(getattr(source, f"pair_b_{target_channel}", source.pair_b), float)
+            interpolated = np.asarray(
+                getattr(source, f"pair_interpolated_{target_channel}", np.zeros(values.size, dtype=bool)),
+                bool,
+            )
+            return np.where(interpolated, source_fields, values) if interpolated.size == values.size else values
+
+        def local_by_branch(seeded: Any, target_channel: str) -> dict[str, Any]:
+            fields = effective_fields(target_channel)
+            if index < 0 or index >= fields.size or not np.isfinite(fields[index]):
+                return {}
+            target_field = float(fields[index])
+            candidates: dict[str, list[tuple[float, Any]]] = {}
+            for track in seeded.tracks:
+                if str(track.feature_kind) != selected_kind or track.quality == BOUNDARY_UNRELIABLE:
+                    continue
+                points = [
+                    item for item in track.points
+                    if item.status == "tracked"
+                    and item.energy_ev is not None
+                    and np.isfinite(item.energy_ev)
+                    and np.isfinite(item.field_t)
+                ]
+                point = min(points, key=lambda item: abs(float(item.field_t) - target_field)) if points else None
+                if point is not None and abs(float(point.energy_ev) - float(center)) <= 0.005 + 1e-9:
+                    candidates.setdefault(str(track.branch), []).append((abs(float(point.energy_ev) - float(center)), track))
+            return {name: min(items, key=lambda item: item[0])[1] for name, items in candidates.items()}
+
+        seeded_results: dict[tuple[str, str], dict[str, Any]] = {}
+        seed_errors: list[str] = []
+        for method in ("Raw spectrum", "Second derivative"):
+            for target_channel in ("pos", "neg"):
+                fields = effective_fields(target_channel)
+                if index < 0 or index >= fields.size or not np.isfinite(fields[index]):
+                    continue
+                try:
+                    adapted = copy.copy(source)
+                    adapted.pair_b = fields
+                    seeded = analyze_peak_shift(
+                        adapted,
+                        source=_mcd_fit_source_for_channel(self.mcd_peak_source_combo.currentText(), target_channel),
+                        prominence_fraction=self.mcd_peak_prom_spin.value(),
+                        min_distance_points=self.mcd_peak_dist_spin.value(),
+                        smoothing_points=self.mcd_peak_smooth_spin.value(),
+                        max_jump_ev=self.mcd_peak_jump_spin.value(),
+                        max_peaks=self.mcd_peak_max_spin.value(),
+                        tracking_method=method,
+                        derivative_window_points=self.mcd_peak_deriv_window_spin.value(),
+                        seed_energy_ev=float(center),
+                        seed_half_width_ev=0.005,
+                        seed_field_t=float(fields[index]),
+                    )
+                except Exception as exc:
+                    seed_errors.append(f"{method} {target_channel}: {exc}")
+                    continue
+                seeded_results[(method, target_channel)] = local_by_branch(seeded, target_channel)
+
+        selected_local = seeded_results.get((selected_method, channel), {}).get(branch)
+        if selected_local is None:
+            selected_error = next(
+                (item for item in seed_errors if item.startswith(f"{selected_method} {channel}:")),
+                None,
+            )
+            message = f"No reliable local feature near E = {float(center):.6g} eV."
+            if selected_error:
+                message += f" Search error: {selected_error.split(': ', 1)[1]}"
+            self.mcd_peak_status.setText(message)
+            self.mcd_peak_selector_combo.blockSignals(True)
+            self.mcd_peak_selector_combo.setCurrentIndex(-1)
+            self.mcd_peak_selector_combo.blockSignals(False)
+            self._refresh_mcd_peak_plot()
+            return
+
+        chosen_keys: dict[tuple[str, str, str], tuple] = {}
+        for (method, target_channel), by_branch in seeded_results.items():
+            current = self.mcd_peak_method_results.setdefault(method, {}).get(target_channel)
+            if current is None:
+                continue
+            fields = effective_fields(target_channel)
+            target_field = float(fields[index])
+            merged_tracks = list(current.tracks)
+            next_id = max((int(track.peak_id) for track in merged_tracks), default=0) + 1
+            energy_grid = np.sort(np.asarray(source.energy_ev, float))
+            finite_grid = energy_grid[np.isfinite(energy_grid)]
+            grid_step = float(np.nanmedian(np.diff(finite_grid))) if finite_grid.size > 1 else 0.001
+            match_tolerance = min(0.003, max(0.001, 2.0 * abs(grid_step)))
+            for target_branch, local_track in by_branch.items():
+                matches = []
+                local_points = [
+                    point for point in local_track.points
+                    if point.energy_ev is not None and np.isfinite(point.energy_ev) and np.isfinite(point.field_t)
+                ]
+                local_point = min(local_points, key=lambda point: abs(float(point.field_t) - target_field), default=None)
+                for existing_index, existing in enumerate(merged_tracks):
+                    if str(existing.branch) != target_branch or str(existing.feature_kind) != selected_kind:
+                        continue
+                    existing_points = [
+                        point for point in existing.points
+                        if point.energy_ev is not None and np.isfinite(point.energy_ev) and np.isfinite(point.field_t)
+                    ]
+                    existing_point = min(existing_points, key=lambda point: abs(float(point.field_t) - target_field), default=None)
+                    ref_distance = (
+                        abs(float(existing.reference_energy_ev) - float(local_track.reference_energy_ev))
+                        if existing.reference_energy_ev is not None and local_track.reference_energy_ev is not None
+                        else float("inf")
+                    )
+                    point_distance = (
+                        abs(float(existing_point.energy_ev) - float(local_point.energy_ev))
+                        if existing_point is not None and local_point is not None
+                        else float("inf")
+                    )
+                    distance = min(ref_distance, point_distance)
+                    if distance <= match_tolerance:
+                        matches.append((distance, existing_index, ref_distance, point_distance))
+                replacement_index = None
+                if matches:
+                    matches.sort(key=lambda item: (item[0], item[1]))
+                    best_distance = matches[0][0]
+                    tied = [item for item in matches if abs(item[0] - best_distance) <= 1e-9]
+                    # An exact point match identifies the previously merged
+                    # manual track. Otherwise a numerical tie is ambiguous;
+                    # append a distinct track instead of overwriting a nearby
+                    # physical resonance.
+                    exact = [item for item in tied if item[3] <= 1e-9]
+                    if len(exact) == 1:
+                        replacement_index = exact[0][1]
+                    elif len(tied) == 1:
+                        replacement_index = tied[0][1]
+                peak_id = int(merged_tracks[replacement_index].peak_id) if replacement_index is not None else next_id
+                if replacement_index is None:
+                    next_id += 1
+                merged_track = replace(local_track, peak_id=peak_id)
+                if replacement_index is None:
+                    merged_tracks.append(merged_track)
+                else:
+                    merged_tracks[replacement_index] = merged_track
+                if method == selected_method and target_channel == channel and target_branch == branch:
+                    chosen_keys[(method, target_channel, target_branch)] = (target_channel, peak_id, target_branch, selected_kind)
+            self.mcd_peak_method_results[method][target_channel] = replace(current, tracks=tuple(merged_tracks))
+
+        self.mcd_peak_channel_results = self.mcd_peak_method_results[selected_method]
+        self.mcd_peak_result = self.mcd_peak_channel_results.get("pos")
+        self._populate_mcd_peak_preview_controls()
+        self._populate_mcd_peak_table()
+        self.mcd_peak_export_btn.setEnabled(
+            any(
+                track.quality != BOUNDARY_UNRELIABLE
+                for analysis in self.mcd_peak_channel_results.values()
+                for track in analysis.tracks
+            )
+        )
+        key = chosen_keys.get((selected_method, channel, branch))
+        if key is None:
+            key = (channel, int(selected_local.peak_id), branch, selected_kind)
+        combo_index = -1
+        for item_index in range(self.mcd_peak_selector_combo.count()):
+            value = self.mcd_peak_selector_combo.itemData(item_index)
+            if value is not None and len(value) == 4 and tuple(value) == tuple(key):
+                combo_index = item_index
+                break
+        if combo_index >= 0:
+            self.mcd_peak_selector_combo.setCurrentIndex(combo_index)
+        else:
+            self.mcd_peak_selector_combo.setCurrentIndex(-1)
+        status = (
+            f"Center E = {float(center):.6g} eV · local {selected_kind} tracked; "
+            "tracked E remains separate from the manual center."
+        )
+        if seed_errors:
+            status += " Some paired searches failed: " + "; ".join(seed_errors)
+        self.mcd_peak_status.setText(status)
+        self._refresh_mcd_peak_plot()
 
     def _on_mcd_valley_pair_changed(self) -> None:
         if self.mcd_peak_result is not None:
@@ -1313,19 +2273,86 @@ class FeatureTabsMixin:
         if not path: return
         with open(path, "w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle); writer.writerow([
-                "peak_id", "B_T", "branch", "E_peak_eV", "delta_E_eV", "status",
+                "peak_id", "feature_kind", "B_T", "branch", "E_peak_eV", "delta_E_eV", "status",
                 "reference_method", "reference_field_T", "selected_K_peak_id",
                 "selected_Kp_peak_id", "E_K_eV", "E_Kp_eV", "delta_E_K_eV",
                 "delta_E_Kp_eV", "delta_E_Kp_minus_K_eV", "average_E_eV",
                 "odd_average_E_eV", "even_average_E_eV", "odd_splitting_eV",
-                "even_splitting_eV",
+                "even_splitting_eV", "channel", "fit_source", "fit_window_low_eV",
+                "fit_window_high_eV", "background_model", "locator_energy_eV",
+                "model_name", "valley_status",
             ])
-            valleys = {(round(float(value["B_T"]), 9), str(value["branch"])): value for value in valley_quantities(self.mcd_peak_result, (self.mcd_peak_k_combo.currentData(), self.mcd_peak_kp_combo.currentData()))}
+            if self.mcd_peak_tracker_method_combo.currentText() == "Local mixed fit":
+                selected = self.mcd_peak_selector_combo.currentData()
+                if selected is None or len(selected) != 4:
+                    self.mcd_peak_status.setText("Local fit export needs a selected resonance.")
+                    return
+                channel, peak_id, branch, feature_kind = selected
+                local_analysis = self.mcd_peak_method_results.get("Local mixed fit", {})
+                selected_analysis = local_analysis.get(str(channel))
+                local_track = next((track for track in selected_analysis.tracks if track.peak_id == int(peak_id) and track.branch == str(branch) and track.feature_kind == str(feature_kind)), None) if selected_analysis is not None else None
+                target_energy = local_track.reference_energy_ev if local_track is not None else None
+                if target_energy is None:
+                    self.mcd_peak_status.setText("Local fit export needs a fitted E0 reference.")
+                    return
+                # Use the same per-branch valley routine as the page.  Fix the
+                # positive-field K/K' ordering once, then apply it to every
+                # branch so exported splitting values match the displayed plot.
+                branch_names = [str(value) for value in dict.fromkeys(np.asarray(self.loaded.mcd_result.pair_labels, str).tolist())]
+                splits = {
+                    direction: compute_valley_splitting(
+                        self.mcd_peak_method_results, method="Local mixed fit", selected_channel=str(channel),
+                        branch=direction, target_energy_ev=float(target_energy), tolerance_ev=0.005,
+                        feature_kind=str(feature_kind), allow_energy_fallback=False,
+                    )
+                    for direction in branch_names
+                }
+                fixed_k = next((item.k_channel for item in splits.values() if item.k_channel in {"pos", "neg"}), None)
+                if fixed_k in {"pos", "neg"}:
+                    splits = {
+                        direction: compute_valley_splitting(
+                            self.mcd_peak_method_results, method="Local mixed fit", selected_channel=str(channel),
+                            branch=direction, target_energy_ev=float(target_energy), tolerance_ev=0.005,
+                            fixed_k_channel=fixed_k, feature_kind=str(feature_kind), allow_energy_fallback=False,
+                        )
+                        for direction in branch_names
+                    }
+                first_analysis = next(iter(local_analysis.values()), None)
+                fit_window = getattr(first_analysis, "fit_window_ev", None)
+                window_low = fit_window[0] if fit_window else None
+                window_high = fit_window[1] if fit_window else None
+                background_model = str(self.mcd_peak_background_combo.currentText()).replace(" background", "").casefold()
+                model_name = getattr(first_analysis, "model_name", None)
+                for local_channel, analysis in local_analysis.items():
+                    for track in analysis.tracks:
+                        for point in track.points:
+                            split = splits.get(str(point.branch))
+                            split_point = next((item for item in split.points if abs(float(item.field_t) - float(point.field_t)) <= 1e-12), None) if split is not None else None
+                            writer.writerow([
+                                track.peak_id, track.feature_kind, point.field_t, point.branch,
+                                point.energy_ev, point.delta_energy_ev, point.status,
+                                track.reference_method, track.reference_field_t,
+                                self.mcd_peak_k_combo.currentData(), self.mcd_peak_kp_combo.currentData(),
+                                None, None, None, None,
+                                None if split_point is None else split_point.splitting_ev,
+                                None, None, None, None, None,
+                                local_channel, self.mcd_peak_source_combo.currentText(), window_low,
+                                window_high, background_model, track.locator_energy_ev,
+                                track.model_name or model_name,
+                                None if split is None else split.status,
+                            ])
+                self.mcd_peak_status.setText(f"Exported {path}")
+                return
+            visible_result = replace(self.mcd_peak_result, tracks=tuple(track for track in self.mcd_peak_result.tracks if track.quality != BOUNDARY_UNRELIABLE))
+            selected_ids = (self.mcd_peak_k_combo.currentData(), self.mcd_peak_kp_combo.currentData())
+            valleys = {(round(float(value["B_T"]), 9), str(value["branch"])): value for value in valley_quantities(visible_result, selected_ids)} if all(value is not None for value in selected_ids) else {}
             for track in self.mcd_peak_result.tracks:
+                if track.quality == BOUNDARY_UNRELIABLE:
+                    continue
                 for point in track.points:
-                    valley = valleys.get((round(point.field_t, 9), point.branch), {})
+                    valley = valleys.get((round(point.field_t, 9), point.branch), {}) if track.feature_kind == "peak" else {}
                     writer.writerow([
-                        track.peak_id, point.field_t, point.branch, point.energy_ev,
+                        track.peak_id, track.feature_kind, point.field_t, point.branch, point.energy_ev,
                         point.delta_energy_ev, point.status, track.reference_method,
                         track.reference_field_t, self.mcd_peak_k_combo.currentData(),
                         self.mcd_peak_kp_combo.currentData(), valley.get("E_K"),
@@ -1333,7 +2360,7 @@ class FeatureTabsMixin:
                         valley.get("delta_E_Kp"), valley.get("splitting_E_Kp_minus_E_K"),
                         valley.get("average_E"), valley.get("odd_average_E"),
                         valley.get("even_average_E"), valley.get("odd_splitting"),
-                        valley.get("even_splitting"),
+                        valley.get("even_splitting"), "", "", "", "", "", "", "", "",
                     ])
         self.mcd_peak_status.setText(f"Exported {path}")
 

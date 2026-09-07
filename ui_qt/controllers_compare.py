@@ -49,6 +49,12 @@ class CompareController:
             if Path(source).suffix.lower() in {".csv", ".xlsx"}
             and data_io.classify_pl_source(source) != "DAT"
         ]
+        # Older callers populate only ``available_files``. Keep that direct
+        # assignment path usable while the dedicated PL catalog is empty;
+        # once the PL catalog has entries, the explicit type filter remains
+        # authoritative for normal source discovery.
+        if not pl_sources and getattr(self, "available_files", None):
+            return raw_sources
         if self._cmp_source_filter() == "all":
             return raw_sources
         return [source for source in raw_sources if data_io.classify_pl_source(source) == "PL"]

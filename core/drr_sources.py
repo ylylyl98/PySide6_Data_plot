@@ -134,6 +134,125 @@ class DrrSavedRecipe:
     baseline_which: str
     metadata_path: str
     saved_time: float
+    member_assignments: tuple["DrrMeasurementAssignment", ...] = ()
+    assignment_metadata_present: bool = False
+    assignment_metadata_valid: bool = True
+
+
+@dataclass(frozen=True)
+class DrrMeasurementAssignment:
+    """Validated numerical background choice for one measurement file."""
+
+    measurement_file: str
+    baseline_mode: str = "Self (last frame)"
+    baseline_files: tuple[str, ...] = ()
+    baseline_which: str = "last"
+    source_recipe: str = ""
+    selection_reason: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.measurement_file, str) or not self.measurement_file.strip():
+            raise ValueError("DRR assignment measurement must be a non-empty string.")
+        if not isinstance(self.baseline_files, (list, tuple)):
+            raise ValueError("DRR assignment baseline_files must be a list of strings.")
+        if any(not isinstance(item, str) or not item.strip() for item in self.baseline_files):
+            raise ValueError("DRR assignment baseline_files must contain non-empty strings.")
+        if not isinstance(self.source_recipe, str) or not isinstance(self.selection_reason, str):
+            raise ValueError("DRR assignment metadata fields must be strings.")
+        if not isinstance(self.baseline_mode, str) or not self.baseline_mode.strip():
+            raise ValueError("DRR assignment baseline mode must be a non-empty string.")
+        if not isinstance(self.baseline_which, str) or not self.baseline_which.strip():
+            raise ValueError("DRR assignment frame method must be a non-empty string.")
+        mode = self.baseline_mode
+        if mode not in {"Self (first frame)", "Self (last frame)", "External"}:
+            raise ValueError(f"Unsupported DRR baseline mode: {mode!r}")
+        which = self.baseline_which.casefold()
+        if which not in {"first", "last", "all"}:
+            raise ValueError(f"Unsupported DRR baseline frame method: {which!r}")
+        files = tuple(self.baseline_files)
+        if mode == "External" and not files:
+            raise ValueError("External DRR assignment requires baseline files.")
+        if mode != "External" and files:
+            raise ValueError("Self DRR assignment cannot contain baseline files.")
+        object.__setattr__(self, "baseline_mode", mode)
+        object.__setattr__(self, "baseline_files", files)
+        object.__setattr__(self, "baseline_which", which)
+
+    @property
+    def measurement(self) -> str:
+        return self.measurement_file
+
+    @property
+    def background_files(self) -> tuple[str, ...]:
+        return self.baseline_files
+
+    @property
+    def frame_method(self) -> str:
+        return self.baseline_which
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "measurement": self.measurement_file,
+            "baseline_mode": self.baseline_mode,
+            "baseline_files": list(self.baseline_files),
+            "baseline_which": self.baseline_which,
+            "source_recipe": self.source_recipe,
+            "selection_reason": self.selection_reason,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "DrrMeasurementAssignment":
+        if not isinstance(value, dict):
+            raise ValueError("DRR assignment must be an object.")
+        measurement = value.get("measurement", value.get("measurement_file"))
+        if not isinstance(measurement, str) or not measurement.strip():
+            raise ValueError("DRR assignment is missing measurement.")
+        raw_files = value.get("baseline_files", value.get("background_files", ()))
+        if isinstance(raw_files, str):
+            raise ValueError("DRR assignment baseline_files must be a list of strings.")
+        if not isinstance(raw_files, (list, tuple)):
+            raise ValueError("DRR assignment baseline_files must be a list of strings.")
+        if any(not isinstance(item, str) or not item.strip() for item in raw_files):
+            raise ValueError("DRR assignment baseline_files must contain non-empty strings.")
+        raw_mode = value.get("baseline_mode", value.get("mode", "External" if raw_files else "Self (last frame)"))
+        raw_which = value.get("baseline_which", value.get("frame_method", "last"))
+        if not isinstance(raw_mode, str) or not isinstance(raw_which, str):
+            raise ValueError("DRR assignment mode and frame method must be strings.")
+        raw_recipe = value.get("source_recipe", value.get("recipe", ""))
+        raw_reason = value.get("selection_reason", value.get("reason", ""))
+        if raw_recipe is not None and not isinstance(raw_recipe, str):
+            raise ValueError("DRR assignment source_recipe must be a string.")
+        if raw_reason is not None and not isinstance(raw_reason, str):
+            raise ValueError("DRR assignment selection_reason must be a string.")
+        return cls(
+            measurement_file=measurement,
+            baseline_mode=raw_mode,
+            baseline_files=tuple(raw_files),
+            baseline_which=raw_which,
+            source_recipe=raw_recipe or "",
+            selection_reason=raw_reason or "",
+        )
+
+
+@dataclass(frozen=True)
+class DrrBackgroundResolution:
+    assignments: tuple[DrrMeasurementAssignment, ...] = ()
+    numerical_path: str = "unresolved"
+    reason: str = ""
+    unresolved_measurements: tuple[str, ...] = ()
+
+    @property
+    def resolved(self) -> bool:
+        return bool(self.assignments) and not self.unresolved_measurements
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "selection_method": "automatic_per_measurement",
+            "numerical_path": self.numerical_path,
+            "reason": self.reason,
+            "unresolved_measurements": list(self.unresolved_measurements),
+            "assignments": [item.to_dict() for item in self.assignments],
+        }
 
 
 @dataclass(frozen=True)
@@ -287,6 +406,40 @@ def _metadata_source_name(root: Path, item: dict[str, object], *, require_exists
     return None if require_exists else fallback
 
 
+def _metadata_assignment_source(
+    root: Path,
+    raw_source: str,
+    descriptors: Sequence[dict[str, object]],
+    *,
+    role: str,
+) -> str | None:
+    """Resolve an assignment path through its corresponding source descriptor.
+
+    Exported assignments historically contained only an absolute path.  When
+    an experiment folder moves, the source descriptor's portable ``name`` is
+    the authoritative recovery hint.  Match by any recorded path, then let
+    ``_metadata_source_name`` prefer the first existing descriptor path.
+    """
+    if not isinstance(raw_source, str) or not raw_source.strip():
+        return None
+    raw = raw_source.replace("\\", "/").casefold()
+    raw_identity = str(resolve_source_path(root, raw_source)).casefold()
+    for descriptor in descriptors:
+        if str(descriptor.get("role") or "").casefold() != role:
+            continue
+        aliases = [
+            value for key in ("source_path", "path", "processing_input_path", "name")
+            if isinstance((value := descriptor.get(key)), str) and value.strip()
+        ]
+        if any(
+            alias.replace("\\", "/").casefold() == raw
+            or str(resolve_source_path(root, alias)).casefold() == raw_identity
+            for alias in aliases
+        ):
+            return _metadata_source_name(root, descriptor)
+    return _metadata_source_name(root, {"source_path": raw_source})
+
+
 def _read_drr_metadata(
     root: Path, *, require_drr_operation: bool = False
 ) -> tuple[dict[str, set[str]], list[DrrSavedRecipe]]:
@@ -319,6 +472,7 @@ def _read_drr_metadata(
             continue
         measurements: list[str] = []
         baselines: list[str] = []
+        descriptors: list[dict[str, object]] = [item for item in inputs if isinstance(item, dict)]
         for item in inputs:
             if not isinstance(item, dict):
                 continue
@@ -339,6 +493,98 @@ def _read_drr_metadata(
         processing = payload.get("processing", {})
         if not isinstance(processing, dict):
             processing = {}
+        assignment_present = False
+        raw_assignments: object = None
+        for container in (processing, payload):
+            for key in ("drr_background_assignments", "background_assignments"):
+                if key in container:
+                    raw_assignments = container[key]
+                    assignment_present = True
+                    break
+            if assignment_present:
+                break
+        if (
+            not assignment_present
+            and isinstance(processing.get("drr_background_selection"), dict)
+            and "assignments" in processing["drr_background_selection"]
+        ):
+            raw_assignments = processing["drr_background_selection"]["assignments"]
+            assignment_present = True
+        assignment_valid = True
+        member_assignments: list[DrrMeasurementAssignment] = []
+        if assignment_present:
+            if isinstance(raw_assignments, dict):
+                entries = []
+                for key, item in raw_assignments.items():
+                    if not isinstance(key, str) or not isinstance(item, dict):
+                        assignment_valid = False
+                        break
+                    declared = item.get("measurement", item.get("measurement_file"))
+                    if declared is not None and declared != key:
+                        assignment_valid = False
+                        break
+                    entry = dict(item)
+                    entry.setdefault("measurement", key)
+                    entries.append(entry)
+            else:
+                entries = raw_assignments
+            if not isinstance(entries, (list, tuple)):
+                assignment_valid = False
+            else:
+                for item in entries:
+                    try:
+                        if isinstance(item, dict):
+                            has_mode = "baseline_mode" in item or "mode" in item
+                            raw_files = item.get("baseline_files", item.get("background_files", ()))
+                            # An assignment entry with no external members and
+                            # no explicit mode is ambiguous; do not reinterpret
+                            # it as a legacy Self-last recipe.
+                            if not has_mode and not isinstance(raw_files, (list, tuple)):
+                                raise ValueError("assignment mode is missing")
+                            if not has_mode and not raw_files:
+                                raise ValueError("assignment mode is missing")
+                        parsed = DrrMeasurementAssignment.from_mapping(item)
+                        measurement_source = _metadata_assignment_source(
+                            root, parsed.measurement_file, descriptors, role="measurement"
+                        )
+                        baseline_sources = tuple(
+                            _metadata_assignment_source(root, source, descriptors, role="background")
+                            or source
+                            for source in parsed.baseline_files
+                        )
+                        if measurement_source is None or any(not str(source).strip() for source in baseline_sources):
+                            raise ValueError("assignment source is empty")
+                        member_assignments.append(
+                            DrrMeasurementAssignment(
+                                measurement_file=measurement_source,
+                                baseline_mode=parsed.baseline_mode,
+                                baseline_files=baseline_sources,
+                                baseline_which=parsed.baseline_which,
+                                source_recipe=parsed.source_recipe or portable_source_name(root, metadata_path),
+                                selection_reason=parsed.selection_reason,
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        assignment_valid = False
+                        break
+                if assignment_valid:
+                    measurement_ids = [
+                        str(resolve_source_path(root, source)).casefold()
+                        for source in measurements
+                    ]
+                    assignment_ids = [
+                        str(resolve_source_path(root, item.measurement_file)).casefold()
+                        for item in member_assignments
+                    ]
+                    # The mapping is a complete keyed relation.  A partial,
+                    # duplicate, or extra entry must never fall back to the
+                    # legacy flat background union.
+                    if (
+                        len(assignment_ids) != len(set(assignment_ids))
+                        or len(measurement_ids) != len(set(measurement_ids))
+                        or set(assignment_ids) != set(measurement_ids)
+                    ):
+                        assignment_valid = False
         try:
             saved_time = float(metadata_path.stat().st_mtime)
         except OSError:
@@ -354,6 +600,9 @@ def _read_drr_metadata(
                 baseline_which=str(processing.get("baseline_which") or "last"),
                 metadata_path=str(metadata_path),
                 saved_time=saved_time,
+                member_assignments=tuple(member_assignments),
+                assignment_metadata_present=assignment_present,
+                assignment_metadata_valid=assignment_valid,
             )
         )
     return roles, records
@@ -413,6 +662,15 @@ def find_saved_drr_recipe(
         }
         if found != wanted:
             continue
+        if record.assignment_metadata_present:
+            if not record.assignment_metadata_valid or not record.member_assignments:
+                continue
+            signatures = {_drr_assignment_signature(item) for item in record.member_assignments}
+            # A heterogeneous member mapping cannot be represented by this
+            # legacy exact-recipe return type without flattening assignments
+            # into a misleading common union.
+            if len(signatures) != 1:
+                continue
         matches.append(DrrSavedRecipe(
             measurement_files=record.measurement_files,
             baseline_files=record.baseline_files,
@@ -420,8 +678,239 @@ def find_saved_drr_recipe(
             baseline_which=record.baseline_which,
             metadata_path=record.metadata_path,
             saved_time=record.saved_time,
+            member_assignments=record.member_assignments,
+            assignment_metadata_present=record.assignment_metadata_present,
+            assignment_metadata_valid=record.assignment_metadata_valid,
         ))
     return max(matches, key=lambda recipe: recipe.saved_time, default=None)
+
+
+def _drr_assignment_signature(assignment: DrrMeasurementAssignment) -> tuple[object, ...]:
+    return (
+        assignment.baseline_mode,
+        assignment.baseline_which,
+        tuple(assignment.baseline_files),
+    )
+
+
+def resolve_drr_background_assignments(
+    root: str | Path,
+    catalog: Sequence[DrrSource],
+    measurement_files: Sequence[str],
+    *,
+    explicit_baseline_files: Sequence[str] | None = None,
+    explicit_baseline_mode: str | None = None,
+    explicit_baseline_which: str = "last",
+) -> DrrBackgroundResolution:
+    """Resolve a concrete baseline for every selected measurement.
+
+    Explicit UI choices are authoritative.  Otherwise the newest valid saved
+    member association wins; equal-time conflicting records and incomplete
+    records remain unresolved.  The fallback deliberately accepts only one
+    high-confidence, exact-grid candidate per measurement.
+    """
+    experiment_root = Path(root).resolve()
+    selected = tuple(dict.fromkeys(str(item) for item in measurement_files if str(item).strip()))
+    if not selected:
+        return DrrBackgroundResolution(reason="No DRR measurements selected.")
+
+    mode = str(explicit_baseline_mode or "").strip()
+    explicit = explicit_baseline_files is not None or bool(mode)
+    if explicit:
+        if not mode:
+            mode = "External" if explicit_baseline_files else "Self (last frame)"
+        if mode == "External" and not explicit_baseline_files:
+            return DrrBackgroundResolution(
+                reason="External DRR mode requires baseline files.",
+                unresolved_measurements=selected,
+            )
+        try:
+            assignment = DrrMeasurementAssignment(
+                measurement_file=selected[0],
+                baseline_mode=mode,
+                baseline_files=tuple(explicit_baseline_files or ()),
+                baseline_which=explicit_baseline_which,
+                selection_reason="explicit user baseline selection",
+            )
+        except ValueError as exc:
+            return DrrBackgroundResolution(reason=str(exc), unresolved_measurements=selected)
+        assignments = tuple(
+            DrrMeasurementAssignment(
+                measurement_file=name,
+                baseline_mode=assignment.baseline_mode,
+                baseline_files=assignment.baseline_files,
+                baseline_which=assignment.baseline_which,
+                selection_reason=assignment.selection_reason,
+            )
+            for name in selected
+        )
+        missing = tuple(
+            source for source in assignment.baseline_files
+            if not resolve_source_path(experiment_root, source).is_file()
+        )
+        if missing:
+            return DrrBackgroundResolution(
+                reason=f"Explicit DRR baseline is unavailable: {', '.join(missing)}",
+                unresolved_measurements=selected,
+            )
+        return DrrBackgroundResolution(
+            assignments=assignments,
+            numerical_path="common",
+            reason="explicit user baseline selection",
+        )
+
+    _roles, records = _read_drr_metadata(experiment_root, require_drr_operation=True)
+    records_by_measurement: dict[str, list[DrrSavedRecipe]] = {}
+    for record in records:
+        for source in record.measurement_files:
+            identity = str(resolve_source_path(experiment_root, source)).casefold()
+            records_by_measurement.setdefault(identity, []).append(record)
+
+    assignments: list[DrrMeasurementAssignment] = []
+    unresolved: list[str] = []
+    reasons: list[str] = []
+    for measurement in selected:
+        identity = str(resolve_source_path(experiment_root, measurement)).casefold()
+        history = records_by_measurement.get(identity, [])
+        assignment: DrrMeasurementAssignment | None = None
+        if history:
+            newest_time = max(record.saved_time for record in history)
+            newest = [record for record in history if record.saved_time == newest_time]
+            candidates: list[DrrMeasurementAssignment] = []
+            if any(
+                record.assignment_metadata_present and not record.assignment_metadata_valid
+                for record in newest
+            ):
+                unresolved.append(measurement)
+                reasons.append(f"malformed saved assignment for {measurement}")
+                continue
+            for record in newest:
+                if not record.assignment_metadata_valid:
+                    continue
+                member = next(
+                    (
+                        item for item in record.member_assignments
+                        if str(resolve_source_path(experiment_root, item.measurement_file)).casefold() == identity
+                    ),
+                    None,
+                )
+                if record.assignment_metadata_present and member is None:
+                    continue
+                if member is None:
+                    mode_text = record.baseline_selection
+                    if record.baseline_files or mode_text == "External":
+                        mode_text = "External"
+                    elif "first" in mode_text.casefold():
+                        mode_text = "Self (first frame)"
+                    else:
+                        mode_text = "Self (last frame)"
+                    try:
+                        member = DrrMeasurementAssignment(
+                            measurement_file=measurement,
+                            baseline_mode=mode_text,
+                            baseline_files=record.baseline_files,
+                            baseline_which=record.baseline_which,
+                            source_recipe=portable_source_name(experiment_root, record.metadata_path),
+                            selection_reason="newest saved DRR recipe",
+                        )
+                    except ValueError:
+                        continue
+                else:
+                    member = DrrMeasurementAssignment(
+                        measurement_file=measurement,
+                        baseline_mode=member.baseline_mode,
+                        baseline_files=member.baseline_files,
+                        baseline_which=member.baseline_which,
+                        source_recipe=member.source_recipe,
+                        selection_reason=member.selection_reason or "newest saved DRR member assignment",
+                    )
+                candidates.append(member)
+            if candidates:
+                signatures = {_drr_assignment_signature(item) for item in candidates}
+                if len(signatures) == 1:
+                    assignment = candidates[0]
+                    reasons.append("saved member assignment")
+                else:
+                    unresolved.append(measurement)
+                    reasons.append(f"conflicting saved assignments for {measurement}")
+            else:
+                unresolved.append(measurement)
+                reasons.append(f"invalid or incomplete saved assignment for {measurement}")
+        else:
+            guess = guess_drr_background(experiment_root, catalog, [measurement])
+            sufficient_data = False
+            if guess is not None:
+                try:
+                    sample_energy, sample_spectra = _measurement_spectral_sample(
+                        experiment_root, [measurement]
+                    )
+                    finite_counts = np.count_nonzero(np.isfinite(sample_spectra), axis=1)
+                    sufficient_data = (
+                        sample_energy.size >= 8
+                        and finite_counts.size > 0
+                        and float(np.nanmedian(finite_counts)) >= max(8, int(np.ceil(0.5 * sample_energy.size)))
+                    )
+                    if sufficient_data:
+                        background_energy, background = _background_group_spectrum(
+                            experiment_root, guess.baseline_files, guess.baseline_which
+                        )
+                        if not _same_spectral_grid(sample_energy, background_energy):
+                            sufficient_data = False
+                        else:
+                            joint_finite = np.isfinite(background) & np.any(
+                                np.isfinite(sample_spectra), axis=0
+                            )
+                            sufficient_data = (
+                                int(np.count_nonzero(joint_finite))
+                                >= max(8, int(np.ceil(0.5 * sample_energy.size)))
+                            )
+                except (OSError, ValueError):
+                    sufficient_data = False
+            if (
+                guess is not None
+                and sufficient_data
+                and guess.confidence == "high"
+                and guess.candidate_group_count == 1
+                and guess.points_within_tolerance_percent is not None
+                and guess.points_within_tolerance_percent >= 50.0
+            ):
+                try:
+                    assignment = DrrMeasurementAssignment(
+                        measurement_file=measurement,
+                        baseline_mode="External",
+                        baseline_files=guess.baseline_files,
+                        baseline_which=guess.baseline_which,
+                        selection_reason=guess.reason,
+                    )
+                    reasons.append("high-confidence exact-grid candidate")
+                except ValueError:
+                    assignment = None
+            if assignment is None:
+                unresolved.append(measurement)
+                reasons.append(f"no unambiguous high-confidence baseline for {measurement}")
+
+        if assignment is not None:
+            missing = [
+                source for source in assignment.baseline_files
+                if not resolve_source_path(experiment_root, source).is_file()
+            ]
+            if missing:
+                unresolved.append(measurement)
+                reasons.append(f"recorded baseline missing for {measurement}")
+            else:
+                assignments.append(assignment)
+
+    if unresolved:
+        return DrrBackgroundResolution(
+            reason="; ".join(dict.fromkeys(reasons)),
+            unresolved_measurements=tuple(dict.fromkeys(unresolved)),
+        )
+    signatures = {_drr_assignment_signature(item) for item in assignments}
+    return DrrBackgroundResolution(
+        assignments=tuple(assignments),
+        numerical_path="common" if len(signatures) == 1 else "heterogeneous",
+        reason="; ".join(dict.fromkeys(reasons)),
+    )
 
 
 def guess_drr_background(
@@ -464,9 +953,10 @@ def guess_drr_background(
     for source in catalog:
         if not source.is_background or Path(source.source).suffix.lower() != ".csv":
             continue
-        if (
-            source.wavelength_center_nm is not None
-            and not wavelength_centers_match(centers[0], source.wavelength_center_nm)
+        if not _conditions_compatible(measurements, source):
+            continue
+        if source.wavelength_center_nm is None or not wavelength_centers_match(
+            centers[0], source.wavelength_center_nm
         ):
             continue
         compatible.append(source)
@@ -480,10 +970,10 @@ def guess_drr_background(
             which = "all"
             gate_reason = "constant matching gates; averaging all frames and files"
         elif gate.all_constant:
-            latest = max(group.files, key=lambda source: source.modified_time)
-            chosen = (latest.source,)
-            which = "all"
-            gate_reason = "different constant gates; using only the closest file"
+            # Multiple constant gate values in one candidate group are
+            # competing acquisitions.  Selecting the newest one would hide
+            # ambiguity and can pair a measurement with the wrong point.
+            continue
         else:
             chosen = tuple(files)
             which = "last"
@@ -694,6 +1184,52 @@ def _raw_spectrum_overlap_metrics(
         float(np.nanmedian(differences)),
         float(np.nanmedian(correlations)),
         float(np.nanmedian(within)),
+    )
+
+
+def _known_acquisition_conditions(name: str) -> dict[str, str]:
+    """Extract only unambiguous condition tokens used for auto matching."""
+    stem = Path(name).stem
+    conditions: dict[str, str] = {}
+    temp = re.search(r"(?<![A-Za-z0-9])(?P<value>\d+(?:[pP.]\d+)?)K(?:_|-|$|[A-Za-z])", stem, re.IGNORECASE)
+    if temp:
+        conditions["temperature"] = temp.group("value").replace("p", ".").replace("P", ".")
+    # Instrument exports use point tokens such as p3n1, p3n2, p5n21 and pe;
+    # retaining the complete token prevents p3n1/p3n2 from collapsing into
+    # the same apparent point.
+    point = re.search(
+        r"(?<![A-Za-z0-9])(?P<value>(?:pt|point|spot|position|p)[A-Za-z0-9]+)(?![A-Za-z0-9])",
+        stem,
+        re.IGNORECASE,
+    )
+    if point:
+        conditions["point"] = point.group("value").casefold()
+    exposure = re.search(
+        r"(?<![A-Za-z0-9])(?P<value>\d+(?:[pP.]\d+)?)\s*(?P<unit>ms|us|μs|µs|s)"
+        r"\s*(?P<accum>x\s*\d+)?(?![A-Za-z0-9])",
+        stem,
+        re.IGNORECASE,
+    )
+    if exposure:
+        value = exposure.group("value").replace("p", ".").replace("P", ".")
+        unit = exposure.group("unit").casefold().replace("μ", "u").replace("µ", "u")
+        accum = exposure.group("accum")
+        suffix = f"x{re.sub(r'\s+', '', accum[1:])}" if accum else ""
+        conditions["exposure"] = f"{value}{unit}{suffix}"
+    return conditions
+
+
+def _conditions_compatible(measurements: Sequence[DrrSource], candidate: DrrSource) -> bool:
+    known: dict[str, set[str]] = {}
+    for source in measurements:
+        for key, value in _known_acquisition_conditions(source.filename).items():
+            known.setdefault(key, set()).add(value)
+    if any(len(values) > 1 for values in known.values()):
+        return False
+    candidate_conditions = _known_acquisition_conditions(candidate.filename)
+    return all(
+        candidate_conditions.get(key) in values
+        for key, values in known.items()
     )
 
 
@@ -1004,9 +1540,27 @@ def discover_drr_sources(
             reason = "gate varies" if item["gate_varies"] is True else "no background indicators found"
         is_background = classification in {"background", "likely_background"}
         links = metadata_links.get(item["identity"], [])
-        linked_backgrounds = tuple(dict.fromkeys(
-            baseline for record in links for baseline in record.baseline_files
-        ))
+        linked_values: list[str] = []
+        for record in links:
+            if record.assignment_metadata_present:
+                if not record.assignment_metadata_valid:
+                    continue
+                member = next(
+                    (
+                        assignment for assignment in record.member_assignments
+                        if str(resolve_source_path(experiment_root, assignment.measurement_file)).casefold()
+                        == item["identity"]
+                    ),
+                    None,
+                )
+                if member is None:
+                    continue
+                linked_values.extend(member.baseline_files)
+            else:
+                # Legacy metadata has one common recipe, so its union remains
+                # the only available provenance representation.
+                linked_values.extend(record.baseline_files)
+        linked_backgrounds = tuple(dict.fromkeys(linked_values))
         saved_modes = tuple(dict.fromkeys(record.baseline_selection for record in links))
         sources.append(
             DrrSource(

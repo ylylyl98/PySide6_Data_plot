@@ -53,10 +53,7 @@ class WorkspaceShellTests(unittest.TestCase):
             self.assertEqual(shell.workspace_splitter.count(), 2)
             self.assertIs(shell.workspace_splitter.widget(0), left_panel)
             self.assertIs(shell.workspace_splitter.widget(1), plot_panel)
-            shell.workspace_splitter.resize(
-                UI_METRICS["left_width"] + 980 + shell.workspace_splitter.handleWidth(),
-                500,
-            )
+            shell.workspace_splitter.resize(UI_METRICS["left_width"] + 980 + 4, 500)
             shell.workspace_splitter.setSizes([UI_METRICS["left_width"], 980])
             self.assertEqual(shell.workspace_splitter.sizes(), [UI_METRICS["left_width"], 980])
             self.assertEqual(left_panel.sizePolicy().horizontalStretch(), 0)

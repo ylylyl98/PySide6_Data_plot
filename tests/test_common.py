@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import sys
 import unittest
@@ -22,30 +23,45 @@ from ui_qt.common import (
     UI_METRICS,
     WrappedFilenameDelegate,
 )
+from tests.profile_phases import emit_phase_duration, profile_phase
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _assert_import_isolated(module_name: str) -> None:
     code = (
-        "import sys; "
+        "import json, sys, time; "
+        "_import_started = time.perf_counter(); "
         f"import {module_name}; "
+        "_import_duration = time.perf_counter() - _import_started; "
+        "_assert_started = time.perf_counter(); "
         "assert 'ui_qt.main_window' not in sys.modules, "
         "'ui_qt.main_window was imported transitively'"
+        "; _assert_duration = time.perf_counter() - _assert_started; "
+        "print('PROFILE_IMPORT_TIMINGS:' + json.dumps({'import_s': _import_duration, 'assert_s': _assert_duration}))"
     )
     env = dict(os.environ)
     env["QT_QPA_PLATFORM"] = "offscreen"
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        capture_output=True,
-        text=True,
-        cwd=_REPO_ROOT,
-        env=env,
-    )
+    with profile_phase(f"fresh_import_subprocess:{module_name}"):
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            cwd=_REPO_ROOT,
+            env=env,
+        )
     if result.returncode != 0:
         raise AssertionError(
             f"{module_name} imports ui_qt.main_window transitively:\n{result.stderr}"
         )
+    marker = next(
+        (line for line in result.stdout.splitlines() if line.startswith("PROFILE_IMPORT_TIMINGS:")),
+        None,
+    )
+    if marker:
+        timings = json.loads(marker.split(":", 1)[1])
+        emit_phase_duration(f"fresh_import_child:{module_name}", float(timings["import_s"]))
+        emit_phase_duration(f"fresh_import_child_assert:{module_name}", float(timings["assert_s"]))
 
 
 class CommonSymbolsTests(unittest.TestCase):
@@ -116,24 +132,35 @@ class CommonSymbolsTests(unittest.TestCase):
 
     def test_main_window_imports_pages_and_controllers_at_top(self) -> None:
         code = (
-            "import sys; "
+            "import json, sys, time; _import_started=time.perf_counter(); "
             "import ui_qt.main_window; "
+            "_import_duration=time.perf_counter()-_import_started; _assert_started=time.perf_counter(); "
             "assert 'ui_qt.feature_pages' in sys.modules, 'feature_pages not imported by main_window'; "
             "assert 'ui_qt.controllers_mcd' in sys.modules, 'controllers not imported by main_window'; "
             "assert 'ui_qt.common' in sys.modules, 'common not imported by main_window'; "
-            "print('ok')"
+            "_assert_duration=time.perf_counter()-_assert_started; "
+            "print('PROFILE_IMPORT_TIMINGS:' + json.dumps({'import_s': _import_duration, 'assert_s': _assert_duration}))"
         )
         env = dict(os.environ)
         env["QT_QPA_PLATFORM"] = "offscreen"
-        result = subprocess.run(
-            [sys.executable, "-c", code],
-            capture_output=True,
-            text=True,
-            cwd=_REPO_ROOT,
-            env=env,
-        )
+        with profile_phase("fresh_main_window_import_subprocess"):
+            result = subprocess.run(
+                [sys.executable, "-c", code],
+                capture_output=True,
+                text=True,
+                cwd=_REPO_ROOT,
+                env=env,
+            )
         if result.returncode != 0:
             raise AssertionError(f"main_window import graph broken:\n{result.stderr}")
+        marker = next(
+            (line for line in result.stdout.splitlines() if line.startswith("PROFILE_IMPORT_TIMINGS:")),
+            None,
+        )
+        if marker:
+            timings = json.loads(marker.split(":", 1)[1])
+            emit_phase_duration("fresh_main_window_import_child", float(timings["import_s"]))
+            emit_phase_duration("fresh_main_window_import_child_assert", float(timings["assert_s"]))
 
 
 if __name__ == "__main__":

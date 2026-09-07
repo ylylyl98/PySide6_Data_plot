@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import json
+import gc
 import os
 import tempfile
 import unittest
+import weakref
 from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PySide6.QtCore import Qt, QThreadPool
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QCoreApplication, QEvent, Qt, QThreadPool
+from PySide6.QtWidgets import QApplication, QMainWindow
 
 from ui_qt.main_window import MainWindow
 from ui_qt.mcd_organizer_window import McdOrganizerWindow
@@ -23,6 +25,35 @@ class McdOrganizerWindowTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
+    def setUp(self) -> None:
+        self._owned_windows: list[QMainWindow] = []
+        self.addCleanup(self._dispose_test_windows)
+
+    def tearDown(self) -> None:
+        self._dispose_test_windows()
+
+    def _dispose_test_windows(self) -> None:
+        for window in reversed(self._owned_windows):
+            if window is not None:
+                window.close()
+                window.deleteLater()
+        self._owned_windows.clear()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        self.app.processEvents()
+
+    def _own_window(self, window: QMainWindow) -> QMainWindow:
+        self._owned_windows.append(window)
+        return window
+
+    def test_test_owned_main_windows_are_destroyed_by_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_text:
+            window = self._own_window(McdOrganizerWindow(Path(folder_text), auto_scan=False))
+            reference = weakref.ref(window)
+            self._dispose_test_windows()
+            del window
+        gc.collect()
+        self.assertIsNone(reference())
+
     def _wait_for_scan(self, window: McdOrganizerWindow) -> None:
         for _ in range(100):
             QThreadPool.globalInstance().waitForDone(10)
@@ -33,7 +64,7 @@ class McdOrganizerWindowTests(unittest.TestCase):
 
     def test_preview_canvases_use_theme_aware_qtagg_binding(self) -> None:
         with tempfile.TemporaryDirectory() as folder_text:
-            window = McdOrganizerWindow(Path(folder_text), auto_scan=False)
+            window = self._own_window(McdOrganizerWindow(Path(folder_text), auto_scan=False))
             try:
                 window._init_plot_widgets()
                 self.assertIsInstance(window.canvas, ThemeAwareFigureCanvasQTAgg)
@@ -88,7 +119,7 @@ class McdOrganizerWindowTests(unittest.TestCase):
             self._write_result(root, "d2_high", doping=2.0, efield=0.2, energy=1.68)
             self._write_result(root, "d6_low", doping=6.3, efield=-0.2, energy=1.57)
             self._write_result(root, "d6_high", doping=6.3, efield=0.2, energy=1.61)
-            window = McdOrganizerWindow(root, auto_scan=False)
+            window = self._own_window(McdOrganizerWindow(root, auto_scan=False))
             try:
                 window._scan()
                 self._wait_for_scan(window)
@@ -123,7 +154,7 @@ class McdOrganizerWindowTests(unittest.TestCase):
             self._write_result(
                 root, "warm", doping=6.3, efield=0.2, energy=1.61, temperature=80.0
             )
-            window = McdOrganizerWindow(root, auto_scan=False)
+            window = self._own_window(McdOrganizerWindow(root, auto_scan=False))
             try:
                 window._scan()
                 self._wait_for_scan(window)
@@ -146,7 +177,7 @@ class McdOrganizerWindowTests(unittest.TestCase):
                 self._write_result(
                     root, name, doping=6.3, efield=efield, energy=energy, temperature=2.5
                 )
-            window = McdOrganizerWindow(root, auto_scan=False)
+            window = self._own_window(McdOrganizerWindow(root, auto_scan=False))
             try:
                 window._scan()
                 self._wait_for_scan(window)
@@ -163,7 +194,7 @@ class McdOrganizerWindowTests(unittest.TestCase):
     def test_main_app_launches_standalone_organizer_with_current_folder(self) -> None:
         with tempfile.TemporaryDirectory() as folder_text:
             root = Path(folder_text)
-            window = MainWindow()
+            window = self._own_window(MainWindow())
             try:
                 window.current_folder = str(root)
                 with patch(
@@ -183,7 +214,7 @@ class McdOrganizerWindowTests(unittest.TestCase):
             root = Path(folder_text)
             self._write_result(root, "low", doping=6.3, efield=0.0, energy=1.57)
             self._write_result(root, "high", doping=6.3, efield=20.0, energy=1.64)
-            window = McdOrganizerWindow(root, auto_scan=False)
+            window = self._own_window(McdOrganizerWindow(root, auto_scan=False))
             try:
                 window._scan()
                 self._wait_for_scan(window)
@@ -204,7 +235,7 @@ class McdOrganizerWindowTests(unittest.TestCase):
             root = Path(folder_text)
             self._write_result(root, "low", doping=6.3, efield=0.0, energy=1.57)
             self._write_result(root, "high", doping=6.3, efield=20.0, energy=1.64)
-            first = McdOrganizerWindow(root, auto_scan=False)
+            first = self._own_window(McdOrganizerWindow(root, auto_scan=False))
             try:
                 first._scan()
                 self._wait_for_scan(first)
@@ -213,7 +244,7 @@ class McdOrganizerWindowTests(unittest.TestCase):
             finally:
                 first.close()
 
-            second = McdOrganizerWindow(root, auto_scan=False)
+            second = self._own_window(McdOrganizerWindow(root, auto_scan=False))
             try:
                 second._scan()
                 self._wait_for_scan(second)

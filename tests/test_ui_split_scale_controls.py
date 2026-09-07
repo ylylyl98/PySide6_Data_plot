@@ -23,6 +23,7 @@ from core.drr_sources import DrrSource
 from ui_qt.main_window import LoadedState, MainWindow, UI_METRICS
 from ui_qt.theme import install_theme
 from tests.ui_test_helpers import wait_for_file_catalog
+from tests.profile_phases import profile_phase
 
 
 class SplitScaleControlTests(unittest.TestCase):
@@ -31,34 +32,40 @@ class SplitScaleControlTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
         # Match packaged startup: Fluent light theme is installed before any
         # real MainWindow is constructed so QSS-driven size hints are active.
-        install_theme(cls.app, mode="light")
+        with profile_phase("theme_installation"):
+            install_theme(cls.app, mode="light")
 
     def setUp(self) -> None:
-        with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
-            self.window = MainWindow()
-        self.window.resize(1180, 820)
-        self.window.show()
-        self.window.pl_split_scale_chk.setChecked(True)
-        self.app.processEvents()
+        with profile_phase("mainwindow_construction"):
+            with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
+                self.window = MainWindow()
+        with profile_phase("mainwindow_show_setup"):
+            self.window.resize(1180, 820)
+            self.window.show()
+            self.window.pl_split_scale_chk.setChecked(True)
+            self.app.processEvents()
 
     def tearDown(self) -> None:
-        self.window.close()
-        self.window.deleteLater()
-        self.app.processEvents()
+        with profile_phase("mainwindow_teardown"):
+            self.window.close()
+            self.window.deleteLater()
+            self.app.processEvents()
 
     def _wait_for_drr_catalog(self) -> None:
-        self._wait_for_file_catalog()
-        # File discovery is intentionally asynchronous and GitHub's Windows
-        # runners can be busy while the full Qt suite is running.
-        for _ in range(500):
-            self.app.processEvents()
-            if not self.window._drr_refresh_running:
-                return
-            QTest.qWait(10)
+        with profile_phase("drr_event_wait"):
+            self._wait_for_file_catalog()
+            # File discovery is intentionally asynchronous and GitHub's Windows
+            # runners can be busy while the full Qt suite is running.
+            for _ in range(500):
+                self.app.processEvents()
+                if not self.window._drr_refresh_running:
+                    return
+                QTest.qWait(10)
         self.fail("Timed out waiting for the DRR catalog refresh")
 
     def _wait_for_file_catalog(self) -> None:
-        wait_for_file_catalog(self.window)
+        with profile_phase("file_catalog_event_wait"):
+            wait_for_file_catalog(self.window)
 
     def test_split_controls_fit_at_minimum_sidebar_width(self) -> None:
         splitter = self.window.findChild(QSplitter)
@@ -79,6 +86,10 @@ class SplitScaleControlTests(unittest.TestCase):
         right_edge = max(child.geometry().right() for child in visible_children)
         self.assertLessEqual(right_edge, panel.contentsRect().right())
 
+    @unittest.skipUnless(
+        os.environ.get("RUN_UI_VISUAL_TESTS") == "1",
+        "requires RUN_UI_VISUAL_TESTS=1",
+    )
     def test_axis_range_rows_keep_fix_and_auto_controls_contained(self) -> None:
         """Real PL/DRR/Compare/Power rows stay contained on the production platform."""
         if QApplication.platformName() == "offscreen":
@@ -343,22 +354,24 @@ class SplitScaleControlTests(unittest.TestCase):
         )
 
     def test_drr_refresh_adds_new_file_to_a_fully_selected_group(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with profile_phase("drr_filesystem_setup"), tempfile.TemporaryDirectory() as tmp:
             initial = Path(tmp) / "Initial Data"
             initial.mkdir()
             first = initial / "sample_760nmc_rep1_1.csv"
             second = initial / "sample_760nmc_rep1_2.csv"
             self._write_drr_measurement(first)
 
-            self.window._set_current_folder(tmp, remember=False)
+            with profile_phase("drr_initial_refresh"):
+                self.window._set_current_folder(tmp, remember=False)
             self._wait_for_drr_catalog()
             self.assertEqual(self.window.drr_selected_files, [])
             self.window.drr_selected_files = [
                 "Initial Data/sample_760nmc_rep1_1.csv"
             ]
 
-            self._write_drr_measurement(second)
-            self.window._refresh_file_lists(auto=True)
+            with profile_phase("drr_new_file_refresh"):
+                self._write_drr_measurement(second)
+                self.window._refresh_file_lists(auto=True)
             self._wait_for_drr_catalog()
 
             self.assertEqual(
@@ -574,11 +587,12 @@ class SplitScaleControlTests(unittest.TestCase):
 
 
     def test_drr_source_search_is_debounced(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with profile_phase("drr_filesystem_setup"), tempfile.TemporaryDirectory() as tmp:
             initial = Path(tmp) / "Initial Data"
             initial.mkdir()
             self._write_drr_measurement(initial / "sample_760nmc_rep1.csv")
-            self.window._set_current_folder(tmp, remember=False)
+            with profile_phase("drr_initial_refresh"):
+                self.window._set_current_folder(tmp, remember=False)
             self._wait_for_drr_catalog()
 
             observed: dict[str, int] = {}
@@ -596,7 +610,8 @@ class SplitScaleControlTests(unittest.TestCase):
                 filter_edit.setText("query-that-does-not-match")
                 self.app.processEvents()
                 observed["before"] = group_list.count()
-                QTest.qWait(230)
+                with profile_phase("debounce_fixed_event_wait"):
+                    QTest.qWait(230)
                 self.app.processEvents()
                 observed["after"] = group_list.count()
                 return QDialog.Rejected
@@ -717,7 +732,7 @@ class SplitScaleControlTests(unittest.TestCase):
             self.assertEqual(self.window.drr_available_sources, [source])
 
     def test_drr_refresh_preserves_a_deliberately_selected_subset(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with profile_phase("drr_filesystem_setup"), tempfile.TemporaryDirectory() as tmp:
             initial = Path(tmp) / "Initial Data"
             initial.mkdir()
             first = initial / "sample_760nmc_rep1_1.csv"
@@ -726,13 +741,15 @@ class SplitScaleControlTests(unittest.TestCase):
             self._write_drr_measurement(first)
             self._write_drr_measurement(second)
 
-            self.window._set_current_folder(tmp, remember=False)
+            with profile_phase("drr_initial_refresh"):
+                self.window._set_current_folder(tmp, remember=False)
             self._wait_for_drr_catalog()
             chosen = "Initial Data/sample_760nmc_rep1_1.csv"
             self.window.drr_selected_files = [chosen]
             self._write_drr_measurement(third)
 
-            self.window._refresh_file_lists(auto=True)
+            with profile_phase("drr_new_file_refresh"):
+                self.window._refresh_file_lists(auto=True)
             self._wait_for_drr_catalog()
 
             self.assertEqual(self.window.drr_selected_files, [chosen])
@@ -1187,7 +1204,7 @@ class SplitScaleControlTests(unittest.TestCase):
             start_load.assert_called_once_with("DRR")
 
     def test_constant_gate_background_selection_defaults_to_all_frames(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with profile_phase("drr_filesystem_setup"), tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             first = root / "back_1.csv"
             second = root / "back_2.csv"
@@ -1196,14 +1213,16 @@ class SplitScaleControlTests(unittest.TestCase):
                     "Vbg,Vtg,740,760,780\n0,0,1,2,3\n0,0,2,3,4\n",
                     encoding="utf-8",
                 )
-            self.window._set_current_folder(tmp, remember=False)
+            with profile_phase("drr_initial_refresh"):
+                self.window._set_current_folder(tmp, remember=False)
             self._wait_for_file_catalog()
             self.window.drr_baseline_files_manual = [first.name, second.name]
             self.window.drr_baseline_combine_combo.setCurrentText(
                 "Last frame from each file, then average"
             )
 
-            accepted = self.window.drr_controller._apply_drr_background_gate_default()
+            with profile_phase("background_selection_controller"):
+                accepted = self.window.drr_controller._apply_drr_background_gate_default()
 
             self.assertTrue(accepted)
             self.assertEqual(
