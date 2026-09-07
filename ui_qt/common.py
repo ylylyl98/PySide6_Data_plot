@@ -106,6 +106,7 @@ class LoadedState:
     drr_baseline_text: str = "Self (last frame)"
     drr_baseline_which: str = "last"
     drr_background_selection: Dict[str, Any] = field(default_factory=dict)
+    drr_assignments: tuple[Any, ...] = ()
     y_axis_spec: str = "auto"
     provenance_records: tuple[WorkingCopyRecord, ...] = ()
 
@@ -131,6 +132,7 @@ class LoadOptions:
     mcd_candidate_metric: str = "mean"
     mcd_candidate_energy_range: tuple[float, float] | None = None
     drr_background_selection: Dict[str, Any] = field(default_factory=dict)
+    drr_assignments: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -36,6 +36,7 @@ from core.drr_sources import (
     group_drr_sources,
     inspect_csv_wavelength_center,
     resolve_source_path,
+    resolve_drr_background_assignments,
     wavelength_centers_match,
 )
 from core.loader import DataCube
@@ -126,75 +127,49 @@ class DrrController:
         return None
 
     def _restore_saved_drr_recipe(self) -> bool:
-        recipe = find_saved_drr_recipe(self.current_folder, self.drr_selected_files)
-        if recipe is None:
-            return False
-        missing = [
-            source
-            for source in recipe.baseline_files
-            if not resolve_source_path(self.current_folder, source).is_file()
-        ]
-        if missing:
-            self._status("Saved DRR background is unavailable; select a background manually.")
-            return False
-
-        measurement_center = self._drr_selected_wavelength_center()
-        baseline_centers = [
-            center
-            for source in recipe.baseline_files
-            if (center := self._drr_source_center(source)) is not None
-        ]
-        compatible = (
-            all(
-                wavelength_centers_match(baseline_centers[0], center)
-                for center in baseline_centers[1:]
-            )
-            if baseline_centers
-            else True
+        resolved = resolve_drr_background_assignments(
+            self.current_folder, self.drr_available_sources, self.drr_selected_files,
         )
-        if (
-            not compatible
-            or measurement_center is not None
-            and baseline_centers
-            and not wavelength_centers_match(measurement_center, baseline_centers[0])
-        ):
-            self._status(
-                "Saved DRR background has an incompatible wavelength center; "
-                "select a background manually."
-            )
-            return False
-
-        mode = recipe.baseline_selection
-        if recipe.baseline_files or mode == "External":
-            mode = "External"
-        elif "first" in mode.casefold():
-            mode = "Self (first frame)"
-        else:
-            mode = "Self (last frame)"
-        combine_text = {
-            "first": "First frame from each file, then average",
-            "last": "Last frame from each file, then average",
-            "all": "Average all frames in each file, then average files",
-        }.get(recipe.baseline_which, "Last frame from each file, then average")
-
-        blocked = self.drr_baseline_combo.blockSignals(True)
-        self.drr_baseline_combo.setCurrentText(mode)
-        self.drr_baseline_combo.blockSignals(blocked)
-        blocked = self.drr_baseline_combine_combo.blockSignals(True)
-        self.drr_baseline_combine_combo.setCurrentText(combine_text)
-        self.drr_baseline_combine_combo.blockSignals(blocked)
-        self.drr_baseline_files_manual = list(recipe.baseline_files)
-        self.drr_baseline_files_found = list(recipe.baseline_files)
-        self._drr_background_guess = None
-        external = mode == "External"
-        self.drr_external_baseline_row.setVisible(external)
-        self.drr_baseline_combine_combo.setVisible(external)
-        self.drr_pin_baseline_chk.setVisible(external)
-        self._status(
-            f"Restored saved DRR recipe: {len(recipe.baseline_files)} background "
-            f"file{'s' if len(recipe.baseline_files) != 1 else ''}, mode={recipe.baseline_which}."
-        )
-        return True
+        if resolved.resolved:
+            self._drr_assignments = tuple(resolved.assignments)
+            self._drr_assignments_automatic = True
+            baseline_files = list(dict.fromkeys(
+                source for assignment in resolved.assignments
+                for source in assignment.baseline_files
+            ))
+            self.drr_baseline_files_manual = baseline_files
+            self.drr_baseline_files_found = list(baseline_files)
+            if baseline_files:
+                blocked = self.drr_baseline_combo.blockSignals(True)
+                self.drr_baseline_combo.setCurrentText("External")
+                self.drr_baseline_combo.blockSignals(blocked)
+                self.drr_external_baseline_row.setVisible(True)
+                self.drr_baseline_combine_combo.setVisible(True)
+                self.drr_pin_baseline_chk.setVisible(True)
+                combine_text = {
+                    "first": "First frame from each file, then average",
+                    "last": "Last frame from each file, then average",
+                    "all": "Average all frames in each file, then average files",
+                }.get(resolved.assignments[0].baseline_which)
+                if combine_text:
+                    blocked = self.drr_baseline_combine_combo.blockSignals(True)
+                    self.drr_baseline_combine_combo.setCurrentText(combine_text)
+                    self.drr_baseline_combine_combo.blockSignals(blocked)
+            else:
+                blocked = self.drr_baseline_combo.blockSignals(True)
+                self.drr_baseline_combo.setCurrentText(resolved.assignments[0].baseline_mode)
+                self.drr_baseline_combo.blockSignals(blocked)
+                self.drr_external_baseline_row.setVisible(False)
+                self.drr_baseline_combine_combo.setVisible(False)
+                self.drr_pin_baseline_chk.setVisible(False)
+            self.drr_baseline_combine_combo.setEnabled(False)
+            self.drr_pin_baseline_chk.setEnabled(False)
+            self._update_drr_selection_labels()
+            self._drr_background_guess = None
+            self._status("Restored automatic DRR background assignments for each measurement.")
+            return True
+        self._status(resolved.reason or "Saved DRR background assignment is unavailable.")
+        return False
 
     def _apply_drr_background_gate_default(self) -> bool:
         if not self.drr_baseline_files_manual:
@@ -223,40 +198,32 @@ class DrrController:
         return True
 
     def _guess_drr_background_for_selection(self) -> bool:
-        guess = guess_drr_background(
-            self.current_folder,
-            self.drr_available_sources,
-            self.drr_selected_files,
+        resolved = resolve_drr_background_assignments(
+            self.current_folder, self.drr_available_sources, self.drr_selected_files,
         )
-        if guess is None:
-            return False
-        combine_text = {
-            "first": "First frame from each file, then average",
-            "last": "Last frame from each file, then average",
-            "all": "Average all frames in each file, then average files",
-        }[guess.baseline_which]
-        blocked = self.drr_baseline_combo.blockSignals(True)
-        self.drr_baseline_combo.setCurrentText("External")
-        self.drr_baseline_combo.blockSignals(blocked)
-        blocked = self.drr_baseline_combine_combo.blockSignals(True)
-        self.drr_baseline_combine_combo.setCurrentText(combine_text)
-        self.drr_baseline_combine_combo.blockSignals(blocked)
-        self.drr_baseline_files_manual = list(guess.baseline_files)
-        self.drr_baseline_files_found = list(guess.baseline_files)
-        self._drr_background_guess = guess
-        self.drr_external_baseline_row.setVisible(True)
-        self.drr_baseline_combine_combo.setVisible(True)
-        self.drr_pin_baseline_chk.setVisible(True)
-        gap_minutes = guess.time_gap_seconds / 60.0
-        message = (
-            f"Auto-selected {len(guess.baseline_files)} background file"
-            f"{'s' if len(guess.baseline_files) != 1 else ''} "
-            f"({guess.confidence} confidence, {gap_minutes:.1f} min time separation): "
-            f"{guess.reason}. Original intensities were not modified."
-        )
-        self._status(message)
-        self._append_log(message)
-        return True
+        if resolved.resolved:
+            self._drr_assignments = tuple(resolved.assignments)
+            self._drr_assignments_automatic = True
+            baseline_files = list(dict.fromkeys(
+                source for assignment in resolved.assignments
+                for source in assignment.baseline_files
+            ))
+            self.drr_baseline_files_manual = baseline_files
+            self.drr_baseline_files_found = list(baseline_files)
+            blocked = self.drr_baseline_combo.blockSignals(True)
+            self.drr_baseline_combo.setCurrentText("External")
+            self.drr_baseline_combo.blockSignals(blocked)
+            self.drr_external_baseline_row.setVisible(True)
+            self.drr_baseline_combine_combo.setVisible(True)
+            self.drr_pin_baseline_chk.setVisible(True)
+            self.drr_baseline_combine_combo.setEnabled(False)
+            self.drr_pin_baseline_chk.setEnabled(False)
+            self._update_drr_selection_labels()
+            self._drr_background_guess = None
+            self._status("Automatically restored a validated DRR background for each measurement.")
+            return True
+        self._status(resolved.reason or "DRR background could not be resolved automatically.")
+        return False
 
     def _drr_selected_wavelength_center(self) -> float | None:
         catalog_centers = {
@@ -333,8 +300,15 @@ class DrrController:
 
     def _read_drr_params(self):
         s = self.drr_spins
+        assignments = tuple(
+            assignment.to_dict() if hasattr(assignment, "to_dict") else dict(assignment)
+            for assignment in getattr(self, "_drr_assignments", ())
+        )
+        baseline_mode = self.drr_baseline_combo.currentText()
+        if assignments and self._drr_assignments_automatic:
+            baseline_mode = "Automatic"
         return {
-            "baseline_mode": self.drr_baseline_combo.currentText(),
+            "baseline_mode": baseline_mode,
             "baseline_which": self.drr_baseline_combine_combo.currentText(),
             "baseline_files": tuple(self.drr_baseline_files_manual),
             "selected_files": tuple(self.drr_selected_files),
@@ -353,6 +327,7 @@ class DrrController:
             "log": bool(self.drr_log_chk.isChecked()),
             "clip": bool(self.drr_clip_chk.isChecked()),
             "center_zero": bool(self.drr_center_zero_chk.isChecked()),
+            "drr_assignments": assignments,
         }
 
     def _is_drr_gate_only_change(self, new_key: tuple) -> bool:
@@ -360,7 +335,7 @@ class DrrController:
             return False
         if len(new_key) != len(self._last_plot_params_key):
             return False
-        gate_idx = 16
+        gate_idx = 17
         return (
             new_key[:gate_idx] == self._last_plot_params_key[:gate_idx]
             and new_key[gate_idx + 1 :] == self._last_plot_params_key[gate_idx + 1 :]
@@ -397,6 +372,22 @@ class DrrController:
             self._schedule_plot_redraw("DRR")
 
     def _on_drr_plot_param_changed(self, source=None) -> None:
+        if source is getattr(self, "drr_baseline_combo", None):
+            self._drr_baseline_user_selected = True
+            # A baseline-mode change is an explicit recipe change.  Clear
+            # every previous per-measurement assignment, including explicit
+            # mappings, so Self cannot accidentally retain external files.
+            if self._drr_assignments:
+                self._drr_assignments = ()
+            self._drr_assignments_automatic = False
+            self.drr_baseline_combine_combo.setEnabled(True)
+            self.drr_pin_baseline_chk.setEnabled(True)
+            if self.drr_baseline_combo.currentText().startswith("Self"):
+                self.drr_baseline_files_manual = []
+                self.drr_baseline_files_found = []
+                blocked = self.drr_pin_baseline_chk.blockSignals(True)
+                self.drr_pin_baseline_chk.setChecked(False)
+                self.drr_pin_baseline_chk.blockSignals(blocked)
         self._invalidate_pending_drr_fit("Fit discarded: plot range or display settings changed.")
         self._invalidate_export_move_sources()
         external_baseline = self.drr_baseline_combo.currentText() == "External"
@@ -423,6 +414,15 @@ class DrrController:
             self._schedule_plot_redraw("DRR")
 
     def _on_drr_baseline_mode_changed(self) -> None:
+        if self._drr_assignments:
+            # The visible frame selector is only a summary for automatic
+            # assignments.  A user change must opt into one common recipe;
+            # otherwise it would silently reuse stale per-file assignments.
+            self._drr_assignments = ()
+            self._drr_assignments_automatic = False
+            self.drr_baseline_combine_combo.setEnabled(True)
+            self.drr_pin_baseline_chk.setEnabled(True)
+            self._status("Frame method changed; automatic per-measurement backgrounds were cleared.")
         self._status(f"State: Baseline mode set: {self.drr_baseline_combine_combo.currentText()}.")
         self._update_drr_selection_labels()
         if self.loaded and self.loaded.mode == "DRR" and not self._suspend_drr_autoplot:
@@ -502,14 +502,28 @@ class DrrController:
             if self.drr_selected_files
             else "No measurement files selected."
         )
-        self.drr_baseline_summary.setText(
-            f"Baselines: {len(self.drr_baseline_files_manual)} files (mode: {mode_short})"
-        )
-        self.drr_baseline_summary.setToolTip(
-            "Selected baseline files:\n" + "\n".join(self.drr_baseline_files_manual)
-            if self.drr_baseline_files_manual
-            else "No external baseline files selected."
-        )
+        if self._drr_assignments_automatic and self._drr_assignments:
+            mapping = "\n".join(
+                f"{Path(item.measurement_file).name} ← "
+                + (", ".join(item.baseline_files) if item.baseline_files else item.baseline_mode)
+                + f" [{item.baseline_which}]"
+                for item in self._drr_assignments
+            )
+            self.drr_baseline_summary.setText(
+                f"Backgrounds: automatic per measurement ({len(self._drr_assignments)} mappings)"
+            )
+            self.drr_baseline_summary.setToolTip(
+                "Automatic per-measurement background mapping:\n" + mapping
+            )
+        else:
+            self.drr_baseline_summary.setText(
+                f"Baselines: {len(self.drr_baseline_files_manual)} files (mode: {mode_short})"
+            )
+            self.drr_baseline_summary.setToolTip(
+                "Selected baseline files:\n" + "\n".join(self.drr_baseline_files_manual)
+                if self.drr_baseline_files_manual
+                else "No external baseline files selected."
+            )
         self._repopulate_drr_yaxis()
     def _edit_drr_measurements(self) -> None:
         previous = list(self.drr_selected_files)
@@ -522,6 +536,9 @@ class DrrController:
         self.drr_selected_files = selected
         measurement_changed = selected != previous
         if measurement_changed and not self.drr_pin_baseline_chk.isChecked():
+            self._drr_assignments = ()
+            self._drr_assignments_automatic = False
+            self._drr_baseline_user_selected = False
             self.drr_baseline_files_manual = []
             self.drr_baseline_files_found = []
             self._drr_background_guess = None
@@ -543,6 +560,11 @@ class DrrController:
             self._start_load("DRR")
     def _clear_drr_measurements(self) -> None:
         self.drr_selected_files = []
+        self._drr_assignments = ()
+        self._drr_assignments_automatic = False
+        self._drr_baseline_user_selected = False
+        self.drr_baseline_combine_combo.setEnabled(True)
+        self.drr_pin_baseline_chk.setEnabled(True)
         if not self.drr_pin_baseline_chk.isChecked():
             self.drr_baseline_files_manual = []
         self._update_drr_selection_labels()
@@ -556,6 +578,10 @@ class DrrController:
             baseline_mode=True,
         )
         self._drr_background_guess = None
+        self._drr_assignments = ()
+        self._drr_assignments_automatic = False
+        self.drr_baseline_combine_combo.setEnabled(True)
+        self.drr_pin_baseline_chk.setEnabled(True)
         if self.drr_baseline_files_manual:
             blocked = self.drr_baseline_combo.blockSignals(True)
             self.drr_baseline_combo.setCurrentText("External")
@@ -571,6 +597,10 @@ class DrrController:
     def _clear_drr_baselines(self) -> None:
         self.drr_baseline_files_manual = []
         self.drr_baseline_files_found = []
+        self._drr_assignments = ()
+        self._drr_assignments_automatic = False
+        self.drr_baseline_combine_combo.setEnabled(True)
+        self.drr_pin_baseline_chk.setEnabled(True)
         self._drr_background_guess = None
         self.drr_pin_baseline_chk.setChecked(False)
         self._update_drr_selection_labels()
@@ -579,12 +609,20 @@ class DrrController:
                 "External background cleared. Select a background before processing."
             )
     def _on_drr_pin_baseline_toggled(self, checked: bool) -> None:
+        if checked and self._drr_assignments_automatic:
+            blocked = self.drr_pin_baseline_chk.blockSignals(True)
+            self.drr_pin_baseline_chk.setChecked(False)
+            self.drr_pin_baseline_chk.blockSignals(blocked)
+            self._status("Automatic per-measurement backgrounds cannot be pinned as one common background.")
+            return
         if checked and not self.drr_baseline_files_manual:
             blocked = self.drr_pin_baseline_chk.blockSignals(True)
             self.drr_pin_baseline_chk.setChecked(False)
             self.drr_pin_baseline_chk.blockSignals(blocked)
             self._status("Select an external background before pinning it.")
             return
+        if checked:
+            self._drr_assignments_automatic = False
         self._status("External background pinned." if checked else "External background follows measurement selection.")
     def _open_drr_source_dialog(
         self,

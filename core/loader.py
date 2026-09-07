@@ -4,11 +4,13 @@ from dataclasses import dataclass
 from functools import lru_cache
 import json
 from pathlib import Path
-from typing import Optional, Sequence, Tuple
+from typing import Any, Optional, Sequence, Tuple
 
 import numpy as np
 
 from core import processing_run as P
+if False:  # pragma: no cover - type-only imports are deferred to avoid a cycle.
+    from core.drr_sources import DrrMeasurementAssignment
 
 
 XLSX_Y_LABEL_DOPING = "Doping (V)"
@@ -455,3 +457,230 @@ def load_drr_avg(
         title=res.get("title", "DR/R"),
         cbar_label=cbar,
     )
+
+
+def _validated_interp_axis(axis: np.ndarray, *, context: str) -> np.ndarray:
+    values = np.asarray(axis, dtype=float).ravel()
+    if values.size < 2 or not np.all(np.isfinite(values)):
+        raise ValueError(f"{context} axis must contain at least two finite points.")
+    if np.unique(values).size != values.size:
+        raise ValueError(f"{context} axis contains duplicate points.")
+    return values
+
+
+def _interp_rows_no_extrapolation(
+    values: np.ndarray, source_axis: np.ndarray, target_axis: np.ndarray, *, context: str
+) -> np.ndarray:
+    original_source = _validated_interp_axis(source_axis, context=context)
+    target = np.asarray(target_axis, dtype=float).ravel()
+    if target.size < 1 or not np.all(np.isfinite(target)):
+        raise ValueError(f"{context} target axis must contain finite points.")
+    order = np.argsort(original_source, kind="stable")
+    source = original_source[order]
+    rows = np.asarray(values, dtype=float)
+    if rows.ndim != 2 or rows.shape[1] != source.size:
+        raise ValueError(f"{context} values do not match its axis.")
+    # An entirely disjoint member would otherwise become an all-NaN row and
+    # disappear from the later nanmean.  Refuse it at the interpolation
+    # boundary so the caller cannot silently average away a measurement.
+    if not np.any((target >= source[0]) & (target <= source[-1])):
+        raise ValueError(f"{context} axes have no finite overlap.")
+    rows = rows[:, order]
+    # Compare against the original ordering before sorting.  This preserves
+    # exact descending grids and their NaN positions without interpolation.
+    if target.shape == original_source.shape and np.array_equal(
+        target, original_source, equal_nan=True
+    ):
+        return np.asarray(values, dtype=float).copy()
+    if target.shape == source.shape and np.array_equal(target, source, equal_nan=True):
+        return rows.copy()
+    out = np.full((rows.shape[0], target.size), np.nan, dtype=float)
+    for row_index, row in enumerate(rows):
+        finite = np.isfinite(row)
+        if np.count_nonzero(finite) < 2:
+            continue
+        x = source[finite][np.argsort(source[finite], kind="stable")]
+        y = row[finite][np.argsort(source[finite], kind="stable")]
+        valid = (target >= x[0]) & (target <= x[-1])
+        out[row_index, valid] = np.interp(target[valid], x, y)
+    return out
+
+
+def _wavelength_center_nm(energy: np.ndarray) -> float:
+    values = np.asarray(energy, dtype=float).ravel()
+    finite = np.isfinite(values) & (values > 0.0)
+    if not np.any(finite):
+        return float("nan")
+    wavelength = 1240.0 / values[finite]
+    return 0.5 * (float(np.min(wavelength)) + float(np.max(wavelength)))
+
+
+def _native_external_baseline(
+    user_folder: str, assignment: DrrMeasurementAssignment, measurement_energy: np.ndarray, *, y_axis: str
+) -> np.ndarray:
+    # Preserve the established recipe order: each source contributes one
+    # frame vector, sources are aligned to the first baseline grid and then
+    # averaged.  Only the resulting baseline is aligned to the measurement.
+    for baseline_file in assignment.baseline_files:
+        data = P._load_canonical(user_folder, baseline_file, y_axis=y_axis)
+        energy = _validated_interp_axis(data["energy"], context=f"Baseline {baseline_file}")
+        z = np.asarray(data["Z"], dtype=float)
+        if z.ndim != 2 or z.shape[1] != energy.size:
+            raise ValueError(f"Baseline {baseline_file} data does not match its energy axis.")
+    baseline = build_external_baseline(
+        user_folder, assignment.baseline_files, which=assignment.baseline_which
+    )
+    measurement_center = _wavelength_center_nm(measurement_energy)
+    baseline_center = _wavelength_center_nm(np.asarray(baseline["energy"], dtype=float))
+    if (
+        np.isfinite(measurement_center)
+        and np.isfinite(baseline_center)
+        and abs(measurement_center - baseline_center) > 1.0
+    ):
+        raise ValueError(
+            "External baseline wavelength center must match the measurement: "
+            f"measurement≈{measurement_center:.3g} nm, "
+            f"background≈{baseline_center:.3g} nm."
+        )
+    aligned = _interp_rows_no_extrapolation(
+        np.asarray(baseline["I0"], dtype=float)[None, :],
+        np.asarray(baseline["energy"], dtype=float), measurement_energy,
+        context="External baseline",
+    )[0]
+    minimum_overlap = max(2, int(np.ceil(0.5 * np.asarray(measurement_energy).size)))
+    if np.count_nonzero(np.isfinite(aligned)) < minimum_overlap:
+        raise ValueError("External baseline coverage is insufficient for this measurement.")
+    return aligned
+
+
+def load_drr_resolved_avg(
+    user_folder: str,
+    files: Sequence[str],
+    *,
+    assignments: Sequence[DrrMeasurementAssignment],
+    y_axis: str = "auto",
+    derivative: Optional[int] = None,
+    dE_window_pts: int = 20,
+    dE_polyorder: int = 2,
+    dE_oversample: float = 1.0,
+    dE_interp_kind: str = "cubic",
+    dE_origin_like: bool = False,
+    dE_pad_flat_edges: bool = True,
+) -> DataCube:
+    """Load DRR from validated per-measurement assignments.
+
+    A common effective baseline delegates to the historic loader.  Different
+    assignments are corrected on their native grids and aligned only after
+    correction, with NaN outside coverage.
+    """
+    selected = tuple(str(item) for item in files)
+    by_measurement = {item.measurement_file: item for item in assignments}
+    if (
+        not selected
+        or len(assignments) != len(selected)
+        or set(by_measurement) != set(selected)
+        or len(by_measurement) != len(selected)
+    ):
+        raise ValueError("DRR assignments must contain exactly one entry per measurement file.")
+    ordered = tuple(by_measurement[item] for item in selected)
+    common = all(item.baseline_mode == ordered[0].baseline_mode for item in ordered)
+    external_descriptors_same = all(
+        item.baseline_files == ordered[0].baseline_files
+        and item.baseline_which == ordered[0].baseline_which
+        for item in ordered
+    ) if common else False
+    if common and ordered[0].baseline_mode == "External" and external_descriptors_same:
+        effective: list[tuple[np.ndarray, np.ndarray]] = []
+        baseline = build_external_baseline(
+            user_folder, ordered[0].baseline_files, which=ordered[0].baseline_which
+        )
+        effective.append((np.asarray(baseline["energy"], float), np.asarray(baseline["I0"], float)))
+    elif common and ordered[0].baseline_mode == "External":
+        effective = []
+        for item in ordered:
+            baseline = build_external_baseline(
+                user_folder, item.baseline_files, which=item.baseline_which
+            )
+            effective.append((np.asarray(baseline["energy"], float), np.asarray(baseline["I0"], float)))
+        common = all(
+            energy.shape == effective[0][0].shape
+            and np.array_equal(energy, effective[0][0], equal_nan=True)
+            and np.array_equal(vector, effective[0][1], equal_nan=True)
+            for energy, vector in effective[1:]
+        )
+    if common:
+        first = ordered[0]
+        if first.baseline_mode == "External":
+            cube = load_drr_avg(
+                user_folder, selected, bg_mode="external", y_axis=y_axis,
+                external_vector=np.asarray(effective[0][1], float),
+                external_energy=np.asarray(effective[0][0], float), derivative=derivative,
+                dE_window_pts=dE_window_pts, dE_polyorder=dE_polyorder,
+                dE_oversample=dE_oversample, dE_interp_kind=dE_interp_kind,
+                dE_origin_like=dE_origin_like, dE_pad_flat_edges=dE_pad_flat_edges,
+            )
+        else:
+            cube = load_drr_avg(
+                user_folder, selected,
+                bg_mode="self_first" if first.baseline_mode == "Self (first frame)" else "self_last",
+                y_axis=y_axis, derivative=derivative,
+                dE_window_pts=dE_window_pts, dE_polyorder=dE_polyorder,
+                dE_oversample=dE_oversample, dE_interp_kind=dE_interp_kind,
+                dE_origin_like=dE_origin_like, dE_pad_flat_edges=dE_pad_flat_edges,
+            )
+        cube.drr_numerical_path = "common"
+        cube.drr_assignments = tuple(item.to_dict() for item in ordered)
+        return cube
+
+    effective_y_axis = P.resolve_shared_y_axis_request(selected, y_axis)
+    canonical: list[dict[str, Any]] = [
+        P._load_canonical(user_folder, item, y_axis=effective_y_axis) for item in selected
+    ]
+    first_energy = _validated_interp_axis(canonical[0]["energy"], context=f"Measurement {selected[0]}")
+    first_gate = _validated_interp_axis(canonical[0]["gate_axis"], context=f"Measurement {selected[0]} gate") if np.asarray(canonical[0]["gate_axis"]).size >= 2 else np.asarray(canonical[0]["gate_axis"], float).ravel()
+    if first_gate.size < 1 or not np.all(np.isfinite(first_gate)) or np.unique(first_gate).size != first_gate.size:
+        raise ValueError(f"Measurement {selected[0]} gate axis is invalid.")
+    gate_label = str(canonical[0].get("gate_label", "Gate"))
+    corrected: list[np.ndarray] = []
+    for name, assignment, data in zip(selected, ordered, canonical):
+        energy = _validated_interp_axis(data["energy"], context=f"Measurement {name}")
+        gate = np.asarray(data["gate_axis"], dtype=float).ravel()
+        if gate.size < 1 or not np.all(np.isfinite(gate)) or np.unique(gate).size != gate.size:
+            raise ValueError(f"Measurement {name} gate axis is invalid.")
+        if str(data.get("gate_label", "Gate")) != gate_label:
+            raise ValueError("DRR assignments use incompatible gate semantics.")
+        z = np.asarray(data["Z"], dtype=float)
+        if z.shape != (gate.size, energy.size):
+            raise ValueError(f"Measurement {name} data does not match its grid.")
+        if assignment.baseline_mode == "External":
+            baseline = _native_external_baseline(
+                user_folder, assignment, energy, y_axis=effective_y_axis
+            )
+            native = P._drr_from_Z(z, "external", baseline)
+        else:
+            native = P._drr_from_Z(
+                z,
+                "first" if assignment.baseline_mode == "Self (first frame)" else "last",
+                None,
+            )
+        if name != selected[0] or energy.shape != first_energy.shape or not np.array_equal(energy, first_energy):
+            native = _interp_rows_no_extrapolation(native, energy, first_energy, context=f"Measurement {name}")
+        if gate.shape != first_gate.shape or not np.array_equal(gate, first_gate):
+            native = _interp_rows_no_extrapolation(native.T, gate, first_gate, context=f"Measurement {name} gate").T
+        corrected.append(native)
+    result = np.nanmean(np.stack(corrected, axis=0), axis=0)
+    if derivative in (1, 2):
+        result = P.sg_derivative_origin_rows(
+            result, first_energy, deriv=derivative,
+            window_pts=dE_window_pts, polyorder=dE_polyorder,
+            oversample=dE_oversample, interp_kind=dE_interp_kind,
+            origin_like=dE_origin_like, pad_flat_edges=dE_pad_flat_edges,
+        )
+    cube = DataCube(
+        energy=first_energy.copy(), gate=first_gate.copy(), Z=result,
+        gate_label=gate_label, title=str(canonical[0].get("title_name", selected[0])),
+        cbar_label="DR/R" if derivative is None else ("d(DR/R)/dE" if derivative == 1 else "d2(DR/R)/dE2"),
+    )
+    cube.drr_numerical_path = "heterogeneous"
+    cube.drr_assignments = tuple(item.to_dict() for item in ordered)
+    return cube
