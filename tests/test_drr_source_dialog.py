@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
 
 from core.drr_sources import (
+    _read_drr_metadata,
     compatible_drr_repeats,
     discover_drr_sources,
     find_saved_drr_recipe,
@@ -24,6 +26,38 @@ def _one_gate_csv(path: Path, gates: list[float]) -> None:
     rows = ["Vbg,740,760,780"]
     rows.extend(f"{gate},1,2,3" for gate in gates)
     path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+
+def _write_drr_recipe(
+    metadata_path: Path,
+    measurements: list[Path],
+    backgrounds: list[Path],
+    *,
+    baseline_selection: str = "External",
+    baseline_which: str = "all",
+) -> None:
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "operation": "DR/R",
+                "sources": [
+                    *(
+                        {"role": "measurement", "source_path": str(path)}
+                        for path in measurements
+                    ),
+                    *(
+                        {"role": "background", "source_path": str(path)}
+                        for path in backgrounds
+                    ),
+                ],
+                "processing": {
+                    "baseline_selection": baseline_selection,
+                    "baseline_which": baseline_which,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 class DrrSourceMetadataAndGridTests(unittest.TestCase):
@@ -74,6 +108,175 @@ class DrrSourceMetadataAndGridTests(unittest.TestCase):
             self.assertEqual(background.classification, "background")
             self.assertEqual(background.gate_labels, ("Vbg", "Vtg"))
             self.assertEqual(background.gate_ranges, ((0.0, 1.0), (0.0, 0.0)))
+
+    def test_per_file_links_stay_independent_when_group_summary_is_union(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initial = root / "Initial Data"
+            processed = root / "Processed Data" / "DRR"
+            initial.mkdir(parents=True)
+            processed.mkdir(parents=True)
+            measurement_a = initial / "sample_760nm_rep1_1.csv"
+            measurement_b = initial / "sample_760nm_rep1_2.csv"
+            background_1 = initial / "bg1.csv"
+            background_2 = initial / "bg2.csv"
+            for path in (measurement_a, measurement_b, background_1, background_2):
+                _csv(path, [(0, 0), (1, 0)])
+            _write_drr_recipe(processed / "a.metadata.json", [measurement_a], [background_1])
+            _write_drr_recipe(processed / "b.metadata.json", [measurement_b], [background_2])
+
+            catalog = discover_drr_sources(root)
+            sources = {source.source: source for source in catalog}
+
+            self.assertEqual(
+                sources["Initial Data/sample_760nm_rep1_1.csv"].linked_backgrounds,
+                ("Initial Data/bg1.csv",),
+            )
+            self.assertEqual(
+                sources["Initial Data/sample_760nm_rep1_2.csv"].linked_backgrounds,
+                ("Initial Data/bg2.csv",),
+            )
+            measurement_groups = [
+                group for group in group_drr_sources(catalog) if not group.is_background
+            ]
+            self.assertEqual(len(measurement_groups), 1)
+            self.assertEqual(
+                set(measurement_groups[0].linked_backgrounds),
+                {"Initial Data/bg1.csv", "Initial Data/bg2.csv"},
+            )
+
+    def test_cross_group_links_do_not_contaminate_different_or_unprocessed_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initial = root / "Initial Data"
+            processed = root / "Processed Data" / "DRR"
+            initial.mkdir(parents=True)
+            processed.mkdir(parents=True)
+            measurement_a = initial / "alpha_rep1_1.csv"
+            measurement_b = initial / "beta_rep1_1.csv"
+            measurement_c = initial / "charlie_rep1_1.csv"
+            measurement_d = initial / "delta_rep1_1.csv"
+            background_1 = initial / "bg1.csv"
+            background_2 = initial / "bg2.csv"
+            background_3 = initial / "bg3.csv"
+            for path in (
+                measurement_a,
+                measurement_b,
+                measurement_c,
+                measurement_d,
+                background_1,
+                background_2,
+                background_3,
+            ):
+                _csv(path, [(0, 0), (1, 0)])
+            _write_drr_recipe(
+                processed / "ac.metadata.json",
+                [measurement_a, measurement_c],
+                [background_1, background_2],
+            )
+            _write_drr_recipe(processed / "b.metadata.json", [measurement_b], [background_3])
+
+            catalog = discover_drr_sources(root)
+            sources = {source.source: source for source in catalog}
+            shared = ("Initial Data/bg1.csv", "Initial Data/bg2.csv")
+
+            self.assertEqual(sources["Initial Data/alpha_rep1_1.csv"].linked_backgrounds, shared)
+            self.assertEqual(sources["Initial Data/charlie_rep1_1.csv"].linked_backgrounds, shared)
+            self.assertEqual(
+                sources["Initial Data/beta_rep1_1.csv"].linked_backgrounds,
+                ("Initial Data/bg3.csv",),
+            )
+            self.assertEqual(sources["Initial Data/delta_rep1_1.csv"].linked_backgrounds, ())
+            groups = {
+                group.title: group
+                for group in group_drr_sources(catalog)
+                if not group.is_background
+            }
+            self.assertEqual(set(groups["alpha"].linked_backgrounds), set(shared))
+            self.assertEqual(groups["beta"].linked_backgrounds, ("Initial Data/bg3.csv",))
+            self.assertEqual(groups["delta"].linked_backgrounds, ())
+
+    def test_exact_recipe_restore_is_per_selection_and_mixed_selection_is_unmatched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initial = root / "Initial Data"
+            processed = root / "Processed Data" / "DRR"
+            initial.mkdir(parents=True)
+            processed.mkdir(parents=True)
+            measurement_a = initial / "sample_a.csv"
+            measurement_b = initial / "sample_b.csv"
+            background_1 = initial / "bg1.csv"
+            background_2 = initial / "bg2.csv"
+            for path in (measurement_a, measurement_b, background_1, background_2):
+                _csv(path, [(0, 0), (1, 0)])
+            _write_drr_recipe(processed / "a.metadata.json", [measurement_a], [background_1])
+            _write_drr_recipe(processed / "b.metadata.json", [measurement_b], [background_2])
+
+            recipe_a = find_saved_drr_recipe(root, ["Initial Data/sample_a.csv"])
+            recipe_b = find_saved_drr_recipe(root, ["Initial Data/sample_b.csv"])
+
+            self.assertIsNotNone(recipe_a)
+            self.assertIsNotNone(recipe_b)
+            self.assertEqual(recipe_a.measurement_files, ("Initial Data/sample_a.csv",))
+            self.assertEqual(recipe_a.baseline_files, ("Initial Data/bg1.csv",))
+            self.assertEqual(recipe_b.measurement_files, ("Initial Data/sample_b.csv",))
+            self.assertEqual(recipe_b.baseline_files, ("Initial Data/bg2.csv",))
+            self.assertIsNone(
+                find_saved_drr_recipe(
+                    root,
+                    ["Initial Data/sample_a.csv", "Initial Data/sample_b.csv"],
+                )
+            )
+
+    def test_multiple_histories_keep_exact_records_and_newest_restore_is_not_union(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initial = root / "Initial Data"
+            processed = root / "Processed Data" / "DRR"
+            initial.mkdir(parents=True)
+            processed.mkdir(parents=True)
+            measurement = initial / "sample_rep1_1.csv"
+            background_1 = initial / "bg1.csv"
+            background_2 = initial / "bg2.csv"
+            for path in (measurement, background_1, background_2):
+                _csv(path, [(0, 0), (1, 0)])
+            old_metadata = processed / "history-old.metadata.json"
+            new_metadata = processed / "history-new.metadata.json"
+            _write_drr_recipe(old_metadata, [measurement], [background_1])
+            _write_drr_recipe(new_metadata, [measurement], [background_2])
+            os.utime(old_metadata, (1_700_000_000, 1_700_000_000))
+            os.utime(new_metadata, (1_700_000_010, 1_700_000_010))
+            metadata_bytes = {
+                path: path.read_bytes() for path in (old_metadata, new_metadata)
+            }
+
+            catalog = discover_drr_sources(root)
+            source = next(item for item in catalog if item.source == "Initial Data/sample_rep1_1.csv")
+            _roles, records = _read_drr_metadata(root, require_drr_operation=True)
+            histories = {Path(record.metadata_path).name: record for record in records}
+
+            self.assertEqual(
+                histories[old_metadata.name].measurement_files,
+                ("Initial Data/sample_rep1_1.csv",),
+            )
+            self.assertEqual(histories[old_metadata.name].baseline_files, ("Initial Data/bg1.csv",))
+            self.assertEqual(
+                histories[new_metadata.name].measurement_files,
+                ("Initial Data/sample_rep1_1.csv",),
+            )
+            self.assertEqual(histories[new_metadata.name].baseline_files, ("Initial Data/bg2.csv",))
+            self.assertEqual(
+                set(source.linked_backgrounds),
+                {"Initial Data/bg1.csv", "Initial Data/bg2.csv"},
+            )
+            newest = find_saved_drr_recipe(root, ["Initial Data/sample_rep1_1.csv"])
+            self.assertIsNotNone(newest)
+            self.assertEqual(newest.baseline_files, ("Initial Data/bg2.csv",))
+            self.assertNotEqual(newest.baseline_files, source.linked_backgrounds)
+            self.assertEqual(
+                {path: path.read_bytes() for path in metadata_bytes},
+                metadata_bytes,
+            )
 
     def test_stale_metadata_does_not_match_unrelated_same_basename(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
