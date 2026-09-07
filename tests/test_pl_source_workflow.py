@@ -18,6 +18,7 @@ from core import data_io
 from core.loader import DataCube
 from ui_qt.controllers_pl import PlController
 from ui_qt.main_window import MainWindow, QComboBox, QDoubleSpinBox, QSpinBox
+from ui_qt.source_picker_dialog import SourcePickerDialog
 from tests.ui_test_helpers import wait_for_file_catalog
 
 
@@ -67,6 +68,71 @@ class PlSourceWorkflowTests(unittest.TestCase):
             {"Initial Data/session/measurement.csv": "2026-08-24T22:00:00+00:00"},
         )
 
+    def test_pl_source_classifier_is_conservative(self) -> None:
+        self.assertEqual(data_io.classify_pl_source("YZ365_p2_1.67KREF_760nmc.csv"), "REF")
+        self.assertEqual(data_io.classify_pl_source("YZD344_pen3_6KPL_690nm.csv"), "PL")
+        self.assertEqual(data_io.classify_pl_source("sample_reference.csv"), "Unknown")
+        self.assertEqual(data_io.classify_pl_source("sample_REF_PL.csv"), "Unknown")
+
+    def test_ref_selection_summary_identifies_raw_preview_without_subtraction(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_text:
+            root = Path(folder_text)
+            source = root / "YZ365_p2_1.67KREF_760nmc.csv"
+            source.write_text("a,b\n1,2\n", encoding="utf-8")
+            window = self._window()
+            try:
+                window._set_current_folder(str(root), remember=False)
+                wait_for_file_catalog(window)
+                window._restore_list_selection(window.pl_files, [source.name])
+                window.pl_controller._update_pl_selection_summary()
+                self.assertIn("REF raw preview · No background subtraction", window.pl_selection_summary.text())
+            finally:
+                window.close()
+
+    def test_pl_picker_separates_raw_type_filters_and_saved_results(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_text:
+            root = Path(folder_text)
+            for name in ("sample_PL.csv", "sample_REF.csv", "sample_reference.csv"):
+                (root / name).write_text("a,b\n1,2\n", encoding="utf-8")
+            saved = root / "Processed Data" / "PL"
+            saved.mkdir(parents=True)
+            for name in ("first.dat", "second.dat"):
+                (saved / name).write_text("saved", encoding="utf-8")
+            window = self._window()
+            try:
+                window._set_current_folder(str(root), remember=False)
+                wait_for_file_catalog(window)
+                seen = {}
+
+                def inspect_raw(dialog):
+                    seen["default"] = [dialog.source_list.item(i).data(Qt.UserRole) for i in range(dialog.source_list.count())]
+                    type_combo = next(combo for combo in dialog.findChildren(QComboBox) if combo.findData("REF") >= 0)
+                    type_combo.setCurrentIndex(type_combo.findData("REF"))
+                    seen["ref"] = [dialog.source_list.item(i).data(Qt.UserRole) for i in range(dialog.source_list.count())]
+                    type_combo.setCurrentIndex(type_combo.findData("All"))
+                    seen["all"] = [dialog.source_list.item(i).data(Qt.UserRole) for i in range(dialog.source_list.count())]
+                    dialog.reject()
+                    return SourcePickerDialog.Rejected
+
+                with patch.object(SourcePickerDialog, "exec", inspect_raw):
+                    self.assertIsNone(window.pl_controller._open_pl_source_dialog(""))
+                self.assertEqual(seen["default"], ["sample_PL.csv"])
+                self.assertEqual(seen["ref"], ["sample_REF.csv"])
+                self.assertEqual(set(seen["all"]), {"sample_PL.csv", "sample_REF.csv", "sample_reference.csv"})
+
+                def inspect_saved(dialog):
+                    seen["saved"] = [dialog.source_list.item(i).data(Qt.UserRole) for i in range(dialog.source_list.count())]
+                    dialog.source_list.setCurrentRow(0)
+                    return SourcePickerDialog.Accepted
+
+                with patch.object(SourcePickerDialog, "exec", inspect_saved), patch.object(window, "_start_load") as start_load:
+                    window.pl_controller._pl_source_filter_preference = "unprocessed"
+                    window.pl_controller._open_pl_saved_results()
+                self.assertEqual(set(seen["saved"]), {"Processed Data/PL/first.dat", "Processed Data/PL/second.dat"})
+                start_load.assert_called_once_with("PL")
+            finally:
+                window.close()
+
     def test_pl_chooser_selection_loads_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as folder_text:
             root = Path(folder_text)
@@ -104,6 +170,24 @@ class PlSourceWorkflowTests(unittest.TestCase):
                     advanced = window.pl_controller._auto_load_next_unprocessed_pl("done.csv")
                 self.assertTrue(advanced)
                 self.assertEqual(window._selected(window.pl_files), ["newest.csv"])
+                start_load.assert_called_once_with("PL")
+            finally:
+                window.close()
+
+    def test_auto_next_does_not_cross_raw_source_categories(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_text:
+            root = Path(folder_text)
+            for name in ("done_REF.csv", "next_REF.csv", "new_PL.csv"):
+                (root / name).write_text("a,b\n1,2\n", encoding="utf-8")
+            window = self._window()
+            try:
+                window._set_current_folder(str(root), remember=False)
+                wait_for_file_catalog(window)
+                window.pl_processed_status = {"done_REF.csv": "2026-08-24T22:00:00+00:00"}
+                window.pl_auto_next_chk.setChecked(True)
+                with patch.object(window, "_start_load") as start_load:
+                    self.assertTrue(window.pl_controller._auto_load_next_unprocessed_pl("done_REF.csv"))
+                self.assertEqual(window._selected(window.pl_files), ["next_REF.csv"])
                 start_load.assert_called_once_with("PL")
             finally:
                 window.close()

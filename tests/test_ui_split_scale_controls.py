@@ -16,7 +16,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QLineEdit, QListWidget, QScrollArea, QSplitter, QStyle, QStyleOptionSpinBox, QToolButton, QWidget
+from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QLineEdit, QListWidget, QPushButton, QScrollArea, QSplitter, QStyle, QStyleOptionSpinBox, QToolButton, QWidget
 
 from core.loader import DataCube
 from core.drr_sources import DrrSource
@@ -381,6 +381,9 @@ class SplitScaleControlTests(unittest.TestCase):
 
             def fake_exec(dialog: QDialog) -> int:
                 filter_edit = dialog.findChild(QLineEdit)
+                type_combo = dialog.findChild(QComboBox, "drr_source_type_combo")
+                self.assertIsNotNone(type_combo)
+                type_combo.setCurrentText("All data")
                 group_list = next(
                     widget for widget in dialog.findChildren(QListWidget) if widget.count()
                 )
@@ -401,6 +404,72 @@ class SplitScaleControlTests(unittest.TestCase):
 
             self.assertGreater(observed["before"], 0)
             self.assertEqual(observed["after"], 0)
+
+    def test_drr_picker_type_filter_defaults_ref_and_all_labels_sources(self) -> None:
+        sources = [
+            DrrSource("pl_760nmc.csv", "pl_760nmc.csv", "session", "2026-08-26", 3.0, False),
+            DrrSource("ref_760nmc.csv", "ref_760nmc.csv", "session", "2026-08-26", 2.0, False),
+            DrrSource("mystery_760nmc.csv", "mystery_760nmc.csv", "session", "2026-08-26", 1.0, False),
+        ]
+        self.window.drr_available_sources = sources
+        observed = {}
+
+        def fake_exec(dialog: QDialog) -> int:
+            combo = dialog.findChild(QComboBox, "drr_source_type_combo")
+            self.assertEqual(combo.currentText(), "REF")
+            group_list = dialog.findChild(QListWidget, "drr_source_group_list")
+            file_list = dialog.findChild(QListWidget, "drr_source_file_list")
+            chosen_list = dialog.findChild(QListWidget, "drr_source_chosen_list")
+            self.assertEqual(group_list.count(), 1)
+            combo.setCurrentText("All data")
+            self.app.processEvents()
+            self.assertEqual(file_list.count(), 3)
+            combo.setCurrentText("REF")
+            self.app.processEvents()
+            self.assertEqual(file_list.count(), 1)
+            self.assertIn("ref_760nmc.csv", str(file_list.item(0).data(Qt.UserRole)))
+            combo.setCurrentText("All data")
+            self.app.processEvents()
+            next(button for button in dialog.findChildren(QPushButton) if button.text() == "Add Entire Group").click()
+            self.assertEqual(chosen_list.count(), 3)
+            observed["rows"] = [group_list.item(0).text(), *(file_list.item(i).text() for i in range(file_list.count()))]
+            return QDialog.Rejected
+
+        with patch.object(QDialog, "exec", fake_exec):
+            self.window.drr_controller._open_drr_source_dialog(
+                title="Choose DRR files", selected=["pl_760nmc.csv"], baseline_mode=False
+            )
+        self.assertTrue(any("PL" in row for row in observed["rows"]))
+        self.assertTrue(any("REF" in row for row in observed["rows"]))
+        self.assertTrue(any("Unknown" in row for row in observed["rows"]))
+
+    def test_drr_baseline_picker_keeps_chosen_when_type_filter_changes(self) -> None:
+        self.window.drr_available_sources = [
+            DrrSource("ref_back_760nmc.csv", "ref_back_760nmc.csv", "back", "2026-08-26", 2.0, True),
+            DrrSource("odd_back_760nmc.csv", "odd_back_760nmc.csv", "back", "2026-08-26", 1.0, True),
+        ]
+        observed = {}
+
+        def fake_exec(dialog: QDialog) -> int:
+            combo = dialog.findChild(QComboBox, "drr_source_type_combo")
+            chosen = dialog.findChild(QListWidget, "drr_source_chosen_list")
+            self.assertEqual(combo.currentText(), "REF")
+            self.assertEqual(chosen.count(), 1)
+            self.assertIn("PL", chosen.item(0).text())
+            combo.setCurrentText("All data")
+            self.app.processEvents()
+            observed["files"] = dialog.findChild(QListWidget, "drr_source_file_list").count()
+            observed["chosen"] = chosen.count()
+            return QDialog.Rejected
+
+        with patch.object(QDialog, "exec", fake_exec):
+            self.window.drr_controller._open_drr_source_dialog(
+                title="Choose Historical or External Baseline",
+                selected=["pl_back_760nmc.csv"],
+                baseline_mode=True,
+            )
+        self.assertEqual(observed["files"], 2)
+        self.assertEqual(observed["chosen"], 1)
 
     def test_drr_catalog_discovery_runs_off_the_gui_thread(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

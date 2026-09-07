@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 import json
+import re
 from pathlib import Path
 from typing import Dict, List, Sequence
 
@@ -173,6 +174,27 @@ def list_pl_source_files(folder: str) -> List[str]:
         pass
     names = {path.relative_to(root).as_posix() for path in candidates}
     return sorted(names, key=_nat_key)
+
+
+_PL_SOURCE_MARKER_RE = re.compile(
+    r"(?:^|[_\-\s])(?P<kind>PL|REF)(?=$|[_\-\s])"
+    r"|(?P<temperature>\d+(?:\.\d+)?)K(?P<attached>PL|REF)(?=$|[_\-\s])",
+    re.IGNORECASE,
+)
+
+
+def classify_pl_source(source: str | Path) -> str:
+    """Classify a raw PL filename conservatively as PL, REF, or Unknown."""
+    suffix = Path(source).suffix.lower()
+    if suffix == ".dat":
+        return "DAT"
+    if suffix not in {".csv", ".xlsx"}:
+        return "Unknown"
+    kinds = {
+        (match.group("kind") or match.group("attached")).upper()
+        for match in _PL_SOURCE_MARKER_RE.finditer(Path(source).stem)
+    }
+    return next(iter(kinds)) if len(kinds) == 1 else "Unknown"
 
 
 def discover_pl_processing_status(

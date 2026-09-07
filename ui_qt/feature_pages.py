@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGridLayout,
     QGroupBox,
+    QLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -59,6 +60,7 @@ class FeatureTabsMixin:
         self.pl_files.itemSelectionChanged.connect(self.pl_controller._on_pl_selection_changed)
         source_row = QWidget()
         source_grid = QGridLayout(source_row)
+        source_grid.setSizeConstraint(QLayout.SetMinimumSize)
         source_grid.setContentsMargins(0, 0, 0, 0)
         source_grid.setHorizontalSpacing(6)
         source_grid.setVerticalSpacing(4)
@@ -66,16 +68,18 @@ class FeatureTabsMixin:
         self.pl_selection_summary.setMinimumWidth(0)
         self.pl_selection_summary.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.pl_select_source_btn = QPushButton("Select...")
-        self.pl_select_source_btn.setFixedHeight(30)
         self.pl_select_source_btn.setMinimumWidth(110)
         self.pl_select_source_btn.setMaximumWidth(110)
         self.pl_clear_source_btn = QPushButton("Clear")
-        self.pl_clear_source_btn.setFixedHeight(30)
         self.pl_clear_source_btn.setMaximumWidth(72)
+        self.pl_saved_results_btn = QPushButton("Saved results")
+        self.pl_saved_results_btn.setMinimumWidth(110)
+        self.pl_saved_results_btn.setMaximumWidth(110)
         source_grid.addWidget(self.pl_selection_summary, 0, 0, 1, 3)
         source_grid.setColumnStretch(0, 1)
         source_grid.addWidget(self.pl_select_source_btn, 1, 1)
         source_grid.addWidget(self.pl_clear_source_btn, 1, 2)
+        source_grid.addWidget(self.pl_saved_results_btn, 1, 0)
         files_layout.addWidget(source_row)
         self.pl_auto_next_chk = QCheckBox("Auto-load next new file after Save")
         auto_next_value = self.settings.value(self.SETTINGS_PL_AUTO_NEXT, True)
@@ -87,6 +91,7 @@ class FeatureTabsMixin:
         )
         files_layout.addWidget(self.pl_auto_next_chk)
         self.pl_select_source_btn.clicked.connect(self.pl_controller._edit_pl_source)
+        self.pl_saved_results_btn.clicked.connect(self.pl_controller._open_pl_saved_results)
         self.pl_clear_source_btn.clicked.connect(self.pl_controller._clear_pl_source)
         self.pl_auto_next_chk.toggled.connect(
             lambda checked: self.settings.setValue(self.SETTINGS_PL_AUTO_NEXT, bool(checked))
@@ -588,6 +593,19 @@ class FeatureTabsMixin:
         assignment_form.setContentsMargins(0, 0, 0, 0)
         assignment_form.setHorizontalSpacing(6)
         assignment_form.setVerticalSpacing(4)
+        source_filter_row = QHBoxLayout()
+        source_filter_row.setContentsMargins(0, 0, 0, 0)
+        source_filter_row.setSpacing(6)
+        source_filter_row.addWidget(QLabel("Source filter"))
+        self.cmp_source_filter_combo = QComboBox()
+        self.cmp_source_filter_combo.addItem("PL raw sources", "pl")
+        self.cmp_source_filter_combo.addItem("All raw data", "all")
+        self.cmp_source_filter_combo.setToolTip(
+            "Auto-detection uses this source set. Manual assignments are retained when a filter changes."
+        )
+        self._style_combo_popup(self.cmp_source_filter_combo)
+        source_filter_row.addWidget(self.cmp_source_filter_combo, 1)
+        assignment_layout.addLayout(source_filter_row)
         def _angle_spin(default: float = 0.0) -> QDoubleSpinBox:
             spin = QDoubleSpinBox()
             spin.setDecimals(3)
