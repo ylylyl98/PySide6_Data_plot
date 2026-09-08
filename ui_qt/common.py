@@ -152,9 +152,12 @@ class ExportOptions:
     compare_gate: float = 0.0
     compare_background: float = 0.0
     compare_export_vp: bool = True
+    compare_vp_vmin: float = -1.0
+    compare_vp_vmax: float = 1.0
     power_axis_log: bool = False
     power_view: str = "Intensity"
     power_background: float = 0.0
+    power_group_key: str = ""
     power_kk_group_key: str = ""
     power_kkp_group_key: str = ""
     power_kk_cube: DataCube | None = None
@@ -164,6 +167,7 @@ class ExportOptions:
     power_kkp_records: tuple[Any, ...] = ()
     power_pairing_mode: str = "stage"
     power_stage_pairs: tuple[Any, ...] = ()
+    power_peak_payload: dict | None = None
     shg_settings: ShgSettings | None = None
     shg_fit_settings: ShgFitSettings | None = None
     mcd_map_name: str = "Combo"

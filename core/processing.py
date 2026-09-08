@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, List, Sequence
 
 import numpy as np
@@ -21,6 +21,15 @@ COMPARE_GATE_CONDITION_RE = re.compile(
     r"(?P<condition>(?:(?P<tg>\d+(?:[pP\.]\d+)?)\s*)?TG\s*(?P<sign>[+-])\s*"
     r"(?:(?P<bg>\d+(?:[pP\.]\d+)?)\s*)?BG\s*=\s*0(?:\.0+)?)"
     r"(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+COMPARE_CHANNEL_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?P<channel>KKp|KpKp|KpK|KK)(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+COMPARE_ANGLE_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:rot\s*[12]|in|out)\s*[^0-9+\-]*"
+    r"[+\-]?\d+(?:[pP\.]\d+)?\s*(?:deg|degree)(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 
@@ -71,6 +80,7 @@ class PowerSweepPoint:
     stage: float | None
     row_index: int
     stage_column: str | None = None
+    source_provenance: str = ""
 
 
 @dataclass(frozen=True)
@@ -116,6 +126,23 @@ class CompareAngleInference:
     out_kp: float | None = None
 
 
+@dataclass
+class CompareSourceGroup:
+    """One searchable group of source files for compare/VP selection.
+
+    ``sources`` contains every eligible source in the group, including files
+    whose current angle references cannot classify them.  ``mapping`` contains
+    only unique channel assignments; duplicate assignments are deliberately
+    left out and reported in ``duplicates`` for local manual resolution.
+    """
+
+    key: str
+    label: str
+    sources: tuple[str, ...]
+    mapping: dict[str, str]
+    duplicates: dict[str, list[str]]
+
+
 def _parse_power_number(text: str) -> float:
     return float(str(text).replace("p", ".").replace("P", "."))
 
@@ -148,6 +175,8 @@ def parse_power_series_file(file_name: str) -> PowerSeriesFile | None:
     group_key = _compact_power_group_stem(file_name)
     if not group_key:
         return None
+    if Path(file_name).parent != Path('.'):
+        group_key = Path(file_name).parent.as_posix() + '/' + group_key
     return PowerSeriesFile(
         file_name=file_name,
         power_uW=_parse_power_number(power_match.group("power")),
@@ -433,7 +462,18 @@ def classify_compare_channel(
 ) -> str | None:
     in_angle, out_angle = parse_compare_in_out_angles(file_name)
     if in_angle is None and out_angle is None:
-        return None
+        tokens = {
+            match.group("channel").casefold()
+            for match in COMPARE_CHANNEL_TOKEN_RE.finditer(Path(file_name).stem)
+        }
+        if len(tokens) != 1:
+            return None
+        return {
+            "kk": "KK",
+            "kkp": "KKp",
+            "kpk": "KpK",
+            "kpkp": "KpKp",
+        }[next(iter(tokens))]
     missing_state = str(fixed_missing_arm or "").strip().casefold()
     if (in_angle is None or out_angle is None) and missing_state not in {"k", "kp", "kprime", "k'"}:
         return None
@@ -475,6 +515,177 @@ def classify_compare_channel(
     return "KpKp"
 
 
+def _compare_source_parts(file_name: str) -> tuple[str, str]:
+    """Return a cross-platform parent path and filename stem."""
+    normalized = str(file_name).replace("\\", "/")
+    path = PurePosixPath(normalized)
+    parent = "" if str(path.parent) == "." else str(path.parent)
+    return parent, path.stem
+
+
+def _compare_group_context_key(file_name: str) -> tuple[str, str]:
+    """Build the parent/context key used by searchable compare groups."""
+    parent, stem = _compare_source_parts(file_name)
+    context = _normalize_gate_signs(stem).replace("$", "")
+    context = COMPARE_ANGLE_TOKEN_RE.sub("_", context)
+    context = POWER_TOKEN_RE.sub("_", context)
+    context = COMPARE_CHANNEL_TOKEN_RE.sub("_", context)
+    context = re.sub(r"[<>:\"/\\|?*]+", "_", context)
+    context = re.sub(r"_+", "_", context)
+    context = re.sub(r"[\s-]+", "_", context)
+    context = context.strip("_").lower()
+    parent_key = re.sub(r"/+", "/", parent)
+    return parent_key, context
+
+
+def _compare_group_power_label(powers: Sequence[float]) -> str:
+    finite = [float(value) for value in powers if np.isfinite(value)]
+    if not finite:
+        return "power unknown"
+    low, high = min(finite), max(finite)
+    if np.isclose(low, high, rtol=0.0, atol=1e-12):
+        return f"{low:g} uW"
+    return f"{low:g}\N{EN DASH}{high:g} uW"
+
+
+def _compare_group_context_label(parent: str, context: str) -> str:
+    value = context.replace("_", " ").strip()
+    if parent:
+        value = f"{parent} / {value}" if value else parent
+    return value or "measurement"
+
+
+def group_compare_sources(
+    file_names: Sequence[str],
+    *,
+    in_k_angle: float,
+    out_k_angle: float,
+    in_kp_angle: float | None = None,
+    out_kp_angle: float | None = None,
+    tolerance: float = 45.0,
+    power_tolerance_fraction: float = 0.05,
+) -> list[CompareSourceGroup]:
+    """Group raw compare sources by measurement context and nearby power.
+
+    Angle tokens and standalone channel labels identify the two arms but do
+    not split a measurement context.  Sources with an angle that is currently
+    ambiguous or outside the supplied references remain in ``sources`` so a
+    later reference edit can resolve them.  A source without an angle and
+    without one unambiguous channel token is skipped.
+    """
+    fraction = float(power_tolerance_fraction)
+    if not np.isfinite(fraction) or fraction < 0.0:
+        raise ValueError("Power tolerance fraction must be finite and non-negative.")
+
+    # Keep original order to make the UI stable and preserve exact source
+    # strings, while grouping by normalized parent/context below.
+    contexts: dict[tuple[str, str], list[tuple[int, str, float, str | None]]] = {}
+    for index, raw_name in enumerate(file_names):
+        file_name = str(raw_name)
+        _parent, stem = _compare_source_parts(file_name)
+        suffix = PurePosixPath(file_name.replace("\\", "/")).suffix.casefold()
+        if suffix not in {".csv", ".xlsx"}:
+            continue
+
+        angles = parse_compare_rotation_angles(file_name)
+        has_angle = angles.rot1 is not None or angles.rot2 is not None
+        channel = classify_compare_channel(
+            file_name,
+            in_k_angle=in_k_angle,
+            out_k_angle=out_k_angle,
+            in_kp_angle=in_kp_angle,
+            out_kp_angle=out_kp_angle,
+            tolerance=tolerance,
+        )
+        # classify_compare_channel intentionally returns None for an
+        # ambiguous/distant angle.  Keep those angle-bearing files for manual
+        # resolution, while filtering arbitrary raw files from the picker.
+        if not has_angle and channel is None:
+            continue
+        parent, context = _compare_group_context_key(file_name)
+        contexts.setdefault((parent, context), []).append(
+            (index, file_name, _compare_file_power(file_name), channel)
+        )
+
+    groups: list[CompareSourceGroup] = []
+    ratio_limit = 1.0 + fraction
+    for (parent, context), records in sorted(
+        contexts.items(), key=lambda item: min(record[0] for record in item[1])
+    ):
+        known = sorted(
+            (record for record in records if np.isfinite(record[2])),
+            key=lambda record: (record[2], record[0]),
+        )
+        buckets: list[list[tuple[int, str, float, str | None]]] = []
+        for record in known:
+            if not buckets:
+                buckets.append([record])
+                continue
+            bucket = buckets[-1]
+            low = min(item[2] for item in bucket)
+            candidate_low = min(low, record[2])
+            candidate_high = max(item[2] for item in bucket + [record])
+            within_ratio = (
+                candidate_low == candidate_high
+                or (
+                    candidate_low > 0.0
+                    and candidate_high / candidate_low <= ratio_limit + 1e-12
+                )
+            )
+            if within_ratio:
+                bucket.append(record)
+            else:
+                buckets.append([record])
+
+        unknown = [record for record in records if not np.isfinite(record[2])]
+        if unknown:
+            buckets.append(unknown)
+
+        for bucket in buckets:
+            ordered = sorted(bucket, key=lambda record: record[0])
+            sources = tuple(record[1] for record in ordered)
+            by_channel: dict[str, list[str]] = {}
+            for _index, source, _power, channel in ordered:
+                if channel is not None:
+                    by_channel.setdefault(channel, []).append(source)
+            mapping = {
+                channel: names[0]
+                for channel, names in by_channel.items()
+                if len(names) == 1
+            }
+            duplicates = {
+                channel: list(names)
+                for channel, names in by_channel.items()
+                if len(names) > 1
+            }
+            power_label = _compare_group_power_label([record[2] for record in bucket])
+            coverage = sorted(set(mapping) | set(duplicates))
+            coverage_label = ", ".join(
+                f"{channel} (duplicate)" if channel in duplicates else channel
+                for channel in coverage
+            ) or "unclassified"
+            label = (
+                f"{_compare_group_context_label(parent, context)}"
+                f" · {power_label} · {coverage_label}"
+            )
+            power_key = (
+                "unknown"
+                if not any(np.isfinite(record[2]) for record in bucket)
+                else ",".join(f"{record[2]:.12g}" for record in bucket)
+            )
+            key = f"{parent}::{context}::power={power_key}"
+            groups.append(
+                CompareSourceGroup(
+                    key=key,
+                    label=label,
+                    sources=sources,
+                    mapping=mapping,
+                    duplicates=duplicates,
+                )
+            )
+    return groups
+
+
 def _compare_file_power(file_name: str) -> float:
     match = POWER_TOKEN_RE.search(str(Path(file_name).stem))
     if not match:
@@ -484,6 +695,7 @@ def _compare_file_power(file_name: str) -> float:
 
 def _compare_context_key(file_name: str, *, ignore_gate_condition: bool = False) -> str:
     stem = _normalize_gate_signs(Path(file_name).stem).replace("$", "")
+    stem = COMPARE_CHANNEL_TOKEN_RE.sub("_", stem)
     stem = POWER_TOKEN_RE.sub("", stem)
     stem = re.sub(
         r"(?:^|[_\s-]+)Rot\s*[12][^_\s-]*(?:deg|degree)",

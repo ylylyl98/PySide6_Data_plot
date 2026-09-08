@@ -22,11 +22,18 @@ class LoaderTests(unittest.TestCase):
                 clear()
 
     def test_csv_signature_errors_for_missing_paths(self) -> None:
-        with self.assertRaises(FileNotFoundError):
-            loader._csv_signature("Z:/missing/folder", "a.csv")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(FileNotFoundError):
+                loader._csv_signature(str(root / "missing" / "folder"), "a.csv")
 
-        with self.assertRaises(FileNotFoundError):
-            loader._csv_signature(str(FIXTURES), "missing.csv")
+            with self.assertRaises(FileNotFoundError):
+                loader._csv_signature(str(FIXTURES), "missing.csv")
+
+            directory = root / "directory.csv"
+            directory.mkdir()
+            with self.assertRaises(FileNotFoundError):
+                loader._csv_signature(str(root), directory.name)
 
     def test_nested_initial_data_csv_can_be_loaded_directly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

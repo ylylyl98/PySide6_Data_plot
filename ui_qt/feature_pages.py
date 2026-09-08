@@ -641,14 +641,14 @@ class FeatureTabsMixin:
         params_layout.setContentsMargins(6, 6, 6, 4)
         params_layout.setSpacing(4)
 
-        assignment = QGroupBox("Assignment")
+        assignment = QGroupBox("Channel Files")
         assignment_layout = QVBoxLayout(assignment)
         assignment_layout.setContentsMargins(6, 8, 6, 6)
         assignment_layout.setSpacing(6)
-        assignment_form = QFormLayout()
-        assignment_form.setContentsMargins(0, 0, 0, 0)
-        assignment_form.setHorizontalSpacing(6)
-        assignment_form.setVerticalSpacing(4)
+        angle_rules_form = QFormLayout()
+        angle_rules_form.setContentsMargins(0, 0, 0, 0)
+        angle_rules_form.setHorizontalSpacing(6)
+        angle_rules_form.setVerticalSpacing(4)
         source_filter_row = QHBoxLayout()
         source_filter_row.setContentsMargins(0, 0, 0, 0)
         source_filter_row.setSpacing(6)
@@ -657,11 +657,31 @@ class FeatureTabsMixin:
         self.cmp_source_filter_combo.addItem("PL raw sources", "pl")
         self.cmp_source_filter_combo.addItem("All raw data", "all")
         self.cmp_source_filter_combo.setToolTip(
-            "Auto-detection uses this source set. Manual assignments are retained when a filter changes."
+            "Auto Detect uses files with recognizable rotation angles or channel labels "
+            "(KK, KKp, KpK, KpKp). Other files remain available for manual assignment. "
+            "Manual assignments are retained when a filter changes."
         )
         self._style_combo_popup(self.cmp_source_filter_combo)
         source_filter_row.addWidget(self.cmp_source_filter_combo, 1)
         assignment_layout.addLayout(source_filter_row)
+
+        group_row = QWidget()
+        group_grid = QGridLayout(group_row)
+        group_grid.setContentsMargins(0, 0, 0, 0)
+        group_grid.setHorizontalSpacing(6)
+        group_grid.setVerticalSpacing(4)
+        self.cmp_group_selection_summary = StatusBadge("No compare group selected.", app_role=None)
+        self.cmp_group_selection_summary.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.cmp_select_group_btn = QPushButton("Select...")
+        self.cmp_select_group_btn.setMinimumWidth(110)
+        self.cmp_select_group_btn.setMaximumWidth(110)
+        self.cmp_clear_group_btn = QPushButton("Clear")
+        self.cmp_clear_group_btn.setMaximumWidth(72)
+        group_grid.addWidget(self.cmp_group_selection_summary, 0, 0, 1, 3)
+        group_grid.setColumnStretch(0, 1)
+        group_grid.addWidget(self.cmp_select_group_btn, 1, 1)
+        group_grid.addWidget(self.cmp_clear_group_btn, 1, 2)
+        assignment_layout.addWidget(group_row)
         def _angle_spin(default: float = 0.0) -> QDoubleSpinBox:
             spin = QDoubleSpinBox()
             spin.setDecimals(3)
@@ -691,6 +711,10 @@ class FeatureTabsMixin:
             "Suggest editable K/Kp references when exactly two filename-angle clusters are detected."
         )
         self.cmp_auto_assign_btn = QPushButton("Auto Detect")
+        self.cmp_auto_assign_btn.setToolTip(
+            "Assign channels from filename rotation angles or explicit KK / KKp / KpK / KpKp labels. "
+            "Files without either are skipped; select them manually below."
+        )
         for button in (self.cmp_infer_angles_btn, self.cmp_auto_assign_btn):
             button.setMinimumWidth(button.fontMetrics().horizontalAdvance(button.text()) + 12)
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -709,15 +733,12 @@ class FeatureTabsMixin:
         angle_grid.addWidget(self.cmp_out_kp_angle_spin, 3, 1, 1, 3)
         angle_grid.addWidget(QLabel("Tolerance"), 4, 0)
         angle_grid.addWidget(self.cmp_angle_tolerance_spin, 4, 1, 1, 3)
-        # Keep the two long actions on a dedicated row so each retains its
-        # full label at the 380 px sidebar width.
+        # Keep the long action on a dedicated row so it retains its full
+        # label at the 380 px sidebar width.
         angle_grid.addWidget(self.cmp_infer_angles_btn, 5, 0, 1, 4)
-        angle_grid.addWidget(self.cmp_auto_assign_btn, 6, 0, 1, 4)
         angle_grid.setColumnStretch(1, 1)
         angle_grid.setColumnStretch(3, 1)
-        angle_grid.setColumnStretch(4, 1)
-        assignment_form.addRow("Angle Rules", angle_box)
-        assignment_layout.addLayout(assignment_form)
+        angle_rules_form.addRow(angle_box)
         self.cmp_channel_combos: dict[str, QComboBox] = {}
         channels_box = QWidget()
         channels_grid = QGridLayout(channels_box)
@@ -729,13 +750,19 @@ class FeatureTabsMixin:
             combo.setEditable(False)
             self._style_combo_popup(combo)
             self.cmp_channel_combos[key] = combo
-            row = idx // 2
-            col = idx % 2
             label = QLabel(key)
             label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            channels_grid.addWidget(label, row, col * 2)
-            channels_grid.addWidget(combo, row, col * 2 + 1)
-        assignment_layout.addWidget(channels_box)
+            channels_grid.addWidget(label, idx, 0)
+            channels_grid.addWidget(combo, idx, 1)
+        channels_grid.setColumnStretch(1, 1)
+        manual_assignment = self._make_expander(
+            "Manual channel assignments", channels_box, expanded=False
+        )
+        assignment_layout.addWidget(manual_assignment)
+        assignment_layout.addWidget(self.cmp_auto_assign_btn)
+        self.cmp_swap_kk_btn = QPushButton("Swap KK / KKp")
+        self.cmp_swap_kk_btn.setToolTip("Swap the KK and KKp assignments without rerunning Auto Detect.")
+        assignment_layout.addWidget(self.cmp_swap_kk_btn)
         self.cmp_assignment_summary = QPlainTextEdit()
         self.cmp_assignment_summary.setReadOnly(True)
         self.cmp_assignment_summary.setMaximumHeight(88)
@@ -745,7 +772,14 @@ class FeatureTabsMixin:
         summary_form.setVerticalSpacing(4)
         summary_form.addRow("Summary", self.cmp_assignment_summary)
         assignment_layout.addLayout(summary_form)
-        layout.addWidget(self._make_expander("Assignment", assignment, expanded=True))
+        self.cmp_group_power_tolerance_percent = 5.0
+        self.cmp_select_group_btn.clicked.connect(self.compare_controller._cmp_open_group_dialog)
+        self.cmp_clear_group_btn.clicked.connect(self.compare_controller._cmp_clear_group)
+        self.cmp_swap_kk_btn.clicked.connect(self.compare_controller._cmp_swap_kk_channels)
+        layout.addWidget(self._make_expander("Data Selection", assignment, expanded=True))
+        angle_rules = QWidget()
+        angle_rules.setLayout(angle_rules_form)
+        layout.addWidget(self._make_expander("Angle Rules", angle_rules, expanded=False))
 
         display = QGroupBox("Display Preset")
         display_form = QFormLayout(display)
@@ -786,6 +820,48 @@ class FeatureTabsMixin:
         bkg_h.addWidget(self.cmp_vp_background_spin)
         bkg_h.addWidget(self.cmp_vp_auto_background_chk)
         bkg_h.addStretch(1)
+        # Valley polarization has its own color limits.  Keeping these
+        # separate from the intensity limits means switching views does not
+        # overwrite a carefully chosen intensity scale.
+        self.cmp_vp_spins = {}
+        self.cmp_vp_fix_checks = {}
+        for key, default, label in (
+            ("vmin", -1.0, "VP color minimum"),
+            ("vmax", 1.0, "VP color maximum"),
+        ):
+            spin = QDoubleSpinBox()
+            spin.setDecimals(6)
+            spin.setRange(-1.0, 1.0)
+            spin.setSingleStep(0.05)
+            spin.setValue(default)
+            spin.setMinimumWidth(116)
+            spin.setMaximumWidth(130)
+            spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            spin.setToolTip(f"{label}; VP limits must stay within -1 and 1.")
+            self.cmp_vp_spins[key] = spin
+            check = QCheckBox("F")
+            check.setToolTip(f"Keep the VP {key} when VP Auto is used.")
+            self.cmp_vp_fix_checks[key] = check
+        self.cmp_vp_auto_v_btn = QToolButton()
+        self.cmp_vp_auto_v_btn.setText("Auto VP")
+        self.cmp_vp_auto_v_btn.setToolTip("Set unlocked VP color limits from finite values in the current ROI.")
+        self.cmp_vp_auto_v_btn.setAutoRaise(True)
+        # Use a stacked layout here because the VP expander sits in the
+        # narrow controls sidebar; a horizontal dense row clips the vmax/F
+        # controls at the supported minimum width.
+        vp_range_row = QWidget()
+        vp_range_grid = QGridLayout(vp_range_row)
+        vp_range_grid.setContentsMargins(0, 0, 0, 0)
+        vp_range_grid.setHorizontalSpacing(4)
+        vp_range_grid.setVerticalSpacing(3)
+        vp_range_grid.addWidget(QLabel("vmin"), 0, 0)
+        vp_range_grid.addWidget(self.cmp_vp_spins["vmin"], 0, 1)
+        vp_range_grid.addWidget(self.cmp_vp_fix_checks["vmin"], 0, 2)
+        vp_range_grid.addWidget(QLabel("vmax"), 1, 0)
+        vp_range_grid.addWidget(self.cmp_vp_spins["vmax"], 1, 1)
+        vp_range_grid.addWidget(self.cmp_vp_fix_checks["vmax"], 1, 2)
+        vp_range_grid.addWidget(self.cmp_vp_auto_v_btn, 2, 0, 1, 3, Qt.AlignLeft)
+        vp_range_grid.setColumnStretch(1, 1)
         self.cmp_vp_filename_preview = QLineEdit()
         self.cmp_vp_filename_preview.setReadOnly(True)
         self.cmp_vp_filename_preview.setMinimumWidth(200)
@@ -796,11 +872,13 @@ class FeatureTabsMixin:
         self.cmp_vp_title_preview = QLineEdit()
         self.cmp_vp_title_preview.setReadOnly(True)
         vp_form.addRow("Background", bkg_row)
+        vp_form.addRow("Color range", vp_range_row)
         vp_form.addRow("VP filename", self.cmp_vp_filename_preview)
         vp_form.addRow("KK title", self.cmp_kk_title_preview)
         vp_form.addRow("KKp title", self.cmp_kkp_title_preview)
         vp_form.addRow("VP title", self.cmp_vp_title_preview)
-        params_layout.addWidget(self._make_expander("VP", vp_box, expanded=False))
+        self.cmp_vp_expander = self._make_expander("VP", vp_box, expanded=False)
+        params_layout.addWidget(self.cmp_vp_expander)
 
         cfg = QFormLayout()
         cfg.setRowWrapPolicy(QFormLayout.WrapLongRows)

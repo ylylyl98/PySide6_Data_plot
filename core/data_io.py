@@ -106,7 +106,7 @@ POWER_SWEEP_KEY_PREFIX = "csv::"
 
 
 def power_sweep_source_key(file_name: str) -> str:
-    return f"{POWER_SWEEP_KEY_PREFIX}{Path(file_name).name}"
+    return f"{POWER_SWEEP_KEY_PREFIX}{Path(file_name).as_posix()}"
 
 
 def is_power_sweep_source_key(key: str) -> bool:
@@ -116,7 +116,7 @@ def is_power_sweep_source_key(key: str) -> bool:
 def power_sweep_file_from_key(key: str) -> str:
     if not is_power_sweep_source_key(key):
         raise ValueError(f"Not a power-sweep CSV source key: {key}")
-    return Path(str(key)[len(POWER_SWEEP_KEY_PREFIX):]).name
+    return Path(str(key)[len(POWER_SWEEP_KEY_PREFIX):]).as_posix()
 
 
 def list_csv_files(folder: str) -> List[str]:
@@ -405,7 +405,7 @@ def _power_table_columns(columns: Sequence[str]) -> tuple[str | None, str | None
 
 def inspect_power_sweep_csv(folder: str, file_name: str) -> bool:
     """Return True when a CSV header describes a single-file power sweep."""
-    path = Path(folder) / Path(file_name).name
+    path = Path(folder) / file_name
     if not path.is_file():
         return False
     try:
@@ -425,15 +425,15 @@ def get_power_series_sources(folder: str, files: Sequence[str]) -> Dict[str, Pow
     table_files: set[str] = set()
     for file_name in files:
         if inspect_power_sweep_csv(folder, file_name):
-            table_files.add(Path(file_name).name)
+            table_files.add(str(file_name))
             key = power_sweep_source_key(file_name)
             sources[key] = PowerSeriesSource(
                 key=key,
                 title=power_group_title(key),
                 source_format="table",
-                file_name=Path(file_name).name,
+                file_name=str(file_name),
             )
-    legacy_files = [file_name for file_name in files if Path(file_name).name not in table_files]
+    legacy_files = [file_name for file_name in files if str(file_name) not in table_files]
     for key, records in get_power_series_groups(legacy_files).items():
         sources[key] = PowerSeriesSource(
             key=key,
@@ -445,9 +445,9 @@ def get_power_series_sources(folder: str, files: Sequence[str]) -> Dict[str, Pow
 
 
 def _power_sweep_signature(folder: str, file_name: str) -> tuple[int, int]:
-    path = Path(folder) / Path(file_name).name
+    path = Path(folder) / file_name
     if not path.is_file():
-        raise FileNotFoundError(f"CSV not found in folder root: {path}")
+        raise FileNotFoundError(f"Power CSV not found: {path}")
     stat = path.stat()
     return int(stat.st_mtime_ns), int(stat.st_size)
 
@@ -459,7 +459,7 @@ def _load_power_sweep_csv_cached(
     signature: tuple[int, int],
 ) -> tuple[DataCube, tuple[PowerSweepPoint, ...]]:
     del signature
-    path = Path(folder) / Path(file_name).name
+    path = Path(folder) / file_name
     sep = processing_impl._guess_sep_from_first_line(path)
     frame = pd.read_csv(path, sep=sep)
     frame.columns = [str(column).strip() for column in frame.columns]
@@ -539,11 +539,13 @@ def _load_power_sweep_csv_cached(
 
     records = tuple(
         PowerSweepPoint(
-            file_name=Path(file_name).name,
+            file_name=str(file_name),
             power_uW=float(power[index]),
             stage=(float(stage_values[index]) if np.isfinite(stage_values[index]) else None),
             row_index=int(power_order[index]) + 2,
             stage_column=stage_col,
+            source_provenance=(str(frame.iloc[int(power_order[index])]["source_provenance"])
+                               if "source_provenance" in frame.columns else ""),
         )
         for index in range(power.size)
     )
@@ -560,7 +562,7 @@ def _load_power_sweep_csv_cached(
 
 def load_power_sweep_csv(folder: str, file_name: str) -> tuple[DataCube, tuple[PowerSweepPoint, ...]]:
     signature = _power_sweep_signature(folder, file_name)
-    cube, records = _load_power_sweep_csv_cached(folder, Path(file_name).name, signature)
+    cube, records = _load_power_sweep_csv_cached(folder, str(Path(file_name)), signature)
     copied_cube = DataCube(
         energy=np.asarray(cube.energy, dtype=float).copy(),
         gate=np.asarray(cube.gate, dtype=float).copy(),
@@ -569,7 +571,26 @@ def load_power_sweep_csv(folder: str, file_name: str) -> tuple[DataCube, tuple[P
         title=cube.title,
         cbar_label=cube.cbar_label,
     )
-    return copied_cube, tuple(records)
+    # Provenance written while a measurement subfolder was selected is relative
+    # to that measurement folder. Rebase it when loading from its parent root.
+    from dataclasses import replace
+    parts = Path(file_name).parts
+    processed = next((i for i, part in enumerate(parts) if part.casefold() == 'processed data'), None)
+    origin = Path(*parts[:processed]) if processed is not None else Path(file_name).parent
+    def rebase(value):
+        if not value or origin == Path('.'):
+            return value
+        try:
+            obj = json.loads(value)
+            for source in obj.get('sources', []):
+                if isinstance(source, dict):
+                    if source.get('file') and not Path(source['file']).is_absolute():
+                        source['file'] = (origin / source['file']).as_posix()
+                    source['prior_provenance'] = rebase(source.get('prior_provenance', ''))
+            return json.dumps(obj)
+        except (ValueError, TypeError, AttributeError):
+            return value
+    return copied_cube, tuple(replace(r, source_provenance=rebase(r.source_provenance)) for r in records)
 
 
 def _spectrum_from_cube(cube: DataCube) -> np.ndarray:

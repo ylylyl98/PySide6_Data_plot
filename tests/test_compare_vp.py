@@ -14,6 +14,7 @@ from core.processing import (
     classify_compare_channel,
     coherent_compare_auto_assignment,
     estimate_constant_background,
+    group_compare_sources,
     infer_compare_angle_references,
     nearest_gate_spectrum,
     parse_compare_gate_condition,
@@ -73,6 +74,44 @@ class CompareAngleParserTests(unittest.TestCase):
         self.assertFalse(duplicates)
         self.assertEqual(gate_group, "TG-0.8BG=0")
         self.assertEqual(gate_groups, ["TG-0.8BG=0", "TG+0.8BG=0"])
+
+    def test_explicit_channel_token_classifies_without_angles(self) -> None:
+        references = {"in_k_angle": 0.0, "out_k_angle": 0.0}
+        cases = {
+            "sample_KK.csv": "KK",
+            "sample_kkp.csv": "KKp",
+            "sample_KpK.csv": "KpK",
+            "sample_kpkp.csv": "KpKp",
+        }
+        for file_name, expected in cases.items():
+            with self.subTest(file_name=file_name):
+                self.assertEqual(classify_compare_channel(file_name, **references), expected)
+
+    def test_channel_token_requires_standalone_unambiguous_label(self) -> None:
+        references = {"in_k_angle": 0.0, "out_k_angle": 0.0}
+        self.assertIsNone(classify_compare_channel("sample_PL.csv", **references))
+        self.assertIsNone(classify_compare_channel("sample_KKPL.csv", **references))
+        self.assertIsNone(classify_compare_channel("sample_KK_KKp.csv", **references))
+
+    def test_angles_take_precedence_over_explicit_channel_token(self) -> None:
+        self.assertEqual(
+            classify_compare_channel(
+                "sample_KK_Rot1195deg_Rot295deg.csv",
+                in_k_angle=195.0,
+                out_k_angle=95.0,
+            ),
+            "KK",
+        )
+
+    def test_explicit_channel_pairs_share_context_for_auto_assignment(self) -> None:
+        files = ["sample_KK_TG-BG=0.csv", "sample_KKp_TG-BG=0.csv"]
+        found, duplicates, gate_group, gate_groups = coherent_compare_auto_assignment(
+            files, in_k_angle=0.0, out_k_angle=0.0
+        )
+        self.assertEqual(found, {"KK": files[0], "KKp": files[1]})
+        self.assertFalse(duplicates)
+        self.assertEqual(gate_group, "TG-BG=0")
+        self.assertEqual(gate_groups, ["TG-BG=0"])
 
     def test_explicit_kp_reference_classifies_variable_rot2_angles(self) -> None:
         cases = {
@@ -207,6 +246,94 @@ class CompareAngleParserTests(unittest.TestCase):
         self.assertEqual(found["KK"], files[2])
         self.assertEqual(found["KKp"], files[1])
         self.assertIn("KKp", duplicates)
+
+
+class CompareSourceGroupingTests(unittest.TestCase):
+    def _groups(self, files, **kwargs):
+        defaults = {"in_k_angle": 195.0, "out_k_angle": 95.0}
+        defaults.update(kwargs)
+        return group_compare_sources(files, **defaults)
+
+    def test_slight_power_variation_groups_and_maps_channels(self) -> None:
+        files = [
+            "sample_5.00uW_Rot1195deg_Rot295deg_Stage0_TG-BG=0.csv",
+            "sample_5.20uW_Rot1195deg_Rot2145deg_Stage0_TG-BG=0.csv",
+        ]
+        groups = self._groups(files)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].sources, tuple(files))
+        self.assertEqual(groups[0].mapping, {"KK": files[0], "KKp": files[1]})
+        self.assertIn("5", groups[0].label)
+        self.assertIn("KK", groups[0].label)
+        self.assertIn("KKp", groups[0].label)
+
+    def test_widely_different_powers_split_without_chaining(self) -> None:
+        files = [
+            "sample_5uW_Rot1195deg_Rot295deg.csv",
+            "sample_5.2uW_Rot1195deg_Rot2145deg.csv",
+            "sample_5.45uW_Rot1150deg_Rot295deg.csv",
+        ]
+        groups = self._groups(files)
+        self.assertEqual([group.sources for group in groups], [(files[0], files[1]), (files[2],)])
+
+    def test_stage_gate_and_parent_path_are_separate_contexts(self) -> None:
+        files = [
+            "runA/sample_5uW_Rot1195deg_Rot295deg_Stage0_TG-BG=0.csv",
+            "runA/sample_5uW_Rot1195deg_Rot2145deg_Stage1_TG-BG=0.csv",
+            "runA/sample_5uW_Rot1195deg_Rot2145deg_Stage0_TG+BG=0.csv",
+            "runB/sample_5uW_Rot1195deg_Rot2145deg_Stage0_TG-BG=0.csv",
+        ]
+        groups = self._groups(files)
+        self.assertEqual(len(groups), 4)
+        self.assertTrue(all(len(group.sources) == 1 for group in groups))
+
+    def test_angle_and_named_channel_variants_share_context(self) -> None:
+        files = [
+            "sample_5uW_in 195 degree_out 95 degree.csv",
+            "sample_KKp_5.1uW.csv",
+        ]
+        groups = self._groups(files)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].mapping, {"KK": files[0], "KKp": files[1]})
+
+    def test_duplicates_are_reported_and_left_unassigned(self) -> None:
+        files = [
+            "sample_KK_5uW.csv",
+            "sample_KK_5.1uW.csv",
+            "sample_KKp_5.1uW.csv",
+        ]
+        groups = self._groups(files)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].mapping, {"KKp": files[2]})
+        self.assertEqual(groups[0].duplicates, {"KK": [files[0], files[1]]})
+        self.assertIn("duplicate", groups[0].label)
+
+    def test_unknown_power_is_eligible_only_with_angle_or_label(self) -> None:
+        files = [
+            "sample_Rot1195deg_Rot295deg.csv",
+            "sample_KK.csv",
+            "sample_without_compare_metadata.csv",
+            "sample_5uW.txt",
+        ]
+        groups = self._groups(files)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].sources, (files[0], files[1]))
+        self.assertIn("power unknown", groups[0].label)
+
+    def test_unmatched_angle_source_is_preserved_for_manual_reference_edit(self) -> None:
+        files = [
+            "sample_5uW_Rot130deg_Rot250deg.csv",
+            "sample_5.1uW_Rot1195deg_Rot295deg.csv",
+        ]
+        groups = self._groups(
+            files,
+            in_kp_angle=150.0,
+            out_kp_angle=20.0,
+            tolerance=10.0,
+        )
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].sources, tuple(files))
+        self.assertEqual(groups[0].mapping, {"KK": files[1]})
 
 
 class CompareVpTests(unittest.TestCase):

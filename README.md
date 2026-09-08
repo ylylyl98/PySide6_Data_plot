@@ -256,12 +256,116 @@ old configurable/default `Processed Data` destination for existing scripts;
 calling those helpers directly is separate from the normal GUI workflow.
 
 ## Usage Notes
+- Mouse-wheel scrolling moves panels and lists without changing dropdown
+  selections, numeric values, sliders/dials, or active tabs. Click or use the
+  keyboard to edit controls; this applies to dialogs as well as the main window.
 - `PL`: one-file plotting workflow for heatmap + spectrum.
 - `Power Dependent`: select a single header-table CSV containing `Power_uW`, optional
   `stage_pos`, and numeric wavelength/energy column names. Each row is one power
   point. Numeric wavelength headers (for example `752.5829`) are converted to
   photon energy and the rows are sorted by power. Legacy multi-file series with a
   power token such as `37.96uW` in each filename remain supported.
+  Single-sweep plotting and export do not require KK/KKp assignments. Enable
+  **Compare KK / KKp** to assign two sweeps and use intensity comparison or VP.
+  **Choose dataset…** opens Available/Chosen panels like DRR. Multi-select rows and
+  use **Add Selected**, or double-click to add. **Remove** and **Clear** manage the
+  persistent Chosen list. Status defaults to All, and status/search filtering keeps
+  chosen files. One chosen sweep uses **Open sweep**;
+  two or more use **Review combination…**. Checking a second file never navigates
+  automatically.
+  Power datasets are discovered automatically beneath the selected main folder,
+  including measurement subfolders such as `power_sweep`. Old/archive folders
+  and analysis CSVs without spectral columns are excluded. Nested saved combinations
+  remain available under Processed. Refresh discovers new acquisitions while
+  preserving the current view. Filename-based legacy grouping is off by default,
+  so ordinary PL filenames containing power values do not clutter the picker.
+  Enable **Include filename-based series** to access these groups; they need at
+  least two distinct powers and are grouped separately by containing folder.
+  Review combines selected segments of the same channel and saves a new
+  CSV under Processed. Check acquisition compatibility in the preview;
+  reference selection and overlap-based scaling are automatic by default. The
+  reference favors valid direct calibrations to the other sweeps, with power
+  coverage breaking ties. Correction subtracts separate backgrounds and scales
+  additional sweeps to the reference. Unsupported or rejected estimates keep the
+  preview visible, identify the affected sweep, and block saving.
+  The default review shows sweeps, multipliers and previews. **Advanced
+  settings** allows disabling automatic setup to choose a reference, no scaling
+  or known factors, and reveals background bands, exclusions, duplicate policy and metadata;
+  rejected corrections and flagged measurements remain visible in the main view.
+  Enabling scaling removes a separate background from every input. Multi-sweep
+  duplicate averaging uses all contributions at once, without pairwise averaging bias.
+  A known factor can be entered, or estimated from overlap without extrapolation.
+  Calibration interpolation only bridges neighboring powers within 25%; spectra
+  in the overlap preview must be within 2% in measured power. Calibration reports
+  pair count, factor scatter, and spectral mismatch using the applied common factor.
+  Backgrounds default to separate medians in an editable shared energy band
+  (initially the highest 20% of the shared spectrum). Choose a signal-free band;
+  manual backgrounds are also available. Estimated corrections with >10% factor
+  scatter or spectral mismatch are rejected, left unapplied, and cannot be saved.
+  Limited power coverage remains explicitly provisional. Check saturation and exclude
+  questionable spectra using their displayed 1-based power-order numbers.
+  **Fit power law…** in peak analysis (also available above the intensity plot)
+  fits integrated peak areas to `I = A P^alpha` without recalculating spectra.
+  Peak 1 is selected initially; any combination of peaks can be fitted separately.
+  Enter or drag power limits, shared by default or independent per peak. These
+  intervals are independent of plot axis limits. The dialog shows exponent and
+  regression standard error, point counts, source-boundary warnings, and an
+  optional seven-point local-slope plot. **Suggest ranges near alpha = 1** searches
+  the full sweep for broad stable intervals (at least six points and half a
+  decade). Suggestions are exploratory and can be adjusted; no reliable interval
+  produces an explicit message. Applying displays the integrated-intensity plot
+  with fit overlays. Export saves the selected limits and results in the analysis
+  JSON, a companion `_power_law.csv`, and overlays on the integrated trend PNG.
+  Regression errors do not include gain-calibration uncertainty.
+  Exact matching powers can keep the first sweep,
+  keep the second, or average; nearby powers remain separate. Spectra use the
+  first sweep's energy grid within the shared energy range, with linear energy
+  interpolation and no extrapolation. Source rows and the merge policy remain in
+  the CSV and DAT/JSON exports. Combine KK segments and KKp segments separately,
+  then assign the saved sweeps for comparison. Repeated stage positions disable
+  stage pairing; use power interpolation in that case.
+  **Choose dataset** uses New/Processed filtering like PL. Combined sweeps are
+  processed results, discovered in `Processed Data/Power Dependence/Combined Sweeps`.
+  Saved combined files appear under Processed and can be selected directly.
+  Reusing the same original rows is blocked, including renamed inputs identified
+  from provenance.
+  Descriptive filenames remain editable; source/settings fingerprints recognize
+  existing combinations and offer Open existing or Create another.
+  **Back to selection** preserves checked sweeps and review settings, including
+  when another sweep is added. **Save and plot** saves and opens the result;
+  **Plot Setup** then
+  controls the loaded result. Existing CSVs are preserved; saving automatically
+  uses a numbered filename when the chosen name is already taken.
+  Enable **Peak Analysis → Intensity + linewidth vs
+  power** for a heatmap, selected spectrum with fit and residual, integrated PL
+  intensity versus power, and FWHM versus power. The default fit is **Lorentzian**;
+  the heatmap and spectrum/residuals occupy the left column, with intensity above
+  linewidth in the right column.
+  **Gaussian** is also available. All peaks are fitted simultaneously across the
+  full measured spectrum with a shared linear baseline. Detect, add, or remove
+  peaks and edit their center and width guesses in the Peak Analysis table.
+  Peak 1 is the lowest energy peak; separate intensity and linewidth curves
+  retain these labels across power. Integrated area uses each fitted component
+  over the measured energy range (a.u. eV); **Peak height** uses its amplitude.
+  **Manual refit selected power** lets you edit guesses, center bounds, and model,
+  preview the fit, and Apply it to just that channel and power. Other fits are
+  preserved. Fits are cached in memory during the session; saved analysis files
+  include manual refit settings but are not automatically restored on restart.
+  Unresolved, noisy, or
+  failed fits are flagged and omitted from trend curves. Click a trend point to
+  inspect its spectrum. **Power Axis: Linear / Log** changes the heatmap's power
+  axis and both trend X axes together without refitting; nonpositive powers are
+  omitted in log views but retained in data exports. **Color Log** is independent.
+  Intensity and linewidth each have an independent Y-axis Log/Linear control,
+  defaulting to Log, also respected in exported plots. Nonpositive Y values are
+  hidden with a note. Colormaps use normal cell boundaries between measured
+  powers; sparse sampling does not insert artificial white bands or alter data.
+  Source marker shapes identify contributing sweeps; colors identify peaks.
+  Fits run in the background. Once the fit status is ready, Save includes a
+  `Power_peak_analysis` CSV, trend PNG, and JSON settings in the power package,
+  including failed-fit status, FWHM in meV, covariance uncertainty, peak center,
+  intensity, and source provenance. KK and KKp are fitted independently in
+  intensity comparison; VP itself is not peak-fitted.
 - `SHG Processing`: load a wide sweep table containing `measured position`, motion
   and acquisition status columns, and numeric wavelength headers. The tab removes
   a per-angle local background, integrates the background-subtracted spectrum over

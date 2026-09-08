@@ -5,11 +5,22 @@ from dataclasses import dataclass
 import numpy as np
 from matplotlib.axes import Axes
 from matplotlib.colors import LogNorm, Normalize, TwoSlopeNorm
+from matplotlib.ticker import LogFormatter
 
 from core.loader import DataCube
 
 
 COMPARE_PANEL_ORDER = ("KK", "KKp", "KpK", "KpKp")
+
+
+def plain_log_ticks(axis) -> None:
+    """Use numeric log ticks without requiring Matplotlib's optional math fonts.
+
+    Logarithmic transforms/locators stay unchanged. MathText formatters can make
+    Qt's deferred canvas draw fail silently when STIX/DejaVu files are missing.
+    """
+    axis.set_major_formatter(LogFormatter())
+    axis.set_minor_formatter(LogFormatter())
 
 
 @dataclass
@@ -264,6 +275,7 @@ def plot_heatmap(ax: Axes, cube: DataCube, params: HeatmapParams):
             ymin = float(np.nanmin(positive))
             ymax = float(np.nanmax(positive))
         ax.set_yscale("log")
+        plain_log_ticks(ax.yaxis)
     ax.set_ylim((ymin, ymax))
     return HeatmapRender(
         primary=images[0],
