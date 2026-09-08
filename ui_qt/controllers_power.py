@@ -55,7 +55,145 @@ class PowerController:
             setattr(object.__getattribute__(self, "_owner"), name, value)
 
     def _power_candidate_files(self) -> list[str]:
-        return list(self.available_files)
+        from core.power_workflow import discover_power_files
+        return discover_power_files(self.current_folder, include_legacy=getattr(self, '_power_include_legacy', False))
+
+    def _power_choose_dataset(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import (QComboBox, QListWidgetItem, QCheckBox, QListWidget,
+            QSplitter, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QAbstractItemView)
+        from ui_qt.source_picker_dialog import SourcePickerDialog
+        from core.power_workflow import is_combined, processed_source_names
+        status = QComboBox()
+        status.addItems(["All", "New", "Processed"])
+        status.setCurrentText(getattr(self, "_power_picker_status_filter", "All"))
+        legacy = QCheckBox("Include filename-based series")
+        legacy.setToolTip("Optional legacy grouping. Ordinary PL filenames containing a power value may also match.")
+        legacy.setChecked(getattr(self, '_power_include_legacy', False))
+        dialog = SourcePickerDialog(self._owner, title="Choose Power Dataset",
+            hint="Select available sweeps and click Add Selected, or double-click a file. One chosen sweep opens; several go to combination review. KK/KKp comparison remains separate.",
+            filter_controls=(("Status", status), (None, legacy)),
+            selection_mode=QAbstractItemView.ExtendedSelection)
+        checked = dict.fromkeys(getattr(self, '_power_picker_selection', ()) or
+                                ([self._power_selected_group_key()] if self._power_selected_group_key() else []))
+        dialog.source_list.itemDoubleClicked.disconnect()
+        chosen = QListWidget()
+        chosen.setObjectName('power_chosen_files')
+        SourcePickerDialog.configure_source_list(chosen, selection_mode=QAbstractItemView.ExtendedSelection)
+        splitter = QSplitter(Qt.Horizontal)
+        def panel(title, widget):
+            box = QWidget()
+            layout = QVBoxLayout(box)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(QLabel(title))
+            layout.addWidget(widget)
+            return box
+        dialog.layout().removeWidget(dialog.source_list)
+        splitter.addWidget(panel('Available sweeps', dialog.source_list))
+        splitter.addWidget(panel('Chosen sweeps', chosen))
+        splitter.setSizes([600, 400])
+        dialog.layout().insertWidget(2, splitter, 1)
+        actions = QHBoxLayout()
+        add = QPushButton('Add Selected')
+        remove = QPushButton('Remove')
+        clear = QPushButton('Clear')
+        add.setObjectName('power_add_selected')
+        remove.setObjectName('power_remove_selected')
+        clear.setObjectName('power_clear_selected')
+        for button in (add, remove, clear): actions.addWidget(button)
+        dialog.layout().insertLayout(3, actions)
+        def populate():
+            dialog.source_list.blockSignals(True)
+            dialog.source_list.clear()
+            processed_names = processed_source_names(self.current_folder)
+            sources = self._power_current_sources()
+            for key in list(checked):
+                if key not in sources:
+                    checked.pop(key)
+            for key, source in sources.items():
+                combined = is_combined(self.current_folder, source.file_name)
+                names = [source.file_name] if source.file_name else [r.file_name for r in source.records]
+                processed = combined or bool(names) and all(name.replace('\\', '/').casefold() in processed_names for name in names)
+                state = "Processed" if processed else "New"
+                label = f"{state} · {'Combined · ' if combined else ''}{source.file_name or source.title}"
+                if status.currentText() not in ("All", state) or dialog.filter_edit.text().casefold() not in label.casefold():
+                    continue
+                item = QListWidgetItem(label)
+                item.setData(Qt.UserRole, key)
+                item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked if key in checked else Qt.Unchecked)
+                dialog.source_list.addItem(item)
+            dialog.source_list.blockSignals(False)
+            details()
+        def details():
+            old_selected = {i.data(Qt.UserRole) for i in chosen.selectedItems()}
+            chosen.clear()
+            for key in checked:
+                item = QListWidgetItem(str(key).removeprefix('csv::'))
+                item.setData(Qt.UserRole, key)
+                chosen.addItem(item)
+                item.setSelected(key in old_selected)
+            count = len(checked)
+            dialog.ok_button.setEnabled(count > 0)
+            dialog.ok_button.setText("Review combination…" if count > 1 else "Open sweep")
+            dialog.details_label.setText(f"{count} sweep{'s' if count != 1 else ''} chosen. Status and search filters do not remove chosen sweeps.")
+        def add_selected(*_):
+            for item in dialog.source_list.selectedItems():
+                checked[item.data(Qt.UserRole)] = None
+            details()
+        def remove_selected():
+            for item in chosen.selectedItems(): checked.pop(item.data(Qt.UserRole), None)
+            populate()
+        def clear_selected():
+            checked.clear()
+            populate()
+        add.clicked.connect(add_selected)
+        dialog.source_list.itemDoubleClicked.connect(add_selected)
+        remove.clicked.connect(remove_selected)
+        clear.clicked.connect(clear_selected)
+        def selection_changed(item):
+            key = item.data(Qt.UserRole)
+            if item.checkState() == Qt.Checked: checked[key] = None
+            else: checked.pop(key, None)
+            details()
+        dialog.filter_requested.connect(populate)
+        def toggle_legacy(enabled):
+            self._power_include_legacy = enabled
+            populate()
+        legacy.toggled.connect(toggle_legacy)
+        status.currentTextChanged.connect(populate)
+        dialog.refresh_button.clicked.connect(populate)
+        dialog.source_list.currentItemChanged.connect(lambda *_: details())
+        dialog.source_list.itemChanged.connect(selection_changed)
+        populate()
+        draft = None
+        while dialog.exec() and checked:
+            self._power_status_filter = status.currentText()
+            self._power_picker_status_filter = status.currentText()
+            self._power_picker_selection = tuple(checked)
+            self._power_refresh_groups()
+            if len(checked) == 1:
+                key = next(iter(checked))
+                self.power_group_combo.setCurrentIndex(self.power_group_combo.findData(key))
+                self._start_load("Power Dependent")
+                return
+            from ui_qt.power_combine_review import PowerCombineReview
+            try:
+                review = PowerCombineReview(self._owner, self, tuple(checked), draft)
+            except (ValueError, OSError) as exc:
+                self._show_error(str(exc))
+                continue
+            review.exec()
+            state = review.snapshot()
+            if draft:
+                state['rows'] = {**draft['rows'], **state['rows']}
+            draft = state
+            if review.saved_path:
+                self._power_finish_combination(review)
+                return
+            if not review.back_requested:
+                return
+            details()
 
     def _power_axis_log(self) -> bool:
         return hasattr(self, "power_axis_scale_combo") and self.power_axis_scale_combo.currentText() == "Log"
@@ -76,9 +214,13 @@ class PowerController:
     def _power_update_view_mode(self) -> None:
         vp_mode = self._power_view() == "VP"
         if hasattr(self, "power_group_combo"):
-            self.power_group_combo.setEnabled(not vp_mode)
+            self.power_group_combo.setEnabled(not self.power_compare_chk.isChecked())
+        if hasattr(self, "power_choose_btn"):
+            self.power_choose_btn.setEnabled(not self.power_compare_chk.isChecked())
         if hasattr(self, "power_pair_mode_combo"):
             self.power_pair_mode_combo.setEnabled(vp_mode)
+        if vp_mode and hasattr(self.power_peak_controller, "status"):
+            self.power_peak_controller.status.setText("Peak analysis applies to PL intensity. Switch to Intensity to view the trends.")
         self._update_plot_view_bar_visibility()
 
     def _power_pairing_mode(self) -> str:
@@ -87,6 +229,8 @@ class PowerController:
         return "power" if self.power_pair_mode_combo.currentText() == "Power Interpolation" else "stage"
 
     def _power_selected_group_key(self) -> str:
+        if hasattr(self, "power_compare_chk") and self.power_compare_chk.isChecked():
+            return self._power_role_group_key("KK")
         if not hasattr(self, "power_group_combo"):
             return ""
         data = self.power_group_combo.currentData()
@@ -99,20 +243,30 @@ class PowerController:
 
     def _power_current_sources(self) -> Dict[str, data_io.PowerSeriesSource]:
         files = tuple(self._power_candidate_files())
+        from pathlib import Path
+        signature = []
+        for name in files:
+            try:
+                stat = (Path(self.current_folder) / name).stat()
+                signature.append((name, stat.st_size, stat.st_mtime_ns))
+            except OSError:
+                signature.append((name, None, None))
+        signature = (self.current_folder, tuple(signature))
         if (
             self._power_sources_cache is not None
-            and self._power_sources_cache_files == files
+            and self._power_sources_cache_files == signature
         ):
             return self._power_sources_cache
         sources = data_io.get_power_series_sources(self.current_folder, list(files))
+        self._power_result_cache.clear()
         self._power_sources_cache = sources
-        self._power_sources_cache_files = files
+        self._power_sources_cache_files = signature
         return sources
 
     def _power_refresh_groups(self) -> None:
         if not hasattr(self, "power_group_combo"):
             return
-        old_key = self._power_selected_group_key()
+        old_key = str(self.power_group_combo.currentData() or "")
         old_kk = self._power_role_group_key("KK") if hasattr(self, "power_kk_group_combo") else ""
         old_kkp = self._power_role_group_key("KKp") if hasattr(self, "power_kkp_group_combo") else ""
         sources = self._power_current_sources()
@@ -136,6 +290,7 @@ class PowerController:
                 key=lambda item: (0 if item[1].source_format == "table" else 1, item[1].title.lower()),
             )
             for key, source in ordered_sources:
+                from core.power_workflow import is_combined
                 if source.source_format == "table":
                     label = f"{source.file_name}  (Power_uW table)"
                 else:
@@ -144,6 +299,8 @@ class PowerController:
                         label = f"{source.title}  ({len(source.records)} files, {min(powers):.4g}-{max(powers):.4g} uW)"
                     else:
                         label = f"{source.title}  ({len(source.records)} files)"
+                if is_combined(self.current_folder, source.file_name):
+                    label = "[Processed · Combined] " + label
                 self.power_group_combo.addItem(label, key)
                 if hasattr(self, "power_kk_group_combo"):
                     self.power_kk_group_combo.addItem(label, key)
@@ -207,8 +364,28 @@ class PowerController:
             row = getattr(record, "row_index", None)
             row_text = "" if row is None else f", row {row}"
             lines.append(f"{getattr(record, 'power_uW', 0.0):.6g} uW{stage_text}{row_text}")
+        if source.file_name:
+            import json
+            from pathlib import Path
+            try:
+                metadata = json.loads((Path(self.current_folder) / source.file_name).with_suffix('.combine.json').read_text(encoding='utf-8'))
+                settings = metadata['settings']
+                if 'rows' in settings:
+                    lines.insert(1, 'Combined: ' + '; '.join(f"sweep {i + 1} × {row['factor']:.6g}, background {row['background']:.6g}"
+                        for i, row in enumerate(settings['rows'])))
+                else:
+                    lines.insert(1, f"Combined: second sweep intensity × {settings['factor_second']:.6g}; backgrounds {settings['backgrounds']}.")
+                for index, names in enumerate(metadata['sources']):
+                    lines.append(f"Input {index + 1}: " + ', '.join(dict.fromkeys(names)))
+            except (OSError, ValueError, KeyError):
+                pass
         if len(records) > 8:
             lines.append(f"+{len(records) - 8} more")
+        from core.power_workflow import record_sources
+        origins = list(dict.fromkeys(tuple(record_sources(record)) for record in records))
+        if len(origins) > 1:
+            for index, names in enumerate(origins):
+                lines.append(f"Plot source {index + 1}: " + ', '.join(names))
         if hasattr(self, "power_kk_group_combo") and self._power_has_distinct_role_groups():
             lines.append(f"KK -> {power_group_title(self._power_role_group_key('KK')) or 'none'}")
             lines.append(f"KKp -> {power_group_title(self._power_role_group_key('KKp')) or 'none'}")
@@ -265,6 +442,8 @@ class PowerController:
         return kk_result, kkp_result, kk_key, kkp_key
 
     def _power_has_distinct_role_groups(self) -> bool:
+        if hasattr(self, "power_compare_chk") and not self.power_compare_chk.isChecked():
+            return False
         kk_key = self._power_role_group_key("KK")
         kkp_key = self._power_role_group_key("KKp")
         return bool(kk_key and kkp_key and kk_key != kkp_key)
@@ -280,9 +459,11 @@ class PowerController:
             if has_distinct:
                 try:
                     kk_result, kkp_result, _kk_key, _kkp_key = self._power_role_payload()
-                    kk_stages = {float(record.stage) for record in kk_result.records if record.stage is not None}
-                    kkp_stages = {float(record.stage) for record in kkp_result.records if record.stage is not None}
-                    stage_available = bool(kk_stages & kkp_stages)
+                    kk_stages = [float(record.stage) for record in kk_result.records if record.stage is not None]
+                    kkp_stages = [float(record.stage) for record in kkp_result.records if record.stage is not None]
+                    stage_available = (bool(set(kk_stages) & set(kkp_stages))
+                                       and len(kk_stages) == len(set(kk_stages))
+                                       and len(kkp_stages) == len(set(kkp_stages)))
                 except Exception:
                     stage_available = False
             item = self.power_pair_mode_combo.model().item(0)
@@ -297,7 +478,7 @@ class PowerController:
             self.power_pair_mode_combo.setToolTip(
                 "Pair matching stage_pos rows, or interpolate by Power_uW."
                 if stage_available
-                else "Stage pairing needs shared stage_pos values; Power Interpolation is selected."
+                else "Stage pairing needs shared, unique stage_pos values; Power Interpolation is selected."
             )
 
     def _power_vp_payload(self) -> tuple[DataCube, DataCube, DataCube, tuple[Any, ...], tuple[Any, ...], str, str, float, str, tuple[Any, ...]]:
@@ -345,6 +526,12 @@ class PowerController:
 
     def _display_power_cube(self, cube: DataCube) -> tuple[DataCube, np.ndarray, np.ndarray]:
         true_power = np.asarray(cube.gate, float).ravel()
+        z = np.asarray(cube.Z, float)
+        if self._power_axis_log():
+            positive = np.isfinite(true_power) & (true_power > 0)
+            if not np.any(positive):
+                raise ValueError("Log power axis needs at least one positive power point. Use Linear for this sweep.")
+            true_power, z = true_power[positive], z[positive]
         display_power = true_power.astype(float, copy=True)
         if display_power.size > 1:
             finite = display_power[np.isfinite(display_power)]
@@ -359,7 +546,7 @@ class PowerController:
         display_cube = DataCube(
             np.asarray(cube.energy, float).copy(),
             display_power,
-            np.asarray(cube.Z, float).copy(),
+            z.copy(),
             cube.gate_label,
             cube.title,
             cube.cbar_label,
@@ -385,13 +572,15 @@ class PowerController:
             idx = int(self._power_selected_row_index)
         else:
             idx = int(np.argmin(np.abs(power_grid - power_value)))
-        power_used = float(power_grid[idx])
+        power_used = float(power_grid[idx]) if len(cubes) == 1 else power_value
         x_ref = np.asarray(first_cube.energy, float).ravel()
         for label, cube in cubes.items():
             z = np.asarray(cube.Z, float)
-            y = z[idx, :] if idx < z.shape[0] else nearest_gate_spectrum(cube, power_used)[1]
+            row = idx if cube is first_cube else int(np.argmin(np.abs(np.asarray(cube.gate) - power_used)))
+            y = z[row, :]
             x = np.asarray(cube.energy, float).ravel()
-            self._power_spectrum_ax.plot(x, np.asarray(y, float), linewidth=1.3, label=label)
+            self._power_spectrum_ax.plot(x, np.asarray(y, float), linewidth=1.3,
+                                        label=f"{label}: {float(cube.gate[row]):.6g} uW")
         if len(cubes) > 1:
             self._power_spectrum_ax.legend(loc="best", fontsize=9)
         self._power_spectrum_ax.set_title(f"Spectrum @ {power_used:.6g} uW")
@@ -407,7 +596,8 @@ class PowerController:
         xs = []
         for cube in cubes.values():
             z = np.asarray(cube.Z, float)
-            y = z[idx, :] if idx < z.shape[0] else nearest_gate_spectrum(cube, power_used)[1]
+            row = idx if cube is first_cube else int(np.argmin(np.abs(np.asarray(cube.gate) - power_used)))
+            y = z[row, :]
             ys.append(np.asarray(y, float))
             xs.append(np.asarray(cube.energy, float))
         if ys:
@@ -435,10 +625,25 @@ class PowerController:
                 )
             else:
                 line.set_ydata([y_line, y_line])
+        self.power_peak_controller.render(cubes)
+        if self.power_peak_controller.is_enabled():
+            self._power_spectrum_ax.set_xlabel("")
         self.canvas.draw_idle()
 
     def _on_power_axis_scale_changed(self) -> None:
         self._invalidate_export_move_sources()
+        if self.loaded and self.loaded.mode == "Power Dependent" and self._power_axis_log():
+            powers = np.asarray(self.loaded.cube.gate)
+            positive = powers[powers > 0]
+            if positive.size and self.power_spins["ymin"].value() <= 0:
+                self._power_linear_ymin_before_log = (self._power_selected_group_key(),
+                    self.power_spins["ymin"].value(), float(positive.min()))
+                self._set_spin_value_silent(self.power_spins["ymin"], float(positive.min()))
+        elif not self._power_axis_log():
+            previous = getattr(self, "_power_linear_ymin_before_log", None)
+            if previous and previous[0] == self._power_selected_group_key() and self.power_spins["ymin"].value() == previous[2]:
+                self._set_spin_value_silent(self.power_spins["ymin"], previous[1])
+            self._power_linear_ymin_before_log = None
         self._power_update_group_summary()
         self._on_power_plot_param_changed()
 
@@ -466,11 +671,50 @@ class PowerController:
 
     def _on_power_source_assignment_changed(self) -> None:
         self._invalidate_export_move_sources()
+        self._power_selected_row_index = None
         self._power_update_group_summary()
         self._power_update_vp_availability()
         if self.loaded and self.loaded.mode == "Power Dependent":
+            if not self._power_selected_group_key() or (
+                self.power_compare_chk.isChecked() and not self._power_has_distinct_role_groups()
+            ):
+                return
             self._refresh_automatic_ranges("Power Dependent", refresh_split=True)
             self._schedule_plot_redraw("Power Dependent")
+
+    def _on_power_comparison_changed(self, checked: bool) -> None:
+        self.power_roles_widget.setVisible(checked)
+        self._power_update_vp_availability()
+        self._power_update_view_mode()
+        self._update_action_states()
+        self._on_power_source_assignment_changed()
+
+    def _on_power_combine(self) -> None:
+        from ui_qt.power_combine_dialog import PowerCombineDialog
+
+        dialog = PowerCombineDialog(self._owner, self)
+        dialog.exec()
+        self._power_finish_combination(dialog)
+
+    def _power_finish_combination(self, dialog):
+        if dialog.saved_path is not None:
+            from pathlib import Path
+            name = str(dialog.saved_path.relative_to(Path(self.current_folder)))
+            if name not in self.available_files:
+                self.available_files.append(name)
+            self._power_sources_cache = None
+            self._power_result_cache.clear()
+            self._power_refresh_groups()
+            if not dialog.open_requested:
+                return
+            self._power_status_filter = "Processed"
+            self.power_compare_chk.setChecked(False)
+            index = self.power_group_combo.findData(data_io.power_sweep_source_key(name))
+            if index < 0:
+                self._show_error(f"The combined sweep was saved but could not be discovered: {dialog.saved_path}")
+                return
+            self.power_group_combo.setCurrentIndex(index)
+            self._start_load("Power Dependent")
 
     def _on_power_plot_view_button_clicked(self, mode: str) -> None:
         self._invalidate_export_move_sources()

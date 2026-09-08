@@ -66,7 +66,7 @@ WORKFLOWS = ["PL", "DRR", "Compare", "Power", "MCD", "MCD Peak Shift", "SHG", "T
 SAFE_EXPANDERS = {
     "PL": {"Measurement File", "Parameters", "Manual plot ranges", "Spectrum Analysis"},
     "DRR": {"Data", "Parameters", "Manual plot ranges", "Spectrum Analysis"},
-    "Compare": {"Assignment", "Parameters", "Manual plot ranges"},
+    "Compare": {"Data Selection", "Parameters", "Manual plot ranges"},
     "Power": {"Power Sweep Files", "Parameters", "Plot Setup", "Manual plot ranges"},
     "MCD": {"Source", "Correction", "Advanced", "Diagnostics", "Plot"},
     "SHG": {"Data", "Peak Integration", "Cosmic Rays", "Angle", "Angular Fit"},

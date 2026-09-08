@@ -22,7 +22,7 @@ from matplotlib.font_manager import FontProperties
 from matplotlib.ticker import FixedFormatter, FixedLocator, FuncFormatter, NullFormatter, NullLocator
 
 from core.loader import DataCube
-from core.plotting import COMPARE_PANEL_ORDER, HeatmapParams, plot_heatmap, resolve_split_boundary
+from core.plotting import COMPARE_PANEL_ORDER, HeatmapParams, plot_heatmap, resolve_split_boundary, plain_log_ticks
 from core.processing import background_correct_cube, parse_compare_gate_condition, power_group_title, valley_polarization_cube
 from core.processing_run import save_as_dat
 from core.shg import ShgProcessResult, ShgSettings, ShgSweepData
@@ -326,6 +326,12 @@ def create_unique_package_dir(root: str | Path, base: str) -> Path:
 
 def _save_heatmap_png(path: Path, cube: DataCube, params: HeatmapParams, *, drr: bool) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if params.y_axis_log and np.any(np.asarray(cube.gate) <= 0):
+        positive = np.isfinite(cube.gate) & (np.asarray(cube.gate) > 0)
+        if not np.any(positive):
+            raise ValueError("Log power export needs positive power points.")
+        cube = DataCube(cube.energy, np.asarray(cube.gate)[positive], np.asarray(cube.Z)[positive],
+                        cube.gate_label, cube.title, cube.cbar_label)
     fig = _build_streamlit_style_heatmap_fig(cube, params, drr=drr)
     try:
         fig.savefig(
@@ -499,6 +505,7 @@ def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *,
     ax.set_xlim(params.xlim)
     if params.y_axis_log:
         ax.set_yscale("log")
+        plain_log_ticks(ax.yaxis)
     ax.set_ylim(params.ylim)
 
     cbar_w = (0.42 if split_render is not None else 0.24) * axpos.width
@@ -949,7 +956,8 @@ def _power_record_header_lines(records: Iterable[object]) -> list[str]:
             f"source[{idx}]={getattr(record, 'file_name', '')}; "
             f"row={getattr(record, 'row_index', '')}; "
             f"power_uW={getattr(record, 'power_uW', '')}; "
-            f"stage={getattr(record, 'stage', '')}"
+            f"stage={getattr(record, 'stage', '')}; "
+            f"provenance={getattr(record, 'source_provenance', '')}"
         )
         for idx, record in enumerate(record_list)
     )
@@ -1033,6 +1041,7 @@ def export_power_series_png_and_dat(
             "background_constant": background,
             "y_axis_log": y_axis_log,
             "power_values_uW": [getattr(record, "power_uW", None) for record in records],
+            "source_provenance": [getattr(record, "source_provenance", "") for record in records],
         },
         plot=params,
         outputs=(png_path, dat_path),
@@ -1563,6 +1572,10 @@ def export_power_vp_pngs_and_dat(
                 "KKp": [getattr(record, "power_uW", None) for record in kkp_records],
             },
             "stage_pairs": list(stage_pairs),
+            "source_provenance": {
+                "KK": [getattr(record, "source_provenance", "") for record in kk_records],
+                "KKp": [getattr(record, "source_provenance", "") for record in kkp_records],
+            },
         },
         plot=vp_params,
         outputs=(png_path, dat_path),
@@ -1613,6 +1626,8 @@ def export_compare_panels(
     clip_outliers: bool,
     correction_background: float = 0.0,
     export_vp: bool = True,
+    vp_vmin: float = -1.0,
+    vp_vmax: float = 1.0,
     processed_name: str = DEFAULT_PROCESSED,
     metadata_extra: dict | None = None,
 ) -> list[Path]:
@@ -1696,6 +1711,10 @@ def export_compare_panels(
         written.extend([png_path, dat_path])
 
     if export_vp and "KK" in cubes and "KKp" in cubes:
+        vp_vmin = max(-1.0, min(1.0, float(vp_vmin)))
+        vp_vmax = max(-1.0, min(1.0, float(vp_vmax)))
+        if vp_vmax <= vp_vmin:
+            raise ValueError("Compare VP color scale requires vmin < vmax.")
         vp_cube = valley_polarization_cube(
             cubes["KK"],
             cubes["KKp"],
@@ -1707,8 +1726,8 @@ def export_compare_panels(
             xlabel=params.xlabel,
             ylabel=vp_cube.gate_label,
             cbar_label="VP",
-            vmin=-1.0,
-            vmax=1.0,
+            vmin=vp_vmin,
+            vmax=vp_vmax,
             xlim=params.xlim,
             ylim=params.ylim,
             cmap="RdBu_r",
@@ -1731,8 +1750,8 @@ def export_compare_panels(
                 f"source_KKp={source_files.get('KKp', '')}",
                 "formula=(KK_corr-KKp_corr)/(KK_corr+KKp_corr)",
                 f"background_constant={correction_background}",
-                "vmin=-1.0",
-                "vmax=1.0",
+                f"vmin={vp_vmin}",
+                f"vmax={vp_vmax}",
                 f"xlim={params.xlim}",
                 f"ylim={params.ylim}",
             ],

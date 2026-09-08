@@ -95,6 +95,8 @@ def install_theme(
 ) -> FluentThemeManager:
     """Install the single application theme manager and apply the theme."""
     global _manager
+    from ui_qt.wheel_policy import install_wheel_value_guard
+    install_wheel_value_guard(app)
     repository = ProjectTokenRepository(
         _RESOURCE_ROOT / "fluent2-official-web-theme-tokens.json",
         _RESOURCE_ROOT / "qt-token-map.json",

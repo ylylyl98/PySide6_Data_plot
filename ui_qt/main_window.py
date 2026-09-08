@@ -277,6 +277,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
     def __init__(self):
         super().__init__()
+        from ui_qt.wheel_policy import install_wheel_value_guard
+        install_wheel_value_guard()
         register_colormaps()
         self.setWindowTitle("DPTK Desktop (PySide6)")
         self.setMinimumSize(1180, 700)
@@ -465,6 +467,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.drr_controller = DrrController(self)
         self.compare_controller = CompareController(self)
         self.power_controller = PowerController(self)
+        from ui_qt.power_peak_controller import PowerPeakController
+        self.power_peak_controller = PowerPeakController(self)
         self.shg_controller = ShgController(self)
 
         self._build_ui()
@@ -482,6 +486,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
         """Invalidate background callbacks and let active file reads finish."""
         self._is_closing = True
+        if self.power_peak_controller.worker is not None:
+            self.power_peak_controller.worker.cancelled.set()
         for timer in self._plot_redraw_timers.values():
             timer.stop()
         self.folder_refresh_timer.stop()
@@ -1714,13 +1720,17 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.power_group_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self._style_combo_popup(self.power_group_combo)
         self.power_group_combo.setToolTip("Select a full-sweep CSV with Power_uW, or a legacy filename-based series.")
-        self.power_refresh_groups_btn = QPushButton("Detect")
-        self.power_refresh_groups_btn.setToolTip("Detect Power_uW tables and legacy filename-based power series.")
+        self.power_refresh_groups_btn = QPushButton("Refresh")
+        self.power_refresh_groups_btn.setToolTip("Find power sweeps in this folder and measurement subfolders; old/archive folders and analysis exports are excluded.")
         group_row = QWidget()
         group_h = QVBoxLayout(group_row)
         group_h.setContentsMargins(0, 0, 0, 0)
         group_h.setSpacing(6)
         group_h.addWidget(self.power_group_combo, 1)
+        self.power_group_combo.hide()
+        self.power_choose_btn = QPushButton("Choose dataset…")
+        self.power_choose_btn.clicked.connect(self.power_controller._power_choose_dataset)
+        group_h.addWidget(self.power_choose_btn)
         group_h.addWidget(self.power_refresh_groups_btn)
         self.power_group_summary = QPlainTextEdit()
         self.power_group_summary.setReadOnly(True)
@@ -1736,8 +1746,15 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.power_kkp_group_combo.setToolTip("Power-sweep source to treat as KKp in VP view.")
         grouping_form.addRow(group_row)
         grouping_form.addRow("Summary", self.power_group_summary)
-        grouping_form.addRow("KK sweep", self.power_kk_group_combo)
-        grouping_form.addRow("KKp sweep", self.power_kkp_group_combo)
+        self.power_compare_chk = QCheckBox("Compare KK / KKp")
+        grouping_form.addRow(self.power_compare_chk)
+        self.power_roles_widget = QWidget()
+        roles_form = QFormLayout(self.power_roles_widget)
+        roles_form.setContentsMargins(0, 0, 0, 0)
+        roles_form.addRow("KK sweep", self.power_kk_group_combo)
+        roles_form.addRow("KKp sweep", self.power_kkp_group_combo)
+        self.power_roles_widget.setVisible(False)
+        grouping_form.addRow(self.power_roles_widget)
         layout.addWidget(self._make_expander("Power Sweep Files", grouping, expanded=True))
 
         params = QWidget()
@@ -1749,7 +1766,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.power_axis_scale_combo = QComboBox()
         self.power_axis_scale_combo.addItems(["Linear", "Log"])
         self._style_combo_popup(self.power_axis_scale_combo)
-        self.power_axis_scale_combo.setToolTip("Set the power y-axis scale.")
+        self.power_axis_scale_combo.setToolTip("Set the heatmap power axis and intensity/linewidth trend power axes together.")
         self.power_pair_mode_combo = QComboBox()
         self.power_pair_mode_combo.addItems(["Stage", "Power Interpolation"])
         self._style_combo_popup(self.power_pair_mode_combo)
@@ -1792,6 +1809,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         setup_grid.setColumnStretch(1, 1)
         setup_grid.setColumnStretch(3, 1)
         params_layout.addWidget(self._make_expander("Plot Setup", setup, expanded=True))
+        params_layout.addWidget(self._make_expander(
+            "Peak Analysis", self.power_peak_controller.build_controls(), expanded=True))
 
         for s in spins.values():
             s.setMinimumWidth(116)
@@ -2172,11 +2191,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.pl_cmap.currentTextChanged.connect(self.pl_controller._on_pl_plot_param_changed)
         self.pl_log_chk.toggled.connect(self.pl_controller._on_pl_plot_param_changed)
         self.pl_clip_chk.toggled.connect(self.pl_controller._on_pl_plot_param_changed)
-        self.cmp_in_k_angle_spin.valueChanged.connect(self.compare_controller._on_cmp_auto_assign_requested)
-        self.cmp_in_kp_angle_spin.valueChanged.connect(self.compare_controller._on_cmp_auto_assign_requested)
-        self.cmp_out_k_angle_spin.valueChanged.connect(self.compare_controller._on_cmp_auto_assign_requested)
-        self.cmp_out_kp_angle_spin.valueChanged.connect(self.compare_controller._on_cmp_auto_assign_requested)
-        self.cmp_angle_tolerance_spin.valueChanged.connect(self.compare_controller._on_cmp_auto_assign_requested)
+        self.cmp_in_k_angle_spin.valueChanged.connect(self.compare_controller._on_cmp_angle_reference_changed)
+        self.cmp_in_kp_angle_spin.valueChanged.connect(self.compare_controller._on_cmp_angle_reference_changed)
+        self.cmp_out_k_angle_spin.valueChanged.connect(self.compare_controller._on_cmp_angle_reference_changed)
+        self.cmp_out_kp_angle_spin.valueChanged.connect(self.compare_controller._on_cmp_angle_reference_changed)
+        self.cmp_angle_tolerance_spin.valueChanged.connect(self.compare_controller._on_cmp_angle_reference_changed)
         self.cmp_infer_angles_btn.clicked.connect(self.compare_controller._on_cmp_infer_angles_requested)
         self.cmp_auto_assign_btn.clicked.connect(self.compare_controller._on_cmp_auto_assign_requested)
         self.cmp_source_filter_combo.currentTextChanged.connect(self.compare_controller._on_cmp_source_filter_changed)
@@ -2184,6 +2203,13 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.cmp_view_vp_btn.clicked.connect(lambda: self.compare_controller._on_cmp_plot_view_button_clicked("Valley Polarization"))
         self.cmp_vp_background_spin.valueChanged.connect(lambda _value: self.compare_controller._on_cmp_plot_param_changed(self.cmp_vp_background_spin))
         self.cmp_vp_auto_background_chk.toggled.connect(self.compare_controller._on_cmp_background_mode_changed)
+        for key, spin in self.cmp_vp_spins.items():
+            spin.valueChanged.connect(
+                lambda _value, widget=spin: self.compare_controller._on_cmp_plot_param_changed(widget)
+            )
+        for check in self.cmp_vp_fix_checks.values():
+            check.toggled.connect(lambda _checked: self._update_action_states())
+        self.cmp_vp_auto_v_btn.clicked.connect(self.compare_controller._auto_cmp_vp_range)
         self.cmp_display_preset_combo.currentTextChanged.connect(self.compare_controller._on_cmp_display_preset_changed)
         for combo in self.cmp_channel_combos.values():
             combo.currentTextChanged.connect(lambda _text, widget=combo: self.compare_controller._on_cmp_plot_param_changed(widget))
@@ -2205,6 +2231,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.power_group_combo.currentIndexChanged.connect(self.power_controller._on_power_plot_param_changed)
         self.power_kk_group_combo.currentIndexChanged.connect(self.power_controller._on_power_source_assignment_changed)
         self.power_kkp_group_combo.currentIndexChanged.connect(self.power_controller._on_power_source_assignment_changed)
+        self.power_compare_chk.toggled.connect(self.power_controller._on_power_comparison_changed)
         self.power_view_intensity_btn.clicked.connect(lambda: self.power_controller._on_power_plot_view_button_clicked("Intensity"))
         self.power_view_vp_btn.clicked.connect(lambda: self.power_controller._on_power_plot_view_button_clicked("VP"))
         self.power_axis_scale_combo.currentTextChanged.connect(self.power_controller._on_power_axis_scale_changed)
@@ -3268,9 +3295,23 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.drr_auto_v_btn.setEnabled(drr_loaded and not self.drr_split_scale_chk.isChecked())
         self.drr_auto_x_btn.setEnabled(drr_loaded)
         self.drr_auto_y_btn.setEnabled(drr_loaded)
-        self.cmp_auto_v_btn.setEnabled(cmp_loaded and not self.cmp_split_scale_chk.isChecked())
+        self.cmp_auto_v_btn.setEnabled(
+            cmp_loaded
+            and not self.compare_controller._cmp_is_vp_view()
+            and not self.cmp_split_scale_chk.isChecked()
+        )
         self.cmp_auto_x_btn.setEnabled(cmp_loaded)
         self.cmp_auto_y_btn.setEnabled(cmp_loaded)
+        vp_active = cmp_loaded and self.compare_controller._cmp_is_vp_view()
+        for key in ("vmin", "vmax"):
+            self.cmp_spins[key].setEnabled(not vp_active)
+            self.cmp_fix_checks[key].setEnabled(not vp_active)
+        if hasattr(self, "cmp_vp_auto_v_btn"):
+            vp_fixed = all(check.isChecked() for check in self.cmp_vp_fix_checks.values())
+            self.cmp_vp_auto_v_btn.setEnabled(vp_active and not vp_fixed)
+            for key in ("vmin", "vmax"):
+                self.cmp_vp_spins[key].setEnabled(vp_active)
+                self.cmp_vp_fix_checks[key].setEnabled(vp_active)
         self.power_auto_v_btn.setEnabled(power_loaded and not self.power_split_scale_chk.isChecked())
         self.power_auto_x_btn.setEnabled(power_loaded)
         self.power_auto_y_btn.setEnabled(power_loaded)
@@ -3479,9 +3520,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             drr_baseline = "Self (last frame)"
             drr_baseline_which = "last"
             y_axis_spec = "auto"
-            if self.power_controller._power_view() == "VP":
+            if self.power_compare_chk.isChecked():
                 if not self.power_controller._power_has_distinct_role_groups():
-                    self._show_error("Assign distinct KK and KKp power sweeps before loading VP.")
+                    self._show_error("Assign distinct KK and KKp power sweeps before loading comparison.")
                     return
                 power_group_key = self.power_controller._power_role_group_key("KK")
             else:
@@ -3925,7 +3966,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if loaded.mode == "Power Dependent":
             self.power_controller._power_refresh_groups()
             idx = self.power_group_combo.findData(loaded.power_group_key)
-            if idx >= 0:
+            if idx >= 0 and not self.power_compare_chk.isChecked():
                 self.power_group_combo.setCurrentIndex(idx)
         if loaded.mode == "MCD" and loaded.mcd_result is not None:
             self.mcd_controller._clear_mcd_center_candidates(restore_manual=False)
@@ -4276,6 +4317,28 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
     def _automatic_cubes_for_mode(self, mode: str) -> list[DataCube]:
         if mode == "MCD" and self.loaded and self.loaded.mode == "MCD" and self.loaded.mcd_result is not None:
             return [self.loaded.mcd_result.cube(self.mcd_map_combo.currentText())]
+        if (
+            mode == "Compare"
+            and self.loaded
+            and self.loaded.mode == "Compare"
+            and self.loaded.compare_cubes
+            and self.compare_controller._cmp_is_vp_view()
+        ):
+            raw = {
+                key: self.loaded.compare_cubes[key]
+                for key in ("KK", "KKp")
+                if key in self.loaded.compare_cubes
+            }
+            if len(raw) == 2:
+                try:
+                    background = self.compare_controller._cmp_background_value(raw)
+                    return [self.compare_controller._cmp_vp_cube(
+                        raw,
+                        self.compare_controller._cmp_source_mapping(),
+                        background=background,
+                    )]
+                except (KeyError, ValueError):
+                    pass
         return self._split_auto_cubes(mode)
 
     def _color_bounds_for_cubes(
@@ -4348,6 +4411,15 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         Numeric fields remain editable, but an unchecked Fix box means the
         value follows the displayed data whenever that data or its ROI changes.
         """
+        # Compare VP has an independent color range.  Automatic intensity
+        # refreshes must not rewrite the remembered intensity limits while VP
+        # is active (background and ROI changes can still request an axis
+        # refresh).
+        skip_compare_vp_color = (
+            mode == "Compare"
+            and hasattr(self, "compare_controller")
+            and self.compare_controller._cmp_is_vp_view()
+        )
         if self._automatic_range_update:
             return False
         cubes = self._automatic_cubes_for_mode(mode)
@@ -4371,12 +4443,15 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
             bounds = self._color_bounds_for_cubes(mode, cubes)
             if bounds is not None:
-                for key, value in zip(("vmin", "vmax"), bounds):
-                    if not self._mode_fix_value(mode, key):
-                        self._set_spin_value_silent(spins[key], value)
-                        changed = True
+                if not skip_compare_vp_color:
+                    for key, value in zip(("vmin", "vmax"), bounds):
+                        if not self._mode_fix_value(mode, key):
+                            self._set_spin_value_silent(spins[key], value)
+                            changed = True
 
             if mode == "MCD" or not refresh_split:
+                return changed
+            if skip_compare_vp_color:
                 return changed
             prefix = "pl" if mode == "PL" else "drr" if mode == "DRR" else "power" if mode == "Power Dependent" else "cmp"
             if not bool(getattr(self, f"{prefix}_split_scale_chk").isChecked()):
@@ -4583,6 +4658,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return self._ensure_loaded_matches_drr_params()
         if mode == "Power Dependent":
             desired_key = self.power_controller._power_selected_group_key()
+            if self.power_compare_chk.isChecked() and not self.power_controller._power_has_distinct_role_groups():
+                raise ValueError("Assign distinct KK and KKp power sweeps for comparison.")
+            if not desired_key:
+                raise ValueError("Select a power sweep before plotting.")
             if desired_key == self.loaded.power_group_key and list(self.loaded.selected_files):
                 return False
             result = self.power_controller._power_load_group_result(desired_key)
@@ -5218,8 +5297,19 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         ticks_on_top: bool = False,
         orientation: str = "vertical",
     ) -> None:
+        from matplotlib.colors import LogNorm
+        from matplotlib.ticker import LogFormatter
+        from core.plotting import plain_log_ticks
+
+        def numeric_log_labels(colorbar):
+            if isinstance(colorbar.norm, LogNorm):
+                colorbar.formatter = LogFormatter()
+                colorbar.update_ticks()
+                plain_log_ticks(colorbar.ax.xaxis if orientation == "horizontal" else colorbar.ax.yaxis)
+
         if not render.is_split:
             colorbar = self.figure.colorbar(render.primary, cax=cax, label=label, orientation=orientation)
+            numeric_log_labels(colorbar)
             if ticks_on_left and orientation == "vertical":
                 colorbar.ax.yaxis.set_ticks_position("left")
                 colorbar.ax.yaxis.set_label_position("left")
@@ -5236,6 +5326,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             right_cax = cax.inset_axes([0.0, 0.02, 1.0, 0.43])
         left_cb = self.figure.colorbar(render.primary, cax=left_cax, orientation=orientation)
         right_cb = self.figure.colorbar(render.secondary, cax=right_cax, orientation=orientation)
+        numeric_log_labels(left_cb)
+        numeric_log_labels(right_cb)
         split_text = f"{float(render.split_x):.6g}"
         left_cb.ax.set_title(f"x ≤ {split_text}", fontsize=8, pad=2)
         right_cb.ax.set_title(f"x ≥ {split_text}", fontsize=8, pad=2)
@@ -6134,6 +6226,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._power_active_cubes = {}
             self._power_active_export_cube = None
             self._power_active_records = ()
+            self.power_peak_controller.axes = None
+            self.power_peak_controller.residual_axis = None
             self._shg_raw_ax = None
             self._shg_corrected_ax = None
             self._shg_angle_ax = None
@@ -6564,17 +6658,26 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                         params = HeatmapParams(**{**params.__dict__, "vmin": new_vmin, "vmax": new_vmax})
                     self.power_controller._power_set_background_spin_silent(background)
                     n = len(cubes)
-                    gs = self.figure.add_gridspec(
-                        nrows=2,
-                        ncols=n + 1,
-                        width_ratios=([1.0] * n) + [0.035],
-                        height_ratios=[1.0, 0.95],
-                        wspace=0.12,
-                        hspace=0.30,
-                    )
-                    heat_axes = [self.figure.add_subplot(gs[0, idx]) for idx in range(n)]
-                    cax = self.figure.add_subplot(gs[0, n])
-                    ax2 = self.figure.add_subplot(gs[1, :n], sharex=heat_axes[0])
+                    if self.power_peak_controller.is_enabled():
+                        outer = self.figure.add_gridspec(
+                            2, 2, width_ratios=[1.6, 1.0], hspace=.5, wspace=.5)
+                        heat_cell, spectrum_cell = outer[0, 0], outer[1, 0]
+                        trend_cells = [outer[0, 1], outer[1, 1]]
+                        heat = heat_cell.subgridspec(1, n + 1, width_ratios=[1.] * n + [.035], wspace=.12)
+                        heat_axes = [self.figure.add_subplot(heat[0, idx]) for idx in range(n)]
+                        cax = self.figure.add_subplot(heat[0, n])
+                        spectrum_grid = spectrum_cell.subgridspec(2, 1, height_ratios=[3, 1], hspace=.3)
+                        ax2 = self.figure.add_subplot(spectrum_grid[0])
+                        self.power_peak_controller.residual_axis = self.figure.add_subplot(spectrum_grid[1], sharex=ax2)
+                        ax2.tick_params(labelbottom=False)
+                        self.power_peak_controller.axes = [self.figure.add_subplot(cell) for cell in trend_cells]
+                    else:
+                        gs = self.figure.add_gridspec(
+                            nrows=2, ncols=n + 1, width_ratios=([1.0] * n) + [0.035],
+                            height_ratios=[1.0, 0.95], wspace=0.12, hspace=0.30)
+                        heat_axes = [self.figure.add_subplot(gs[0, idx]) for idx in range(n)]
+                        cax = self.figure.add_subplot(gs[0, n])
+                        ax2 = self.figure.add_subplot(gs[1, :n], sharex=heat_axes[0])
                     renders: list[HeatmapRender] = []
                     for ax, (key, cube) in zip(heat_axes, cubes.items()):
                         display_cube, true_power, display_power = self.power_controller._display_power_cube(cube)
@@ -6610,13 +6713,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self.compare_controller._cmp_update_title_previews()
                 if self.compare_controller._cmp_is_vp_view():
                     vp_cube = self.compare_controller._cmp_vp_cube(raw_cubes, source_files, background=background)
+                    vp_vmin, vp_vmax = self.compare_controller._cmp_vp_color_limits()
                     vp_params = HeatmapParams(
                         title=vp_cube.title,
                         xlabel=params.xlabel,
                         ylabel=vp_cube.gate_label,
                         cbar_label="VP",
-                        vmin=-1.0,
-                        vmax=1.0,
+                        vmin=vp_vmin,
+                        vmax=vp_vmax,
                         xlim=params.xlim,
                         ylim=params.ylim,
                         cmap="RdBu_r",
@@ -6757,6 +6861,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return (
                 mode,
                 self.power_controller._power_selected_group_key(),
+                self.power_compare_chk.isChecked(),
                 self.power_controller._power_view(),
                 self.power_controller._power_role_group_key("KK"),
                 self.power_controller._power_role_group_key("KKp"),
@@ -6775,6 +6880,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 float(self.power_spins["ymax"].value()),
                 float(self.power_spins["gate"].value()),
                 bool(self.power_log_chk.isChecked()),
+                self.power_peak_controller.enabled.isChecked(),
+                self.power_peak_controller.settings(),
+                self.power_peak_controller.metric.currentText(),
+                self.power_peak_controller.intensity_scale.currentText(),
+                self.power_peak_controller.linewidth_scale.currentText(),
                 bool(self.power_clip_chk.isChecked()),
                 self._split_scale_key("power"),
             )
@@ -6796,6 +6906,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self._resolved_cmap(self.cmp_cmap),
                 float(self.cmp_spins["vmin"].value()),
                 float(self.cmp_spins["vmax"].value()),
+                tuple(self.compare_controller._cmp_vp_color_limits()),
                 float(self.cmp_spins["xmin"].value()),
                 float(self.cmp_spins["xmax"].value()),
                 float(self.cmp_spins["ymin"].value()),
@@ -7014,6 +7125,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
     def _on_canvas_click(self, event: Any) -> None:
         if event.button != 1:
             return
+        if self.last_plotted_mode == "Power Dependent" and self.power_peak_controller.click(event):
+            return
         if self.last_plotted_mode == "MCD Peak Shift" and self._mcd_peak_toolbar_navigation_active():
             return
         if self.last_plotted_mode == "MCD Peak Shift" and self._on_mcd_peak_candidate_marker_click(event):
@@ -7124,7 +7237,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             _display_cube, true_power, display_power = self.power_controller._display_power_cube(cube)
             idx = int(np.argmin(np.abs(display_power - float(event.ydata))))
             power = float(true_power[idx])
-            self._power_selected_row_index = idx
+            raw_indices = (np.flatnonzero(np.asarray(cube.gate) > 0)
+                           if self.power_controller._power_axis_log() else np.arange(len(cube.gate)))
+            self._power_selected_row_index = int(raw_indices[idx]) if len(self._power_active_cubes) == 1 else None
             self.power_spins["gate"].setValue(power)
             self.power_controller._update_power_compare_spectrum_and_lines(self._power_active_cubes)
             return
@@ -7151,6 +7266,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if self.last_plotted_mode != mode:
             self._show_error("Plot/Update before exporting.")
             return
+        if mode == "Power Dependent":
+            try:
+                self._ensure_loaded_matches_ui_params(mode)
+            except Exception as exc:
+                self._show_error(str(exc))
+                return
         self._invalidate_export_move_sources()
         if mode == "PL":
             self._pl_last_export_source = str(self.loaded.primary_file or "")
@@ -7250,6 +7371,21 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._show_error("Nothing to export for this mode.")
             return
 
+        power_peak_payload = None
+        if mode == "Power Dependent" and self.power_peak_controller.is_enabled():
+            if power_vp_payload:
+                peak_cubes = {"KK": power_vp_payload[0], "KKp": power_vp_payload[1]}
+                peak_records = {"KK": power_vp_payload[3], "KKp": power_vp_payload[4]}
+            else:
+                peak_cubes = {"Power": export_cube}
+                peak_records = {"Power": power_records}
+            try:
+                power_peak_payload = self.power_peak_controller.export_payload(
+                    peak_cubes, peak_records, self.power_background_spin.value())
+            except ValueError as exc:
+                self._status(str(exc))
+                return
+
         if mode == "PL":
             log_split = params.split_scale
             if log_split is not None and (
@@ -7284,6 +7420,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 drr_cube=export_cube,
                 power_view=("Intensity Compare" if power_vp_payload and power_vp_payload[8] == "intensity" else self.power_controller._power_view()),
                 power_background=float(self.power_background_spin.value()),
+                power_group_key=self.loaded.power_group_key,
                 power_axis_log=self.power_controller._power_axis_log(),
                 power_kk_group_key=(power_vp_payload[5] if power_vp_payload else ""),
                 power_kkp_group_key=(power_vp_payload[6] if power_vp_payload else ""),
@@ -7294,6 +7431,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 power_kkp_records=(power_vp_payload[4] if power_vp_payload else ()),
                 power_pairing_mode=(power_vp_payload[8] if power_vp_payload else self.power_controller._power_pairing_mode()),
                 power_stage_pairs=(power_vp_payload[9] if power_vp_payload else ()),
+                power_peak_payload=power_peak_payload,
             )
         elif mode == "SHG Processing":
             options = ExportOptions(
@@ -7337,6 +7475,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 compare_gate=float(self.cmp_spins["gate"].value()),
                 compare_background=compare_background,
                 compare_export_vp=True,
+                compare_vp_vmin=float(self.compare_controller._cmp_vp_color_limits()[0]),
+                compare_vp_vmax=float(self.compare_controller._cmp_vp_color_limits()[1]),
                 cleanup_verified_sources=bool(self.clean_verified_sources_chk.isChecked()),
             )
 
@@ -7709,6 +7849,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 log.emit(f"Exported DAT: {paths['dat'].name}")
                 out_folder = str(paths["png"].parent)
                 files_to_move = list(loaded.selected_files)
+            if options.power_peak_payload is not None:
+                from core.power_peaks import export_peak_analysis
+                peak_path = export_peak_analysis(out_folder, options.power_peak_payload)
+                log.emit(f"Exported peak analysis: {peak_path.name}, PNG and JSON settings")
         elif (
             mode == "SHG Processing"
             and loaded.shg_data is not None
@@ -7798,6 +7942,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 clip_outliers=options.compare_clip,
                 correction_background=options.compare_background,
                 export_vp=options.compare_export_vp,
+                vp_vmin=options.compare_vp_vmin,
+                vp_vmax=options.compare_vp_vmax,
                 processed_name=str(Path("Processed Data") / "Compare"),
                 metadata_extra=metadata_extra,
             )
