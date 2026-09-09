@@ -1435,7 +1435,19 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             item = form.itemAt(row, QFormLayout.LabelRole)
             if item and isinstance(item.widget(), QLabel):
                 lbl = item.widget()
-                lbl.setFixedWidth(width)
+                # QLabel cannot break a word. Reserve the rendered width of
+                # the longest token before enabling wrapping so labels such
+                # as ``Integration wavelength`` remain fully visible.
+                longest_word = max(
+                    (lbl.fontMetrics().horizontalAdvance(word) for word in lbl.text().split()),
+                    default=0,
+                )
+                lbl.setFixedWidth(max(width, longest_word + 4))
+                # Long form labels must participate in the form's height-for-
+                # width calculation. A fixed-width, single-line QLabel paints
+                # past its right edge when QFormLayout wraps the field.
+                lbl.setWordWrap(True)
+                lbl.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
                 lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
     def _make_axis_range_row(
@@ -1773,14 +1785,17 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.power_pair_mode_combo.setToolTip("Choose how KK and KKp spectra are paired for VP.")
         for combo in (self.power_axis_scale_combo, self.power_pair_mode_combo):
             combo.setMinimumWidth(0)
-            combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+            combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.power_background_spin = QDoubleSpinBox()
         self.power_background_spin.setDecimals(6)
         self.power_background_spin.setRange(-1.0e12, 1.0e12)
         self.power_background_spin.setSingleStep(100.0)
-        self.power_background_spin.setFixedWidth(140)
+        self.power_background_spin.setMinimumWidth(0)
+        self.power_background_spin.setMaximumWidth(180)
+        self.power_background_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.power_background_auto_chk = QCheckBox("Auto")
-        self.power_background_auto_chk.setFixedWidth(40)
+        self.power_background_auto_chk.setMinimumWidth(0)
         self.power_background_auto_chk.setChecked(True)
         self.power_background_auto_chk.setToolTip("Estimate one constant background from low-percentile intensity.")
         bkg_row = QWidget()
@@ -1792,22 +1807,17 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         bkg_h.addStretch(1)
 
         setup = QGroupBox("Plot Setup")
-        setup_grid = QGridLayout(setup)
-        setup_grid.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
-        setup_grid.setHorizontalSpacing(8)
-        setup_grid.setVerticalSpacing(UI_METRICS["row_spacing"])
-        setup_grid.addWidget(QLabel("Power Axis"), 0, 0)
-        setup_grid.addWidget(self.power_axis_scale_combo, 0, 1)
-        setup_grid.addWidget(QLabel("Cmap"), 0, 2)
-        setup_grid.addWidget(cmap, 0, 3)
-        setup_grid.addWidget(QLabel("VP Pair By"), 1, 0)
-        setup_grid.addWidget(self.power_pair_mode_combo, 1, 1)
-        # Give the background field a full-width row; the former narrow
-        # fourth column compressed the spinbox beneath its text hit target.
-        setup_grid.addWidget(QLabel("Background"), 2, 0)
-        setup_grid.addWidget(bkg_row, 2, 1, 1, 3)
-        setup_grid.setColumnStretch(1, 1)
-        setup_grid.setColumnStretch(3, 1)
+        setup_form = QFormLayout(setup)
+        # Let wrapped long combo fields use the complete inner width at the
+        # minimum sidebar size; the group frame already supplies edge padding.
+        setup_form.setContentsMargins(0, UI_METRICS["group_margin"], 0, UI_METRICS["group_margin"])
+        setup_form.setHorizontalSpacing(8)
+        setup_form.setVerticalSpacing(UI_METRICS["row_spacing"])
+        setup_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        setup_form.addRow("Power Axis", self.power_axis_scale_combo)
+        setup_form.addRow("Cmap", cmap)
+        setup_form.addRow("VP Pair By", self.power_pair_mode_combo)
+        setup_form.addRow("Background", bkg_row)
         params_layout.addWidget(self._make_expander("Plot Setup", setup, expanded=True))
         params_layout.addWidget(self._make_expander(
             "Peak Analysis", self.power_peak_controller.build_controls(), expanded=True))
@@ -1838,14 +1848,13 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         basic_form.addRow(power_y_range_row)
         basic_form.addRow("Cursor Power", spins["gate"])
         flags = QWidget()
-        flags_h = QHBoxLayout(flags)
+        flags_h = QVBoxLayout(flags)
         flags_h.setContentsMargins(0, 0, 0, 0)
-        flags_h.setSpacing(10)
+        flags_h.setSpacing(3)
         self.power_log_chk.setText("Color Log")
         self.power_log_chk.setToolTip("Use logarithmic color normalization.")
         flags_h.addWidget(self.power_log_chk)
         flags_h.addWidget(self.power_clip_chk)
-        flags_h.addStretch(1)
         basic_form.addRow("Color / Clip", flags)
         self._set_form_label_width(basic_form, UI_METRICS["label_col_width"])
         manual_ranges = self._make_expander("Manual plot ranges", basic, expanded=False)
@@ -1952,7 +1961,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             # hard minimum wider than the sidebar causes clipping at the
             # supported minimum window size, so let the row elide naturally.
             combo.setMinimumWidth(0)
-            combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
     def _build_plot_panel(self) -> QWidget:
         box = QWidget()
