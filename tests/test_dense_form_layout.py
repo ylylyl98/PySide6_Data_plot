@@ -66,6 +66,27 @@ class DenseFormRowLayoutTests(unittest.TestCase):
         self.assertGreater(narrow, wide)
         self.assertTrue(layout.hasHeightForWidth())
 
+    def test_narrow_width_wraps_primary_groups_without_overflow(self) -> None:
+        from ui_qt.dense_form_layout import DenseFormRowLayout
+
+        host = QWidget(); layout = DenseFormRowLayout(host, spacing=4); host.setLayout(layout)
+        controls = []
+        for value in ("-12.0000", "0.0000"):
+            spin = QDoubleSpinBox(); spin.setMinimumWidth(130); spin.setValue(float(value))
+            fix = QCheckBox("F"); fix.setMinimumWidth(38)
+            controls.extend((spin, fix))
+            layout.add_group((spin, fix), role="range", priority=10, grow_weight=1)
+        action = QPushButton("Auto"); action.setMinimumWidth(77)
+        layout.add_group((action,), role="action", priority=1, grow_weight=0)
+        host.resize(238, 220); host.show(); self.app.processEvents()
+        constrained = QRect(0, 0, 238, 220)
+        layout.setGeometry(constrained)
+
+        self.assertEqual(layout.mode_for_width(constrained.width()), "WRAPPED")
+        self.assertGreaterEqual(host.minimumHeight(), layout.heightForWidth(constrained.width()))
+        self.assertTrue(all(constrained.contains(widget.geometry()) for widget in (*controls, action)))
+        self.assertFalse(any(a.geometry().intersects(b.geometry()) for i, a in enumerate((*controls, action)) for b in (*controls, action)[i + 1:]))
+
     def _make_range_row(self, width: int = 380):
         from ui_qt.dense_form_layout import DenseFormRowLayout
 

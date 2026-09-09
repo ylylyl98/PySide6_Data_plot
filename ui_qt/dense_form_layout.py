@@ -1,7 +1,8 @@
-"""Bounded two-mode layout for dense form rows.
+"""Bounded responsive layout for dense form rows.
 
 The label always sits above the controls. Controls use one row when their
-rendered font/style widths fit; otherwise the trailing action moves to row 2.
+rendered font/style widths fit; otherwise complete control groups wrap while
+trailing actions move below the primary controls.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ class _Group:
 
 
 class DenseFormRowLayout(QLayout):
-    """Height-for-width layout with ``SINGLE_ROW`` and ``WRAPPED`` modes."""
+    """Height-for-width layout with single-row and grouped wrapped modes."""
 
     SINGLE_ROW = "SINGLE_ROW"
     WRAPPED = "WRAPPED"
@@ -283,12 +284,29 @@ class DenseFormRowLayout(QLayout):
         if self._row_width(items) <= available:
             return [items], self.SINGLE_ROW
 
-        action_index = next((index for index, group in enumerate(groups) if group.role == "action"), len(groups) - 1)
-        first_row = [item for group in groups[:action_index] for item in group.items]
-        second_row = [item for group in groups[action_index:] for item in group.items]
-        if not first_row:
-            first_row, second_row = items[:-1], items[-1:]
-        return [row for row in (first_row, second_row) if row], self.WRAPPED
+        action_index = next((index for index, group in enumerate(groups) if group.role == "action"), len(groups))
+        primary_groups = groups[:action_index]
+        rows: list[list[QLayoutItem]] = []
+        current: list[QLayoutItem] = []
+        for group in primary_groups:
+            group_items = list(group.items)
+            candidate = current + group_items
+            if current and self._row_width(candidate) > available:
+                rows.append(current)
+                current = []
+            current.extend(group_items)
+        if current:
+            rows.append(current)
+
+        # Actions stay below the primary controls when the complete row does
+        # not fit.  This also prevents a long primary group from pushing the
+        # action beyond the constrained sidebar edge.
+        for group in groups[action_index:]:
+            if group.items:
+                rows.append(list(group.items))
+        if not rows:
+            rows = [items]
+        return rows, self.WRAPPED
 
     def mode_for_width(self, width: int) -> str:
         return self._rows_for_width(max(0, int(width)))[1]
@@ -360,6 +378,18 @@ class DenseFormRowLayout(QLayout):
         super().setGeometry(rect)
         rows, mode = self._rows_for_width(rect.width())
         self._last_mode = mode
+        # QFormLayout/QScrollArea can cache a child row's height before its
+        # width is constrained. Keep the host's minimum height synchronized
+        # with the current height-for-width result so newly wrapped rows are
+        # not clipped at narrow sidebar widths.
+        parent = self.parentWidget()
+        if parent is not None:
+            required_height = self.heightForWidth(rect.width())
+            managed = bool(parent.property("denseLayoutManagedMinHeight"))
+            if managed or parent.minimumHeight() < required_height:
+                parent.setProperty("denseLayoutManagedMinHeight", True)
+                if parent.minimumHeight() != required_height:
+                    parent.setMinimumHeight(required_height)
         left, top, right, bottom = self.getContentsMargins()
         content = rect.adjusted(left, top, -right, -bottom)
         gap = self.spacing()
