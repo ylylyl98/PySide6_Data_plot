@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 import json
+import csv
 import re
 from pathlib import Path
 from typing import Dict, List, Sequence
@@ -409,14 +410,24 @@ def inspect_power_sweep_csv(folder: str, file_name: str) -> bool:
     if not path.is_file():
         return False
     try:
-        sep = processing_impl._guess_sep_from_first_line(path)
-        columns = pd.read_csv(path, sep=sep, nrows=0).columns
-        power_col, _stage_col, _spectrum_cols = _power_table_columns(columns)
+        stat = path.stat()
+        power_col = _power_header_column(str(path.resolve()), stat.st_mtime_ns, stat.st_size)
         # Keep malformed candidates visible in the UI so selecting one produces
         # the loader's actionable missing-spectrum error.
         return power_col is not None
     except Exception:
         return False
+
+
+@lru_cache(maxsize=512)
+def _power_header_column(path: str, modified: int, size: int) -> str | None:
+    # A header-only pandas frame still constructs thousands of empty Series
+    # for wide spectrometer CSVs. Read one CSV record instead.
+    sep = processing_impl._guess_sep_from_first_line(Path(path))
+    with open(path, encoding='utf-8-sig', newline='') as stream:
+        columns = next(csv.reader(stream, delimiter=sep), [])
+    return _find_table_column(columns,
+        ['power_uw', 'power (uw)', 'poweruw', 'laser_power_uw', 'laserpoweruw', 'power'])
 
 
 def get_power_series_sources(folder: str, files: Sequence[str]) -> Dict[str, PowerSeriesSource]:

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import sys
+import os
+import faulthandler
+import logging
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtGui import QIcon
@@ -10,6 +14,41 @@ from app_version import __version__
 
 APP_USER_MODEL_ID = "com.ylylyl98.dptk_desktop.data_plot"
 APP_ICON_PATH = Path("assets") / "icons" / "app_icon.ico"
+_diagnostic_stream = None
+
+
+def enable_crash_diagnostics() -> None:
+    """Keep Python/Qt error output available after a pythonw native abort."""
+    global _diagnostic_stream
+    if _diagnostic_stream is not None:
+        return
+    log_dir = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'DPTK' / 'logs'
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        stream = (log_dir / f'app-{stamp}-{os.getpid()}.log').open('a', encoding='utf-8', buffering=1)
+    except OSError:
+        return
+    _diagnostic_stream = stream  # faulthandler requires an open file for the process lifetime.
+    if sys.stderr is None:
+        sys.stderr = stream
+    if sys.stdout is None:
+        sys.stdout = stream
+    stream.write(f'DPTK {__version__} | Python {sys.version} | {Path(__file__).resolve()}\n')
+    faulthandler.enable(file=stream, all_threads=True)
+    logger = logging.getLogger('dptk')
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+    logger.addHandler(handler)
+    from PySide6.QtCore import qInstallMessageHandler, QtMsgType
+
+    def qt_message(kind, context, message):
+        stream.write(f'Qt {kind}: {message}\n')
+        if kind == QtMsgType.QtFatalMsg:
+            faulthandler.dump_traceback(file=stream, all_threads=True)
+
+    qInstallMessageHandler(qt_message)
 
 
 def resource_path(relative_path: str | Path) -> Path:
@@ -36,6 +75,7 @@ def load_app_icon() -> QIcon:
 
 
 def main() -> int:
+    enable_crash_diagnostics()
     if "--mcd-organizer" in sys.argv:
         index = sys.argv.index("--mcd-organizer")
         experiment = sys.argv[index + 1] if index + 1 < len(sys.argv) else str(Path.cwd())

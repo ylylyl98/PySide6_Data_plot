@@ -122,7 +122,7 @@ class PowerWorkflowTests(unittest.TestCase):
                 self.assertFalse(dialog.ok_button.isEnabled())
                 return 0
             with patch.object(SourcePickerDialog, 'exec', inspect):
-                self.window.power_controller._power_choose_dataset()
+                self.window.power_controller._power_choose_combination()
 
     def test_add_multiple_to_chosen_panel_and_keep_across_filter(self):
         from PySide6.QtWidgets import QListWidget, QPushButton, QComboBox, QAbstractItemView
@@ -157,7 +157,68 @@ class PowerWorkflowTests(unittest.TestCase):
             return 0
         with patch.object(type(c), '_power_current_sources', return_value={k: PowerSeriesSource(k, k, 'table') for k in ('a', 'b')}), \
              patch.object(SourcePickerDialog, 'exec', inspect):
-            c._power_choose_dataset()
+            c._power_choose_combination()
+
+    def test_picker_uses_current_combo_over_stale_picker_memory(self):
+        from PySide6.QtCore import Qt
+        from core.data_io import PowerSeriesSource
+        from ui_qt.source_picker_dialog import SourcePickerDialog
+        c = self.window.power_controller
+        c._power_picker_selection = ('csv::old.csv',)
+        c.power_group_combo.clear()
+        c.power_group_combo.addItem('— Select power sweep —', '')
+        c.power_group_combo.addItem('Current', 'csv::current.csv')
+        c.power_group_combo.setCurrentIndex(c.power_group_combo.findData('csv::current.csv'))
+        seen = []
+        def inspect(dialog):
+            seen.append([dialog.source_list.item(i).checkState() == Qt.Checked
+                         for i in range(dialog.source_list.count())])
+            return 0
+        with patch.object(type(c), '_power_current_sources', return_value={
+                'csv::current.csv': PowerSeriesSource('csv::current.csv', 'Current', 'table')}), \
+             patch.object(SourcePickerDialog, 'exec', inspect):
+            c._power_choose_combination()
+        self.assertEqual(seen, [[True]])
+
+    def test_role_pickers_are_single_sweep_and_load_only_when_pair_complete(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QAbstractItemView
+        from core.data_io import PowerSeriesSource
+        from ui_qt.source_picker_dialog import SourcePickerDialog
+        c = self.window.power_controller
+        self.window.power_compare_chk.setChecked(True)
+        sources = {key: PowerSeriesSource(key, key, 'table') for key in ('a', 'b')}
+        results = {key: sweep(key, [1., 2.], [[1., 2.], [3., 4.]]) for key in sources}
+        calls = []
+        def pick(dialog):
+            self.assertEqual(dialog.source_list.selectionMode(), QAbstractItemView.SingleSelection)
+            self.assertEqual(dialog.source_list.count(), 2 if not calls else 1)
+            dialog.source_list.setCurrentRow(0)
+            dialog.findChild(type(dialog.ok_button), 'power_add_selected').click()
+            calls.append(dialog.windowTitle())
+            return 1
+        with patch.object(type(c), '_power_current_sources', return_value=sources), \
+             patch.object(type(c), '_power_load_group_result', side_effect=lambda key: results[key]), \
+             patch.object(type(self.window), '_start_load') as load, \
+             patch.object(SourcePickerDialog, 'exec', pick):
+            c._power_choose_dataset('KK')
+            self.assertEqual(load.call_count, 0)
+            c._power_choose_dataset('KKp')
+        self.assertEqual(load.call_count, 1)
+        self.assertNotEqual(c._power_role_group_key('KK'), c._power_role_group_key('KKp'))
+
+    def test_cancelled_role_picker_leaves_existing_assignment_untouched(self):
+        from core.data_io import PowerSeriesSource
+        from ui_qt.source_picker_dialog import SourcePickerDialog
+        c = self.window.power_controller
+        sources = {key: PowerSeriesSource(key, key, 'table') for key in ('a', 'b')}
+        with patch.object(type(c), '_power_current_sources', return_value=sources):
+            c._power_refresh_groups()
+            c.power_kk_group_combo.setCurrentIndex(c.power_kk_group_combo.findData('a'))
+            before = c.power_kk_group_combo.currentData()
+            with patch.object(SourcePickerDialog, 'exec', lambda _dialog: 0):
+                c._power_choose_dataset('KK')
+        self.assertEqual(c.power_kk_group_combo.currentData(), before)
 
     def test_multiselect_back_preserves_settings_and_selection(self):
         from PySide6.QtCore import Qt
@@ -198,8 +259,24 @@ class PowerWorkflowTests(unittest.TestCase):
         with patch.object(type(c), '_power_current_sources', return_value={k: PowerSeriesSource(k, k, 'table') for k in data}), \
              patch.object(type(c), '_power_load_group_result', side_effect=lambda k: data[k]), \
              patch.object(SourcePickerDialog, 'exec', picker), patch.object(PowerCombineReview, 'exec', review):
-            c._power_choose_dataset()
+            c._power_choose_combination()
         self.assertEqual(review_calls, [('a', 'b'), ('a', 'b', 'c')])
+
+    def test_combination_rejects_cross_channel_sources(self):
+        from core.data_io import PowerSeriesSource
+        from ui_qt.power_combine_review import PowerCombineReview
+        c = self.window.power_controller
+        sources = {
+            'kk': PowerSeriesSource('kk', 'sample_KK.csv', 'table', 'sample_KK.csv'),
+            'kkp': PowerSeriesSource('kkp', 'sample_KKp.csv', 'table', 'sample_KKp.csv'),
+        }
+        data = {'kk': sweep('sample_KK.csv', [1., 2.], [[1., 2.], [2., 3.]]),
+                'kkp': sweep('sample_KKp.csv', [1., 2.], [[1., 2.], [2., 3.]])}
+        with patch.object(type(c), '_power_current_sources', return_value=sources), \
+             patch.object(type(c), '_power_load_group_result', side_effect=lambda key: data[key]):
+            with self.assertRaises(ValueError) as error:
+                PowerCombineReview(self.window, c, ('kk', 'kkp'))
+        self.assertIn('same-channel', str(error.exception))
 
     def test_three_sweeps_correct_then_save_and_plot(self):
         from core.data_io import PowerSeriesSource

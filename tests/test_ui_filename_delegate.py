@@ -118,6 +118,35 @@ class WrappedFilenameDelegateTests(unittest.TestCase):
         finally:
             file_list.close()
 
+    def test_power_style_long_rows_fit_at_wrap_boundaries_after_resize(self) -> None:
+        class CapturingDelegate(WrappedFilenameDelegate):
+            def paint(self, painter, option, index):
+                opt = QStyleOptionViewItem(option)
+                self.initStyleOption(opt, index)
+                layout = self._layout_text(opt.text, opt.font, option.rect.width() - 16)
+                self.extents.append((option.rect.height(), layout.boundingRect().height() + 12))
+                super().paint(painter, option, index)
+
+        view = QListWidget()
+        view.setResizeMode(QListView.Adjust)
+        view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        delegate = CapturingDelegate(view)
+        delegate.extents = []
+        view.setItemDelegate(delegate)
+        prefix = 'processed data/power dependence/combined sweeps/yz212_p7_690nm_860nmc_2sx1_motion_sweep_stage_vbg0_vtg0_vb0_'
+        view.addItems([prefix + 'combined_sweeps_' * i + ' · Single sweep · 0.044–888.5 uW' for i in range(18)])
+        try:
+            for width in (1100, 420, 1180):
+                view.resize(width, 700)
+                view.show()
+                self.app.processEvents()
+                view.grab()
+            self.assertTrue(delegate.extents)
+            for row_height, text_height in delegate.extents:
+                self.assertGreaterEqual(row_height, text_height)
+        finally:
+            view.close()
+
 
 if __name__ == "__main__":
     unittest.main()

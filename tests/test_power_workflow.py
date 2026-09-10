@@ -13,6 +13,42 @@ from core.plotting import plot_heatmap, HeatmapParams
 
 
 class CorrectionTests(unittest.TestCase):
+    def test_discovery_excludes_initial_data_copies(self):
+        from core.power_workflow import discover_power_files
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for directory in (root, root / 'Initial Data',
+                              root / 'nested' / 'INITIAL DATA' / 'sweep',
+                              root / 'archive', root / 'Initial Data after processing'):
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / 'raw.csv').write_text(
+                    'Power_uW,1.4,1.5\n1,2,3\n2,4,5\n')
+            for include_legacy in (False, True):
+                self.assertEqual(discover_power_files(folder, include_legacy=include_legacy),
+                                 ['raw.csv'])
+            self.assertEqual(discover_power_files(root / 'Initial Data'), [])
+            self.assertEqual(discover_power_files(root / 'archive'), [])
+
+    def test_processed_status_falls_back_to_portable_name_after_folder_move(self):
+        import json
+        from core.power_workflow import processed_source_names
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / 'nested' / 'raw.csv'
+            source.parent.mkdir(parents=True)
+            source.write_text('Power_uW,1.4,1.5\n1,2,3\n2,4,5\n')
+            output = root / 'Processed Data' / 'Power Dependence' / 'run.metadata.json'
+            output.parent.mkdir(parents=True)
+            output.write_text(json.dumps({'sources': [{
+                'name': 'nested/raw.csv',
+                'source_path': 'C:/old-experiment/nested/raw.csv',
+            }]}))
+            names = processed_source_names(root)
+            self.assertIn('nested/raw.csv', names)
+            source.unlink()
+            (root / 'raw.csv').write_text('Power_uW,1.4,1.5\n1,2,3\n2,4,5\n')
+            self.assertNotIn('raw.csv', processed_source_names(root))
+
     def test_recursive_discovery_archives_metadata_and_nested_provenance(self):
         import json
         from core.power_workflow import discover_power_files, acquisition_info

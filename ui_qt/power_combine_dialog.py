@@ -13,7 +13,28 @@ from matplotlib.figure import Figure
 
 from core.power_combine import combine_power_sweeps, save_combined_power_sweep
 from core.power_workflow import (COMBINED_FOLDER, is_combined, corrected, estimate_factor,
-    acquisition_info, suspicious_rows, fingerprint, suggested_name, estimate_background)
+    acquisition_info, suspicious_rows, fingerprint, suggested_name, estimate_background, _power_context_and_channel)
+
+
+def _known_power_channels(controller, sources):
+    """Use the same metadata, lineage and angle rules as the group picker."""
+    from core.power_workflow import group_power_measurement_sources
+    references = {}
+    for key, widget in (('in_k', 'cmp_in_k_angle_spin'), ('in_kp', 'cmp_in_kp_angle_spin'),
+                        ('out_k', 'cmp_out_k_angle_spin'), ('out_kp', 'cmp_out_kp_angle_spin')):
+        control = getattr(controller, widget, None)
+        if control is not None:
+            references[key] = float(control.value())
+    control = getattr(controller, 'cmp_angle_tolerance_spin', None)
+    tolerance = float(control.value()) if control is not None else 45.
+    roles = {}
+    for group in group_power_measurement_sources(controller.current_folder, sources,
+                                                 angle_refs=references, angle_tolerance=tolerance):
+        for role, key in group.mapping.items():
+            roles[key] = role
+        for role, keys in group.duplicates.items():
+            roles.update({key: role for key in keys})
+    return roles
 
 
 class PowerCombineDialog(QDialog):
@@ -55,6 +76,7 @@ class PowerCombineDialog(QDialog):
                 continue
             self.first.addItem(source.title, key)
             self.second.addItem(source.title, key)
+        self._channel_by_key = _known_power_channels(controller, self.sources)
         self.second.setCurrentIndex(1 if self.second.count() > 1 else 0)
         selected = self.first.findData(controller._power_selected_group_key())
         if selected >= 0:
@@ -185,6 +207,10 @@ class PowerCombineDialog(QDialog):
                 raise ValueError("Detect at least two power sweeps first.")
             a = self.controller._power_load_group_result(self.first.currentData())
             b = self.controller._power_load_group_result(self.second.currentData())
+            first_channel = self._channel_by_key.get(self.first.currentData())
+            second_channel = self._channel_by_key.get(self.second.currentData())
+            if first_channel and second_channel and first_channel != second_channel:
+                raise ValueError('Combine sweeps accepts same-channel segments only; choose KK with KK or KKp with KKp.')
             self.original_inputs = (a, b)
             source_keys = (self.first.currentData(), self.second.currentData())
             if source_keys != self._background_sources:
