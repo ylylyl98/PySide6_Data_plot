@@ -21,6 +21,7 @@ class _PowerOwner:
 
     def __init__(self) -> None:
         self._power_sources_cache = None
+        self._power_result_cache = {}
         self._power_sources_cache_files = ()
         self.available_files = ["one.csv"]
 
@@ -208,7 +209,8 @@ class ResponsivenessTests(unittest.TestCase):
         owner = _PowerOwner()
         controller = PowerController(owner)
         sentinel = {"group": object()}
-        with patch("core.data_io.get_power_series_sources", return_value=sentinel) as discover:
+        with patch.object(PowerController, '_power_candidate_files', side_effect=lambda: list(owner.available_files)), \
+                patch("core.data_io.get_power_series_sources", return_value=sentinel) as discover:
             self.assertIs(controller._power_current_sources(), sentinel)
             self.assertIs(controller._power_current_sources(), sentinel)
             self.assertEqual(discover.call_count, 1)

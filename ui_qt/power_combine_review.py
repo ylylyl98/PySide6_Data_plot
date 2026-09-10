@@ -6,9 +6,9 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QLabel, QCombo
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from core.power_combine import combine_many_power_sweeps
-from core.power_workflow import corrected, estimate_background, estimate_factor, fingerprint, acquisition_info, suspicious_rows, suggested_name
+from core.power_workflow import corrected, estimate_background, estimate_factor, fingerprint, acquisition_info, suspicious_rows, suggested_name, _power_context_and_channel
 from core.plotting import HeatmapParams, plot_heatmap
-from ui_qt.power_combine_dialog import PowerCombineDialog
+from ui_qt.power_combine_dialog import PowerCombineDialog, _known_power_channels
 
 
 class PowerCombineReview(PowerCombineDialog):
@@ -19,6 +19,11 @@ class PowerCombineReview(PowerCombineDialog):
         self.open_requested = self.back_requested = False
         self.result = self.preview_result = None
         self.original_inputs = tuple(controller._power_load_group_result(k) for k in keys)
+        sources = controller._power_current_sources()
+        roles = _known_power_channels(controller, sources)
+        channels = [roles[key] for key in keys if key in roles]
+        if len(set(channels)) > 1:
+            raise ValueError('Combine sweeps accepts same-channel segments only; select KK sweeps or KKp sweeps separately.')
         self._updating = True
         self.setWindowTitle("Review power combination")
         self.resize(1100, 850)

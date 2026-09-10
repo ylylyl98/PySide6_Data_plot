@@ -58,7 +58,12 @@ class PowerController:
         from core.power_workflow import discover_power_files
         return discover_power_files(self.current_folder, include_legacy=getattr(self, '_power_include_legacy', False))
 
-    def _power_choose_dataset(self):
+    def _power_choose_dataset(self, role=None, _force_legacy=False):
+        # The primary Power action selects one complete measurement context.
+        # Role-specific pickers remain available as explicit manual overrides.
+        if role is None and not _force_legacy:
+            return self._power_choose_measurement_group()
+        role = role if role in ('KK', 'KKp') else None
         from PySide6.QtCore import Qt
         from PySide6.QtWidgets import (QComboBox, QListWidgetItem, QCheckBox, QListWidget,
             QSplitter, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QAbstractItemView)
@@ -70,12 +75,14 @@ class PowerController:
         legacy = QCheckBox("Include filename-based series")
         legacy.setToolTip("Optional legacy grouping. Ordinary PL filenames containing a power value may also match.")
         legacy.setChecked(getattr(self, '_power_include_legacy', False))
-        dialog = SourcePickerDialog(self._owner, title="Choose Power Dataset",
-            hint="Select available sweeps and click Add Selected, or double-click a file. One chosen sweep opens; several go to combination review. KK/KKp comparison remains separate.",
+        dialog = SourcePickerDialog(self._owner, title=f"Choose {role} Power Sweep" if role else "Choose Power Dataset",
+            hint=(f"Choose one sweep for {role}. The other channel's assigned sweep is excluded."
+                  if role else "Select available sweeps and click Add Selected, or double-click a file. One chosen sweep opens; several go to combination review. For KK/KKp, enable Compare KK / KKp on the Power page."),
             filter_controls=(("Status", status), (None, legacy)),
             selection_mode=QAbstractItemView.ExtendedSelection)
-        checked = dict.fromkeys(getattr(self, '_power_picker_selection', ()) or
-                                ([self._power_selected_group_key()] if self._power_selected_group_key() else []))
+        selected_key = self._power_role_group_key(role) if role else self._power_selected_group_key()
+        checked = dict.fromkeys([selected_key] if selected_key else [])
+        other_key = self._power_role_group_key('KKp' if role == 'KK' else 'KK') if role else ''
         dialog.source_list.itemDoubleClicked.disconnect()
         chosen = QListWidget()
         chosen.setObjectName('power_chosen_files')
@@ -106,7 +113,8 @@ class PowerController:
             dialog.source_list.blockSignals(True)
             dialog.source_list.clear()
             processed_names = processed_source_names(self.current_folder)
-            sources = self._power_current_sources()
+            sources = {key: source for key, source in self._power_current_sources().items()
+                       if not role or key != other_key}
             for key in list(checked):
                 if key not in sources:
                     checked.pop(key)
@@ -125,6 +133,7 @@ class PowerController:
                 dialog.source_list.addItem(item)
             dialog.source_list.blockSignals(False)
             details()
+
         def details():
             old_selected = {i.data(Qt.UserRole) for i in chosen.selectedItems()}
             chosen.clear()
@@ -134,12 +143,16 @@ class PowerController:
                 chosen.addItem(item)
                 item.setSelected(key in old_selected)
             count = len(checked)
-            dialog.ok_button.setEnabled(count > 0)
-            dialog.ok_button.setText("Review combination…" if count > 1 else "Open sweep")
+            dialog.ok_button.setEnabled(count == 1 if role else count > 0)
+            dialog.ok_button.setText(f"Use as {role}" if role else "Review combination…" if count > 1 else "Open sweep")
             dialog.details_label.setText(f"{count} sweep{'s' if count != 1 else ''} chosen. Status and search filters do not remove chosen sweeps.")
         def add_selected(*_):
+            if role and dialog.source_list.selectedItems():
+                checked.clear()
             for item in dialog.source_list.selectedItems():
                 checked[item.data(Qt.UserRole)] = None
+                if role:
+                    break
             details()
         def remove_selected():
             for item in chosen.selectedItems(): checked.pop(item.data(Qt.UserRole), None)
@@ -153,7 +166,10 @@ class PowerController:
         clear.clicked.connect(clear_selected)
         def selection_changed(item):
             key = item.data(Qt.UserRole)
-            if item.checkState() == Qt.Checked: checked[key] = None
+            if item.checkState() == Qt.Checked:
+                if role:
+                    checked.clear()
+                checked[key] = None
             else: checked.pop(key, None)
             details()
         dialog.filter_requested.connect(populate)
@@ -166,12 +182,28 @@ class PowerController:
         dialog.source_list.currentItemChanged.connect(lambda *_: details())
         dialog.source_list.itemChanged.connect(selection_changed)
         populate()
+        if role:
+            dialog.source_list.setSelectionMode(QAbstractItemView.SingleSelection)
         draft = None
         while dialog.exec() and checked:
             self._power_status_filter = status.currentText()
             self._power_picker_status_filter = status.currentText()
             self._power_picker_selection = tuple(checked)
             self._power_refresh_groups()
+            if role:
+                combo = self.power_kk_group_combo if role == 'KK' else self.power_kkp_group_combo
+                blocked = combo.blockSignals(True)
+                try:
+                    combo.setCurrentIndex(combo.findData(next(iter(checked))))
+                finally:
+                    combo.blockSignals(blocked)
+                # Route picker assignments through the same state transition as
+                # the combo boxes: invalidate exports, clear selected rows, and
+                # redraw an already loaded Power view when appropriate.
+                self._on_power_source_assignment_changed()
+                if self._power_has_distinct_role_groups():
+                    self._start_load("Power Dependent")
+                return
             if len(checked) == 1:
                 key = next(iter(checked))
                 self.power_group_combo.setCurrentIndex(self.power_group_combo.findData(key))
@@ -195,6 +227,75 @@ class PowerController:
                 return
             details()
 
+    def _power_choose_measurement_group(self):
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QDialog
+        from ui_qt.power_group_dialog import PowerGroupDialog
+        existing = getattr(self, '_power_group_dialog', None)
+        if existing is not None:
+            existing.raise_()
+            return
+        dlg = PowerGroupDialog(self, self._owner)
+        self._power_group_dialog = dlg
+
+        def finished(result):
+            def apply_and_release():
+                try:
+                    if result == QDialog.DialogCode.Accepted and not getattr(self, '_is_closing', False):
+                        self._apply_power_measurement_group(dlg)
+                finally:
+                    self._power_group_dialog = None
+                    dlg.deleteLater()
+            # Keep all picker widgets alive until their signal delivery ends.
+            QTimer.singleShot(0, self._owner, apply_and_release)
+
+        dlg.finished.connect(finished)
+        dlg.open()
+
+    def _apply_power_measurement_group(self, dlg):
+        selection = dlg.selection()
+        import logging
+        logging.getLogger('dptk').info('Open Power group: folder=%s selection=%s', self.current_folder, selection)
+        self._power_include_legacy = bool(selection["legacy"])
+        self._power_picker_status_filter = selection["status"]
+        self._power_measurement_group_key = selection["group"]
+        self._power_refresh_groups()
+        combos = [getattr(self, name, None) for name in ("power_group_combo", "power_kk_group_combo", "power_kkp_group_combo", "power_compare_chk", "power_pair_mode_combo")]
+        combos = [c for c in combos if c is not None]
+        blocks = [c.blockSignals(True) for c in combos]
+        try:
+            for name, key in (("power_kk_group_combo", selection["KK"]), ("power_kkp_group_combo", selection["KKp"])):
+                combo = getattr(self, name, None)
+                if combo is not None: combo.setCurrentIndex(max(0, combo.findData(key)))
+            primary = selection["single"] if selection['action'] == 'Single intensity' else selection['KK']
+            if primary and hasattr(self, "power_group_combo"):
+                self.power_group_combo.setCurrentIndex(max(0, self.power_group_combo.findData(primary)))
+            if hasattr(self, 'power_compare_chk'):
+                self.power_compare_chk.setChecked(selection['action'] != 'Single intensity')
+            if hasattr(self, 'power_pair_mode_combo'):
+                self.power_pair_mode_combo.setCurrentText('Stage' if selection['pairing'] == 'Pair by Stage' else 'Power Interpolation')
+        finally:
+            for combo, blocked in zip(combos, blocks): combo.blockSignals(blocked)
+        if hasattr(self, 'power_roles_widget'):
+            self.power_roles_widget.setVisible(selection['action'] != 'Single intensity')
+        validated = getattr(dlg, '_validation_results', {})
+        if isinstance(validated, dict) and primary in validated:
+            # The picker already loaded and checked this exact pair. Keep it
+            # alive through the GUI handoff instead of starting another worker.
+            self._power_result_cache.update(validated)
+            self._power_prevalidated_load = (self.current_folder, primary, validated[primary])
+        timer = getattr(self, '_plot_redraw_timers', {}).get('Power Dependent')
+        if timer is not None:
+            timer.stop()
+        getattr(self, '_plot_redraw_pending', set()).discard('Power Dependent')
+        self._power_selected_row_index = None
+        # Do not redraw an old LoadedState using the newly assigned channels.
+        self._invalidate_export_move_sources()
+        if hasattr(self, "_power_set_view_mode"):
+            self._power_set_view_mode("VP" if selection["action"] == "VP" else "Intensity")
+        if hasattr(self, "_start_load"):
+            self._start_load("Power Dependent")
+
     def _power_axis_log(self) -> bool:
         return hasattr(self, "power_axis_scale_combo") and self.power_axis_scale_combo.currentText() == "Log"
 
@@ -216,7 +317,7 @@ class PowerController:
         if hasattr(self, "power_group_combo"):
             self.power_group_combo.setEnabled(not self.power_compare_chk.isChecked())
         if hasattr(self, "power_choose_btn"):
-            self.power_choose_btn.setEnabled(not self.power_compare_chk.isChecked())
+            self.power_choose_btn.setEnabled(True)
         if hasattr(self, "power_pair_mode_combo"):
             self.power_pair_mode_combo.setEnabled(vp_mode)
         if vp_mode and hasattr(self.power_peak_controller, "status"):
@@ -486,6 +587,10 @@ class PowerController:
         background = self._power_background_value([kk_result.cube, kkp_result.cube])
         vp_title = _vp_short_title(power_group_title(kk_key), power_group_title(kkp_key))
         pairing_mode = self._power_pairing_mode()
+        from core.power_workflow import validate_power_vp_pairing
+        pairing_error = validate_power_vp_pairing(kk_result, kkp_result, mode=pairing_mode)
+        if pairing_error:
+            raise ValueError(pairing_error)
         if pairing_mode == "stage":
             kk_cube, kkp_cube, vp_cube, stage_pairs = power_stage_paired_vp_cubes(
                 kk_result.cube,
@@ -654,19 +759,23 @@ class PowerController:
 
     def _on_power_plot_param_changed(self, sender=None) -> None:
         self._invalidate_export_move_sources()
-        self._power_update_group_summary()
+        if sender is None or isinstance(sender, int):
+            self._power_update_group_summary()
         if self.loaded and self.loaded.mode == "Power Dependent":
+            if sender is self.power_spins['gate']:
+                self._power_selected_row_index = None
+                if self._power_active_cubes and self.last_plotted_mode == 'Power Dependent':
+                    self._update_power_compare_spectrum_and_lines(self._power_active_cubes)
+                    return
             if sender in (
                 self.power_spins["xmin"], self.power_spins["xmax"],
                 self.power_spins["ymin"], self.power_spins["ymax"],
                 self.power_log_chk, self.power_background_spin,
                 self.power_background_auto_chk,
             ):
-                self._refresh_automatic_ranges(
-                    "Power Dependent",
-                    refresh_split=True,
-                    center_split=sender in (self.power_spins["xmin"], self.power_spins["xmax"]),
-                )
+                self._power_pending_range_refresh = True
+                self._power_pending_center_split = bool(getattr(self, '_power_pending_center_split', False)) or sender in (
+                    self.power_spins['xmin'], self.power_spins['xmax'])
             self._schedule_plot_redraw("Power Dependent")
 
     def _on_power_source_assignment_changed(self) -> None:
@@ -674,6 +783,7 @@ class PowerController:
         self._power_selected_row_index = None
         self._power_update_group_summary()
         self._power_update_vp_availability()
+        self._update_action_states()
         if self.loaded and self.loaded.mode == "Power Dependent":
             if not self._power_selected_group_key() or (
                 self.power_compare_chk.isChecked() and not self._power_has_distinct_role_groups()
@@ -690,11 +800,11 @@ class PowerController:
         self._on_power_source_assignment_changed()
 
     def _on_power_combine(self) -> None:
-        from ui_qt.power_combine_dialog import PowerCombineDialog
+        self._power_choose_combination()
 
-        dialog = PowerCombineDialog(self._owner, self)
-        dialog.exec()
-        self._power_finish_combination(dialog)
+    def _power_choose_combination(self) -> None:
+        """Open the dedicated same-channel combination workflow."""
+        return self._power_choose_dataset(_force_legacy=True)
 
     def _power_finish_combination(self, dialog):
         if dialog.saved_path is not None:

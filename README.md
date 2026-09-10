@@ -265,16 +265,43 @@ calling those helpers directly is separate from the normal GUI workflow.
   point. Numeric wavelength headers (for example `752.5829`) are converted to
   photon energy and the rows are sorted by power. Legacy multi-file series with a
   power token such as `37.96uW` in each filename remain supported.
-  Single-sweep plotting and export do not require KK/KKp assignments. Enable
-  **Compare KK / KKp** to assign two sweeps and use intensity comparison or VP.
-  **Choose dataset…** opens Available/Chosen panels like DRR. Multi-select rows and
-  use **Add Selected**, or double-click to add. **Remove** and **Clear** manage the
-  persistent Chosen list. Status defaults to All, and status/search filtering keeps
-  chosen files. One chosen sweep uses **Open sweep**;
-  two or more use **Review combination…**. Checking a second file never navigates
-  automatically.
+  **Choose Power Group…** shows recent measurements, newest modification first.
+  The first 20 groups are shown initially; **Show older measurements** opens the
+  rest. Each row shows its modification date, measurement identity, available
+  channels and power range. Modification time controls ordering, never pairing.
+  Whole-sweep KK/KKp filenames share measurement settings; polarization `deg`
+  fields identify the channels and do not split the group.
+  Bare legacy tokens such as `deg24` and `deg69` are treated as output/analyzer
+  angles by both Compare and Power. A unique legacy Power pair can infer its
+  two output references using Compare's group-local inference; the reference
+  nearest the configured output K angle remains K. Run suffixes and other
+  measurement settings remain part of the group identity.
+  Different power grids inside the two CSVs are supported. A unique pair uses **Open comparison**;
+  a single sweep uses **Open sweep**. Ambiguous matches use **Resolve pairing**.
+  Full filenames and manual assignments live under **Details / Adjust pairing**.
+  Confirmed manual assignments are remembered in `.power-selection.json` in the
+  experiment folder and remain portable when that folder is moved.
+  **Swap KK ↔ KKp** exchanges the assignments without opening Details and shows
+  the assigned angles. **Open comparison** saves that choice for this measurement
+  group; Cancel leaves the saved choice unchanged. Other groups retain their assignments.
+  Single-sweep plotting and export need one sweep and no KK/KKp assignment.
+  Intensity comparison needs two distinct assigned channels. VP additionally
+  requires compatible spectral overlap and valid stage or power pairing.
+  Switch between Intensity and VP on the Power page after opening a pair.
+  A compatible stage/power pairing is suggested automatically, with an override
+  available in the detailed selection controls.
+  Grouping prefers matching `*.experiment.metadata.json` sidecars with
+  `files[].path`, `session_id` and `measurement_id`; optional sample, position,
+  temperature and gate fields further identify the measurement. A per-file
+  `channel`, `compare_channel` or `polarization` value can identify KK/KKp.
+  Without an explicit measurement identity, filename context remains part of
+  the group. Angle-based suggestions use the references configured in Compare.
+  Search and status filters retain the current draft and use the cached catalog;
+  **Refresh** rescans files. Cancel leaves the active selection unchanged.
+  **Combine sweeps…** is a separate operation for segments of the same channel;
+  selecting KK and KKp together does not combine their intensities.
   Power datasets are discovered automatically beneath the selected main folder,
-  including measurement subfolders such as `power_sweep`. Old/archive folders
+  including measurement subfolders such as `power_sweep`. `Initial Data`, old/archive folders
   and analysis CSVs without spectral columns are excluded. Nested saved combinations
   remain available under Processed. Refresh discovers new acquisitions while
   preserving the current view. Filename-based legacy grouping is off by default,
@@ -324,7 +351,7 @@ calling those helpers directly is separate from the normal GUI workflow.
   the CSV and DAT/JSON exports. Combine KK segments and KKp segments separately,
   then assign the saved sweeps for comparison. Repeated stage positions disable
   stage pairing; use power interpolation in that case.
-  **Choose dataset** uses New/Processed filtering like PL. Combined sweeps are
+  The group picker separates channel readiness from processing status. Combined sweeps are
   processed results, discovered in `Processed Data/Power Dependence/Combined Sweeps`.
   Saved combined files appear under Processed and can be selected directly.
   Reusing the same original rows is blocked, including renamed inputs identified

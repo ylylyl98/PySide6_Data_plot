@@ -1740,9 +1740,13 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         group_h.setSpacing(6)
         group_h.addWidget(self.power_group_combo, 1)
         self.power_group_combo.hide()
-        self.power_choose_btn = QPushButton("Choose dataset…")
-        self.power_choose_btn.clicked.connect(self.power_controller._power_choose_dataset)
+        self.power_choose_btn = QPushButton("Choose Power Group…")
+        self.power_choose_btn.clicked.connect(lambda _checked=False: self.power_controller._power_choose_dataset())
         group_h.addWidget(self.power_choose_btn)
+        self.power_combine_btn = QPushButton("Combine sweeps…")
+        self.power_combine_btn.setToolTip("Combine explicitly selected segments from two sweeps of the same channel.")
+        self.power_combine_btn.clicked.connect(self.power_controller._on_power_combine)
+        group_h.addWidget(self.power_combine_btn)
         group_h.addWidget(self.power_refresh_groups_btn)
         self.power_group_summary = QPlainTextEdit()
         self.power_group_summary.setReadOnly(True)
@@ -1754,8 +1758,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self._style_combo_popup(self.power_kk_group_combo)
         self._style_combo_popup(self.power_kkp_group_combo)
-        self.power_kk_group_combo.setToolTip("Power-sweep source to treat as KK in VP view.")
-        self.power_kkp_group_combo.setToolTip("Power-sweep source to treat as KKp in VP view.")
+        self.power_kk_group_combo.setToolTip("KK source for intensity comparison and VP.")
+        self.power_kkp_group_combo.setToolTip("KKp source for intensity comparison and VP.")
         grouping_form.addRow(group_row)
         grouping_form.addRow("Summary", self.power_group_summary)
         self.power_compare_chk = QCheckBox("Compare KK / KKp")
@@ -1765,6 +1769,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         roles_form.setContentsMargins(0, 0, 0, 0)
         roles_form.addRow("KK sweep", self.power_kk_group_combo)
         roles_form.addRow("KKp sweep", self.power_kkp_group_combo)
+        for role in ('KK', 'KKp'):
+            choose_role = QPushButton(f"Choose {role} sweep…")
+            choose_role.setObjectName(f'power_choose_{role.lower()}')
+            choose_role.clicked.connect(lambda _checked=False, role=role: self.power_controller._power_choose_dataset(role))
+            roles_form.addRow(choose_role)
+        role_hint = QLabel("Select two different sweeps for intensity comparison or VP. A single intensity sweep needs no KK/KKp assignment.")
+        role_hint.setWordWrap(True)
+        roles_form.addRow(role_hint)
         self.power_roles_widget.setVisible(False)
         grouping_form.addRow(self.power_roles_widget)
         layout.addWidget(self._make_expander("Power Sweep Files", grouping, expanded=True))
@@ -1917,6 +1929,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._plot_redraw_pending.discard(mode)
         if self._load_in_progress or not self.loaded or self.loaded.mode != mode:
             return
+        if mode == 'Power Dependent' and getattr(self, '_power_pending_range_refresh', False):
+            center = bool(getattr(self, '_power_pending_center_split', False))
+            self._power_pending_range_refresh = False
+            self._power_pending_center_split = False
+            self._refresh_automatic_ranges(mode, refresh_split=True, center_split=center)
         self._plot_mode(mode)
 
     def _update_plot_view_bar_visibility(self) -> None:
@@ -3366,6 +3383,38 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if self._load_in_progress:
             self._status("State: Load already in progress.")
             return
+        prepared = getattr(self, '_power_prevalidated_load', None)
+        self._power_prevalidated_load = None
+        if mode == 'Power Dependent' and prepared is not None:
+            folder, key, result = prepared
+            if folder == self.current_folder and key == self.power_controller._power_selected_group_key():
+                loaded = LoadedState(mode=mode, folder=folder,
+                    primary_file=result.records[0].file_name if result.records else None,
+                    selected_files=list(dict.fromkeys(r.file_name for r in result.records)),
+                    cube=result.cube, power_records=result.records,
+                    power_groups=result.groups, power_group_key=key)
+                self._load_in_progress = True
+                self._active_load_mode = mode
+                self._active_load_succeeded = False
+                self._set_stage('Loading...')
+                def finish_prevalidated_load():
+                    if self._is_closing:
+                        return
+                    import logging
+                    logger = logging.getLogger('dptk')
+                    try:
+                        if self.current_folder == folder:
+                            logger.info('Applying validated Power group on GUI thread: %s', key)
+                            self._on_loaded(loaded)
+                            logger.info('Validated Power group applied: %s', key)
+                    except Exception as exc:
+                        import traceback
+                        self._show_error(f'{exc}\n\n{traceback.format_exc()}')
+                    finally:
+                        self._on_load_finished()
+                # Leave the modal picker callback before touching plot widgets.
+                QTimer.singleShot(0, self, finish_prevalidated_load)
+                return
         if not self.current_folder:
             self._show_error("Choose a folder first.")
             return
@@ -7249,7 +7298,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             raw_indices = (np.flatnonzero(np.asarray(cube.gate) > 0)
                            if self.power_controller._power_axis_log() else np.arange(len(cube.gate)))
             self._power_selected_row_index = int(raw_indices[idx]) if len(self._power_active_cubes) == 1 else None
-            self.power_spins["gate"].setValue(power)
+            blocked = self.power_spins['gate'].blockSignals(True)
+            try:
+                self.power_spins['gate'].setValue(power)
+            finally:
+                self.power_spins['gate'].blockSignals(blocked)
+            self._invalidate_export_move_sources()
             self.power_controller._update_power_compare_spectrum_and_lines(self._power_active_cubes)
             return
 

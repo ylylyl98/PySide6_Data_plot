@@ -10,10 +10,12 @@ compatibility with existing tests and callers.
 from __future__ import annotations
 
 import traceback
+from math import ceil
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List
 
-from PySide6.QtCore import QObject, QRect, QRunnable, QSize, Qt, Signal
+from PySide6.QtCore import QObject, QPointF, QRect, QRunnable, QSize, Qt, Signal
+from PySide6.QtGui import QTextLayout, QTextOption
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox as _QComboBox,
@@ -243,11 +245,11 @@ class WrappedFilenameDelegate(QStyledItemDelegate):
         cached = self._size_hint_cache.get(cache_key)
         if cached is not None:
             return QSize(cached)
-        text_rect = opt.fontMetrics.boundingRect(
+        text_layout = self._layout_text(text, opt.font, self._text_width(opt))
+        metric_height = opt.fontMetrics.boundingRect(
             QRect(0, 0, self._text_width(opt), 10000),
-            Qt.AlignLeft | Qt.TextWrapAnywhere,
-            text,
-        )
+            Qt.AlignLeft | Qt.TextWrapAnywhere, text,
+        ).height()
         base = super().sizeHint(opt, index)
         view = self.parent()
         row_width = (
@@ -257,7 +259,8 @@ class WrappedFilenameDelegate(QStyledItemDelegate):
         )
         result = QSize(
             row_width,
-            max(base.height(), text_rect.height() + 2 * self.VERTICAL_PADDING),
+            max(base.height(), max(metric_height, ceil(text_layout.boundingRect().height()))
+                + 2 * self.VERTICAL_PADDING),
         )
         # Keep this bounded in practice; a list normally has only a handful
         # of viewport widths, but a dialog can be resized many times.
@@ -265,6 +268,27 @@ class WrappedFilenameDelegate(QStyledItemDelegate):
             self._size_hint_cache.clear()
         self._size_hint_cache[cache_key] = QSize(result)
         return result
+
+    @staticmethod
+    def _layout_text(text, font, width):
+        # Use precisely the same line breaking for measurement and painting.
+        # QFontMetrics.boundingRect and QPainter.drawText can disagree at a
+        # wrap boundary on Windows, leaving a two-line filename in one row.
+        layout = QTextLayout(text, font)
+        text_option = QTextOption()
+        text_option.setWrapMode(QTextOption.WrapAnywhere)
+        layout.setTextOption(text_option)
+        layout.beginLayout()
+        height = 0.0
+        while True:
+            line = layout.createLine()
+            if not line.isValid():
+                break
+            line.setLineWidth(max(1, width))
+            line.setPosition(QPointF(0, height))
+            height += line.height()
+        layout.endLayout()
+        return layout
 
     def paint(self, painter, option: QStyleOptionViewItem, index) -> None:
         opt = QStyleOptionViewItem(option)
@@ -287,9 +311,6 @@ class WrappedFilenameDelegate(QStyledItemDelegate):
             -self.HORIZONTAL_PADDING,
             -self.VERTICAL_PADDING,
         )
-        painter.drawText(
-            text_rect,
-            Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWrapAnywhere,
-            text,
-        )
+        text_layout = self._layout_text(text, opt.font, text_rect.width())
+        text_layout.draw(painter, QPointF(text_rect.left(), text_rect.top()))
         painter.restore()
