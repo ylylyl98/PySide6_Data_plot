@@ -31,6 +31,32 @@ def _table(folder, name, channel):
 
 
 class PowerGroupDialogTests(unittest.TestCase):
+    def test_separate_single_and_comparison_pickers(self):
+        with tempfile.TemporaryDirectory() as folder:
+            for name in ('sample_KK_deg24.csv', 'sample_KKp_deg69.csv', 'waiting_deg24.csv', 'plain.csv'):
+                _table(folder, name, '')
+            controller = _Controller(folder)
+            single = PowerGroupDialog(controller, mode='single')
+            compare = PowerGroupDialog(controller, mode='compare')
+            try:
+                self.assertEqual(single.source_list.count(), 4)
+                self.assertTrue(all(len(g.sources) == 1 for g in single._catalog_groups))
+                self.assertEqual(single.selection()['action'], 'Single intensity')
+                self.assertTrue(single.swap_button.isHidden())
+                self.assertTrue(single.action_combo.isHidden())
+                self.assertEqual(compare.source_list.count(), 1)
+                compare.incomplete_check.setChecked(True)
+                self.assertEqual(compare.source_list.count(), 2)
+                for row, group in enumerate(compare._groups):
+                    compare.source_list.setCurrentRow(row)
+                    self.assertEqual(compare.selection()['action'], 'Compare intensity')
+                    self.assertEqual(compare.ok_button.isEnabled(), len(group.sources) == 2)
+                    if len(group.sources) == 1:
+                        self.assertIn('Waiting for partner', compare.source_list.item(row).text())
+                self.assertTrue(compare.action_combo.isHidden())
+            finally:
+                single.close(); compare.close(); controller._owner.close()
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
@@ -239,7 +265,7 @@ class PowerGroupDialogTests(unittest.TestCase):
         owner._on_power_source_assignment_changed = Mock(); owner._power_set_view_mode = Mock(); owner._start_load = Mock()
         ctl = PowerController(owner)
         class Dialog(QDialog):
-            def __init__(self, *_args): super().__init__(owner)
+            def __init__(self, *_args, **_kwargs): super().__init__(owner)
             def open(self): self.accept()
             def selection(self): return {"group": "ctx", "action": "Single intensity", "single": "csv::source.csv", "KK": "", "KKp": "", "pairing": "Pair by Stage", "status": "All", "legacy": False}
         with patch("ui_qt.power_group_dialog.PowerGroupDialog", Dialog), patch.object(PowerController, "_power_refresh_groups", Mock()), patch.object(PowerController, "_on_power_source_assignment_changed", Mock()), patch.object(PowerController, "_power_set_view_mode", Mock()):
@@ -286,7 +312,7 @@ class PowerGroupDialogTests(unittest.TestCase):
         owner.power_compare_chk = QCheckBox(); owner._power_refresh_groups = Mock(); owner._on_power_source_assignment_changed = Mock(); owner._power_set_view_mode = Mock(); owner._start_load = Mock()
         ctl = PowerController(owner)
         class Dialog(QDialog):
-            def __init__(self, *_args): super().__init__(owner)
+            def __init__(self, *_args, **_kwargs): super().__init__(owner)
             def open(self): self.accept()
             def selection(self): return {"group": "ctx", "action": "Compare intensity", "single": "", "KK": "csv::source.csv", "KKp": "csv::other.csv", "pairing": "Pair by Stage", "status": "All", "legacy": False}
         with patch("ui_qt.power_group_dialog.PowerGroupDialog", Dialog), patch.object(PowerController, "_power_refresh_groups", Mock()), patch.object(PowerController, "_on_power_source_assignment_changed", Mock()), patch.object(PowerController, "_power_set_view_mode", Mock()):

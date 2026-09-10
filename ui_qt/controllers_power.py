@@ -62,7 +62,7 @@ class PowerController:
         # The primary Power action selects one complete measurement context.
         # Role-specific pickers remain available as explicit manual overrides.
         if role is None and not _force_legacy:
-            return self._power_choose_measurement_group()
+            return self._power_choose_measurement_group(mode='single')
         role = role if role in ('KK', 'KKp') else None
         from PySide6.QtCore import Qt
         from PySide6.QtWidgets import (QComboBox, QListWidgetItem, QCheckBox, QListWidget,
@@ -227,7 +227,7 @@ class PowerController:
                 return
             details()
 
-    def _power_choose_measurement_group(self):
+    def _power_choose_measurement_group(self, *, mode='compare'):
         from PySide6.QtCore import QTimer
         from PySide6.QtWidgets import QDialog
         from ui_qt.power_group_dialog import PowerGroupDialog
@@ -235,7 +235,7 @@ class PowerController:
         if existing is not None:
             existing.raise_()
             return
-        dlg = PowerGroupDialog(self, self._owner)
+        dlg = PowerGroupDialog(self, self._owner, mode=mode)
         self._power_group_dialog = dlg
 
         def finished(result):
