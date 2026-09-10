@@ -324,7 +324,7 @@ def _power_metadata_identity(folder, name, catalog=None):
 
 
 def group_power_measurement_sources(folder, sources, *, angle_refs=None,
-                                    angle_tolerance=45.0, processed_names=()):
+                                    angle_tolerance=45.0, processed_names=(), individual=False):
     """Group complete Power sources by session/sample context.
 
     ``sources`` is the mapping returned by :func:`get_power_series_sources`.
@@ -333,6 +333,8 @@ def group_power_measurement_sources(folder, sources, *, angle_refs=None,
     """
     buckets = {}
     metadata_catalog = _power_metadata_index(folder)
+    from core.power_manifest import manifest_assignments
+    manifest_catalog = manifest_assignments(folder, _active_files(folder, '.json'), angle_refs, angle_tolerance)
     processed = {str(v).replace('\\', '/').casefold() for v in processed_names}
     for key, source in dict(sources or {}).items():
         names = [source.file_name] if source.file_name else [r.file_name for r in source.records]
@@ -369,6 +371,10 @@ def group_power_measurement_sources(folder, sources, *, angle_refs=None,
                 pass
         contexts = []
         for value in dict.fromkeys(identity_names):
+            manifest_identity = manifest_catalog.get(str(value).replace('\\', '/').casefold())
+            if manifest_identity:
+                contexts.append(manifest_identity)
+                continue
             metadata_identity = _power_metadata_identity(folder, value, metadata_catalog)
             if metadata_identity:
                 metadata_context, metadata_channel = metadata_identity
@@ -401,6 +407,8 @@ def group_power_measurement_sources(folder, sources, *, angle_refs=None,
         # malformed series spans contexts, keep it intact and disclose it.
         channel_candidates = [channel for ctx, channel in contexts if ctx == context and channel]
         channel = channel_candidates[0] if len(set(channel_candidates)) == 1 else None
+        if individual:
+            context = str(key).removeprefix('csv::')
         entry = buckets.setdefault(context, {'sources': [], 'channels': {}, 'issues': set(), 'source_names': {}})
         entry['sources'].append(str(key))
         entry['source_names'][str(key)] = tuple(dict.fromkeys(names))

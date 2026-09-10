@@ -22,9 +22,10 @@ class PowerGroupDialog(SourcePickerDialog):
     ACTIONS = ("Single intensity", "Compare intensity", "VP")
     PAIRING = ("Pair by Stage", "Power Interpolation")
 
-    def __init__(self, controller, parent=None):
+    def __init__(self, controller, parent=None, *, mode=None):
         from core.power_workflow import group_power_measurement_sources, processed_source_names
         self.controller = controller
+        self.mode = mode
         self._group_fn = group_power_measurement_sources
         self._processed_fn = processed_source_names
         self._groups = []
@@ -56,11 +57,15 @@ class PowerGroupDialog(SourcePickerDialog):
         legacy = QCheckBox("Include filename-based series"); legacy.setObjectName("power_group_legacy")
         legacy.setChecked(self._legacy_value)
         super().__init__(parent or getattr(controller, "_owner", None),
-            title="Choose Power Measurement Group",
-            hint="Choose a recent measurement to open its sweep or KK/KKp comparison.",
+            title="Open Power Sweep" if mode == 'single' else "Choose Power Comparison Group",
+            hint="Choose an individual sweep." if mode == 'single' else "Choose an available measurement group to compare KK and KKp.",
             selected=self._initial["group"], filter_placeholder="Search sample, session, filename...",
             filter_controls=(("Status", status), (None, legacy)), minimum_size=(920, 580), size=(1120, 700))
         self.status_combo, self.legacy_check = status, legacy
+        self.incomplete_check = QCheckBox('Show incomplete groups')
+        self.incomplete_check.setVisible(mode == 'compare')
+        self.filter_row.insertWidget(self.filter_row.count() - 1, self.incomplete_check)
+        self.incomplete_check.toggled.connect(self._render_groups)
         self.legacy_check.setVisible(False)
         # Replace the single list with a left/right splitter while retaining
         # the SourcePickerDialog shell's filtering and buttons.
@@ -116,6 +121,15 @@ class PowerGroupDialog(SourcePickerDialog):
         self.details_toggle.toggled.connect(self._set_details_visible)
         self.show_older_button.clicked.connect(self._show_older)
         self._set_details_visible(False)
+        if mode is not None:
+            self._owner_action = 'Single intensity' if mode == 'single' else 'Compare intensity'
+            self.action_combo.setCurrentText(self._owner_action)
+            for control in (self.action_combo, self.single_combo, self.pair_combo):
+                form.setRowVisible(control, False)
+            self.swap_button.setVisible(mode == 'compare')
+            self.assignment_summary.setVisible(mode == 'compare')
+            self.details_toggle.setVisible(mode == 'compare')
+            self.legacy_check.setVisible(mode == 'single')
         self._wire()
         self._restore_initial = True
         self.refresh()
@@ -144,7 +158,23 @@ class PowerGroupDialog(SourcePickerDialog):
         modified = self._group_modified(group)
         identity = getattr(group, "context", "") or getattr(group, "label", group.key)
         identity = str(identity).split(" · ")[0]
+        if self.mode == 'compare' and '.json/condition=' in identity:
+            manifest, condition = identity.split('.json/condition=', 1)
+            base, _, run = Path(manifest).name.rpartition('_manifest')
+            condition, _, remainder = condition.partition('/repeat=')
+            repeat, _, gates = remainder.partition('/')
+            identity = f'{base} · Run {run.lstrip("_") or "1 (original)"} · Condition {condition} · Repeat {repeat} · {gates}'
         channels = ", ".join(k for k in ("KK", "KKp") if k in group.mapping)
+        if self.mode == 'single':
+            channels = 'Single sweep'
+        elif self.mode == 'compare':
+            from core.processing import parse_compare_rotation_angles
+            angles = sorted({a.rot2 for key in group.sources
+                             if (a := parse_compare_rotation_angles(key)).rot2 is not None})
+            channels = ('Paired' if set(group.mapping) >= {'KK', 'KKp'} and not group.duplicates
+                        else 'Waiting for partner' if len(group.sources) == 1 else 'Needs assignment')
+            if angles:
+                channels += ' · ' + ' / '.join(f'{angle:g}°' for angle in angles)
         if not channels:
             channels = "Single sweep" if len(group.sources) == 1 else "Needs pairing"
         power = f" · {group.power_min:.6g}–{group.power_max:.6g} uW" if group.power_min is not None else ""
@@ -168,7 +198,7 @@ class PowerGroupDialog(SourcePickerDialog):
         if action == "Single intensity": text = "Open sweep"
         elif group and (("KK" in group.mapping and "KKp" in group.mapping) or
                         (self._drafts.get(group.key, {}).get("KK") and self._drafts.get(group.key, {}).get("KKp"))): text = "Open comparison"
-        elif group: text = "Resolve pairing"
+        elif group: text = "Open comparison" if len(group.sources) == 1 else "Resolve pairing"
         else: text = "Open"
         self.ok_button.setText(text)
         draft = self._drafts.get(group.key, {}) if group else {}
@@ -238,6 +268,8 @@ class PowerGroupDialog(SourcePickerDialog):
         item = self.source_list.currentItem()
         if item is None:
             message = "Selected group is missing or hidden by the current filters." if self._selected_group_key else "Select a measurement group."
+            if self.mode == 'compare' and not self.source_list.count():
+                message = 'No available comparison groups match the filters. Show incomplete groups to inspect missing partners, or Refresh after acquisition finishes.'
             self.set_details(message)
             self.ok_button.setEnabled(False)
             self.swap_button.setEnabled(False)
@@ -251,6 +283,8 @@ class PowerGroupDialog(SourcePickerDialog):
             saved = self._saved_assignments.get(group.key, {})
             draft.update({k: str(v) for k, v in saved.items() if k in ("single", "KK", "KKp")})
         draft.setdefault("action", self._owner_action if self._restore_initial else self._default_action(group))
+        if self.mode is not None:
+            draft['action'] = self._owner_action
         self._fill(self.single_combo, group, "single", group.sources[0] if len(group.sources) == 1 else "", draft.get("single"))
         self._fill(self.kk_combo, group, "KK", group.mapping.get("KK", ""), draft.get("KK"))
         self._fill(self.kkp_combo, group, "KKp", group.mapping.get("KKp", ""), draft.get("KKp"))
@@ -320,7 +354,10 @@ class PowerGroupDialog(SourcePickerDialog):
             return 'The experiment folder changed. Reopen the Power group picker.'
         group = next(g for g in self._groups if g.key == str(item.data(Qt.UserRole)))
         d = self._drafts.get(group.key, {}); required = [d.get("single")] if action == "Single intensity" else [d.get("KK"), d.get("KKp")]
-        if any(not x for x in required): return "Assign every required source before loading."
+        if any(not x for x in required):
+            if self.mode == 'compare' and len(group.sources) == 1:
+                return 'Waiting for the matching KK/KKp sweep. Refresh after acquisition finishes.'
+            return "Assign every required source before loading."
         if any(x not in self._sources for x in required): return "A selected source is missing after refresh. Choose another source."
         if action != "Single intensity" and d.get("KK") == d.get("KKp"): return "KK and KKp must use distinct sources."
         try:
@@ -357,7 +394,14 @@ class PowerGroupDialog(SourcePickerDialog):
         except (ImportError, OSError, ValueError, TypeError) as exc:
             self._saved_assignments = {}
             self._manifest_warning = f"Saved pairing preferences could not be read: {exc}"
-        groups = self._group_fn(self.controller.current_folder, sources, angle_refs=self._refs(), angle_tolerance=self._tolerance(), processed_names=self._processed_fn(self.controller.current_folder))
+        options = {'individual': True} if self.mode == 'single' else {}
+        groups = self._group_fn(self.controller.current_folder, sources, angle_refs=self._refs(), angle_tolerance=self._tolerance(), processed_names=self._processed_fn(self.controller.current_folder), **options)
+        if self.mode == 'compare':
+            from core.processing import parse_compare_rotation_angles
+            groups = [g for g in groups if len(g.sources) > 1 or g.mapping or any(
+                (a := parse_compare_rotation_angles(k)).rot1 is not None or a.rot2 is not None for k in g.sources)]
+        if self.mode is not None and not any(g.key == self._selected_group_key for g in groups):
+            self._selected_group_key = ''
         self._catalog_groups = groups
         if self._restore_initial:
             primary = self._initial_roles['single'] if self.action_combo.currentText() == 'Single intensity' else self._initial_roles['KK']
@@ -379,6 +423,10 @@ class PowerGroupDialog(SourcePickerDialog):
         """Search the cached catalog; only Refresh rescans physical files."""
         status, needle = self.status_combo.currentText(), self.filter_edit.text().casefold().strip()
         filtered_groups = [g for g in self._catalog_groups if (status == "All" or g.status == status) and (not needle or needle in (g.key + " " + g.label + " " + " ".join(g.sources)).casefold())]
+        if self.mode == 'compare' and not self.incomplete_check.isChecked():
+            filtered_groups = [g for g in filtered_groups if set(g.mapping) >= {'KK', 'KKp'} and not g.duplicates and not g.issues]
+        if self.mode == 'compare' and not any(g.key == self._selected_group_key for g in filtered_groups):
+            self._selected_group_key = ''
         total = len(filtered_groups)
         self._groups = filtered_groups
         if not self._show_all:
