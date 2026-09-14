@@ -52,11 +52,14 @@ class DenseFormRowLayout(QLayout):
         *,
         spacing: int | None = None,
         label: QWidget | None = None,
+        stable_spin_width: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setContentsMargins(0, 0, 0, 0)
         self._groups: list[_Group] = []
         self._items: list[QLayoutItem] = []
+        self._width_cache: dict[QWidget, tuple[tuple, int]] = {}
+        self._stable_spin_width = stable_spin_width
         self._spacing_override = spacing
         self._last_mode = self.SINGLE_ROW
         self._label_widget = label
@@ -119,7 +122,6 @@ class DenseFormRowLayout(QLayout):
 
     def eventFilter(self, watched, event):  # noqa: N802 - Qt API
         if event.type() in {
-            QEvent.Resize,
             QEvent.StyleChange,
             QEvent.FontChange,
             QEvent.PaletteChange,
@@ -127,9 +129,14 @@ class DenseFormRowLayout(QLayout):
             QEvent.LayoutRequest,
             QEvent.DevicePixelRatioChange,
         }:
+            # LayoutRequest may simply be the result of our own setGeometry.
+            # Content keys below detect actual edits without remeasuring the
+            # native style on every pass. Font/style changes need a fresh probe.
+            if event.type() != QEvent.LayoutRequest:
+                self._width_cache.clear()
             self.invalidate()
             parent = self.parentWidget()
-            if parent is not None:
+            if parent is not None and event.type() != QEvent.LayoutRequest:
                 parent.updateGeometry()
         return super().eventFilter(watched, event)
 
@@ -143,6 +150,10 @@ class DenseFormRowLayout(QLayout):
         if not 0 <= index < len(self._items):
             return None
         item = self._items.pop(index)
+        widget = item.widget()
+        if widget is not None:
+            widget.removeEventFilter(self)
+            self._width_cache.pop(widget, None)
         if item is self._label_item:
             widget = item.widget()
             if widget is not None:
@@ -157,6 +168,7 @@ class DenseFormRowLayout(QLayout):
                 if not group.items:
                     self._groups.remove(group)
                 break
+        self.invalidate()
         return item
 
     def hasHeightForWidth(self) -> bool:  # noqa: N802 - Qt API
@@ -182,12 +194,18 @@ class DenseFormRowLayout(QLayout):
         if line_edit is None:
             return max(1, widget.minimumWidth())
 
-        values = [widget.text()]
+        # Range rows intentionally cap their editors (130 px in the shell).
+        # Budget that width up front; long loaded values can scroll inside the
+        # native editor instead of changing the row's wrapping after a load.
+        bounded = self._stable_spin_width and widget.maximumWidth() < 16777215
+        values = [] if bounded else [widget.text()]
         minimum = getattr(widget, "minimum", lambda: 0)()
         maximum = getattr(widget, "maximum", lambda: 0)()
         for representative in (0, -12):
             if minimum <= representative <= maximum:
-                values.append(widget.textFromValue(representative))
+                values.append(widget.prefix() + widget.textFromValue(representative) + widget.suffix())
+        if not values:
+            values.append(widget.prefix() + widget.textFromValue(minimum) + widget.suffix())
         text_width = max(QFontMetrics(line_edit.font()).horizontalAdvance(value) for value in values)
         text_margins = line_edit.textMargins()
 
@@ -207,6 +225,7 @@ class DenseFormRowLayout(QLayout):
         return max(
             1,
             widget.minimumWidth(),
+            widget.maximumWidth() if bounded else 0,
             text_width + text_margins.left() + text_margins.right() + required_chrome,
         )
 
@@ -248,6 +267,38 @@ class DenseFormRowLayout(QLayout):
         return max(1, widget.minimumWidth(), text_width + chrome)
 
     def _widget_min_width(self, widget: QWidget) -> int:
+        # Cheap format/content keys keep programmatic edits correct even when
+        # signals are blocked during load completion. Live geometry is excluded.
+        key = (widget.minimumWidth(), widget.maximumWidth(), widget.isEnabled())
+        if isinstance(widget, QAbstractSpinBox):
+            bounded = self._stable_spin_width and widget.maximumWidth() < 16777215
+            editor = widget.lineEdit()
+            margins = editor.textMargins()
+            key += (widget.minimum(), widget.maximum(),
+                    getattr(widget, "decimals", lambda: 0)(), widget.prefix(), widget.suffix(),
+                    widget.specialValueText(), widget.locale().name(),
+                    widget.locale().numberOptions(), widget.buttonSymbols(),
+                    widget.isGroupSeparatorShown(), widget.hasFrame(),
+                    editor.font().key(), margins.left(), margins.right(),
+                    "" if bounded else widget.text())
+        elif isinstance(widget, QComboBox):
+            key += (widget.currentText(), widget.isEditable())
+        elif isinstance(widget, QLabel):
+            margins = widget.contentsMargins()
+            key += (widget.text(), margins.left(), margins.right())
+        elif isinstance(widget, QAbstractButton):
+            key += (widget.text(),)
+        else:
+            hint = widget.sizeHint()
+            key += (hint.width(), hint.height())
+        cached = self._width_cache.get(widget)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        width = self._measure_widget_min_width(widget)
+        self._width_cache[widget] = (key, width)
+        return width
+
+    def _measure_widget_min_width(self, widget: QWidget) -> int:
         if isinstance(widget, QAbstractSpinBox):
             return self._spin_width(widget)
         if isinstance(widget, QCheckBox):

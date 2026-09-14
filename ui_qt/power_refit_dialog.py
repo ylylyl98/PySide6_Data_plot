@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
     QHeaderView, QLabel, QPushButton, QTableWidget, QVBoxLayout,
 )
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from ui_qt.matplotlib_theme import QtFontFigureCanvasQTAgg as FigureCanvasQTAgg
 from matplotlib.figure import Figure
 
 from core.loader import DataCube

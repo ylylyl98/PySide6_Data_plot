@@ -807,6 +807,7 @@ class PlController:
                 AxesRegionBlitter(self.canvas), AxesRegionBlitter(self.canvas)
             )
             self._pl_region_blitters = helpers
+        rebuild = False
         spectrum_blit, heatmap_blit = helpers
         for helper, axis, artist in (
             (spectrum_blit, self._pl_spectrum_ax, line),
@@ -820,9 +821,12 @@ class PlController:
             ):
                 helper.configure(axis, [artist])
                 helper._layout_bbox = bbox
-                helper.restore_interactive_drawing()
+                rebuild = True
             elif not helper.draw():
-                helper.restore_interactive_drawing()
+                rebuild = True
+        if rebuild:
+            AxesRegionBlitter.restore_many(helpers)
+
     def _update_pl_analysis_text(self, gate_used: float, x: np.ndarray, y: np.ndarray) -> None:
         lines: list[str] = []
         if (

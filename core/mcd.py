@@ -1525,24 +1525,33 @@ def window_trace_comparison(
     return traces
 
 
+def _pair_window_energy(result: McdResult) -> tuple[np.ndarray, np.ndarray]:
+    wavelength = np.asarray(result.wavelength_nm, float)
+    cached = getattr(result, '_pair_window_energy_cache', None)
+    if cached is not None and np.array_equal(cached[0], wavelength, equal_nan=True):
+        _, order, energy = cached
+    else:
+        energy = EV_NM / wavelength
+        order = np.argsort(energy)
+        energy = energy[order]
+        try:
+            result._pair_window_energy_cache = (wavelength.copy(), order, energy)
+        except (AttributeError, TypeError):
+            pass
+    return order, energy
+
+
 def _pair_window_metric(
-    result: McdResult,
-    spectra: np.ndarray,
-    *,
-    center_ev: float,
-    width_mev: float,
-    metric: WindowMetric,
+    result: McdResult, spectra: np.ndarray, *, center_ev: float,
+    width_mev: float, metric: WindowMetric,
 ) -> np.ndarray:
     """Reduce every acquired pair without binning different sweep branches."""
-    energy = EV_NM / np.asarray(result.wavelength_nm, float)
-    order = np.argsort(energy)
-    energy = energy[order]
-    values = np.asarray(spectra, float)[:, order]
+    order, energy = _pair_window_energy(result)
     half = float(width_mev) * 5e-4
     mask = np.abs(energy - float(center_ev)) <= half
     if not np.any(mask):
         mask[int(np.argmin(np.abs(energy - float(center_ev))))] = True
-    selected = values[:, mask]
+    selected = np.asarray(spectra, float)[:, order[mask]]
     if metric == "integral":
         return np.trapezoid(selected, x=energy[mask], axis=1)
     if metric == "absolute_mean":
@@ -1579,9 +1588,7 @@ def pair_window_trace_by_branch(
     # Sorting the spectrum and finding the energy window used to happen once
     # per source and metric (up to eight times for one redraw).  Do it once,
     # then derive every requested reduction from the same selected arrays.
-    energy = EV_NM / np.asarray(result.wavelength_nm, float)
-    order = np.argsort(energy)
-    energy = energy[order]
+    order, energy = _pair_window_energy(result)
     half = float(width_mev) * 5e-4
     mask = np.abs(energy - float(center_ev)) <= half
     if not np.any(mask):
@@ -1594,7 +1601,7 @@ def pair_window_trace_by_branch(
         sources.insert(0, ("raw", result.pair_mcd_raw))
     pair_sign = np.sign(np.asarray(result.pair_b, float))
     for source, spectra in sources:
-        selected = np.asarray(spectra, float)[:, order][:, mask]
+        selected = np.asarray(spectra, float)[:, order[mask]]
         mean_values: np.ndarray | None = None
         absolute_values: np.ndarray | None = None
         for metric in requested:

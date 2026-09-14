@@ -92,7 +92,7 @@ class LazyCatalogTests(unittest.TestCase):
             widget.set_experiment_folder(folder)
             refresh.assert_called_once()
 
-    def test_pending_manual_refresh_retains_its_mode_and_force(self):
+    def test_pending_manual_refresh_retains_its_mode_without_rebuilding(self):
         w = self.window()
         with tempfile.TemporaryDirectory() as folder:
             w.current_folder = folder
@@ -105,7 +105,46 @@ class LazyCatalogTests(unittest.TestCase):
                 w._run_pending_catalog_refresh()
             worker = start.call_args.args[0]
             self.assertEqual(worker.kwargs['mode'], 'MCD')
-            self.assertTrue(worker.kwargs['force'])
+            self.assertFalse(worker.kwargs['force'])
+
+    def test_explicit_rebuild_survives_queued_normal_refresh(self):
+        w = self.window()
+        with tempfile.TemporaryDirectory() as folder:
+            w.current_folder = folder
+            w._file_refresh_running = True
+            w._refresh_file_lists(mode='MCD', force=True)
+            w._refresh_file_lists(mode='MCD')
+            w._file_refresh_running = False
+            with patch.object(w.thread_pool, 'start') as start:
+                w._run_pending_catalog_refresh()
+            self.assertEqual(start.call_args.args[0].kwargs['mode'], 'MCD')
+            self.assertTrue(start.call_args.args[0].kwargs['force'])
+
+    def test_refresh_button_reuses_catalog_and_rebuild_action_forces_discovery(self):
+        w = self.window()
+        with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as cache:
+            with patch.dict(os.environ, {'LOCALAPPDATA': cache}):
+                w.current_folder = folder
+                _cached_folder_sources_worker(folder, mode='PL', power_include_legacy=False,
+                    force=False, publish_cached=None, progress=None, log=None)
+                with patch.object(w.thread_pool, 'start', side_effect=lambda worker: worker.run()), \
+                     patch('ui_qt.main_window._scan_folder_sources_worker', wraps=_scan_folder_sources_worker) as scan:
+                    w.refresh_btn.click()
+                    self.assertEqual(scan.call_count, 0)
+                    w.rebuild_catalog_action.trigger()
+                    self.assertEqual(scan.call_count, 1)
+
+    def test_drr_rebuild_survives_queued_normal_refresh(self):
+        w = self.window()
+        with tempfile.TemporaryDirectory() as folder:
+            w.current_folder = folder
+            w._drr_refresh_running = True
+            w._queue_drr_catalog_refresh(auto=False, old_source_files=set(), force=True)
+            w._queue_drr_catalog_refresh(auto=True, old_source_files=set())
+            w._drr_refresh_running = False
+            with patch.object(w.thread_pool, 'start') as start:
+                w._finish_drr_catalog_refresh()
+            self.assertTrue(start.call_args.args[0].kwargs['force'])
 
     def test_old_folder_preview_does_not_replace_new_sources(self):
         w = self.window()
@@ -146,7 +185,7 @@ class LazyCatalogTests(unittest.TestCase):
             w._on_file_lists_result(tuple(result), *args)
             self.assertEqual(w._selected(w.pl_files), ['new.csv'])
 
-    def test_drr_manual_refresh_remains_forced_behind_auto(self):
+    def test_drr_manual_refresh_remains_manual_behind_auto(self):
         w = self.window()
         w._drr_refresh_running = True
         w._queue_drr_catalog_refresh(auto=True, old_source_files=set())

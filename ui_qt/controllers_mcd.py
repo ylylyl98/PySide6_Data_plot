@@ -34,6 +34,7 @@ from ui_qt.common import QComboBox, Worker
 from ui_qt.theme import alias as theme_alias
 from ui_qt.matplotlib_theme import ThemeAwareFigureCanvasQTAgg
 from ui_qt.source_picker_dialog import SourcePickerDialog
+from ui_qt.time_format import format_local_timestamp
 
 from core.mcd import format_mcd_energy, suggest_mcd_window_centers
 
@@ -266,7 +267,8 @@ class McdController:
             if sender in center_only_controls:
                 # Spin boxes can emit many values while their arrows are held.
                 # Coalesce those events and render only the latest requested value.
-                self._mcd_center_refresh_timer.start()
+                if not self._mcd_center_refresh_timer.isActive():
+                    self._mcd_center_refresh_timer.start(40)
                 return
             self._mcd_center_refresh_timer.stop()
             trace_only_controls = {
@@ -309,7 +311,7 @@ class McdController:
                 unified.update_mcd_slope_readout(slopes.to_dict() if slopes is not None else None)
                 # Match the full-render path: saving can use these refreshed slopes.
                 owner._mcd_unified_slopes_key = owner._unified_window_analysis_key()
-                if not unified._blit_update():
+                if not unified._blit_update(center_only=True):
                     unified.canvas.draw_idle()
             except (AttributeError, TypeError, ValueError):
                 pass
@@ -624,7 +626,7 @@ class McdController:
                 badge_state = "new"
             if hasattr(self, "mcd_selection_summary"):
                 self.mcd_selection_summary.set_source(status=state, filename=display_name,
-                    saved_at=(processed_at[:16].replace("T", " ") if processed_at else ""),
+                    saved_at=format_local_timestamp(processed_at),
                     tooltip=source, badge_state=badge_state)
         peak_summary = getattr(self, "mcd_peak_source_selection_summary", None)
         if peak_summary is not None:
@@ -639,7 +641,7 @@ class McdController:
                     "New source"
                 )
                 peak_summary.set_source(status=history_state, filename=display_name,
-                    saved_at=(self.mcd_processed_status.get(source, "")[:16].replace("T", " ") if processed else ""),
+                    saved_at=format_local_timestamp(self.mcd_processed_status.get(source, "")) if processed else "",
                     tooltip=f"{source}\nMCD source history; saved history does not verify current settings.",
                     badge_state="unknown" if unknown else "processed" if processed else "new")
             else:
@@ -762,7 +764,7 @@ class McdController:
                     text = f"? HISTORY UNKNOWN — {Path(source).name}\nModified {modified_text} · Legacy metadata matches multiple files"
                     color = QColor(theme_alias("source_new_foreground")); bold = True
                 elif processed_at:
-                    text = f"✓ PROCESSED — {Path(source).name}\nModified {modified_text} · Saved {processed_at[:16].replace('T', ' ')}"
+                    text = f"✓ PROCESSED — {Path(source).name}\nModified {modified_text} · Saved {format_local_timestamp(processed_at)}"
                     color = QColor(theme_alias("source_processed_foreground")); bold = False
                 else:
                     text = f"● NEW — {Path(source).name}\nModified {modified_text} · No saved analysis"

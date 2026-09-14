@@ -845,6 +845,7 @@ class PowerController:
             for helper in helpers.values():
                 helper.disconnect()
             helpers = {}
+        rebuild = False
         active = set()
         for (kind, axis_id), (axis, artists) in entries.items():
             key = f"{kind}:{axis_id}"
@@ -855,17 +856,19 @@ class PowerController:
             if helper is None:
                 helper = AxesRegionBlitter(self.canvas); helpers[key] = helper
                 helper.configure(axis, artists); helper._layout_bbox = bbox
-                helper.restore_interactive_drawing()
+                rebuild = True
             elif (helper._layout_bbox != bbox or helper.axes is not axis
                   or helper.artists != tuple(artists)):
                 helper.configure(axis, artists); helper._layout_bbox = bbox
-                helper.restore_interactive_drawing()
+                rebuild = True
             elif not helper.draw():
-                helper.restore_interactive_drawing()
+                rebuild = True
         for key in set(helpers) - active:
             helpers[key].disconnect()
             del helpers[key]
         self._power_region_blitters = helpers
+        if rebuild:
+            AxesRegionBlitter.restore_many(helpers.values())
 
     def _on_power_axis_scale_changed(self) -> None:
         self._invalidate_export_move_sources()

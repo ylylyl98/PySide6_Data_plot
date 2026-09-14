@@ -48,6 +48,8 @@ class MCDDisplayStyleTests(unittest.TestCase):
              'slope': 100., 'intercept': 0., 'field_min_t': 0., 'field_max_t': 1.}]}})
         np.testing.assert_allclose(view.axes['mcd_vs_b'].get_ylim(), [-.11, .11])
         view.set_window(1.66, 5.)
+        from PySide6.QtTest import QTest
+        QTest.qWait(220)
         np.testing.assert_allclose(view.axes['mcd_vs_b'].get_ylim(), [-.011, .011])
 
     @classmethod
@@ -73,8 +75,10 @@ class MCDDisplayStyleTests(unittest.TestCase):
         fits = []
         for region, low, high in (("low", -.2, .2), ("high_positive", .4, .8), ("high_negative", -.8, -.4)):
             for branch in ("B increasing", "B decreasing"):
-                fits.append({"region": region, "branch": branch, "status": "ok", "slope": .01,
-                             "intercept": .01, "field_min_t": low, "field_max_t": high, "slope_se": .003})
+                # Keep this layout fixture inside the measured Y range;
+                # off-range fit annotations are intentionally clipped.
+                fits.append({"region": region, "branch": branch, "status": "ok", "slope": .001,
+                             "intercept": .011, "field_min_t": low, "field_max_t": high, "slope_se": .003})
         view.render(_result(), analysis={"slopes": {"fits": fits}})
         view.canvas.draw()
         renderer = view.canvas.get_renderer()
@@ -110,7 +114,9 @@ class MCDDisplayStyleTests(unittest.TestCase):
         legend = view._artists["spectra_legend"]
         dynamic = view._dynamic_artists_by_axis()["spectra"]
         assert legend in dynamic
-        assert legend.get_animated() is True
+        # Only background capture temporarily marks overlays animated; normal
+        # canvas redraws must include the legend without callback assistance.
+        assert legend.get_animated() is False
         assert all(text not in dynamic for text in legend.get_texts())
         view.set_selected_b(2)
         assert all("B=" in text.get_text() for text in legend.get_texts())
@@ -134,6 +140,10 @@ class MCDDisplayStyleTests(unittest.TestCase):
         assert view.axes["feature_vs_b"].get_ylabel() == "Energy (eV)"
         assert view._feature_energy_axis is not None
         assert view._feature_energy_axis.get_ylabel() == "Shift (meV)"
+        secondary = view._feature_energy_axis
+        with patch.object(secondary, 'draw', wraps=secondary.draw) as draw:
+            view._prepare_blit(full_draw=False)
+            draw.assert_called_once()
 
     def test_splitting_uses_cached_channel_energies_with_correct_units(self):
         view = McdUnifiedView()
