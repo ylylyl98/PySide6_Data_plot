@@ -7,10 +7,10 @@ refactoring stage.
 
 from __future__ import annotations
 
-import csv
 import copy
 import threading
 from dataclasses import replace
+from pathlib import Path
 from typing import Dict
 
 import numpy as np
@@ -42,11 +42,19 @@ from PySide6.QtWidgets import (
 from core.mcd_local_fit import FIT_OK, local_fit_cache_key
 from core.mcd_peak_shift import BOUNDARY_UNRELIABLE, analyze_local_peak_shift, analyze_peak_shift, format_mcd_angle, spectrum_energy_order, valley_quantities
 from core.mcd_valley_split import compute_valley_splitting
+from core.colormaps import RDBU_R_P0P60_ID
+from core.mcd_peak_export import (
+    mcd_peak_shift_export_worker,
+    peak_shift_history_status,
+    source_descriptor,
+)
 from core.plotting import COMPARE_PANEL_ORDER
 from ui_qt.common import UI_METRICS, QComboBox, QDoubleSpinBox, QSpinBox, Worker
 from ui_qt.fluent_ui.style import set_fluent_property
 from ui_qt.status_badge import StatusBadge
+from ui_qt.mcd_source_summary import McdSourceSummary
 from ui_qt.dense_form_layout import DenseFormRowLayout
+from ui_qt.mcd_unified_page import McdUnifiedControls
 
 
 def _mcd_local_fit_worker(
@@ -93,11 +101,71 @@ def _mcd_local_fit_worker(
     return output
 
 
+def _mcd_peak_shift_worker(
+    source,
+    *,
+    source_selector: str,
+    prominence: float,
+    distance: int,
+    smoothing: int,
+    jump: float,
+    peak_limit: int,
+    derivative_window: int,
+    cancel_event=None,
+    progress=None,
+    log=None,
+):
+    """Compute the default MCD peak catalog away from the Qt GUI thread.
+
+    Every value used by the numerical routine is passed as a plain snapshot;
+    this function intentionally has no widget or controller access.
+    """
+    method_results = {"Raw spectrum": {}, "Second derivative": {}}
+    pair_fields = np.asarray(source.pair_b, dtype=float)
+    total = 4
+    completed = 0
+    for channel in ("pos", "neg"):
+        if cancel_event is not None and cancel_event.is_set():
+            return None
+        field = np.asarray(getattr(source, f"pair_b_{channel}", source.pair_b), dtype=float)
+        interpolated = np.asarray(
+            getattr(source, f"pair_interpolated_{channel}", np.zeros(field.size, dtype=bool)),
+            dtype=bool,
+        )
+        effective = np.where(interpolated, pair_fields, field) if interpolated.size == field.size else field
+        adapted = copy.copy(source)
+        adapted.pair_b = effective
+        fit_source = _mcd_fit_source_for_channel(source_selector, channel)
+        for method in ("Raw spectrum", "Second derivative"):
+            if cancel_event is not None and cancel_event.is_set():
+                return None
+            method_results[method][channel] = analyze_peak_shift(
+                adapted,
+                source=fit_source,
+                prominence_fraction=float(prominence),
+                min_distance_points=int(distance),
+                smoothing_points=int(smoothing),
+                max_jump_ev=float(jump),
+                max_peaks=int(peak_limit),
+                tracking_method=method,
+                derivative_window_points=int(derivative_window),
+            )
+            completed += 1
+            if progress is not None:
+                progress.emit(int(completed * 100 / total))
+    return method_results
+
+
 def _mcd_fit_source_for_channel(spectrum_source: str, channel: str) -> str:
     """Map the shared selector to one physical channel per local fit."""
     normalized = str(spectrum_source).casefold().strip()
     base = "corrected" if normalized.startswith(("corrected", "mcd-corrected")) else "raw"
     return f"{base} {str(channel).casefold()}"
+
+
+def _mcd_peak_history_worker(folder: str, descriptor: dict, *, progress=None, log=None):
+    """Read the small Peak Shift index outside the GUI thread."""
+    return peak_shift_history_status(folder, descriptor)
 
 
 class FeatureTabsMixin:
@@ -172,15 +240,6 @@ class FeatureTabsMixin:
         _pl_yc_h.setContentsMargins(0, 0, 0, 0)
         _pl_yc_h.setSpacing(6)
         _pl_yc_h.addWidget(self.pl_yaxis_combo)
-        _pl_cmap_row = QWidget()
-        _pl_cmap_h = QHBoxLayout(_pl_cmap_row)
-        _pl_cmap_h.setContentsMargins(0, 0, 0, 0)
-        _pl_cmap_h.setSpacing(4)
-        _pl_cmap_h.addWidget(QLabel("Cmap"))
-        cmap.setMinimumWidth(112)
-        cmap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        _pl_cmap_h.addWidget(cmap, 1)
-        _pl_yc_h.addWidget(_pl_cmap_row)
         cfg.addRow("Y-axis", _pl_yc_row)
         cfg.addRow("", self.pl_yaxis_advanced_box)
         self.pl_dat_yaxis_label_edit = QLineEdit()
@@ -207,6 +266,27 @@ class FeatureTabsMixin:
         self.pl_auto_x_btn = QToolButton()
         self.pl_auto_y_btn = QToolButton()
 
+        common_display = QGroupBox("Common display")
+        common_form = QFormLayout(common_display)
+        common_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
+        common_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        common_form.setHorizontalSpacing(4)
+        common_form.setVerticalSpacing(UI_METRICS["row_spacing"])
+        common_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        cmap.setMinimumWidth(112)
+        cmap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        common_form.addRow("Color map", cmap)
+        common_form.addRow(
+            "Color range",
+            self._make_axis_range_row(
+                spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"],
+                self.pl_auto_v_btn, "Auto V", dense=True, label_text="vmin / vmax",
+            ),
+        )
+        common_form.addRow("Cursor Gate", spins["gate"])
+        self._set_form_label_width(common_form, UI_METRICS["label_col_width"])
+        params_layout.addWidget(common_display)
+
         basic = QGroupBox("Axis Ranges")
         basic_form = QFormLayout(basic)
         basic_form.setContentsMargins(4, UI_METRICS["group_margin"], 4, UI_METRICS["group_margin"])
@@ -214,9 +294,6 @@ class FeatureTabsMixin:
         basic_form.setHorizontalSpacing(4)
         basic_form.setVerticalSpacing(UI_METRICS["row_spacing"])
         basic_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        basic_form.addRow(
-            self._make_axis_range_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.pl_auto_v_btn, "Auto V", dense=True, label_text="vmin / vmax"),
-        )
         basic_form.addRow("Color scale", self.pl_split_scale_chk)
         basic_form.addRow(self.pl_split_scale_panel)
         basic_form.addRow(
@@ -225,7 +302,6 @@ class FeatureTabsMixin:
         basic_form.addRow(
             self._make_axis_range_row(spins["ymin"], spins["ymax"], fix_checks["ymin"], fix_checks["ymax"], self.pl_auto_y_btn, "Auto Y", dense=True, label_text="ymin / ymax"),
         )
-        basic_form.addRow("Cursor Gate", spins["gate"])
         flags = QWidget()
         flags_h = QHBoxLayout(flags)
         flags_h.setContentsMargins(0, 0, 0, 0)
@@ -356,8 +432,11 @@ class FeatureTabsMixin:
         base_grid.setContentsMargins(0, 0, 0, 0)
         base_grid.setHorizontalSpacing(6)
         base_grid.setVerticalSpacing(4)
-        self.drr_baseline_summary = QLabel("Baselines: 0 files")
+        self.drr_baseline_summary = QLabel("Using last frame")
         self.drr_baseline_summary.setWordWrap(True)
+        self.drr_baseline_summary.setFixedHeight(
+            2 * self.drr_baseline_summary.fontMetrics().lineSpacing() + 4
+        )
         self.drr_edit_baselines_btn = QPushButton("Select...")
         self.drr_edit_baselines_btn.setMinimumHeight(UI_METRICS["input_h"])
         self.drr_edit_baselines_btn.setMinimumWidth(110)
@@ -392,9 +471,15 @@ class FeatureTabsMixin:
             "The wavelength center and spectral grid are still validated."
         )
         files_layout.addWidget(self.drr_pin_baseline_chk)
-        self.drr_external_baseline_row.setVisible(False)
-        self.drr_baseline_combine_combo.setVisible(False)
-        self.drr_pin_baseline_chk.setVisible(False)
+        # Keep the baseline area stable while Self/External changes; the
+        # controller enables the applicable controls for the selected mode.
+        self.drr_external_baseline_row.setVisible(True)
+        self.drr_baseline_combine_combo.setVisible(True)
+        self.drr_pin_baseline_chk.setVisible(True)
+        self.drr_edit_baselines_btn.setEnabled(False)
+        self.drr_baseline_autofind_btn.setEnabled(False)
+        self.drr_baseline_combine_combo.setEnabled(False)
+        self.drr_pin_baseline_chk.setEnabled(False)
         layout.addWidget(self._make_expander("Data", files, expanded=True))
 
         params = QGroupBox("Plot Options")
@@ -409,9 +494,37 @@ class FeatureTabsMixin:
         self._style_combo_popup(self.drr_baseline_combo)
         self.drr_derivative_combo = QComboBox()
         self.drr_derivative_combo.addItems(["None", "dE", "d2E"])
-        self.drr_derivative_combo.setToolTip("Apply derivative transform to DRR")
+        self.drr_derivative_combo.setToolTip(
+            "Advanced derivative processing. The visible DRR tabs remain ΔR/R and Second derivative."
+        )
         self._style_combo_popup(self.drr_derivative_combo)
+        self.drr_advanced_derivative_label = QLabel("Advanced: None")
+        self.drr_advanced_derivative_label.setToolTip(
+            "Advanced first derivative processing is labeled separately from the two standard DRR products."
+        )
         _grid, spins, log_chk, clip_chk, cmap, fix_checks = self._build_common_range_grid("drr", "RdBu_r")
+        # d2E keeps its own two-region limits.  The panel is placed in a
+        # collapsed expander below the compact single-scale row so the
+        # derivative controls do not consume the narrow sidebar by default.
+        self._build_split_scale_controls("drr_second")
+        # x0 and the boundary marker are global DRR controls.  The d2E panel
+        # keeps the state entries for serialization, but hides its duplicate
+        # row so users edit the single shared control above.
+        second_layout = self.drr_second_split_scale_panel.layout()
+        if isinstance(second_layout, QGridLayout):
+            for index in range(second_layout.count()):
+                item = second_layout.itemAt(index)
+                row, _column, _row_span, _column_span = second_layout.getItemPosition(index)
+                if row <= 1 and item.widget() is not None:
+                    item.widget().hide()
+        self.drr_second_cmap = QComboBox()
+        for index in range(cmap.count()):
+            self.drr_second_cmap.addItem(cmap.itemText(index), cmap.itemData(index))
+        second_cmap_index = self.drr_second_cmap.findData(RDBU_R_P0P60_ID)
+        if second_cmap_index >= 0:
+            self.drr_second_cmap.setCurrentIndex(second_cmap_index)
+        self._style_combo_popup(self.drr_second_cmap)
+        self.drr_second_cmap.setToolTip("Independent d2E color map (default: RdBu_r p=0.60)")
 
         for s in spins.values():
             s.setMinimumWidth(116)
@@ -449,6 +562,21 @@ class FeatureTabsMixin:
         self.drr_sg_window_spin.setVisible(False)
         self.drr_sg_poly_spin.setVisible(False)
 
+        # Raw and second-derivative panels have separate color ranges while
+        # sharing the DRR axis and cursor controls.  Keep these lightweight
+        # fields close to the existing range controls so the values are part
+        # of the normal plot snapshot and export request.
+        self.drr_second_vmin_spin = QDoubleSpinBox()
+        self.drr_second_vmax_spin = QDoubleSpinBox()
+        self.drr_second_auto_scale = True
+        for spin, value in ((self.drr_second_vmin_spin, -1.0), (self.drr_second_vmax_spin, 1.0)):
+            spin.setDecimals(8)
+            spin.setRange(-1.0e12, 1.0e12)
+            spin.setValue(value)
+            spin.setMinimumWidth(0)
+            spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            spin.setMinimumHeight(UI_METRICS["input_h"])
+
         deriv_row = QWidget()
         deriv_grid = QGridLayout(deriv_row)
         deriv_grid.setContentsMargins(0, 0, 0, 0)
@@ -464,6 +592,7 @@ class FeatureTabsMixin:
         # DRR range actions are real push buttons so their readable content
         # width participates in the dense row's metric-based packing.
         self.drr_auto_v_btn = QPushButton()
+        self.drr_second_auto_v_btn = QPushButton("Auto V")
         self.drr_auto_x_btn = QPushButton()
         self.drr_auto_y_btn = QPushButton()
         self.drr_center_zero_chk = QCheckBox("Center Zero")
@@ -496,9 +625,11 @@ class FeatureTabsMixin:
         _drr_yc_h.setSpacing(6)
         _drr_yc_h.addWidget(self.drr_yaxis_combo, 1)
         cfg.addRow("DRR Baseline", baseline_cmap_row)
+        cfg.addRow("d2E Cmap", self.drr_second_cmap)
         cfg.addRow("Y-axis", _drr_yc_row)
         cfg.addRow("", self.drr_yaxis_advanced_box)
         cfg.addRow("Derivative / SG", deriv_row)
+        cfg.addRow("Advanced view", self.drr_advanced_derivative_label)
         self._set_form_label_width(cfg, UI_METRICS["label_col_width"])
         params_layout.addLayout(cfg)
 
@@ -518,8 +649,22 @@ class FeatureTabsMixin:
         basic_form.addRow(
             self._make_axis_range_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.drr_auto_v_btn, "Auto V", dense=True, label_text="vmin / vmax"),
         )
+        second_scale = QWidget()
+        second_scale_h = QHBoxLayout(second_scale)
+        second_scale_h.setContentsMargins(0, 0, 0, 0)
+        second_scale_h.setSpacing(4)
+        second_scale_h.addWidget(QLabel("vmin"))
+        second_scale_h.addWidget(self.drr_second_vmin_spin, 1)
+        second_scale_h.addWidget(QLabel("vmax"))
+        second_scale_h.addWidget(self.drr_second_vmax_spin, 1)
+        second_scale_h.addWidget(self.drr_second_auto_v_btn)
+        basic_form.addRow("d2E color", second_scale)
         basic_form.addRow("Color scale", self.drr_split_scale_chk)
         basic_form.addRow(self.drr_split_scale_panel)
+        self.drr_second_split_expander = self._make_expander(
+            "d2E split color scale", self.drr_second_split_scale_panel, expanded=False
+        )
+        basic_form.addRow("d2E split", self.drr_second_split_expander)
         basic_form.addRow(
             self._make_axis_range_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.drr_auto_x_btn, "Auto X", dense=True, label_text="xmin / xmax"),
         )
@@ -664,7 +809,6 @@ class FeatureTabsMixin:
         )
         self._style_combo_popup(self.cmp_source_filter_combo)
         source_filter_row.addWidget(self.cmp_source_filter_combo, 1)
-        assignment_layout.addLayout(source_filter_row)
 
         group_row = QWidget()
         group_grid = QGridLayout(group_row)
@@ -683,6 +827,7 @@ class FeatureTabsMixin:
         group_grid.addWidget(self.cmp_select_group_btn, 1, 1)
         group_grid.addWidget(self.cmp_clear_group_btn, 1, 2)
         assignment_layout.addWidget(group_row)
+        assignment_layout.addLayout(source_filter_row)
         def _angle_spin(default: float = 0.0) -> QDoubleSpinBox:
             spin = QDoubleSpinBox()
             spin.setDecimals(3)
@@ -724,6 +869,20 @@ class FeatureTabsMixin:
         angle_grid.setContentsMargins(0, 0, 0, 0)
         angle_grid.setHorizontalSpacing(6)
         angle_grid.setVerticalSpacing(4)
+        self.cmp_rotation_mapping_combo = QComboBox()
+        self.cmp_rotation_mapping_combo.addItem("Rot1: In / Rot2: Out", "rot1_input")
+        self.cmp_rotation_mapping_combo.addItem("Rot1: Out / Rot2: In", "rot1_output")
+        self.cmp_rotation_mapping_combo.setAccessibleName("Rotation input/output mapping")
+        self.cmp_rotation_mapping_combo.setToolTip(
+            "Choose which rotation controls input and output polarization. "
+            "A missing arm is treated as K. Explicit in/out filename labels keep their meaning."
+        )
+        settings = getattr(self, "settings", None)
+        saved_mapping = settings.value("compare/rotation_mapping", "rot1_input") if settings is not None else "rot1_input"
+        self.cmp_rotation_mapping_combo.setCurrentIndex(
+            max(0, self.cmp_rotation_mapping_combo.findData(saved_mapping))
+        )
+        angle_rules_form.addRow("Rot mapping", self.cmp_rotation_mapping_combo)
         angle_grid.addWidget(QLabel("In K"), 0, 0)
         angle_grid.addWidget(self.cmp_in_k_angle_spin, 0, 1, 1, 3)
         angle_grid.addWidget(QLabel("In Kp"), 1, 0)
@@ -813,7 +972,7 @@ class FeatureTabsMixin:
             checks_grid.addWidget(chk, index // 2, index % 2)
         checks_grid.setColumnStretch(1, 1)
         display_form.addRow("Channels", checks_row)
-        params_layout.addWidget(self._make_expander("Display", display, expanded=False))
+        params_layout.addWidget(self._make_expander("Display", display, expanded=True))
 
         vp_box = QGroupBox("Valley Polarization")
         vp_form = QFormLayout(vp_box)
@@ -981,13 +1140,8 @@ class FeatureTabsMixin:
         source_grid.setContentsMargins(0, 0, 0, 0)
         source_grid.setHorizontalSpacing(6)
         source_grid.setVerticalSpacing(4)
-        self.mcd_selection_summary = StatusBadge("No MCD CSV selected.", app_role=None)
+        self.mcd_selection_summary = McdSourceSummary("No MCD CSV selected.")
         self.mcd_selection_summary.setMinimumWidth(0)
-        # Keep the action row anchored when the status changes between NEW,
-        # PROCESSED, and long-filename states.  The status text is allowed to
-        # wrap inside this reserved area; it must not change the panel height.
-        self.mcd_selection_summary.setMinimumHeight(56)
-        self.mcd_selection_summary.setMaximumHeight(56)
         self.mcd_selection_summary.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.mcd_select_source_btn = QPushButton("Select...")
         self.mcd_select_source_btn.setMinimumHeight(UI_METRICS["input_h"])
@@ -998,7 +1152,6 @@ class FeatureTabsMixin:
         self.mcd_clear_source_btn.setMaximumWidth(72)
         source_grid.addWidget(self.mcd_selection_summary, 0, 0, 1, 3)
         source_grid.setColumnStretch(0, 1)
-        source_grid.setRowMinimumHeight(0, 56)
         source_grid.setRowMinimumHeight(1, UI_METRICS["input_h"])
         source_grid.addWidget(self.mcd_select_source_btn, 1, 1)
         source_grid.addWidget(self.mcd_clear_source_btn, 1, 2)
@@ -1176,7 +1329,6 @@ class FeatureTabsMixin:
         advanced_form.addRow("Dark sigma+", self.mcd_dark_pos_combo)
         advanced_form.addRow("Dark sigma-", self.mcd_dark_neg_combo)
         correction_layout.addWidget(self._make_expander("Advanced", advanced_correction, expanded=False))
-        layout.addWidget(self._make_expander("Correction", correction, expanded=False))
 
         diagnostics = QGroupBox("Pair diagnostics")
         diagnostics_layout = QVBoxLayout(diagnostics)
@@ -1190,7 +1342,6 @@ class FeatureTabsMixin:
         )
         diagnostics_layout.addWidget(self.mcd_diagnostics_text)
         self.mcd_diagnostics_expander = self._make_expander("Diagnostics", diagnostics, expanded=False)
-        layout.addWidget(self.mcd_diagnostics_expander)
 
         display = QGroupBox("Display and MCD(B)")
         display_form = QFormLayout(display)
@@ -1270,9 +1421,28 @@ class FeatureTabsMixin:
         display_form.addRow("MCD(B) E0", self.mcd_window_center_spin)
         display_form.addRow("MCD(B) width", self.mcd_window_width_spin)
         display_form.addRow("MCD(B) traces", trace_visibility)
-        display_form.addRow("Primary export metric", self.mcd_window_metric_combo)
-        display_form.addRow("Near-zero fit", self._pair_row(self.mcd_fit_zero_chk, self.mcd_fit_b_window_spin))
-        layout.addWidget(self._make_expander("Plot", display, expanded=True))
+        plot_expander = self._make_expander("Plot", display, expanded=True)
+
+        analysis = QGroupBox("MCD(B) analysis")
+        analysis_form = QFormLayout(analysis)
+        analysis_form.setContentsMargins(6, 4, 6, 4)
+        analysis_form.setHorizontalSpacing(6)
+        analysis_form.setVerticalSpacing(3)
+        analysis_form.addRow("Primary export metric", self.mcd_window_metric_combo)
+        analysis_form.addRow("Near-zero fit", self._pair_row(self.mcd_fit_zero_chk, self.mcd_fit_b_window_spin))
+        analysis_expander = self._make_expander("Analysis", analysis, expanded=False)
+
+        # Keep the plot surface close to the source, with processing controls
+        # available below it and advanced analysis collapsed by default.
+        layout.addWidget(plot_expander)
+        layout.addWidget(analysis_expander)
+        layout.addWidget(self._make_expander("Correction", correction, expanded=False))
+        layout.addWidget(self.mcd_diagnostics_expander)
+        # Feature/slope controls share this visible MCD page.  The existing
+        # source, angle, correction, dark-file, and diagnostics controls above
+        # remain authoritative for the processing worker.
+        self.mcd_unified_controls = McdUnifiedControls(tab, expander_factory=self._make_expander)
+        layout.addWidget(self.mcd_unified_controls)
         layout.addStretch(1)
         return tab
 
@@ -1288,7 +1458,7 @@ class FeatureTabsMixin:
         source_layout = QVBoxLayout(source_row)
         source_layout.setContentsMargins(0, 0, 0, 0)
         source_layout.setSpacing(4)
-        self.mcd_peak_source_selection_summary = StatusBadge("No MCD CSV selected.", app_role=None)
+        self.mcd_peak_source_selection_summary = McdSourceSummary("No MCD CSV selected.")
         self.mcd_peak_source_selection_summary.setMinimumWidth(0)
         self.mcd_peak_source_selection_summary.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.mcd_peak_select_source_btn = QPushButton("Select...")
@@ -1301,6 +1471,9 @@ class FeatureTabsMixin:
         source_actions.addWidget(self.mcd_peak_select_source_btn)
         source_actions.addWidget(self.mcd_peak_clear_source_btn)
         source_layout.addLayout(source_actions)
+        self.mcd_peak_export_history = QLabel("Peak Shift history: New")
+        self.mcd_peak_export_history.setWordWrap(True)
+        source_layout.addWidget(self.mcd_peak_export_history)
         form.addRow("MCD CSV", source_row)
         self.mcd_peak_source_summary = QLabel("No MCD result loaded. Load an MCD sweep to begin.")
         self.mcd_peak_source_summary.setWordWrap(True)
@@ -1471,6 +1644,20 @@ class FeatureTabsMixin:
         self._mcd_peak_local_fit_cache = {}
         self._mcd_peak_fit_generation = 0
         self._mcd_peak_fit_worker = None
+        self._mcd_peak_analysis_cache = {}
+        self._mcd_peak_analysis_cache_sources = {}
+        self._mcd_peak_analysis_key = None
+        self._mcd_peak_analysis_generation = 0
+        self._mcd_peak_analysis_worker = None
+        self._mcd_peak_analysis_cancel_event = None
+        self._mcd_peak_analysis_workers = set()
+        self._mcd_peak_analysis_pending_request = None
+        self._mcd_peak_export_worker = None
+        self._mcd_peak_history_worker = None
+        self._mcd_peak_history_generation = 0
+        self._mcd_peak_history_cache: dict[str, tuple[str, str | None]] = {}
+        self._mcd_peak_analysis_source_descriptor: dict = {}
+        self._mcd_peak_analysis_source_folder = ""
         self.mcd_peak_map_axes = []
         self.mcd_peak_spectrum_ax = None
         self._mcd_peak_track_lines = []
@@ -1527,6 +1714,87 @@ class FeatureTabsMixin:
         index = combo.currentIndex()
         combo.setCurrentIndex((index + int(delta)) % combo.count())
 
+    def _mcd_peak_source_descriptor(self) -> dict:
+        result = getattr(self, "_mcd_peak_analysis_source", None)
+        if result is None:
+            result = getattr(getattr(self, "loaded", None), "mcd_result", None)
+        cached = getattr(self, "_mcd_peak_analysis_source_descriptor", {})
+        if result is getattr(self, "_mcd_peak_analysis_source", None) and cached:
+            return dict(cached)
+        return source_descriptor(
+            getattr(self, "current_folder", None),
+            getattr(result, "source_file", None),
+            include_hash=False,
+        )
+
+    def _refresh_mcd_peak_export_history(self) -> None:
+        label = getattr(self, "mcd_peak_export_history", None)
+        if label is None:
+            return
+        self._mcd_peak_history_generation += 1
+        generation = self._mcd_peak_history_generation
+        descriptor = self._mcd_peak_source_descriptor()
+        if not descriptor.get("name"):
+            label.setText("Peak Shift history: New (no source selected)")
+            return
+        folder = self._mcd_peak_analysis_source_folder or str(getattr(self, "current_folder", "") or "")
+        cache_key = str(descriptor.get("path", "")).casefold()
+        cached = self._mcd_peak_history_cache.get(cache_key)
+        if cached is not None:
+            self._set_mcd_peak_history_status(*cached)
+            return
+        label.setText("Peak Shift history: checking…")
+        pool = getattr(self, "thread_pool", None)
+        if pool is None:
+            label.setText("Peak Shift history: Unknown (history unavailable)")
+            return
+        worker = Worker(
+            _mcd_peak_history_worker,
+            folder,
+            descriptor,
+        )
+        self._mcd_peak_history_worker = worker
+        worker.signals.result.connect(
+            lambda value, w=worker, g=generation: self._on_mcd_peak_history_result(w, g, value)
+        )
+        worker.signals.error.connect(
+            lambda message, w=worker, g=generation: self._on_mcd_peak_history_error(w, g, message)
+        )
+        worker.signals.finished.connect(
+            lambda w=worker, g=generation: self._on_mcd_peak_history_finished(w, g)
+        )
+        pool.start(worker)
+
+    def _set_mcd_peak_history_status(self, status: str, stamp: str | None) -> None:
+        label = getattr(self, "mcd_peak_export_history", None)
+        if label is None:
+            return
+        if status == "processed":
+            shown = str(stamp or "").replace("T", " ")[:16]
+            label.setText(f"Peak Shift history: Saved{(' · ' + shown) if shown else ''}")
+        elif status == "unknown":
+            label.setText("Peak Shift history: Unknown (legacy export identity incomplete)")
+        else:
+            label.setText("Peak Shift history: New")
+
+    def _on_mcd_peak_history_result(self, worker, generation: int, value) -> None:
+        if worker is not getattr(self, "_mcd_peak_history_worker", None):
+            return
+        if generation == self._mcd_peak_history_generation and not getattr(self, "_is_closing", False):
+            self._mcd_peak_history_cache[
+                str(self._mcd_peak_source_descriptor().get("path", "")).casefold()
+            ] = tuple(value)
+            self._set_mcd_peak_history_status(*value)
+
+    def _on_mcd_peak_history_error(self, worker, generation: int, message: str) -> None:
+        if worker is getattr(self, "_mcd_peak_history_worker", None):
+            if generation == self._mcd_peak_history_generation and not getattr(self, "_is_closing", False):
+                self._set_mcd_peak_history_status("unknown", None)
+
+    def _on_mcd_peak_history_finished(self, worker, generation: int) -> None:
+        if worker is getattr(self, "_mcd_peak_history_worker", None) and generation == self._mcd_peak_history_generation:
+            self._mcd_peak_history_worker = None
+
     def _update_mcd_peak_shift_source(self, result) -> None:
         if not hasattr(self, "mcd_peak_source_summary"):
             return
@@ -1538,9 +1806,25 @@ class FeatureTabsMixin:
         cancel = getattr(self, "_mcd_peak_fit_cancel_event", None)
         if cancel is not None:
             cancel.set()
+        analysis_cancel = getattr(self, "_mcd_peak_analysis_cancel_event", None)
+        if analysis_cancel is not None:
+            analysis_cancel.set()
+        self._mcd_peak_analysis_generation = int(getattr(self, "_mcd_peak_analysis_generation", 0)) + 1
+        self._mcd_peak_analysis_key = None
+        self._mcd_peak_analysis_pending_request = None
+        self._mcd_peak_analysis_cache.clear()
+        self._mcd_peak_analysis_cache_sources.clear()
         self._mcd_peak_fit_generation = int(getattr(self, "_mcd_peak_fit_generation", 0)) + 1
         self._mcd_peak_local_fit_cache = {}
         self._mcd_peak_locator_results = {}
+        self._mcd_peak_analysis_source_descriptor = (
+            source_descriptor(
+                getattr(self, "current_folder", None),
+                getattr(result, "source_file", None),
+                include_hash=False,
+            ) if result is not None else {}
+        )
+        self._mcd_peak_analysis_source_folder = str(getattr(self, "current_folder", "") or "")
         if result is None:
             self.mcd_peak_result = None
             self.mcd_peak_source_summary.setText("No MCD result loaded. Load an MCD sweep to begin.")
@@ -1557,6 +1841,7 @@ class FeatureTabsMixin:
             self.mcd_peak_field_combo.clear()
             self.mcd_peak_table.setRowCount(0)
             self.mcd_valley_table.setRowCount(0)
+            self._refresh_mcd_peak_export_history()
             return
         n = int(np.asarray(result.pair_b).size)
         self.mcd_peak_source_summary.setText(f"{n} paired spectra; {result.source_file}. K/K' labels follow energy ordering: lower branch is K for B > 0; labels are not waveplate-angle calibration.")
@@ -1574,20 +1859,23 @@ class FeatureTabsMixin:
         self.mcd_peak_export_btn.setEnabled(False)
         self.mcd_peak_table.setRowCount(0)
         self.mcd_valley_table.setRowCount(0)
+        self._refresh_mcd_peak_export_history()
 
     def _mcd_peak_computation_key(self) -> tuple:
         """Cheap freshness check; display controls do not affect computation."""
+        source = getattr(getattr(self, "loaded", None), "mcd_result", None)
+        revision = getattr(source, "revision", getattr(source, "source_revision", None))
         return (
-            id(self.loaded.mcd_result),
+            id(source), revision,
             self.mcd_peak_source_combo.currentText(),
-            self.mcd_peak_tracker_method_combo.currentText(),
-            self.mcd_peak_background_combo.currentText(),
             self.mcd_peak_prom_spin.value(), self.mcd_peak_dist_spin.value(),
             self.mcd_peak_smooth_spin.value(), self.mcd_peak_jump_spin.value(),
             self.mcd_peak_max_spin.value(), self.mcd_peak_deriv_window_spin.value(),
         )
 
     def _ensure_mcd_peak_analysis(self) -> None:
+        if not self._mcd_peak_page_active():
+            return
         if self.loaded is None or self.loaded.mode != "MCD" or self.loaded.mcd_result is None:
             return
         if self._load_in_progress or self.mcd_controller._mcd_auto_apply_timer.isActive():
@@ -1600,17 +1888,142 @@ class FeatureTabsMixin:
         self._analyze_mcd_peak_shift()
 
     def _analyze_mcd_peak_shift(self) -> None:
-        if self.loaded is not None and self.loaded.mode == "MCD" and self.loaded.mcd_result is not None:
-            self._mcd_peak_analysis_key = self._mcd_peak_computation_key()
         if self.mcd_peak_tracker_method_combo.currentText() == "Local mixed fit":
+            analysis_cancel = getattr(self, "_mcd_peak_analysis_cancel_event", None)
+            if analysis_cancel is not None:
+                analysis_cancel.set()
+            self._mcd_peak_analysis_generation = int(getattr(self, "_mcd_peak_analysis_generation", 0)) + 1
+            self._mcd_peak_analysis_key = None
+            self._mcd_peak_analysis_pending_request = None
             self._request_mcd_local_fit()
             return
-        cancel = getattr(self, "_mcd_peak_fit_cancel_event", None)
-        if cancel is not None:
-            cancel.set()
-        self._mcd_peak_local_pending_key = None
+        local_cancel = getattr(self, "_mcd_peak_fit_cancel_event", None)
+        if local_cancel is not None:
+            local_cancel.set()
         self._mcd_peak_fit_generation = int(getattr(self, "_mcd_peak_fit_generation", 0)) + 1
-        self._analyze_mcd_peak_shift_legacy()
+        self._mcd_peak_local_pending_key = None
+        self._request_mcd_peak_shift_analysis()
+
+    def _request_mcd_peak_shift_analysis(self) -> None:
+        if not self.loaded or self.loaded.mode != "MCD" or self.loaded.mcd_result is None:
+            self.mcd_peak_status.setText("Error: no MCD result is loaded.")
+            return
+        source = self.loaded.mcd_result
+        key = self._mcd_peak_computation_key()
+        active = getattr(self, "_mcd_peak_analysis_cancel_event", None)
+        if key == getattr(self, "_mcd_peak_analysis_key", None):
+            selected_method = str(self.mcd_peak_tracker_method_combo.currentText())
+            if self.mcd_peak_result is not None and selected_method != getattr(self, "_mcd_peak_selected_result_method", None):
+                if selected_method in getattr(self, "mcd_peak_method_results", {}):
+                    self._apply_mcd_peak_shift_results(self.mcd_peak_method_results, source)
+                    return
+            if active is not None and not active.is_set():
+                return
+        cached = self._mcd_peak_analysis_cache.get(key)
+        if cached is not None:
+            if active is not None and not active.is_set():
+                active.set()
+                self._mcd_peak_analysis_generation += 1
+                self._mcd_peak_analysis_worker = None
+                self._mcd_peak_analysis_cancel_event = None
+            self._mcd_peak_analysis_key = key
+            self._apply_mcd_peak_shift_results(cached, source)
+            self.mcd_peak_analyze_btn.setEnabled(True)
+            return
+        options = {
+            "source_selector": str(self.mcd_peak_source_combo.currentText()),
+            "prominence": float(self.mcd_peak_prom_spin.value()),
+            "distance": int(self.mcd_peak_dist_spin.value()),
+            "smoothing": int(self.mcd_peak_smooth_spin.value()),
+            "jump": float(self.mcd_peak_jump_spin.value()),
+            "peak_limit": int(self.mcd_peak_max_spin.value()),
+            "derivative_window": int(self.mcd_peak_deriv_window_spin.value()),
+        }
+        if getattr(self, "_mcd_peak_analysis_worker", None) is not None:
+            self._mcd_peak_analysis_pending_request = (source, key, options)
+            if active is not None:
+                active.set()
+            self._mcd_peak_analysis_key = key
+            return
+        self._launch_mcd_peak_shift_analysis(source, key, options)
+
+    def _launch_mcd_peak_shift_analysis(self, source, key, options: dict) -> None:
+        self._mcd_peak_analysis_generation += 1
+        generation = self._mcd_peak_analysis_generation
+        cancel_event = threading.Event()
+        self._mcd_peak_analysis_cancel_event = cancel_event
+        self._mcd_peak_analysis_key = key
+        self.mcd_peak_analyze_btn.setEnabled(False)
+        self.mcd_peak_status.setText("Analyzing reflection peaks…")
+        worker = Worker(
+            _mcd_peak_shift_worker,
+            source,
+            **options,
+            cancel_event=cancel_event,
+        )
+        self._mcd_peak_analysis_worker = worker
+        self._mcd_peak_analysis_workers.add(worker)
+        worker.signals.result.connect(
+            lambda results, w=worker, g=generation, s=source, k=key:
+            self._finish_mcd_peak_shift_analysis(w, g, results, s, k)
+        )
+        worker.signals.error.connect(
+            lambda message, w=worker, g=generation:
+            self._mcd_peak_shift_analysis_error(w, g, message)
+        )
+        worker.signals.finished.connect(
+            lambda w=worker, g=generation:
+            self._mcd_peak_shift_analysis_finished(w, g)
+        )
+        self.thread_pool.start(worker)
+
+    def _finish_mcd_peak_shift_analysis(self, worker, generation: int, results, source, key) -> None:
+        if (
+            worker is not getattr(self, "_mcd_peak_analysis_worker", None)
+            or generation != int(getattr(self, "_mcd_peak_analysis_generation", -1))
+            or getattr(self, "_is_closing", False)
+            or self.loaded is None
+            or self.loaded.mcd_result is not source
+            or self._mcd_peak_computation_key() != key
+            or self.mcd_peak_tracker_method_combo.currentText() == "Local mixed fit"
+            or results is None
+        ):
+            return
+        self._mcd_peak_analysis_cache[key] = results
+        self._mcd_peak_analysis_cache_sources[key] = source
+        while len(self._mcd_peak_analysis_cache) > 4:
+            oldest = next(iter(self._mcd_peak_analysis_cache))
+            self._mcd_peak_analysis_cache.pop(oldest)
+            self._mcd_peak_analysis_cache_sources.pop(oldest, None)
+        self._apply_mcd_peak_shift_results(results, source)
+
+    def _mcd_peak_shift_analysis_error(self, worker, generation: int, message: str) -> None:
+        if worker is self._mcd_peak_analysis_worker and generation == self._mcd_peak_analysis_generation and not getattr(self, "_is_closing", False):
+            self.mcd_peak_status.setText(f"Error: {str(message).splitlines()[0]}")
+
+    def _mcd_peak_shift_analysis_finished(self, worker, generation: int) -> None:
+        self._mcd_peak_analysis_workers.discard(worker)
+        if worker is self._mcd_peak_analysis_worker:
+            self._mcd_peak_analysis_worker = None
+            self._mcd_peak_analysis_cancel_event = None
+            pending = getattr(self, "_mcd_peak_analysis_pending_request", None)
+            self._mcd_peak_analysis_pending_request = None
+            pending_source = pending[0] if pending is not None else None
+            pending_key = pending[1] if pending is not None else None
+            pending_valid = (
+                pending is not None
+                and not getattr(self, "_is_closing", False)
+                and self.loaded is not None
+                and self.loaded.mode == "MCD"
+                and self.loaded.mcd_result is pending_source
+                and self._mcd_peak_computation_key() == pending_key
+                and self.mcd_peak_tracker_method_combo.currentText() != "Local mixed fit"
+            )
+            if pending_valid:
+                source, key, options = pending
+                self._launch_mcd_peak_shift_analysis(source, key, options)
+            elif not getattr(self, "_is_closing", False) and self.mcd_peak_tracker_method_combo.currentText() != "Local mixed fit":
+                self.mcd_peak_analyze_btn.setEnabled(True)
 
     def _on_mcd_peak_source_changed(self, _source_text: str = "") -> None:
         """Invalidate source-dependent locators while retaining reusable fits."""
@@ -1622,6 +2035,12 @@ class FeatureTabsMixin:
             cancel_event = getattr(self, "_mcd_peak_fit_cancel_event", None)
             if cancel_event is not None:
                 cancel_event.set()
+            analysis_cancel = getattr(self, "_mcd_peak_analysis_cancel_event", None)
+            if analysis_cancel is not None:
+                analysis_cancel.set()
+            self._mcd_peak_analysis_generation = int(getattr(self, "_mcd_peak_analysis_generation", 0)) + 1
+            self._mcd_peak_analysis_key = None
+            self._mcd_peak_analysis_pending_request = None
             # Locator candidates belong to the selected reflection source;
             # cached local model results are keyed by source and can be reused
             # when the user returns to a prior source.
@@ -1788,6 +2207,8 @@ class FeatureTabsMixin:
             return
         self._mcd_peak_local_fit_cache = getattr(self, "_mcd_peak_local_fit_cache", {})
         self._mcd_peak_local_fit_cache[cache_key] = results
+        if not self._mcd_peak_page_active():
+            return
         self._apply_mcd_local_fit(results, source=source, seed_energy_ev=seed_energy_ev, locator_energy_ev=locator_energy_ev, feature_kind=feature_kind, cache_key=cache_key)
 
     def _mcd_local_fit_error(self, generation: int, message: str) -> None:
@@ -1846,13 +2267,12 @@ class FeatureTabsMixin:
             f"Complete: local mixed fit; Locator E0 = {locator_energy_ev:.6g} eV; "
             f"{valid_count} usable branch track(s). Fit centres are model values; raw/D2 remain locator diagnostics."
         )
+        if getattr(self, "last_plotted_mode", None) == "MCD" and hasattr(self, "_plot_mcd_unified") and not self._unified_mcd_canvas_live():
+            self._plot_mcd_unified(auto=True)
 
-    def _analyze_mcd_peak_shift_legacy(self) -> None:
-        if not self.loaded or self.loaded.mode != "MCD" or self.loaded.mcd_result is None:
-            self.mcd_peak_status.setText("Error: no MCD result is loaded."); return
-        self.mcd_peak_analyze_btn.setEnabled(False); self.mcd_peak_status.setText("Analyzing reflection peaks…")
+    def _apply_mcd_peak_shift_results(self, method_analyses, source) -> None:
+        """Publish an accepted worker snapshot using the legacy UI semantics."""
         try:
-            source = self.loaded.mcd_result
             previous_selection = self.mcd_peak_selector_combo.currentData()
             preferred = None
             if previous_selection is not None:
@@ -1866,26 +2286,12 @@ class FeatureTabsMixin:
                         old_kind,
                         None if old_track.reference_energy_ev is None else float(old_track.reference_energy_ev),
                     )
-            analyses = {}
-            method_analyses = {}
             selected_method = self.mcd_peak_tracker_method_combo.currentText()
-            for method in ("Raw spectrum", "Second derivative"):
-                method_analyses[method] = {}
-            for channel, field_name in (("pos", "pair_b_pos"), ("neg", "pair_b_neg")):
-                field = np.asarray(getattr(source, field_name, source.pair_b), float)
-                interpolated = np.asarray(getattr(source, f"pair_interpolated_{channel}", np.zeros(field.size, dtype=bool)), bool)
-                effective = np.where(interpolated, np.asarray(source.pair_b, float), field)
-                adapted = copy.copy(source); adapted.pair_b = effective
-                for method in method_analyses:
-                    method_analyses[method][channel] = analyze_peak_shift(
-                        adapted, source=_mcd_fit_source_for_channel(self.mcd_peak_source_combo.currentText(), channel),
-                        prominence_fraction=self.mcd_peak_prom_spin.value(), min_distance_points=self.mcd_peak_dist_spin.value(),
-                        smoothing_points=self.mcd_peak_smooth_spin.value(), max_jump_ev=self.mcd_peak_jump_spin.value(), max_peaks=self.mcd_peak_max_spin.value(),
-                        tracking_method=method, derivative_window_points=self.mcd_peak_deriv_window_spin.value())
             analyses = method_analyses[selected_method]
             self.mcd_peak_method_results = method_analyses
             self.mcd_peak_channel_results = analyses
             self.mcd_peak_result = analyses["pos"]
+            self._mcd_peak_selected_result_method = selected_method
             self._mcd_peak_preferred_selection = preferred
             self._populate_mcd_peak_preview_controls()
             self._populate_mcd_peak_table()
@@ -1902,14 +2308,34 @@ class FeatureTabsMixin:
             if getattr(self, "_mcd_peak_selection_unavailable", False):
                 status += " Previous selected energy was not found within 5 meV; choose a peak."
             self.mcd_peak_status.setText(status)
+            if getattr(self, "last_plotted_mode", None) == "MCD" and hasattr(self, "_plot_mcd_unified") and not self._unified_mcd_canvas_live():
+                self._plot_mcd_unified(auto=True)
         except Exception as exc:
             self.mcd_peak_result = None; self.mcd_peak_channel_results = {}; self.mcd_peak_method_results = {}; self.mcd_peak_export_btn.setEnabled(False)
             self.mcd_peak_selector_combo.clear(); self.mcd_peak_field_combo.clear(); self.mcd_peak_k_combo.clear(); self.mcd_peak_kp_combo.clear()
             self.mcd_peak_table.setRowCount(0); self.mcd_valley_table.setRowCount(0)
             self.mcd_peak_status.setText(f"Error: {exc}")
             self._refresh_mcd_peak_plot()
-        finally:
-            self.mcd_peak_analyze_btn.setEnabled(True)
+
+    def _analyze_mcd_peak_shift_legacy(self) -> None:
+        """Compatibility entry point retained for integrations using the old name."""
+        if not self.loaded or self.loaded.mode != "MCD" or self.loaded.mcd_result is None:
+            self.mcd_peak_status.setText("Error: no MCD result is loaded.")
+            return
+        source = self.loaded.mcd_result
+        results = _mcd_peak_shift_worker(
+            source,
+            source_selector=str(self.mcd_peak_source_combo.currentText()),
+            prominence=float(self.mcd_peak_prom_spin.value()),
+            distance=int(self.mcd_peak_dist_spin.value()),
+            smoothing=int(self.mcd_peak_smooth_spin.value()),
+            jump=float(self.mcd_peak_jump_spin.value()),
+            peak_limit=int(self.mcd_peak_max_spin.value()),
+            derivative_window=int(self.mcd_peak_deriv_window_spin.value()),
+            cancel_event=threading.Event(),
+        )
+        if results is not None:
+            self._apply_mcd_peak_shift_results(results, source)
 
     def _reanalyze_mcd_peak_shift(self) -> None:
         if self.loaded is not None and self.loaded.mcd_result is not None:
@@ -2099,8 +2525,26 @@ class FeatureTabsMixin:
         self.mcd_valley_table.resizeColumnsToContents()
 
     def _refresh_mcd_peak_plot(self) -> None:
+        # Peak Shift is a compatibility page. Its late callbacks must not
+        # take ownership of the shared canvas while unified MCD is visible.
+        if not self._mcd_peak_page_active():
+            return
         self._update_mcd_peak_candidate_buttons()
         self._plot_mode("MCD Peak Shift")
+
+    def _mcd_peak_page_active(self) -> bool:
+        tabs = getattr(self, "tabs", None)
+        if tabs is None:
+            return True
+        try:
+            return str(tabs.tabText(tabs.currentIndex())) == "MCD Peak Shift"
+        except (AttributeError, TypeError, ValueError):
+            return True
+
+    def _unified_mcd_canvas_live(self) -> bool:
+        view = getattr(self, "mcd_unified_view", None)
+        owns = getattr(view, "_owns_current_figure", None)
+        return bool(view is not None and callable(owns) and owns())
 
     def _mcd_peak_candidate_track(self, key: tuple):
         if len(key) != 4:
@@ -2411,102 +2855,123 @@ class FeatureTabsMixin:
             self._populate_mcd_peak_table()
             self._refresh_mcd_peak_plot()
 
-    def _export_mcd_peak_shift(self) -> None:
-        if self.mcd_peak_result is None: return
-        path, _ = QFileDialog.getSaveFileName(self, "Export MCD peak shifts", "mcd_peak_shift.csv", "CSV files (*.csv)")
-        if not path: return
-        with open(path, "w", newline="", encoding="utf-8") as handle:
-            writer = csv.writer(handle); writer.writerow([
-                "peak_id", "feature_kind", "B_T", "branch", "E_peak_eV", "delta_E_eV", "status",
-                "reference_method", "reference_field_T", "selected_K_peak_id",
-                "selected_Kp_peak_id", "E_K_eV", "E_Kp_eV", "delta_E_K_eV",
-                "delta_E_Kp_eV", "delta_E_Kp_minus_K_eV", "average_E_eV",
-                "odd_average_E_eV", "even_average_E_eV", "odd_splitting_eV",
-                "even_splitting_eV", "channel", "fit_source", "fit_window_low_eV",
-                "fit_window_high_eV", "background_model", "locator_energy_eV",
-                "model_name", "valley_status",
-            ])
-            if self.mcd_peak_tracker_method_combo.currentText() == "Local mixed fit":
-                selected = self.mcd_peak_selector_combo.currentData()
-                if selected is None or len(selected) != 4:
-                    self.mcd_peak_status.setText("Local fit export needs a selected resonance.")
-                    return
-                channel, peak_id, branch, feature_kind = selected
-                local_analysis = self.mcd_peak_method_results.get("Local mixed fit", {})
-                selected_analysis = local_analysis.get(str(channel))
-                local_track = next((track for track in selected_analysis.tracks if track.peak_id == int(peak_id) and track.branch == str(branch) and track.feature_kind == str(feature_kind)), None) if selected_analysis is not None else None
-                target_energy = local_track.reference_energy_ev if local_track is not None else None
-                if target_energy is None:
-                    self.mcd_peak_status.setText("Local fit export needs a fitted E0 reference.")
-                    return
-                # Use the same per-branch valley routine as the page.  Fix the
-                # positive-field K/K' ordering once, then apply it to every
-                # branch so exported splitting values match the displayed plot.
-                branch_names = [str(value) for value in dict.fromkeys(np.asarray(self.loaded.mcd_result.pair_labels, str).tolist())]
-                splits = {
-                    direction: compute_valley_splitting(
-                        self.mcd_peak_method_results, method="Local mixed fit", selected_channel=str(channel),
-                        branch=direction, target_energy_ev=float(target_energy), tolerance_ev=0.005,
-                        feature_kind=str(feature_kind), allow_energy_fallback=False,
-                    )
-                    for direction in branch_names
-                }
-                fixed_k = next((item.k_channel for item in splits.values() if item.k_channel in {"pos", "neg"}), None)
-                if fixed_k in {"pos", "neg"}:
-                    splits = {
-                        direction: compute_valley_splitting(
-                            self.mcd_peak_method_results, method="Local mixed fit", selected_channel=str(channel),
-                            branch=direction, target_energy_ev=float(target_energy), tolerance_ev=0.005,
-                            fixed_k_channel=fixed_k, feature_kind=str(feature_kind), allow_energy_fallback=False,
-                        )
-                        for direction in branch_names
-                    }
-                first_analysis = next(iter(local_analysis.values()), None)
-                fit_window = getattr(first_analysis, "fit_window_ev", None)
-                window_low = fit_window[0] if fit_window else None
-                window_high = fit_window[1] if fit_window else None
-                background_model = str(self.mcd_peak_background_combo.currentText()).replace(" background", "").casefold()
-                model_name = getattr(first_analysis, "model_name", None)
-                for local_channel, analysis in local_analysis.items():
-                    for track in analysis.tracks:
-                        for point in track.points:
-                            split = splits.get(str(point.branch))
-                            split_point = next((item for item in split.points if abs(float(item.field_t) - float(point.field_t)) <= 1e-12), None) if split is not None else None
-                            writer.writerow([
-                                track.peak_id, track.feature_kind, point.field_t, point.branch,
-                                point.energy_ev, point.delta_energy_ev, point.status,
-                                track.reference_method, track.reference_field_t,
-                                self.mcd_peak_k_combo.currentData(), self.mcd_peak_kp_combo.currentData(),
-                                None, None, None, None,
-                                None if split_point is None else split_point.splitting_ev,
-                                None, None, None, None, None,
-                                local_channel, self.mcd_peak_source_combo.currentText(), window_low,
-                                window_high, background_model, track.locator_energy_ev,
-                                track.model_name or model_name,
-                                None if split is None else split.status,
-                            ])
-                self.mcd_peak_status.setText(f"Exported {path}")
+    @staticmethod
+    def _mcd_peak_same_source(left: dict, right: dict) -> bool:
+        return str(left.get("path", "")).casefold() == str(right.get("path", "")).casefold()
+
+    def _queue_mcd_peak_export(self) -> None:
+        if getattr(self, "_mcd_peak_export_worker", None) is not None:
+            self.mcd_peak_status.setText("Export already running; wait for it to finish.")
+            return
+        result = self.mcd_peak_result
+        if result is None:
+            return
+        tracker_method = self.mcd_peak_tracker_method_combo.currentText()
+        selected = self.mcd_peak_selector_combo.currentData()
+        local_analysis = self.mcd_peak_method_results.get("Local mixed fit", {})
+        if tracker_method == "Local mixed fit":
+            if selected is None or len(selected) != 4:
+                self.mcd_peak_status.setText("Local fit export needs a selected resonance.")
                 return
-            visible_result = replace(self.mcd_peak_result, tracks=tuple(track for track in self.mcd_peak_result.tracks if track.quality != BOUNDARY_UNRELIABLE))
-            selected_ids = (self.mcd_peak_k_combo.currentData(), self.mcd_peak_kp_combo.currentData())
-            valleys = {(round(float(value["B_T"]), 9), str(value["branch"])): value for value in valley_quantities(visible_result, selected_ids)} if all(value is not None for value in selected_ids) else {}
-            for track in self.mcd_peak_result.tracks:
-                if track.quality == BOUNDARY_UNRELIABLE:
-                    continue
-                for point in track.points:
-                    valley = valleys.get((round(point.field_t, 9), point.branch), {}) if track.feature_kind == "peak" else {}
-                    writer.writerow([
-                        track.peak_id, track.feature_kind, point.field_t, point.branch, point.energy_ev,
-                        point.delta_energy_ev, point.status, track.reference_method,
-                        track.reference_field_t, self.mcd_peak_k_combo.currentData(),
-                        self.mcd_peak_kp_combo.currentData(), valley.get("E_K"),
-                        valley.get("E_Kp"), valley.get("delta_E_K"),
-                        valley.get("delta_E_Kp"), valley.get("splitting_E_Kp_minus_E_K"),
-                        valley.get("average_E"), valley.get("odd_average_E"),
-                        valley.get("even_average_E"), valley.get("odd_splitting"),
-                        valley.get("even_splitting"), "", "", "", "", "", "", "", "",
-                    ])
-        self.mcd_peak_status.setText(f"Exported {path}")
+            channel, peak_id, branch, feature_kind = selected
+            selected_analysis = local_analysis.get(str(channel))
+            local_track = next(
+                (track for track in selected_analysis.tracks
+                 if track.peak_id == int(peak_id)
+                 and track.branch == str(branch)
+                 and track.feature_kind == str(feature_kind)),
+                None,
+            ) if selected_analysis is not None else None
+            if local_track is None or local_track.reference_energy_ev is None:
+                self.mcd_peak_status.setText("Local fit export needs a fitted E0 reference.")
+                return
+        source = self._mcd_peak_source_descriptor()
+        if not source.get("name"):
+            self.mcd_peak_status.setText("Export needs a selected MCD source.")
+            return
+        snapshot = {
+            "result": copy.deepcopy(result),
+            "method_results": copy.deepcopy(self.mcd_peak_method_results),
+            "source_branch_labels": tuple(
+                str(value) for value in np.asarray(
+                    getattr(getattr(self, "loaded", None), "mcd_result", result).pair_labels,
+                    str,
+                ).tolist()
+            ),
+            "tracker_method": str(tracker_method),
+            "selected": tuple(selected) if selected is not None else None,
+            "selected_k": self.mcd_peak_k_combo.currentData(),
+            "selected_kp": self.mcd_peak_kp_combo.currentData(),
+            "spectrum_source": self.mcd_peak_source_combo.currentText(),
+            "background_model": str(self.mcd_peak_background_combo.currentText()).replace(" background", "").casefold(),
+            "experiment_folder": self._mcd_peak_analysis_source_folder,
+            "source_descriptor": source,
+            "history_settings": {
+                "tracker_method": str(tracker_method),
+                "spectrum_source": self.mcd_peak_source_combo.currentText(),
+                "background_model": self.mcd_peak_background_combo.currentText(),
+            },
+        }
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export MCD peak shifts", "mcd_peak_shift.csv", "CSV files (*.csv)"
+        )
+        if not path:
+            return
+        worker = Worker(mcd_peak_shift_export_worker, snapshot, str(path))
+        self._mcd_peak_export_worker = worker
+        self.mcd_peak_export_btn.setEnabled(False)
+        self.mcd_peak_status.setText(f"Exporting Peak Shift CSV: {Path(path).name}…")
+        worker.signals.result.connect(
+            lambda payload, w=worker, s=snapshot: self._on_mcd_peak_export_done(w, s, payload)
+        )
+        worker.signals.error.connect(
+            lambda message, w=worker: self._on_mcd_peak_export_error(w, message)
+        )
+        worker.signals.finished.connect(
+            lambda w=worker: self._on_mcd_peak_export_finished(w)
+        )
+        pool = getattr(self, "thread_pool", None)
+        if pool is None:
+            pool = getattr(self, "_thread_pool", None)
+        if pool is None:
+            self._on_mcd_peak_export_error(worker, "No worker pool is available.")
+            self._on_mcd_peak_export_finished(worker)
+            return
+        pool.start(worker)
+
+    def _on_mcd_peak_export_done(self, worker, snapshot: dict, payload: dict) -> None:
+        if worker is not getattr(self, "_mcd_peak_export_worker", None):
+            return
+        # The export belongs to the analysis-time source.  Invalidate that
+        # cache entry even when the user is currently viewing another source;
+        # returning to it must observe the newly written history.
+        source_key = str(snapshot.get("source_descriptor", {}).get("path", "")).casefold()
+        self._mcd_peak_history_cache.pop(source_key, None)
+        current = self._mcd_peak_source_descriptor()
+        if not getattr(self, "_is_closing", False):
+            if self._mcd_peak_same_source(current, snapshot.get("source_descriptor", {})):
+                self._refresh_mcd_peak_export_history()
+                self.mcd_peak_status.setText(f"Exported {payload.get('csv_path', '')}")
+            else:
+                self.mcd_peak_status.setText(
+                    f"Exported {Path(payload.get('csv_path', '')).name} for the previous MCD source; current source history unchanged."
+                )
+
+    def _on_mcd_peak_export_error(self, worker, message: str) -> None:
+        if worker is not getattr(self, "_mcd_peak_export_worker", None):
+            return
+        if not getattr(self, "_is_closing", False):
+            self.mcd_peak_status.setText(f"Peak Shift export failed: {str(message).splitlines()[0]}")
+
+    def _on_mcd_peak_export_finished(self, worker) -> None:
+        if worker is not getattr(self, "_mcd_peak_export_worker", None):
+            return
+        self._mcd_peak_export_worker = None
+        if not getattr(self, "_is_closing", False):
+            self.mcd_peak_export_btn.setEnabled(self.mcd_peak_result is not None)
+
+    def _export_mcd_peak_shift(self) -> None:
+        self._queue_mcd_peak_export()
 
     def _build_shg_tab(self) -> QWidget:
         tab = QWidget()
@@ -2530,6 +2995,24 @@ class FeatureTabsMixin:
         self.shg_files.setMaximumHeight(120)
         self.shg_files.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.shg_files.setToolTip("Select an SHG sweep CSV to load")
+        source_toolbar = QWidget()
+        source_toolbar_layout = QHBoxLayout(source_toolbar)
+        source_toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        source_toolbar_layout.setSpacing(6)
+        self.shg_source_filter_combo = QComboBox()
+        self.shg_source_filter_combo.setMinimumWidth(150)
+        self._style_combo_popup(self.shg_source_filter_combo)
+        self.shg_refresh_sources_btn = QPushButton("Refresh")
+        self.shg_refresh_sources_btn.setToolTip("Rescan SHG source history and files")
+        source_toolbar_layout.addWidget(QLabel("Status"))
+        source_toolbar_layout.addWidget(self.shg_source_filter_combo, 1)
+        source_toolbar_layout.addWidget(self.shg_refresh_sources_btn)
+        self.shg_source_hint = QLabel(
+            "SHG expects a measured-angle column (for example measured_value or measured angle) "
+            "and numeric wavelength columns. Status filtering uses saved SHG history; All root CSVs remain available."
+        )
+        self.shg_source_hint.setWordWrap(True)
+        self.shg_source_hint.setObjectName("shgSourceHint")
         self.shg_background_combo = QComboBox()
         self.shg_background_combo.setMinimumWidth(124)
         self.shg_background_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -2544,6 +3027,8 @@ class FeatureTabsMixin:
         background_layout.addWidget(QLabel("External background"))
         background_layout.addWidget(self.shg_background_combo, 1)
         data_layout.addWidget(self.shg_files)
+        data_layout.addWidget(source_toolbar)
+        data_layout.addWidget(self.shg_source_hint)
         data_layout.addWidget(background_row)
         data_layout.addWidget(self.shg_summary)
         single_layout.addWidget(self._make_expander("Data", data_box, expanded=True))

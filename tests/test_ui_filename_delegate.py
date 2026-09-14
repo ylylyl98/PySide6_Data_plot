@@ -6,12 +6,13 @@ import unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QRect, Qt
-from PySide6.QtGui import QFontMetrics
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
     QListView,
     QListWidget,
+    QStyle,
     QStyleOptionViewItem,
 )
 
@@ -19,6 +20,47 @@ from ui_qt.main_window import WrappedFilenameDelegate
 
 
 class WrappedFilenameDelegateTests(unittest.TestCase):
+    def test_filename_and_status_rows_fit_the_actual_paint_layout(self) -> None:
+        class CapturingDelegate(WrappedFilenameDelegate):
+            def paint(self, painter, option, index):
+                self.paint_option = QStyleOptionViewItem(option)
+                self.initStyleOption(self.paint_option, index)
+                return super().paint(painter, option, index)
+
+        file_list = QListWidget()
+        file_list.resize(315, 350)
+        file_list.setStyleSheet("QListWidget::item { padding: 3px 4px; }")
+        file_list.setSpacing(3)
+        file_list.setWordWrap(True)
+        file_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        delegate = CapturingDelegate(file_list)
+        file_list.setItemDelegate(delegate)
+        short_layout = delegate._layout_text(
+            delegate._normalize_text("name.csv\nPROCESSED"),
+            QFont("Segoe UI", 12),
+            500,
+        )
+        self.assertEqual(short_layout.lineCount(), 2)
+        file_list.addItem(
+            "YZ365_p5n2_5T_1.67KREF_720nmc_0p08sx10_RotIn100deg_TG-1.087BG=0.csv\n"
+            "PROCESSED 1/1 · 1 file · 2026-09-12 22:43:08"
+        )
+        file_list.item(0).setFont(QFont("Segoe UI", 12))
+        try:
+            file_list.show()
+            for width in (315, 280, 400, 230):
+                file_list.resize(width, 350)
+                self.app.processEvents()
+                file_list.viewport().repaint()
+                option = delegate.paint_option
+                layout = delegate._layout_text(
+                    option.text, option.font, option.rect.width() - 2 * delegate.HORIZONTAL_PADDING
+                )
+                required = layout.boundingRect().height() + 2 * delegate.VERTICAL_PADDING
+                self.assertGreaterEqual(option.rect.height(), required, f"width={width}")
+        finally:
+            file_list.close()
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
@@ -146,6 +188,36 @@ class WrappedFilenameDelegateTests(unittest.TestCase):
                 self.assertGreaterEqual(row_height, text_height)
         finally:
             view.close()
+
+    def test_selected_status_text_uses_highlighted_palette_color(self) -> None:
+        view = QListWidget()
+        view.resize(400, 100)
+        view.setItemDelegate(WrappedFilenameDelegate(view))
+        view.addItem("✓ PROCESSED · sample measurement")
+        view.setCurrentRow(0)
+        view.show()
+        self.app.processEvents()
+        item = view.item(0)
+        option = QStyleOptionViewItem()
+        option.initFrom(view)
+        option.rect = view.visualItemRect(item)
+        option.state |= QStyle.State_Selected
+        selected_text = QColor("#ff00aa")
+        selection = QColor("#101010")
+        option.palette.setColor(QPalette.HighlightedText, selected_text)
+        option.palette.setColor(QPalette.Highlight, selection)
+        image = QImage(option.rect.size(), QImage.Format_ARGB32)
+        image.fill(selection)
+        painter = QPainter(image)
+        view.itemDelegate().paint(painter, option, view.model().index(0, 0))
+        painter.end()
+        painted = sum(
+            image.pixelColor(x, y) == selected_text
+            for x in range(image.width())
+            for y in range(image.height())
+        )
+        self.assertGreater(painted, 0)
+        view.close()
 
 
 if __name__ == "__main__":

@@ -323,7 +323,7 @@ class ExportMetadataTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp, patch(
             "core.export._save_heatmap_png", side_effect=render
-        ):
+        ) as render_png:
             source = Path(tmp) / "sample.csv"
             source.write_text("raw", encoding="utf-8")
             cube = DataCube(
@@ -350,8 +350,10 @@ class ExportMetadataTests(unittest.TestCase):
 
             second = export_drr_png_and_dat(tmp, **kwargs)
 
-            self.assertEqual(second.save_status, "reused")
+            self.assertEqual(second.save_status, "updated")
             self.assertEqual(second["dat"], first["dat"])
+            self.assertEqual(second["png"], first["png"])
+            self.assertEqual(render_png.call_count, 2)
 
     def test_changed_drr_processing_creates_a_distinct_result(self) -> None:
         def render(path, *_args, **_kwargs):

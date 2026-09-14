@@ -1,6 +1,6 @@
 """Catalog, filter, and export previously processed MCD(B) analyses.
 
-The saved MCD(B) CSV intentionally stores increasing and decreasing field
+The saved MCD(B) workbook (or legacy CSV) stores increasing and decreasing field
 branches in separate column blocks.  This module preserves that distinction
 when results are collected across experiments; repeated field values from the
 return sweep are never merged with the outward sweep.
@@ -8,7 +8,7 @@ return sweep are never merged with the outward sweep.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from contextlib import contextmanager
 from functools import lru_cache
@@ -18,6 +18,7 @@ import csv
 from pathlib import Path
 import re
 import sqlite3
+from zipfile import BadZipFile
 from typing import Iterable, Literal, Sequence
 
 class _LazyNumpy:
@@ -47,6 +48,11 @@ pd = _LazyPandas()
 
 McdBranch = Literal["B increasing", "B decreasing"]
 BRANCHES: tuple[McdBranch, ...] = ("B increasing", "B decreasing")
+SLOPE_METRICS = {
+    "near_zero": "Near zero",
+    "low_minus_negative": "Near zero - Negative high field",
+    "low_minus_positive": "Near zero - Positive high field",
+}
 
 
 @dataclass(frozen=True)
@@ -67,6 +73,8 @@ class ProcessedMcdRecord:
     decreasing_slope_per_t: float | None
     temperature_setpoint_k: float | None = None
     temperature_measured_k: float | None = None
+    workbook_columns: dict[str, str] | None = None
+    high_field_slopes: dict[str, dict[str, float]] = field(default_factory=dict)
 
     def condition_value(self, label: str) -> float | None:
         bounds = self.acquisition_conditions.get(label)
@@ -76,12 +84,19 @@ class ProcessedMcdRecord:
         finite = values[np.isfinite(values)]
         return float(np.mean(finite)) if finite.size else None
 
-    def slope(self, branch: McdBranch) -> float | None:
-        return (
+    def slope(self, branch: McdBranch, metric: str = "near_zero") -> float | None:
+        if metric not in SLOPE_METRICS:
+            raise ValueError(f"Unknown slope metric: {metric}")
+        low = (
             self.increasing_slope_per_t
             if branch == "B increasing"
             else self.decreasing_slope_per_t
         )
+        if metric == "near_zero":
+            return low
+        region = "high_negative" if metric == "low_minus_negative" else "high_positive"
+        high = self.high_field_slopes.get(region, {}).get(branch)
+        return low - high if low is not None and high is not None else None
 
 
 @dataclass(frozen=True)
@@ -113,9 +128,9 @@ class McdSeries:
     fixed_conditions: dict[str, float | None]
 
 
-_CATALOG_SCHEMA_VERSION = 4
+_CATALOG_SCHEMA_VERSION = 8
 _CATALOG_NAME = ".mcd_extract_catalog.json"
-_SQLITE_CATALOG_SCHEMA_VERSION = 4
+_SQLITE_CATALOG_SCHEMA_VERSION = 8
 _SQLITE_CATALOG_NAME = ".mcd_catalog.sqlite3"
 _SERIES_VARIABLES = ("E-field", "Temperature", "Doping", "Vtg", "Vbg", "Vbias", "Energy")
 MCD_DEFAULT_TEMPERATURE_K = 1.67
@@ -264,6 +279,11 @@ def _processed_mcd_root(root: str | Path) -> Path:
 
 
 def _trace_path_from_payload(settings_path: Path, payload: dict) -> Path | None:
+    workbook = payload.get("trace_workbook")
+    if isinstance(workbook, dict) and workbook.get("sheet") == "MCD":
+        candidate = settings_path.parent / Path(str(workbook.get("filename", ""))).name
+        if candidate.suffix.casefold() == ".xlsx" and candidate.is_file():
+            return candidate
     outputs = payload.get("outputs", [])
     if isinstance(outputs, list):
         for output in outputs:
@@ -322,6 +342,16 @@ def _has_complete_mcd_branches(path_text: str, modified_ns: int, size: int) -> b
 
 
 def mcd_record_has_complete_branches(record: ProcessedMcdRecord) -> bool:
+    if record.trace_path.suffix.casefold() == ".xlsx":
+        try:
+            table = load_branch_traces(record)
+            return all(
+                np.any(np.isfinite(pd.to_numeric(
+                    table.loc[table["branch"] == branch, "corrected_signed_mean"], errors="coerce"
+                ))) for branch in BRANCHES
+            )
+        except (OSError, ValueError, KeyError, BadZipFile):
+            return False
     signature = _path_signature(record.trace_path)
     return signature is not None and _has_complete_mcd_branches(
         str(record.trace_path), *signature
@@ -348,6 +378,8 @@ def _record_to_catalog(record: ProcessedMcdRecord, signature: tuple[int, int]) -
         "decreasing_slope_per_t": record.decreasing_slope_per_t,
         "temperature_setpoint_k": record.temperature_setpoint_k,
         "temperature_measured_k": record.temperature_measured_k,
+        "workbook_columns": record.workbook_columns,
+        "high_field_slopes": record.high_field_slopes,
     }
 
 
@@ -390,6 +422,8 @@ def _record_from_catalog(
         decreasing_slope_per_t=_finite_or_none(value.get("decreasing_slope_per_t")),
         temperature_setpoint_k=_finite_or_none(value.get("temperature_setpoint_k")),
         temperature_measured_k=_finite_or_none(value.get("temperature_measured_k")),
+        workbook_columns=value.get("workbook_columns"),
+        high_field_slopes=value.get("high_field_slopes", {}),
     )
 
 
@@ -571,6 +605,13 @@ def _slope_from_csv(path: Path, column: str) -> float | None:
     return float(finite[0]) if finite.size else None
 
 
+@lru_cache(maxsize=256)
+def _cached_acquisition_conditions(path_text: str, modified_ns: int, size: int) -> dict:
+    del modified_ns, size
+    from core.mcd import extract_mcd_acquisition_conditions
+    return extract_mcd_acquisition_conditions(path_text)
+
+
 def _record_from_settings_payload(
     search_root: Path, settings_path: Path, payload: dict[str, object]
 ) -> ProcessedMcdRecord | None:
@@ -586,14 +627,88 @@ def _record_from_settings_payload(
         return None
     increasing = _finite_or_none(mcd_b.get("low_field_mcd_slope_increasing_per_T"))
     decreasing = _finite_or_none(mcd_b.get("low_field_mcd_slope_decreasing_per_T"))
-    if increasing is None:
+    # Unified saves retain fitted values per window instead of copying them
+    # into the legacy mcd_b fields. Never substitute a high-field fit or a
+    # different energy window for the Organizer's signed-mean low-field slope.
+    windows = payload.get("windows", [])
+    windows = [windows] if isinstance(windows, dict) else windows
+    windows = windows if isinstance(windows, list) else []
+    matching_ids = {
+        str(w.get("window_id", "")) for w in windows if isinstance(w, dict)
+        and _finite_or_none(w.get("center_ev")) is not None
+        and _finite_or_none(w.get("width_mev")) is not None
+        and abs(float(w["center_ev"]) - center) <= 1e-9
+        and abs(float(w["width_mev"]) - width) <= 1e-9
+    }
+    slopes = payload.get("slopes", [])
+    if isinstance(slopes, dict):
+        slopes = slopes.get("fits", [])
+    if isinstance(slopes, dict):
+        slopes = list(slopes.values())
+    high_field_slopes = {}
+    for fit in slopes if isinstance(slopes, list) else []:
+        if not isinstance(fit, dict) or fit.get("status", "ok") != "ok":
+            continue
+        region = {"high+": "high_positive", "high-": "high_negative"}.get(fit.get("region"), fit.get("region"))
+        if region not in {"low", "high_positive", "high_negative"}:
+            continue
+        metric = str(fit.get("metric", "mean")).casefold().replace(" ", "_")
+        if metric not in {"mean", "signed_mean", "corrected_signed_mean"}:
+            continue
+        fit_center = _finite_or_none(fit.get("center_ev"))
+        fit_width = _finite_or_none(fit.get("width_mev"))
+        if fit_center is not None and abs(fit_center - center) > 1e-9:
+            continue
+        if fit_width is not None and abs(fit_width - width) > 1e-9:
+            continue
+        if fit.get("window_id"):
+            if str(fit["window_id"]) not in matching_ids:
+                continue
+        elif (fit_center is None or fit_width is None) and len(windows) > 1:
+            continue
+        slope = _finite_or_none(fit.get("slope"))
+        if region != "low":
+            if slope is not None and fit.get("branch") in BRANCHES:
+                high_field_slopes.setdefault(region, {})[fit["branch"]] = slope
+            continue
+        if fit.get("branch") == "B increasing" and increasing is None:
+            increasing = slope
+        if fit.get("branch") == "B decreasing" and decreasing is None:
+            decreasing = slope
+    if increasing is None and trace_path.suffix.casefold() == ".csv":
         increasing = _slope_from_csv(trace_path, "low_field_mcd_slope_increasing_per_T")
-    if decreasing is None:
+    if decreasing is None and trace_path.suffix.casefold() == ".csv":
         decreasing = _slope_from_csv(trace_path, "low_field_mcd_slope_decreasing_per_T")
     fit_window = _finite_or_none(mcd_b.get("fit_window_t"))
     source_file = str(payload.get("source_file", settings_path.parent.name))
     conditions = _condition_mapping(payload.get("acquisition_conditions"))
     condition_sources = {label: "MCD settings JSON" for label in conditions}
+    # Early unified exports omitted acquisition conditions. Recover missing
+    # fields from the exact measurement, retaining saved values when present.
+    if any(key not in conditions for key in ("Doping", "E-field", "Vbias")):
+        experiment = search_root.parent.parent if (
+            search_root.name.casefold() == "mcd" and search_root.parent.name.casefold() == "processed data"
+        ) else search_root
+        descriptor = payload.get("source_descriptor", {})
+        source_path = payload.get("source_path") or (descriptor.get("path") if isinstance(descriptor, dict) else None)
+        candidates = ([Path(str(source_path))] if source_path else []) + [
+            experiment / "mcd" / Path(source_file).name,
+            experiment / Path(source_file).name,
+        ]
+        for candidate in candidates:
+            signature = _path_signature(candidate)
+            if signature is None:
+                continue
+            try:
+                recovered = _cached_acquisition_conditions(str(candidate), *signature)
+            except (OSError, ValueError):
+                continue
+            for label, bounds in recovered.items():
+                if label not in conditions:
+                    conditions[label] = bounds
+                    condition_sources[label] = "measurement CSV"
+            if recovered:
+                break
     measured_temperature = None
     if "T" in conditions:
         bounds = conditions["T"]
@@ -627,6 +742,34 @@ def _record_from_settings_payload(
             )
             condition_sources["T"] = "assumed default: missing temperature metadata"
     resolved_settings = settings_path.resolve()
+    workbook_columns = None
+    if trace_path.suffix.casefold() == ".xlsx":
+        workbook_columns = {}
+        traces = payload.get("trace_workbook", {}).get("traces", [])
+        if not isinstance(traces, list):
+            return None
+        selected_window = None
+        for trace in traces:
+            if not isinstance(trace, dict):
+                continue
+            trace_center = _finite_or_none(trace.get("center_ev"))
+            trace_width = _finite_or_none(trace.get("width_mev"))
+            if trace_center is None or trace_width is None:
+                continue
+            if abs(trace_center - center) > 1e-9 or abs(trace_width - width) > 1e-9:
+                continue
+            window_id = trace.get("window_id")
+            if selected_window is None:
+                selected_window = window_id
+            if window_id != selected_window or trace.get("branch") not in BRANCHES:
+                continue
+            suffix = "increasing" if trace["branch"] == "B increasing" else "decreasing"
+            columns = trace.get("columns")
+            if not isinstance(columns, dict):
+                return None
+            for key, column in columns.items():
+                canonical = f"B_{suffix}_T" if key == "B_T" else f"{key}_{suffix}"
+                workbook_columns[canonical] = str(column)
     return ProcessedMcdRecord(
         record_id=str(resolved_settings).casefold(),
         settings_path=resolved_settings,
@@ -644,6 +787,8 @@ def _record_from_settings_payload(
         decreasing_slope_per_t=decreasing,
         temperature_setpoint_k=filename_temperature,
         temperature_measured_k=measured_temperature,
+        workbook_columns=workbook_columns,
+        high_field_slopes=high_field_slopes,
     )
 
 
@@ -996,6 +1141,8 @@ def organize_mcd_series(
 @lru_cache(maxsize=256)
 def _cached_trace_table(path_text: str, modified_ns: int, size: int) -> pd.DataFrame:
     del modified_ns, size
+    if Path(path_text).suffix.casefold() == ".xlsx":
+        return pd.read_excel(path_text, sheet_name="MCD", engine="openpyxl")
     return pd.read_csv(path_text)
 
 
@@ -1012,6 +1159,12 @@ def load_branch_traces(
     if signature is None:
         raise OSError(f"MCD trace file is unavailable: {record.trace_path}")
     table = _cached_trace_table(str(record.trace_path), *signature)
+    if record.workbook_columns is not None:
+        # Project only the selected window; never combine equal B values from
+        # different windows or sweep branches.
+        table = table[list(record.workbook_columns.values())].rename(
+            columns={column: key for key, column in record.workbook_columns.items()}
+        )
     blocks: list[pd.DataFrame] = []
     for branch in branches:
         suffix = "increasing" if branch == "B increasing" else "decreasing"
@@ -1098,7 +1251,7 @@ ORDER_VARIABLES: dict[str, tuple[str, str, str | None]] = {
 }
 
 PALETTES: tuple[str, ...] = (
-    "viridis", "plasma", "inferno", "magma", "cividis", "turbo", "cubehelix",
+    "tab10", "viridis", "plasma", "inferno", "magma", "cividis", "turbo", "cubehelix",
     "Blues", "BuGn", "BuPu", "GnBu", "Greens", "Greys", "Oranges", "OrRd",
     "PuBu", "PuBuGn", "PuRd", "Purples", "RdPu", "Reds", "YlGn", "YlGnBu",
     "YlOrBr", "YlOrRd", "coolwarm", "Spectral", "RdBu", "RdYlBu", "RdYlGn",
@@ -1186,7 +1339,7 @@ def assign_plot_colors(
     from matplotlib import colormaps
     from matplotlib.colors import Normalize, TwoSlopeNorm, to_hex
 
-    selected_palette = palette if palette in PALETTES else "viridis"
+    selected_palette = palette if palette in PALETTES else "tab10"
     cmap = colormaps[selected_palette]
     values = [record_order_value(record, variable) if variable else None for record in records]
     numeric = np.asarray([
@@ -1386,7 +1539,8 @@ def descriptive_export_base(
 def _unused_export_base(out: Path, requested: str) -> str:
     suffixes = (
         "_Origin.xlsx", "_Summary.xlsx", "_MCD_increasing_vs_B.png", "_MCD_decreasing_vs_B.png",
-        "_Slope_vs_Efield.png", "_Slope_vs_Temperature.png", "_settings.json",
+        "_Slope_All.png", "_Slope_NearZero.png", "_Slope_NearZero_minus_NegativeHigh.png",
+        "_Slope_NearZero_minus_PositiveHigh.png", "_Window_energy_vs_Efield.png", "_Slope_vs_Efield.png", "_Slope_vs_Temperature.png", "_settings.json",
     )
     if not any((out / f"{requested}{suffix}").exists() for suffix in suffixes):
         return requested
@@ -1395,6 +1549,43 @@ def _unused_export_base(out: Path, requested: str) -> str:
         if not any((out / f"{candidate}{suffix}").exists() for suffix in suffixes):
             return candidate
     raise FileExistsError("Could not create an unused MCD extract filename.")
+
+
+def _export_group_mcd_png(path, records, branch, groups, colors, group_name=None):
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.lines import Line2D
+    figure = Figure(figsize=(6,4.5),dpi=300,facecolor='white')
+    FigureCanvasAgg(figure)
+    axis = figure.add_axes([.14,.125,.73,.765])
+    inc = branch == 'B increasing'
+    field_handles = {}
+    for record in sorted(records,key=lambda r:(r.condition_value('E-field') or 0,r.center_ev)):
+        trace = load_branch_traces(record,(branch,))
+        block = trace[trace['branch']==branch]
+        color = colors[record.record_id]
+        axis.plot(block['B_T'],block['corrected_signed_mean'],color=color,
+                  linestyle='-' if inc else '--',linewidth=1.25,
+                  marker='o' if inc else 's',markersize=2.7,
+                  markevery=max(1,len(block)//24),markerfacecolor=color if inc else 'white',
+                  markeredgewidth=.7)
+        field = record.condition_value('E-field')
+        if field is not None:
+            field_handles[field] = Line2D([],[],color=color,linewidth=1.25,label=f'{field:g} V')
+    axis.set_xlabel('B field (T)',fontsize=12)
+    axis.set_ylabel('Corrected signed-mean MCD',fontsize=12)
+    axis.tick_params(labelsize=10);axis.grid(alpha=.18)
+    axis.axhline(0,color='#555',linewidth=.65)
+    if group_name:
+        handles = [field_handles[f] for f in sorted(field_handles)]
+    else:
+        handles = [Line2D([],[],color=colors[next(r.record_id for r in records if groups[r.record_id]==name)],linewidth=1.25,label=name)
+                   for name in sorted({groups[r.record_id] for r in records})]
+    axis.legend(handles=handles,loc='upper left',fontsize=8,ncol=2 if len(handles)>4 else 1,
+                framealpha=.88,borderpad=.35,labelspacing=.25)
+    topic = f"MCD vs B — {'increasing' if inc else 'decreasing'} | {group_name or 'All groups'}"
+    _set_export_heading(figure,axis,topic,records)
+    figure.savefig(path,dpi=300,facecolor='white',bbox_inches=None)
 
 
 def _export_comparison_png(
@@ -1416,7 +1607,7 @@ def _export_comparison_png(
     branch_list = list(branches)
     figure = Figure(figsize=(6.0, 4.5), dpi=300, facecolor="white")
     FigureCanvasAgg(figure)
-    axes = [figure.add_axes([0.15, 0.14, 0.68, 0.76])]
+    axes = [figure.add_axes([0.14, 0.125, 0.73, 0.765])]
     if len(branch_list) > 1:
         axes = [figure.add_axes([0.10, 0.14, 0.36, 0.76]),
                 figure.add_axes([0.50, 0.14, 0.36, 0.76])]
@@ -1471,8 +1662,7 @@ def _export_comparison_png(
                 fixed_bits.append(f"{label} = {finite[0]:g} {unit}")
         branch_name = "increasing" if branch == "B increasing" else "decreasing"
         suffix = f" | {', '.join(fixed_bits)}" if fixed_bits else ""
-        axis.set_title(f"MCD vs B — {branch_name}{suffix}", fontsize=12.5,
-                       fontweight="bold", pad=4)
+        _set_export_heading(figure,axis,f"MCD vs B — {branch_name}",records)
         axis.tick_params(labelsize=10)
         axis.grid(alpha=0.18)
 
@@ -1506,7 +1696,7 @@ def _export_comparison_png(
             norm = Normalize(vmin=low, vmax=high)
         else:
             norm = Normalize(vmin=low - 0.5, vmax=high + 0.5)
-        cax = figure.add_axes([0.842, 0.14, 0.025, 0.76])
+        cax = figure.add_axes([0.882, 0.125, 0.022, 0.765])
         colorbar = figure.colorbar(ScalarMappable(norm=norm, cmap=colormaps[palette]), cax=cax)
         descriptor = ORDER_VARIABLES.get(order_variable, (order_variable, "", None))
         colorbar.set_label(f"{descriptor[0]} ({descriptor[1]})" if descriptor[1] else descriptor[0],
@@ -1519,11 +1709,13 @@ def _export_comparison_png(
             loc="lower right", fontsize=8, framealpha=0.88, borderpad=0.3,
         )
     figure.savefig(path, dpi=figure.dpi, facecolor="white", edgecolor="none",
-                   bbox_inches="tight", pad_inches=0.03)
+                   bbox_inches=None)
 
 
 def compact_slope_table(
-    records: Sequence[ProcessedMcdRecord], comparison_variable: str
+    records: Sequence[ProcessedMcdRecord], comparison_variable: str,
+    slope_metrics: Sequence[str] = ("near_zero",), branches: Sequence[McdBranch] = BRANCHES,
+    energy_groups: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     """One analysis-ready row per condition, with both branch slopes."""
     axis_labels = {
@@ -1538,12 +1730,20 @@ def compact_slope_table(
             record.center_ev if comparison_variable == "Energy"
             else record.condition_value(comparison_variable)
         )
-        rows.append({
+        row = {
             axis_label: axis_value,
-            "Energy (eV)": record.center_ev,
-            "Increasing slope (MCD/T)": record.increasing_slope_per_t,
-            "Decreasing slope (MCD/T)": record.decreasing_slope_per_t,
-        })
+            "Window center (eV)": record.center_ev,
+        }
+        for metric in slope_metrics:
+            for branch in branches:
+                name = "Increasing" if branch == "B increasing" else "Decreasing"
+                label = f"{name} slope (MCD/T)" if metric == "near_zero" else f"{SLOPE_METRICS[metric]} - {name} (MCD/T)"
+                value = record.slope(branch, metric)
+                row[label] = value if value is not None else "N/A"
+        row["Window width (meV)"] = record.width_mev
+        row["Energy subgroup"] = (energy_groups or {}).get(record.record_id, "")
+        row["Record ID"] = record.record_id
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -1564,17 +1764,91 @@ def compact_conditions_table(
             "E-field (V)": record.condition_value("E-field"),
             "Temperature setpoint (K)": record.temperature_setpoint_k or record.condition_value("T"),
             "Temperature measured (K)": record.temperature_measured_k,
-            "Energy (eV)": record.center_ev,
+            "Window center (eV)": record.center_ev,
             "Width (meV)": record.width_mev,
         })
     return pd.DataFrame(rows)
 
 
+def _export_group_caption(records):
+    samples = {re.split(r'[_\s]+', Path(r.source_file).stem)[0] for r in records}
+    bits = [next(iter(samples)) if len(samples)==1 else 'Multiple samples']
+    for label,key,unit in (('D','Doping','V'),('T','T','K')):
+        values = [r.condition_value(key) for r in records]
+        if not values or any(v is None or not np.isfinite(v) for v in values):
+            continue
+        low,high = min(values),max(values)
+        value = f'{low:g}' if np.isclose(low,high,atol=1e-6,rtol=0) else f'{low:g}–{high:g}'
+        bits.append(f'{label}={value} {unit}')
+    return ' · '.join(bits)
+
+
+def _set_export_heading(figure, axis, topic, records):
+    axis.set_title('')
+    axis.set_title('',loc='left')
+    center = axis.get_position().x0 + axis.get_position().width/2
+    figure.text(center,.977,topic,ha='center',va='top',fontsize=12.5,fontweight='bold')
+    figure.text(center,.93,_export_group_caption(records),ha='center',va='top',fontsize=10.5)
+
+
+def _style_energy_slope_export(figure, records, groups, metrics, branches, panel, palette, group_palette):
+    """Match the compact typography and axes used by MCD(B) exports."""
+    from matplotlib.legend import Legend
+    from matplotlib.lines import Line2D
+    from core.mcd_energy_groups import energy_group_colors
+    axis = figure.axes[0]
+    for child in list(axis.get_children()):
+        if isinstance(child, Legend):
+            child.remove()
+    for text in list(axis.texts):
+        if text.get_text().startswith('Within group:'):
+            text.remove()
+    energy = panel == 'energy'
+    titles = {'near_zero':'Near-zero slope vs E-field',
+              'low_minus_negative':'Near-zero − Negative high-field slope vs E-field',
+              'low_minus_positive':'Near-zero − Positive high-field slope vs E-field'}
+    title = 'Window energy vs E-field' if energy else (titles[metrics[0]] if len(metrics)==1 else 'MCD slopes vs E-field')
+    axis.set_xlabel('E-field (V)',fontsize=12)
+    ylabel = 'Window center (eV)' if energy else ('Slope (MCD/T)' if metrics==('near_zero',) or list(metrics)==['near_zero'] else 'Slope difference (MCD/T)' if len(metrics)==1 else 'Slope / difference (MCD/T)')
+    axis.set_ylabel(ylabel,fontsize=12)
+    axis.tick_params(labelsize=10)
+    axis.grid(alpha=.18)
+    colors = energy_group_colors(groups,palette)
+    colors.update(group_palette or {})
+    present = {groups[r.record_id] for r in records}
+    handles = [Line2D([],[],color=colors[name],marker='o',linestyle='none',markersize=4,label=name) for name in sorted(present)]
+    if not energy:
+        handles += [Line2D([],[],color='#555',marker='o' if b=='B increasing' else 's',markerfacecolor='#555' if b=='B increasing' else 'none',linestyle='none',markersize=4,label='Inc' if b=='B increasing' else 'Dec') for b in branches]
+    legend = axis.legend(handles=handles,loc='upper right',fontsize=8.5,ncol=3 if len(handles)>4 else 2,framealpha=.88,borderpad=.35,labelspacing=.25,handlelength=1,columnspacing=.8)
+    if not energy and len(metrics)>1:
+        axis.add_artist(legend)
+        styles = {'near_zero':'-','low_minus_negative':'--','low_minus_positive':':'}
+        axis.legend(handles=[Line2D([],[],color='#555',linestyle=styles[m],label=SLOPE_METRICS[m]) for m in metrics],loc='lower left',fontsize=7.5,framealpha=.88,borderpad=.35)
+    axis.set_position([.14,.125,.73,.765])
+    _set_export_heading(figure,axis,title,records)
+
+
 def _export_slope_png(
-    path: Path, records: Sequence[ProcessedMcdRecord], comparison_variable: str
+    path: Path, records: Sequence[ProcessedMcdRecord], comparison_variable: str,
+    slope_metrics: Sequence[str] = ("near_zero",), branches: Sequence[McdBranch] = BRANCHES,
+    energy_groups: dict[str, str] | None = None, group_tolerance_mev: float = 5., palette: str = 'tab10',
+    energy_group_palette: dict | None = None,
+    manual_record_ids: Sequence[str] = (),
+    energy_record_palette: dict | None = None,
+    panel: str = "slopes",
 ) -> None:
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
+
+    if comparison_variable == 'E-field':
+        from core.mcd_energy_groups import initial_energy_groups, draw_energy_slope_panels
+        figure = Figure(figsize=(6., 4.5), dpi=300, facecolor='white')
+        FigureCanvasAgg(figure)
+        groups = energy_groups or initial_energy_groups(records,group_tolerance_mev)
+        draw_energy_slope_panels(figure,records,groups,slope_metrics,branches,group_tolerance_mev,palette,energy_group_palette,manual_record_ids,energy_record_palette,panel)
+        _style_energy_slope_export(figure, records, groups, slope_metrics, branches, panel, palette, energy_group_palette)
+        figure.savefig(path,dpi=300,facecolor='white',edgecolor='none',bbox_inches=None)
+        return
 
     figure = Figure(figsize=(6.0, 4.5), dpi=300, facecolor="white")
     FigureCanvasAgg(figure)
@@ -1584,24 +1858,26 @@ def _export_slope_png(
         else record.condition_value(comparison_variable)
         for record in records
     ], float)
-    for values, label, linestyle, filled in (
-        ([record.increasing_slope_per_t for record in records], "B increasing", "-", True),
-        ([record.decreasing_slope_per_t for record in records], "B decreasing", "--", False),
-    ):
+    colors = {"near_zero": "#3568a8", "low_minus_negative": "#b45309", "low_minus_positive": "#7c3aed"}
+    for metric, branch in ((m, b) for m in slope_metrics for b in branches):
+        values = [record.slope(branch, metric) for record in records]
+        filled = branch == "B increasing"
+        linestyle = "-" if filled else "--"
+        label = f"{SLOPE_METRICS[metric]} · {'Inc' if filled else 'Dec'}"
         y = np.asarray([np.nan if value is None else value for value in values], float)
         valid = np.isfinite(x) & np.isfinite(y)
         if np.any(valid):
             axis.plot(
                 x[valid], y[valid], linestyle=linestyle, marker="o", linewidth=1.8,
                 markersize=5.5, markeredgewidth=1.0,
-                color="#3568a8", markerfacecolor="#3568a8" if filled else "white",
-                markeredgecolor="#3568a8", label=label,
+                color=colors[metric], markerfacecolor=colors[metric] if filled else "white",
+                markeredgecolor=colors[metric], label=label,
             )
     axis.axhline(0.0, color="#555", linewidth=0.7)
     descriptor = ORDER_VARIABLES.get(comparison_variable, (comparison_variable, "", None))
     x_label = f"{descriptor[0]} ({descriptor[1]})" if descriptor[1] else descriptor[0]
     axis.set_xlabel(x_label, fontsize=12)
-    axis.set_ylabel("Low-field MCD slope (MCD/T)", fontsize=12)
+    axis.set_ylabel("MCD slope / slope difference (MCD/T)", fontsize=12)
 
     fixed_conditions: list[str] = []
     condition_descriptors = (
@@ -1634,7 +1910,7 @@ def _export_slope_png(
     if handles:
         axis.legend(loc="best", fontsize=10, framealpha=0.9, borderpad=0.4)
     figure.savefig(path, dpi=figure.dpi, facecolor="white", edgecolor="none",
-                   bbox_inches="tight", pad_inches=0.03)
+                   bbox_inches=None)
 
 
 def export_mcd_extract(
@@ -1646,9 +1922,15 @@ def export_mcd_extract(
     energy_tolerance_mev: float = 5.0,
     order_by: str = "Auto",
     descending: bool = False,
-    palette: str = "viridis",
+    palette: str = "tab10",
     export_csv: bool = False,
     series_groups: Sequence[McdSeries] | None = None,
+    slope_metrics: Sequence[str] = tuple(SLOPE_METRICS),
+    energy_groups: dict[str, str] | None = None,
+    group_tolerance_mev: float = 5.,
+    energy_group_palette: dict | None = None,
+    manual_record_ids: Sequence[str] = (),
+    energy_record_palette: dict | None = None,
 ) -> dict[str, Path]:
     """Export branch-only Origin data, compact summaries, plots, and settings."""
     from openpyxl import Workbook
@@ -1657,6 +1939,8 @@ def export_mcd_extract(
         raise ValueError("Select at least one processed MCD(B) result to export.")
     if not branches:
         raise ValueError("Select at least one B-sweep branch to export.")
+    if any(metric not in SLOPE_METRICS for metric in slope_metrics):
+        raise ValueError("Unknown slope metric selected.")
     effective_order = (
         series_groups[0].variable
         if order_by == "Auto" and series_groups and len(series_groups) == 1
@@ -1665,8 +1949,11 @@ def export_mcd_extract(
     ordered_records, resolved_order = order_mcd_records(
         records, effective_order, descending=descending
     )
+    from core.mcd_energy_groups import initial_energy_groups
+    resolved_groups = initial_energy_groups(ordered_records, group_tolerance_mev)
+    resolved_groups.update({key: value for key,value in (energy_groups or {}).items() if key in resolved_groups})
     comparison_variable = resolved_order
-    selected_palette = palette if palette in PALETTES else "viridis"
+    selected_palette = palette if palette in PALETTES else "tab10"
     colors = assign_plot_colors(ordered_records, selected_palette, comparison_variable)
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -1677,7 +1964,7 @@ def export_mcd_extract(
     summary_workbook_path = out / f"{base}_Summary.xlsx"
     increasing_png = out / f"{base}_MCD_increasing_vs_B.png"
     decreasing_png = out / f"{base}_MCD_decreasing_vs_B.png"
-    slope_png = out / f"{base}_Slope_vs_{resolved_order.replace('-', '')}.png"
+    slope_png = out / f"{base}_Slope_All.png"
     settings_path = out / f"{base}_settings.json"
 
     origin_workbook = Workbook()
@@ -1695,37 +1982,71 @@ def export_mcd_extract(
 
     summary_workbook = Workbook()
     summary_workbook.remove(summary_workbook.active)
-    _write_dataframe_sheet(
-        summary_workbook, "Slopes", compact_slope_table(ordered_records, comparison_variable)
-    )
+    if slope_metrics:
+        _write_dataframe_sheet(
+            summary_workbook, "Slopes", compact_slope_table(ordered_records, comparison_variable, slope_metrics, BRANCHES, resolved_groups)
+        )
     _write_dataframe_sheet(
         summary_workbook, "Conditions", compact_conditions_table(ordered_records, comparison_variable)
     )
     summary_workbook.properties.title = f"Processed MCD summary ordered by {resolved_order}"
-    summary_workbook.properties.subject = "Low-field slopes and essential condition metadata"
+    summary_workbook.properties.subject = "; ".join(SLOPE_METRICS[m] for m in slope_metrics)
     summary_workbook.save(summary_workbook_path)
-    if "B increasing" in branches:
+    if "B increasing" in branches and comparison_variable != "E-field":
         _export_comparison_png(
             increasing_png, ordered_records, ("B increasing",), colors,
             comparison_variable, selected_palette,
         )
-    if "B decreasing" in branches:
+    if "B decreasing" in branches and comparison_variable != "E-field":
         _export_comparison_png(
             decreasing_png, ordered_records, ("B decreasing",), colors,
             comparison_variable, selected_palette,
         )
-    _export_slope_png(slope_png, ordered_records, comparison_variable)
+    group_plot_paths = {}
+    if comparison_variable == 'E-field':
+        from core.mcd_energy_groups import energy_record_colors, energy_group_colors
+        bases = energy_group_colors(resolved_groups,selected_palette)
+        bases.update(energy_group_palette or {})
+        shared_colors = energy_record_colors(ordered_records,resolved_groups,bases)
+        shared_colors.update(energy_record_palette or {})
+        for branch in branches:
+            tag = 'increasing' if branch == 'B increasing' else 'decreasing'
+            overview = increasing_png if tag == 'increasing' else decreasing_png
+            _export_group_mcd_png(overview,ordered_records,branch,resolved_groups,shared_colors)
+            for index,name in enumerate(sorted(set(resolved_groups.values())),1):
+                members = [r for r in ordered_records if resolved_groups[r.record_id]==name]
+                safe_name = re.sub(r'[^A-Za-z0-9._-]+','_',name).strip('_')
+                path = out / f'{base}_MCD_{tag}_vs_B_{index}_{safe_name}.png'
+                _export_group_mcd_png(path,members,branch,resolved_groups,shared_colors,name)
+                group_plot_paths[f'mcd_group_{index}_{tag}_png'] = path
+    if slope_metrics:
+        _export_slope_png(slope_png, ordered_records, comparison_variable, slope_metrics, BRANCHES, resolved_groups, group_tolerance_mev, selected_palette, energy_group_palette, manual_record_ids, energy_record_palette)
 
     paths: dict[str, Path] = {
         "origin_xlsx": origin_workbook_path,
         "summary_xlsx": summary_workbook_path,
-        "slope_png": slope_png,
         "settings": settings_path,
     }
+    if slope_metrics:
+        paths["slope_png"] = slope_png
+        names = {'near_zero':'NearZero', 'low_minus_negative':'NearZero_minus_NegativeHigh', 'low_minus_positive':'NearZero_minus_PositiveHigh'}
+        for metric in slope_metrics:
+            path = out / f"{base}_Slope_{names[metric]}.png"
+            _export_slope_png(path, ordered_records, comparison_variable, (metric,), BRANCHES,
+                              resolved_groups, group_tolerance_mev, selected_palette,
+                              energy_group_palette, manual_record_ids, energy_record_palette)
+            paths[f"slope_{metric}_png"] = path
+    if comparison_variable == 'E-field':
+        energy_png = out / f"{base}_Window_energy_vs_Efield.png"
+        _export_slope_png(energy_png, ordered_records, comparison_variable, (), BRANCHES,
+                          resolved_groups, group_tolerance_mev, selected_palette,
+                          energy_group_palette, manual_record_ids, energy_record_palette, panel='energy')
+        paths['energy_png'] = energy_png
     if "B increasing" in branches:
         paths["increasing_png"] = increasing_png
     if "B decreasing" in branches:
         paths["decreasing_png"] = decreasing_png
+    paths.update(group_plot_paths)
     if export_csv:
         for branch, table in branch_tables.items():
             key = "increasing_csv" if branch == "B increasing" else "decreasing_csv"
@@ -1734,6 +2055,14 @@ def export_mcd_extract(
             paths[key] = csv_path
     selection = {
         "schema_version": 2,
+        "slope_metrics": list(slope_metrics),
+        "slope_branches": list(BRANCHES),
+        "energy_semantics": "saved integration window center; not fitted peak energy",
+        "energy_groups": resolved_groups,
+        "energy_group_palette": energy_group_palette or {},
+        "manual_record_ids": list(manual_record_ids),
+        "energy_record_palette": energy_record_palette or {},
+        "group_tolerance_mev": float(group_tolerance_mev),
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "branches": list(branches),
         "energy_group_tolerance_mev": float(energy_tolerance_mev),

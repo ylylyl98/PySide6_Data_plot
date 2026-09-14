@@ -284,14 +284,30 @@ class _DiscoverySignals(QObject):
 
 
 class _DiscoveryWorker(QRunnable):
-    def __init__(self, root: str) -> None:
+    def __init__(self, root: str, *, force: bool = True) -> None:
         super().__init__()
         self.root = root
+        self.force = force
         self.signals = _DiscoverySignals()
 
     def run(self) -> None:
         try:
-            records = discover_plot_images(self.root) if self.root else []
+            from core.source_catalog_cache import SourceCatalogCache
+            from core.presentation import PlotImage
+            if not self.root:
+                self.signals.result.emit((self.root, []))
+                return
+            cache = SourceCatalogCache(self.root, "Slides")
+            def restore(rows):
+                return [PlotImage(Path(row['path']), row['relative_path'], row['workflow'], row['modified_time'], row['plot_kind']) for row in rows]
+            cached = cache.read()
+            if cached is not None:
+                self.signals.result.emit((self.root, restore(cached)))
+            def discover():
+                return [dict(path=str(row.path), relative_path=row.relative_path, workflow=row.workflow,
+                             modified_time=row.modified_time, plot_kind=row.plot_kind)
+                        for row in discover_plot_images(self.root)]
+            records = restore(cache.refresh(discover, force=self.force))
             self.signals.result.emit((self.root, records))
         except Exception as exc:
             self.signals.failed.emit(str(exc))
@@ -319,6 +335,10 @@ class PresentationBuilderWidget(QWidget):
         self._discovery_pending_root: str | None = None
         self._discovery_workers: list[_DiscoveryWorker] = []
         self._closing = False
+        self._queue_batch_depth = 0
+        self._queue_membership: set[str] = set()
+        self._plan_cache = None
+        self._plan_cache_key = None
         self._build_ui()
         self._wire_actions()
 
@@ -626,13 +646,13 @@ class PresentationBuilderWidget(QWidget):
         self.up_btn.clicked.connect(lambda: self._move_selected(-1))
         self.down_btn.clicked.connect(lambda: self._move_selected(1))
         self.queue_list.model().rowsMoved.connect(lambda *_args: self._queue_order_changed())
-        self.queue_list.model().rowsInserted.connect(lambda *_args: self._rebuild_plan())
-        self.queue_list.model().rowsRemoved.connect(lambda *_args: self._rebuild_plan())
-        self.images_per_slide_combo.currentIndexChanged.connect(self._rebuild_plan)
-        self.group_by_combo.currentIndexChanged.connect(self._rebuild_plan)
+        self.queue_list.model().rowsInserted.connect(lambda *_args: self._queue_rows_changed())
+        self.queue_list.model().rowsRemoved.connect(lambda *_args: self._queue_rows_changed())
+        self.images_per_slide_combo.currentIndexChanged.connect(self._plan_options_changed)
+        self.group_by_combo.currentIndexChanged.connect(self._plan_options_changed)
         self.caption_combo.currentIndexChanged.connect(self._update_preview)
         self.panel_labels_chk.toggled.connect(self._update_preview)
-        self.title_edit.textChanged.connect(self._rebuild_plan)
+        self.title_edit.textChanged.connect(self._plan_options_changed)
         self.slide_list.currentRowChanged.connect(self._update_preview)
         self.source_edit.editingFinished.connect(self._source_changed)
         self.build_copy_btn.clicked.connect(lambda: self._start_build("copy"))
@@ -669,11 +689,14 @@ class PresentationBuilderWidget(QWidget):
         if not folder:
             return
         root = Path(folder).expanduser().resolve()
+        unchanged = root == self._experiment_folder
         self._experiment_folder = root
         if self._auto_image_root:
             processed = root / "Processed Data"
             self.image_root_edit.setText(str(processed if processed.is_dir() else root))
-            self.refresh_plots()
+            if not unchanged or getattr(self, "_plots_catalog_dirty", False):
+                self._plots_catalog_dirty = False
+                self.refresh_plots(force=False)
 
     def _browse_source(self) -> None:
         start = self.source_edit.text().strip() or str(self._experiment_folder or Path.home())
@@ -705,10 +728,11 @@ class PresentationBuilderWidget(QWidget):
             self.image_root_edit.setText(path)
             self.refresh_plots()
 
-    def refresh_plots(self) -> None:
+    def refresh_plots(self, *, force: bool = True) -> None:
         root_text = self.image_root_edit.text().strip()
         if self._discovery_running:
             self._discovery_pending_root = root_text
+            self._discovery_pending_force = getattr(self, "_discovery_pending_force", False) or force
             self.status_message.emit("Waiting for the current plot scan to finish…")
             return
         self._discovery_running = True
@@ -716,7 +740,7 @@ class PresentationBuilderWidget(QWidget):
         generation = self._discovery_generation
         self._discovery_pending_root = None
         self.status_message.emit("Scanning processed PNG plots…")
-        worker = _DiscoveryWorker(root_text)
+        worker = _DiscoveryWorker(root_text, force=force)
         self._discovery_workers.append(worker)
         worker.signals.result.connect(lambda payload, g=generation: self._on_discovery_result(g, payload))
         worker.signals.failed.connect(lambda message, g=generation: self._on_discovery_failed(g, message))
@@ -752,6 +776,7 @@ class PresentationBuilderWidget(QWidget):
         if self._closing:
             return
         if generation == self._discovery_generation:
+            self._plots_catalog_dirty = True
             self.status_message.emit(f"Plot scan failed: {message.splitlines()[0]}")
 
     def _on_discovery_finished(self, worker: _DiscoveryWorker) -> None:
@@ -764,11 +789,13 @@ class PresentationBuilderWidget(QWidget):
             return
         self._discovery_running = False
         pending = self._discovery_pending_root
+        pending_force = getattr(self, "_discovery_pending_force", False)
+        self._discovery_pending_force = False
         self._discovery_pending_root = None
         if pending is not None and pending != self.image_root_edit.text().strip():
-            self.refresh_plots()
+            self.refresh_plots(force=pending_force)
         elif pending is not None:
-            self.refresh_plots()
+            self.refresh_plots(force=pending_force)
 
     def _schedule_filter(self, _text: str = "") -> None:
         """Coalesce rapid search edits into one list rebuild."""
@@ -902,15 +929,35 @@ class PresentationBuilderWidget(QWidget):
         return [Path(self.queue_list.item(index).data(Qt.UserRole)) for index in range(self.queue_list.count())]
 
     def _append_queue_path(self, path: Path) -> bool:
-        normalized = str(path.resolve())
-        if normalized in {str(item.resolve()) for item in self._queued_paths()}:
-            return False
-        item = QListWidgetItem()
-        item.setData(Qt.UserRole, normalized)
-        item.setToolTip(normalized)
-        self.queue_list.addItem(item)
-        self._refresh_queue_labels()
-        return True
+        return bool(self._append_queue_paths([path]))
+
+    def _append_queue_paths(self, paths) -> int:
+        """Append normalized, unique paths in one queue update transaction."""
+        added = 0
+        outermost = self._queue_batch_depth == 0
+        self._queue_batch_depth += 1
+        try:
+            if not self._queue_membership and self.queue_list.count():
+                self._queue_membership = {
+                    str(path.resolve()) for path in self._queued_paths()
+                }
+            for path in paths:
+                normalized = str(Path(path).expanduser().resolve())
+                if normalized in self._queue_membership:
+                    continue
+                item = QListWidgetItem()
+                item.setData(Qt.UserRole, normalized)
+                item.setToolTip(normalized)
+                self.queue_list.addItem(item)
+                self._queue_membership.add(normalized)
+                added += 1
+        finally:
+            self._queue_batch_depth -= 1
+        if outermost and added:
+            self._refresh_queue_labels()
+            self._invalidate_plan_cache()
+            self._rebuild_plan()
+        return added
 
     def _refresh_queue_labels(self) -> None:
         for index in range(self.queue_list.count()):
@@ -959,14 +1006,15 @@ class PresentationBuilderWidget(QWidget):
         paths = list(self._available_selection_order)
         if not paths:
             paths = [str(item.data(Qt.UserRole)) for item in self.available_list.selectedItems()]
-        added = sum(self._append_queue_path(Path(path)) for path in paths)
+        added = self._append_queue_paths(Path(path) for path in paths)
         if added:
             self.status_message.emit(f"Added {added} plot(s) to the slide queue.")
 
     def _add_all_shown(self) -> None:
-        added = 0
-        for index in range(self.available_list.count()):
-            added += self._append_queue_path(Path(self.available_list.item(index).data(Qt.UserRole)))
+        added = self._append_queue_paths(
+            Path(self.available_list.item(index).data(Qt.UserRole))
+            for index in range(self.available_list.count())
+        )
         if added:
             self.status_message.emit(f"Added {added} plot(s) to the slide queue.")
 
@@ -986,42 +1034,76 @@ class PresentationBuilderWidget(QWidget):
             self.status_message.emit("No matching MCD Combo and MCD(B) plot pair was found.")
             return
         newest = max(complete, key=lambda group: float(group["modified"]))
-        added = 0
-        for kind in ("mcd_combo", "mcd_b"):
-            added += self._append_queue_path(newest[kind].path)
+        added = self._append_queue_paths(newest[kind].path for kind in ("mcd_combo", "mcd_b"))
         self.status_message.emit(
             f"Added {added} plot(s) from the newest MCD pair (Combo first, MCD(B) second)."
             if added else "The newest MCD pair is already in the slide queue."
         )
 
     def _clear_queue(self) -> None:
-        self.queue_list.clear()
+        self._queue_batch_depth += 1
+        try:
+            self.queue_list.clear()
+            self._queue_membership.clear()
+        finally:
+            self._queue_batch_depth -= 1
         self._update_mcd_folder_status()
+        self._invalidate_plan_cache()
         self._rebuild_plan()
 
     def _queue_order_changed(self) -> None:
+        if self._queue_batch_depth:
+            return
         self._refresh_queue_labels()
+        self._invalidate_plan_cache()
+        self._rebuild_plan()
+
+    def _queue_rows_changed(self) -> None:
+        if self._queue_batch_depth:
+            return
+        self._queue_membership = {str(path.resolve()) for path in self._queued_paths()}
+        self._refresh_queue_labels()
+        self._invalidate_plan_cache()
+        self._rebuild_plan()
+
+    def _invalidate_plan_cache(self) -> None:
+        self._plan_cache = None
+        self._plan_cache_key = None
+
+    def _plan_options_changed(self, *_args) -> None:
+        self._invalidate_plan_cache()
         self._rebuild_plan()
 
     def _remove_selected(self) -> None:
-        for row in sorted({self.queue_list.row(item) for item in self.queue_list.selectedItems()}, reverse=True):
-            self.queue_list.takeItem(row)
+        self._queue_batch_depth += 1
+        try:
+            for row in sorted({self.queue_list.row(item) for item in self.queue_list.selectedItems()}, reverse=True):
+                self.queue_list.takeItem(row)
+        finally:
+            self._queue_batch_depth -= 1
+        self._queue_membership = {str(path.resolve()) for path in self._queued_paths()}
         self._refresh_queue_labels()
+        self._invalidate_plan_cache()
         self._rebuild_plan()
 
     def _move_selected(self, direction: int) -> None:
         rows = sorted({self.queue_list.row(item) for item in self.queue_list.selectedItems()})
         if not rows:
             return
-        rows = rows if direction < 0 else list(reversed(rows))
-        for row in rows:
-            target = row + direction
-            if target < 0 or target >= self.queue_list.count():
-                continue
-            item = self.queue_list.takeItem(row)
-            self.queue_list.insertItem(target, item)
-            item.setSelected(True)
+        self._queue_batch_depth += 1
+        try:
+            rows = rows if direction < 0 else list(reversed(rows))
+            for row in rows:
+                target = row + direction
+                if target < 0 or target >= self.queue_list.count():
+                    continue
+                item = self.queue_list.takeItem(row)
+                self.queue_list.insertItem(target, item)
+                item.setSelected(True)
+        finally:
+            self._queue_batch_depth -= 1
         self._refresh_queue_labels()
+        self._invalidate_plan_cache()
         self._rebuild_plan()
 
     def _slide_groups(self) -> list[list[Path]]:
@@ -1031,12 +1113,22 @@ class PresentationBuilderWidget(QWidget):
         ]
 
     def _planned_slides(self):
-        images = [PresentationImage(path) for path in self._queued_paths()]
-        return plan_presentation_slides(
-            images,
+        key = (
+            tuple(str(path.resolve()) for path in self._queued_paths()),
             self._images_per_slide(),
             str(self.group_by_combo.currentData() or "doping"),
         )
+        if self._plan_cache_key == key and self._plan_cache is not None:
+            return self._plan_cache
+        images = [PresentationImage(path) for path in self._queued_paths()]
+        plans = plan_presentation_slides(
+            images,
+            key[1],
+            key[2],
+        )
+        self._plan_cache_key = key
+        self._plan_cache = plans
+        return plans
 
     def _images_per_slide(self) -> int:
         selected = int(self.images_per_slide_combo.currentData())
@@ -1050,38 +1142,43 @@ class PresentationBuilderWidget(QWidget):
 
     def _rebuild_plan(self) -> None:
         selected = max(0, self.slide_list.currentRow())
-        groups = self._slide_groups()
+        plans = self._planned_slides()
         self.slide_list.blockSignals(True)
         self.slide_list.clear()
-        for index, group in enumerate(groups):
+        for index, plan in enumerate(plans):
+            group = [Path(image.path) for image in plan.images]
             grid = grid_for_count(len(group))
-            title = self._slide_title(index, len(groups))
+            title = planned_slide_title(plan, self.title_edit.text())
             label = f"Slide {index + 1}: {len(group)} plots · {grid.rows} × {grid.columns}"
             if title:
                 label += f" · {title}"
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, [str(path) for path in group])
             self.slide_list.addItem(item)
-        if groups:
-            self.slide_list.setCurrentRow(min(selected, len(groups) - 1))
+        if plans:
+            self.slide_list.setCurrentRow(min(selected, len(plans) - 1))
         self.slide_list.blockSignals(False)
         self.build_summary.setText(
-            f"{len(self._queued_paths())} plots · {len(groups)} new slide(s)"
-            if groups else "No plots queued"
+            f"{len(self._queued_paths())} plots · {len(plans)} new slide(s)"
+            if plans else "No plots queued"
         )
-        self._update_preview()
+        self._update_preview(plans)
 
-    def _update_preview(self) -> None:
-        groups = self._slide_groups()
+    def _update_preview(self, plans=None) -> None:
+        # Qt option/selection signals pass an int or bool.  Only the private
+        # list supplied by _rebuild_plan is a plan snapshot.
+        plans = plans if isinstance(plans, list) else self._planned_slides()
         row = self.slide_list.currentRow()
-        if not groups:
+        if not plans:
             self.preview.set_slide([], "", str(self.caption_combo.currentData()), self.panel_labels_chk.isChecked())
             return
-        if row < 0 or row >= len(groups):
+        if row < 0 or row >= len(plans):
             row = 0
+        plan = plans[row]
+        slide_paths = [Path(image.path) for image in plan.images]
         self.preview.set_slide(
-            groups[row],
-            self._slide_title(row, len(groups)),
+            slide_paths,
+            planned_slide_title(plan, self.title_edit.text()),
             str(self.caption_combo.currentData()),
             self.panel_labels_chk.isChecked(),
         )

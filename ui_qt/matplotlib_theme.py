@@ -86,6 +86,9 @@ def apply_display_theme(figure: Any, theme: MatplotlibDisplayTheme) -> None:
         axis.xaxis.label.set_color(theme.text)
         axis.yaxis.label.set_color(theme.text)
         axis.title.set_color(theme.text)
+        for text in axis.texts:
+            if getattr(text, "_use_theme_text", False):
+                text.set_color(theme.text)
         for text in (*axis.get_xticklabels(), *axis.get_yticklabels()):
             text.set_color(theme.text_secondary)
         for gridline in (*axis.get_xgridlines(), *axis.get_ygridlines()):

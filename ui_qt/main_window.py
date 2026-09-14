@@ -3,7 +3,9 @@ from __future__ import annotations
 import tempfile
 import sys
 import threading
+from dataclasses import replace
 from collections import deque
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
@@ -14,10 +16,10 @@ import matplotlib.patheffects as path_effects
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
-from matplotlib.ticker import PercentFormatter
+from matplotlib.ticker import PercentFormatter, ScalarFormatter
 from matplotlib.transforms import Bbox
 from matplotlib.widgets import SpanSelector
-from PySide6.QtCore import QFileSystemWatcher, QMimeData, QProcess, QSettings, Qt, QRunnable, QThreadPool, QTimer, QUrl, Signal
+from PySide6.QtCore import QFileSystemWatcher, QMimeData, QProcess, QSettings, Qt, QRunnable, QThreadPool, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QColor, QDesktopServices, QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -92,6 +94,7 @@ from core.mcd import (
 )
 from core.export import (
     build_drr_export_base,
+    export_drr_pair_pngs_and_dat,
     create_unique_package_dir,
     export_compare_panels,
     export_drr_png_and_dat,
@@ -102,6 +105,7 @@ from core.export import (
     export_shg_twist_comparison,
 )
 from core.loader import DataCube, resolve_dat_y_axis
+from core.workflow_request import LatestRequest, RequestToken
 from core.provenance import WorkingCopyRecord, cleanup_working_copy, verify_initial_data_working_file
 from core.plotting import (
     COMPARE_PANEL_ORDER,
@@ -138,6 +142,21 @@ from ui_qt.shell.dock_host import DockHost
 from ui_qt.shell.menu_toolbar import MenuToolbarHost
 from ui_qt.shell.workspace import WorkspaceShell
 from ui_qt.shell.workflow_navigation import WorkflowNavigation
+from ui_qt.mcd_unified_page import McdUnifiedView
+from ui_qt.mcd_result_retention import McdRetentionController, RetainedResultError
+
+
+def _plain_retained(value: Any) -> Any:
+    """Convert typed retention snapshots to exporter-safe plain containers."""
+    if hasattr(value, "to_dict") and not isinstance(value, Mapping):
+        return _plain_retained(value.to_dict())
+    if isinstance(value, Mapping):
+        return {str(key): _plain_retained(item) for key, item in value.items()}
+    if isinstance(value, np.ndarray):
+        return np.array(value, copy=True)
+    if isinstance(value, (list, tuple)):
+        return tuple(_plain_retained(item) for item in value)
+    return value
 from ui_qt.common import (
     ExportOptions,
     LoadOptions,
@@ -167,25 +186,117 @@ class _OwnedRunnable(QRunnable):
             self._pool._run_finished(self._runnable)
 
 
+def _run_unified_mcd_export(snapshot: dict, output_root: str, *, progress=None, log=None) -> dict:
+    """Worker adapter adding the shared Worker ``log`` keyword."""
+    from core.mcd_unified_export import export_mcd_analysis
+    result = export_mcd_analysis(snapshot, output_root, progress=progress)
+    if log is not None:
+        log.emit(f"Saved unified MCD results: {result.get('export_id', '')}")
+    return result
+
+
+def _read_mcd_history_worker(folder, source, roots, *, progress=None, log=None):
+    from core.mcd_center_history import read_center_history
+    return read_center_history(folder, source, extra_roots=roots)
+
+
+def _run_unified_mcd_analysis(result: Any, *, detection_mode: str = "raw", progress=None, log=None) -> Any:
+    """Worker adapter for the pure detector.
+
+    ``Worker`` supplies the common ``progress``/``log`` keywords to every
+    callable.  The numerical detector intentionally has no Qt-facing worker
+    arguments, so keep that boundary explicit and reusable in tests.
+    """
+    from core.mcd_analysis import detect_analysis_features
+    analysis = detect_analysis_features(result, detection_mode=str(detection_mode))
+    if log is not None:
+        log.emit(f"Detected {len(analysis.features)} unified MCD features.")
+    return analysis
+
+
+def _run_unified_selected_feature_analysis(
+    result: Any,
+    feature: Any,
+    candidates: tuple[Any, ...],
+    *,
+    method: str,
+    source: str,
+    half_width_ev: float,
+    search_window_ev: tuple[float, float] | None = None,
+    prominence_fraction: float = 0.03,
+    reference_energy_ev: float | None = None,
+    mapping_mode: str = "unknown",
+    k_channel: str | None = None,
+    reference_id: str | None = None,
+    manual_links: tuple[Any, ...] = (),
+    progress=None,
+    log=None,
+) -> dict[str, Any]:
+    """Worker adapter for one selected feature and its supported tracks."""
+    from core.mcd_feature_analysis import analyze_selected_feature, enrich_valley_analysis
+    options = dict(
+        candidates=candidates, method=method, source=source,
+        half_width_ev=half_width_ev, manual_links=manual_links,
+        search_window_ev=search_window_ev, prominence_fraction=prominence_fraction,
+        reference_energy_ev=reference_energy_ev,
+    )
+    try:
+        payload = analyze_selected_feature(result, feature, **options)
+    except TypeError as exc:
+        # Keep compatibility with the first additive helper revision while it
+        # is being upgraded with explicit search/reference controls.
+        if not any(name in str(exc) for name in ("search_window_ev", "prominence_fraction", "reference_energy_ev")):
+            raise
+        options.pop("search_window_ev", None); options.pop("prominence_fraction", None); options.pop("reference_energy_ev", None)
+        payload = analyze_selected_feature(result, feature, **options)
+    # Mapping is an explicit presentation choice.  Enrich the selected result
+    # only after the measured tracks are available so splitting is calculated
+    # from exact shared fields rather than inferred curves.
+    payload = enrich_valley_analysis(
+        payload, mapping_mode=mapping_mode, k_channel=k_channel,
+        reference_id=reference_id,
+    )
+    if log is not None:
+        log.emit(f"Selected feature analysis: {payload.get('status', 'unknown')}.")
+    return payload
+
+
 class _MainWindowThreadPool(QThreadPool):
     """Per-window pool that owns every runnable until execution has returned."""
+
+    _completed = Signal(object)
 
     def __init__(self, owner: "MainWindow") -> None:
         super().__init__(owner)
         self._owner = owner
         self._registry_lock = threading.Lock()
         owner._owned_workers: set[QRunnable] = set()
+        self._completed.connect(self._retire_worker, Qt.QueuedConnection)
 
     def start(self, runnable: QRunnable, priority: int = 0) -> None:
         if getattr(self._owner, "_is_closing", False):
             return
+        if isinstance(runnable, Worker):
+            # These QObjects (and PySide's lambda receivers) belong to the GUI
+            # thread. Keep Qt ownership there even if the runnable's final
+            # Python reference happens to be released by the pool thread.
+            runnable.signals.setParent(self)
         with self._registry_lock:
             self._owner._owned_workers.add(runnable)
         super().start(_OwnedRunnable(self, runnable), priority)
 
     def _run_finished(self, runnable: QRunnable) -> None:
+        # Queue retirement after result/error/finished delivery. Releasing the
+        # worker here drops pending lambda callbacks and deletes their Qt
+        # receivers in the wrong thread.
+        self._completed.emit(runnable)
+
+    @Slot(object)
+    def _retire_worker(self, runnable: QRunnable) -> None:
         with self._registry_lock:
             self._owner._owned_workers.discard(runnable)
+        if isinstance(runnable, Worker):
+            runnable.signals.deleteLater()
 from ui_qt.feature_pages import FeatureTabsMixin
 from ui_qt.dense_form_layout import DenseFormRowLayout
 from ui_qt.controllers_pl import PlController
@@ -203,6 +314,7 @@ from core.shg_fit import (
     fit_shg_angular_result,
     fit_shg_twist_comparison,
 )
+from core.shg_history import scan_shg_history
 from core.mcd_peak_shift import BOUNDARY_UNRELIABLE, analyze_peak_shift, format_mcd_angle, spectrum_energy_order, valley_quantities
 from core.mcd_valley_split import compute_valley_splitting
 from core.mcd_peak_display import second_derivative_map
@@ -215,6 +327,13 @@ class _PlotToolbar(NavigationToolbar2QT):
         controller = getattr(owner, "mcd_controller", None)
         prepare = getattr(controller, "_prepare_mcd_toolbar_save", None)
         restore = getattr(controller, "_restore_mcd_toolbar_save", None)
+        if getattr(owner, "last_plotted_mode", None) == "Compare":
+            controller = getattr(owner, "compare_controller", None)
+            prepare = getattr(controller, "_prepare_cmp_toolbar_save", None)
+            restore = getattr(controller, "_restore_cmp_toolbar_save", None)
+        unified = getattr(owner, "mcd_unified_view", None) if getattr(owner, "last_plotted_mode", None) == "MCD" else None
+        if unified is not None:
+            unified.prepare_full_redraw()
         if callable(prepare):
             prepare()
         try:
@@ -228,28 +347,187 @@ class _PlotToolbar(NavigationToolbar2QT):
         finally:
             if callable(restore):
                 restore()
+            if unified is not None:
+                unified.restore_interactive_drawing()
 
 
 def _scan_drr_catalog_worker(
     folder: str,
     cache: DrrSourceCache,
     *,
+    publish_cached=None,
+    force: bool = False,
+    include_all: bool = False,
+    selected_sources=(),
     progress,
     log,
-) -> tuple[str, List[DrrSource], DrrSourceCache]:
+) -> tuple[str, List[DrrSource], DrrSourceCache, bool, bool]:
     """Discover DRR sources away from the GUI thread."""
-    return folder, discover_drr_sources(folder, cache=cache), cache
+    from core.drr_catalog import load_drr_catalog
+    sources = load_drr_catalog(
+        folder, cache, force=force, include_all=include_all,
+        publish_cached=(lambda sources: publish_cached((folder, sources, cache, True, include_all)))
+        if publish_cached is not None else None,
+    )
+    # Selected files may be absolute paths outside the experiment partition.
+    # Inspect those exact files in the worker and merge only successful
+    # DrrSource records into the catalog result.
+    from core.drr_sources import resolve_source_path
+    known = {str(resolve_source_path(folder, source.source).resolve()).casefold()
+             for source in sources}
+    missing_selected = []
+    if selected_sources:
+        from core.drr_sources import discover_drr_sources
+        for selected in dict.fromkeys(str(value) for value in selected_sources):
+            path = resolve_source_path(folder, selected)
+            if not path.is_file():
+                missing_selected.append(selected)
+                continue
+            try:
+                inspected = discover_drr_sources(path.parent, include_all=True, include_history=False)
+            except (OSError, ValueError, TypeError):
+                inspected = []
+            identity = str(path.resolve()).casefold()
+            if identity in known:
+                continue
+            for source in inspected:
+                inspected_identity = str(resolve_source_path(path.parent, source.source).resolve()).casefold()
+                if inspected_identity == identity and identity not in known:
+                    sources.append(replace(source, source=str(selected), filename=path.name))
+                    known.add(identity)
+                    break
+            else:
+                missing_selected.append(selected)
+    return folder, sources, cache, False, include_all, tuple(missing_selected)
 
 
-def _scan_folder_sources_worker(folder: str, *, progress, log) -> tuple[str, list[str], list[str], list[str], dict[str, str], list[str], dict[str, str]]:
+def _scan_folder_sources_worker(folder: str, *, power_include_legacy: bool = False, mode: str = "all", progress, log) -> tuple:
     """Collect the cross-tab source catalogs without blocking Qt's GUI thread."""
     csv_files = data_io.list_csv_files(folder)
-    map_files = data_io.list_map_input_files(folder)
-    pl_files = data_io.list_pl_source_files(folder)
-    pl_status = data_io.discover_pl_processing_status(folder, pl_files)
-    mcd_files = data_io.list_mcd_csv_files(folder)
-    mcd_status = discover_mcd_processing_status(folder, mcd_files)
-    return folder, csv_files, map_files, pl_files, pl_status, mcd_files, mcd_status
+    map_files = data_io.list_map_input_files(folder) if mode in {"all", "Compare"} else []
+    pl_files = data_io.list_pl_source_files(folder) if mode in {"all", "PL", "Compare"} else []
+    pl_ambiguous: set[str] = set()
+    pl_status = data_io.discover_pl_processing_status(folder, pl_files, ambiguous_sources=pl_ambiguous) if mode in {"all", "PL"} else {}
+    mcd_files = data_io.list_mcd_csv_files(folder) if mode in {"all", "MCD"} else []
+    mcd_ambiguous: set[str] = set()
+    mcd_status = discover_mcd_processing_status(folder, mcd_files, ambiguous_sources=mcd_ambiguous) if mode in {"all", "MCD"} else {}
+    shg_ambiguous: set[str] = set()
+    shg_history = scan_shg_history(folder, csv_files, ambiguous_sources=shg_ambiguous) if mode in {"all", "SHG Processing"} else None
+    shg_mtimes: dict[str, float] = {}
+    for source in (csv_files if shg_history is not None else ()):
+        try:
+            shg_mtimes[source] = (Path(folder) / source).stat().st_mtime
+        except OSError:
+            shg_mtimes[source] = 0.0
+    # Publish source mtimes with the worker snapshot so picker sorting never
+    # needs to touch the filesystem from the GUI thread.
+    mtime_by_source: dict[str, float] = {}
+    def _snapshot_mtime(source: str) -> float:
+        if source in mtime_by_source:
+            return mtime_by_source[source]
+        try:
+            value = resolve_source_path(folder, source).stat().st_mtime
+        except OSError:
+            value = 0.0
+        mtime_by_source[source] = float(value)
+        return float(value)
+    pl_mtimes = {source: _snapshot_mtime(source) for source in pl_files}
+    mcd_mtimes = {source: _snapshot_mtime(source) for source in mcd_files}
+    compare_mtimes = {source: _snapshot_mtime(source) for source in map_files}
+    # Power discovery reads headers and, for table sources, the Power_uW
+    # column. Keep that work in this catalog worker so GUI group refreshes are
+    # a pure application of an accepted snapshot.
+    from core.power_workflow import discover_power_files, is_combined, processed_source_names
+    power_files = discover_power_files(folder, include_legacy=bool(power_include_legacy)) if mode in {"all", "Power Dependent"} else []
+    power_signatures = []
+    for name in power_files:
+        try:
+            stat = (Path(folder) / name).stat()
+            power_signatures.append((str(name), int(stat.st_size), int(stat.st_mtime_ns)))
+        except OSError:
+            power_signatures.append((str(name), None, None))
+    power_sources = data_io.get_power_series_sources(folder, power_files) if mode in {"all", "Power Dependent"} else {}
+    power_combined = {
+        str(source.file_name).replace("\\", "/").casefold()
+        for source in power_sources.values()
+        if source.file_name and is_combined(folder, source.file_name)
+    }
+    power_snapshot = {
+        "tag": "power_catalog",
+        "version": 1,
+        "folder": str(folder),
+        "include_legacy": bool(power_include_legacy),
+        "candidates": tuple(power_files),
+        "signatures": tuple(power_signatures),
+        "sources": power_sources,
+        "processed_names": tuple(sorted(processed_source_names(folder))) if mode in {"all", "Power Dependent"} else (),
+        "combined_names": tuple(sorted(power_combined)),
+    }
+    try:
+        from core.power_selection_store import load_power_selections
+        power_snapshot["saved_assignments"] = load_power_selections(folder, power_sources)
+    except (ImportError, OSError, ValueError, TypeError):
+        power_snapshot["saved_assignments"] = {}
+    history = []
+    if mode in {"all", "Compare"}:
+        import json
+        for path in (Path(folder) / "Processed Data" / "Compare").rglob("*.metadata.json"):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(record, dict):
+                    history.append(dict(record, path=str(path)))
+            except (OSError, ValueError, UnicodeError):
+                continue
+    return (
+        folder, csv_files, map_files, pl_files, pl_status, mcd_files, mcd_status,
+        pl_ambiguous, mcd_ambiguous, dict(shg_history.processed_at) if shg_history else {},
+        shg_ambiguous, shg_mtimes,
+        dict(shg_history.roles) if shg_history else {},
+        {"tag": "source_metadata", "version": 1, "folder": str(folder),
+         "mode": mode, "generation": 0,
+         "modes": tuple(name for name in ("PL", "MCD", "Compare", "SHG", "Power", "DRR")
+                        if mode == "all" or mode == name
+                        or (name == "SHG" and mode == "SHG Processing")
+                        or (name == "Power" and mode == "Power Dependent")),
+         "pl_mtimes": pl_mtimes, "mcd_mtimes": mcd_mtimes,
+         "shg_mtimes": shg_mtimes,
+         "compare_mtimes": compare_mtimes},
+        power_snapshot,
+        {"tag": "catalog_scope", "mode": mode, "compare_history": history},
+    )
+
+
+def _catalog_payload_compatible(payload, folder: str, mode: str) -> bool:
+    """Validate scoped metadata before publishing an on-disk preview."""
+    if not isinstance(payload, tuple):
+        return False
+    metadata = next((item for item in payload
+                     if isinstance(item, dict) and item.get("tag") == "source_metadata"), None)
+    scope = next((item for item in payload
+                  if isinstance(item, dict) and item.get("tag") == "catalog_scope"), None)
+    if not isinstance(metadata, dict) or metadata.get("version") != 1:
+        return False
+    if str(metadata.get("folder", "")).casefold() != str(folder).casefold():
+        return False
+    requested = str(mode)
+    modes = {str(value) for value in metadata.get("modes", ())}
+    covered = requested in modes or (requested == "SHG Processing" and "SHG" in modes) \
+        or (requested == "Power Dependent" and "Power" in modes) \
+        or (requested == "all" and {"PL", "MCD", "Compare"}.issubset(modes))
+    return covered and isinstance(scope, dict) and str(scope.get("mode", "")) == requested
+
+
+def _cached_folder_sources_worker(folder: str, *, mode: str, power_include_legacy: bool,
+                                  force: bool, publish_cached, progress, log) -> tuple:
+    from core.source_catalog_cache import SourceCatalogCache
+    cache = SourceCatalogCache(folder, f"{mode}-{int(power_include_legacy)}")
+    cached = cache.read()
+    cache_usable = cached is not None and _catalog_payload_compatible(cached, folder, mode)
+    if cache_usable:
+        publish_cached(tuple(cached[:-1]) + (dict(cached[-1], preview=True),))
+    return cache.refresh(lambda: _scan_folder_sources_worker(
+        folder, mode=mode, power_include_legacy=power_include_legacy, progress=progress, log=log),
+        force=force or not cache_usable)
 
 
 
@@ -264,6 +542,9 @@ def _enumerate_watch_dirs_worker(root: str, *, progress, log) -> tuple[str, list
 
 
 class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
+    file_catalog_refresh_finished = Signal(str, bool)
+    drr_catalog_refresh_finished = Signal(str, bool)
+    drr_catalog_preview_ready = Signal(str)
     SETTINGS_ORG = "DPTK"
     SETTINGS_APP = "PySide6_Data_Plot"
     SETTINGS_LAST_DATA_FOLDER = "data/last_folder"
@@ -290,7 +571,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         ).casefold()
         self._mcd_source_filter_preference = (
             saved_mcd_filter
-            if saved_mcd_filter in {"all", "unprocessed", "processed"}
+            if saved_mcd_filter in {"all", "unprocessed", "processed", "unknown"}
             else "all"
         )
         saved_pl_filter = str(
@@ -298,7 +579,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         ).casefold()
         self._pl_source_filter_preference = (
             saved_pl_filter
-            if saved_pl_filter in {"all", "unprocessed", "processed"}
+            if saved_pl_filter in {"all", "unprocessed", "processed", "unknown"}
             else "all"
         )
         self._pending_update: CheckResult | None = None
@@ -312,6 +593,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.folder_watcher.directoryChanged.connect(self._on_watched_folder_changed)
         self.folder_refresh_timer.timeout.connect(self._refresh_watched_folder)
         self._file_refresh_generation = 0
+        self._catalog_ready_modes: set[str] = set()
+        self._catalog_displayed_modes: set[str] = set()
+        self._catalog_active_scan: str | None = None
+        self._catalog_pending_requests: dict[str, bool] = {}
         self._file_refresh_running = False
         self._file_refresh_pending = False
         self._file_refresh_pending_auto = False
@@ -324,16 +609,24 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.available_map_files: List[str] = []
         self.pl_available_files: List[str] = []
         self._pl_source_mtime_cache: dict[str, float] = {}
+        self._mcd_source_mtime_cache: dict[str, float] = {}
         self.pl_processed_status: dict[str, str] = {}
+        self.pl_processing_ambiguous: set[str] = set()
         self.mcd_available_files: List[str] = []
         self.mcd_processed_status: dict[str, str] = {}
+        self.mcd_processing_ambiguous: set[str] = set()
+        self.shg_processed_status: dict[str, str] = {}
+        self.shg_processing_ambiguous: set[str] = set()
+        self.shg_processing_roles: dict[str, tuple[str, ...]] = {}
+        self._shg_source_mtime_cache: dict[str, float] = {}
         self.drr_available_sources: List[DrrSource] = []
-        self._drr_source_cache = DrrSourceCache()
+        self._drr_source_cache = DrrSourceCache(load_on_init=False)
         self._drr_refresh_generation = 0
         self._drr_refresh_running = False
         self._drr_refresh_pending = False
         self._drr_refresh_pending_auto = False
         self._drr_refresh_pending_old_sources: set[str] | None = None
+        self._drr_refresh_pending_selected_sources: set[str] | None = None
         self._drr_refresh_workers: list[Worker] = []
         self._drr_derivative_cache: dict[tuple[int, int | None, int, int], tuple[DataCube, int]] = {}
         self.drr_selected_files: List[str] = []
@@ -352,6 +645,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._pl_auto_next_queue: list[str] = []
         self._pl_auto_next_active = False
         self.log_lines: deque[str] = deque(maxlen=300)
+        # Opt-in interaction instrumentation; disabled for normal use.
+        self._workflow_metrics_enabled = False
+        self._workflow_metrics: deque[dict[str, Any]] = deque(maxlen=2000)
         self._last_plot_params_key: tuple[Any, ...] | None = None
         self._last_plot_cube: DataCube | None = None
         # Plot controls can emit several valueChanged signals during one user
@@ -364,12 +660,24 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._sidebar_last_expanded_width = UI_METRICS["left_width"]
         self._drr_heatmap_ax = None
         self._drr_spectrum_ax = None
+        self._drr_heatmap_axes: dict[str, Any] = {}
+        self._drr_spectrum_axes: dict[str, Any] = {}
+        self._drr_plot_cubes: dict[str, DataCube] = {}
+        self._drr_gate_lines: dict[str, Any] = {}
+        self._drr_plot_view = "raw"
+        self._drr_side_by_side = False
+        self._drr_view_limits: tuple[tuple[float, float], tuple[float, float]] | None = None
+        self._drr_limits_from_controls = False
         self._pl_heatmap_ax = None
         self._pl_spectrum_ax = None
         self._cmp_heatmap_axes: dict[str, Any] = {}
         self._cmp_gate_lines: dict[str, Any] = {}
         self._cmp_linecut_ax = None
         self._cmp_active_cubes: dict[str, DataCube] = {}
+        self._cmp_rendered_loaded_marker = None
+        self._cmp_blit_enabled = False
+        self._cmp_blit_bbox = None
+        self._cmp_blit_background = None
         self._power_heatmap_ax = None
         self._power_heatmap_axes: dict[str, Any] = {}
         self._power_spectrum_ax = None
@@ -382,6 +690,18 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._power_selected_row_index: int | None = None
         self._power_sources_cache: Dict[str, data_io.PowerSeriesSource] | None = None
         self._power_sources_cache_files: tuple[str, ...] = ()
+        self._power_catalog_folder = ""
+        self._power_catalog_include_legacy = False
+        self._power_catalog_candidates: tuple[str, ...] = ()
+        self._power_catalog_signatures: tuple = ()
+        self._power_catalog_processed_names: set[str] = set()
+        self._power_catalog_combined_names: set[str] = set()
+        self._power_catalog_pending = False
+        self._power_pending_open_name = ""
+        self._power_pending_open_generation = None
+        self._power_pending_measurement_selection = None
+        self._power_pending_measurement_validation = {}
+        self._power_pending_measurement_generation = None
         self._power_result_cache: dict[str, data_io.PowerSeriesResult] = {}
         self._shg_raw_ax = None
         self._shg_corrected_ax = None
@@ -460,8 +780,41 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._last_export_request_key = ""
         self._active_load_mode: str | None = None
         self._active_load_succeeded = False
+        self._load_requests: dict[str, LatestRequest[LoadOptions]] = {}
+        self._active_load_token: RequestToken | None = None
+        self._last_draw_identity: dict[str, tuple[str, ...]] = {}
+        self._shown_draw_mode: str | None = None
+        self._shown_draw_identity: tuple[str, ...] = ()
+        self._shown_selection_identity: tuple[str, ...] = ()
+        self._data_state_error: str | None = None
+        self._data_state_loading = False
+        self._pending_load_mode: str | None = None
+        self._pending_load_options: LoadOptions | None = None
+        self._capture_pending_load = False
+        self._invalidated_load_modes: set[str] = set()
+        self._pending_range_refresh: dict[str, bool] = {}
+        self._load_lifecycle_generation = 0
         self._mcd_source_generation = 0
         self._mcd_reload_pending = False
+        self._mcd_unified_analysis_generation = 0
+        self._mcd_unified_analysis_worker = None
+        self._mcd_unified_analysis_pending = False
+        self._mcd_unified_catalog_requested_key = None
+        self._mcd_unified_catalog_completed_key = None
+        self._mcd_unified_detector_settings_version = 1
+        self._mcd_unified_detection_mode = "raw"
+        self._mcd_unified_analysis_source = None
+        self._mcd_unified_features: tuple[Any, ...] = ()
+        self._mcd_unified_track_generation = 0
+        self._mcd_unified_track_worker = None
+        self._mcd_unified_track_pending = None
+        self._mcd_unified_track_key = None
+        self._mcd_unified_track_payload: dict[str, Any] | None = None
+        self._mcd_unified_track_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
+        self._mcd_unified_manual_links: dict[str, list[str]] = {}
+        self._mcd_unified_export_worker = None
+        self._mcd_export_output_root: str | None = None
+        self.mcd_retention = McdRetentionController(parent=self)
         self.mcd_controller = McdController(self)
         self.pl_controller = PlController(self)
         self.drr_controller = DrrController(self)
@@ -493,6 +846,15 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.folder_refresh_timer.stop()
         self.shg_controller._stop_shg_reprocessing()
         self.mcd_controller._shutdown_mcd_lifecycle()
+        peak_cancel = getattr(self, "_mcd_peak_analysis_cancel_event", None)
+        if peak_cancel is not None:
+            peak_cancel.set()
+        if hasattr(self, "_mcd_peak_analysis_generation"):
+            self._mcd_peak_analysis_generation += 1
+            self._mcd_peak_analysis_pending_request = None
+        self._mcd_unified_analysis_generation += 1
+        self._mcd_unified_track_generation += 1
+        self._mcd_unified_track_pending = None
         if self._automatic_update_timer is not None:
             self._automatic_update_timer.stop()
         self._file_refresh_generation += 1
@@ -610,6 +972,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return False
         folder_changed = str(path).lower() != self.current_folder.lower()
         if folder_changed:
+            self._catalog_ready_modes.clear()
+            self._drr_include_all_sources = False
+            self._catalog_displayed_modes.clear()
+            self._catalog_pending_requests.clear()
             self._invalidate_export_move_sources()
             self._reset_workflow_state_for_folder_change()
             if hasattr(self, "drr_pin_baseline_chk"):
@@ -624,7 +990,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         else:
             self._populate_recent_folder_combo()
         if refresh:
-            self._refresh_file_lists()
+            self._refresh_file_lists(auto=True)
         return True
 
     def _watch_current_folder(self) -> None:
@@ -738,6 +1104,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if self._load_in_progress:
             self.folder_refresh_timer.start()
             return
+        self._catalog_ready_modes.clear()
+        self.presentation_widget._plots_catalog_dirty = True
+        if self.tabs.tabText(self.tabs.currentIndex()) == "Slides":
+            self.presentation_widget.set_experiment_folder(self.current_folder)
         self._refresh_file_lists(auto=True)
         self._watch_current_folder()
 
@@ -936,6 +1306,22 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.workflow_tabs.currentChanged.connect(self.tabs.setCurrentIndex)
         self.tabs.currentChanged.connect(self.workflow_tabs.setCurrentIndex)
         self.tabs.currentChanged.connect(self._on_central_tab_changed)
+        # Keep the compatibility page in the stack for existing callers and
+        # tests, while exposing one user-facing MCD destination.
+        hidden_peak_indices = []
+        for index in range(self.tabs.count()):
+            if self.tabs.tabText(index) == "MCD Peak Shift":
+                self.tabs.setTabVisible(index, False)
+                self.workflow_tabs.setTabVisible(index, False)
+                hidden_peak_indices.append(index)
+        # A prior session or a legacy request may have restored the retired
+        # page as the current tab.  Redirect that landing state to the single
+        # visible MCD workflow while leaving the compatibility page callable
+        # by internal tests/controllers.
+        if self.tabs.currentIndex() in hidden_peak_indices:
+            mcd_index = next((i for i in range(self.tabs.count()) if self.tabs.tabText(i) == "MCD" and self.tabs.isTabVisible(i)), -1)
+            if mcd_index >= 0:
+                self.tabs.setCurrentIndex(mcd_index)
         self.sidebar_toggle_btn.toggled.connect(self._set_sidebar_visible)
         self.workspace_shell = WorkspaceShell(
             self,
@@ -1095,6 +1481,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.refresh_btn.setObjectName("refreshButton")
         self.refresh_btn.setToolTip("Re-scan the current folder for new or changed CSV files")
         apply_accessible_identity(self.refresh_btn, name="Refresh", identifier="source.refresh")
+        self.data_state_label = QLabel("Shown: no data")
+        self.data_state_label.setObjectName("dataStateLabel")
+        self.data_state_label.setToolTip("Shows whether the visible plot matches the current source selection")
+        self.data_state_label.hide()
         self.recent_folder_combo = QComboBox()
         self.recent_folder_combo.setObjectName("recentFolderCombo")
         self.recent_folder_combo.setEditable(True)
@@ -1120,6 +1510,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         folder_grid.addWidget(self.browse_btn)
         folder_grid.addWidget(self.open_file_btn)
         folder_grid.addWidget(self.refresh_btn)
+        folder_grid.addWidget(self.data_state_label)
         QWidget.setTabOrder(self.recent_folder_combo, self.browse_btn)
         QWidget.setTabOrder(self.browse_btn, self.open_file_btn)
         QWidget.setTabOrder(self.open_file_btn, self.refresh_btn)
@@ -1130,6 +1521,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.tabs.tabBar().setElideMode(Qt.ElideNone)
         self.tabs.tabBar().setUsesScrollButtons(False)
         for feature in FEATURES:
+            self._expander_workflow_context = feature.key
             page = feature.build(self)
             if feature.scrollable:
                 page = self._make_scrollable_tab(page, feature.key)
@@ -1184,6 +1576,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             "ymax": spin(),
             "gate": spin(),
         }
+        # Keep the DRR cursor readable at millivolt precision.
+        spins["gate"].setDecimals(3 if prefix == "drr" else 9)
         fix_checks = {
             "vmin": QCheckBox("F"),
             "vmax": QCheckBox("F"),
@@ -1277,6 +1671,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         )
         if prefix == "mcd":
             toggle.hide()
+        if prefix == "drr_second":
+            # The DRR checkbox is the single user-facing switch for both
+            # products; this hidden state holder keeps product-specific
+            # d2E limits in the same parameter pipeline.
+            toggle.hide()
         toggle.setToolTip("Use independent color limits on the two sides of x0.")
 
         def split_spin() -> QDoubleSpinBox:
@@ -1321,47 +1720,71 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             "Two X-Region Color Limits", self if prefix == "mcd" else None
         )
         grid = QGridLayout(panel)
-        grid.setContentsMargins(6, 8, 6, 6)
-        grid.setHorizontalSpacing(5)
-        grid.setVerticalSpacing(5)
+        grid.setContentsMargins(4, 5, 4, 4)
+        grid.setHorizontalSpacing(3)
+        grid.setVerticalSpacing(3)
         show_boundary = QCheckBox("Show boundary")
         show_boundary.setChecked(True)
         auto_left = QToolButton()
-        auto_left.setText("Auto Left")
+        auto_left.setText("Auto")
         auto_left.setToolTip("Automatically set unlocked limits from data between xmin and x0.")
         auto_right = QToolButton()
-        auto_right.setText("Auto Right")
+        auto_right.setText("Auto")
         auto_right.setToolTip("Automatically set unlocked limits from data between x0 and xmax.")
 
-        # Region titles get their own rows so the controls remain readable at
-        # the sidebar's minimum width instead of clipping its right edge.
-        grid.addWidget(QLabel("Split position (x0)"), 0, 0, 1, 2)
-        grid.addWidget(split_spins["x0"], 0, 2, 1, 2)
-        grid.addWidget(split_fix_checks["x0"], 0, 4)
-        grid.addWidget(show_boundary, 0, 5)
-
-        left_title = QLabel("Region 1: xmin → x0")
-        set_fluent_property(left_title, "appRole", "regionTitle")
-        grid.addWidget(left_title, 1, 0, 1, 4)
-        grid.addWidget(auto_left, 1, 4, 1, 2)
-        grid.addWidget(QLabel("vmin"), 2, 0)
-        grid.addWidget(split_spins["left_vmin"], 2, 1, 1, 2)
-        grid.addWidget(split_fix_checks["left_vmin"], 2, 3)
-        grid.addWidget(QLabel("vmax"), 3, 0)
-        grid.addWidget(split_spins["left_vmax"], 3, 1, 1, 2)
-        grid.addWidget(split_fix_checks["left_vmax"], 3, 3)
-
-        right_title = QLabel("Region 2: x0 → xmax")
-        set_fluent_property(right_title, "appRole", "regionTitle")
-        grid.addWidget(right_title, 4, 0, 1, 4)
-        grid.addWidget(auto_right, 4, 4, 1, 2)
-        grid.addWidget(QLabel("vmin"), 5, 0)
-        grid.addWidget(split_spins["right_vmin"], 5, 1, 1, 2)
-        grid.addWidget(split_fix_checks["right_vmin"], 5, 3)
-        grid.addWidget(QLabel("vmax"), 6, 0)
-        grid.addWidget(split_spins["right_vmax"], 6, 1, 1, 2)
-        grid.addWidget(split_fix_checks["right_vmax"], 6, 3)
-        grid.setColumnStretch(4, 1)
+        if prefix in {"drr", "drr_second"}:
+            # DRR uses the compact sidebar form: one control per row keeps
+            # the input and Fix checkbox readable at the minimum width.
+            grid.addWidget(QLabel("x0"), 0, 0)
+            grid.addWidget(split_spins["x0"], 0, 1, 1, 2)
+            grid.addWidget(split_fix_checks["x0"], 0, 3)
+            grid.addWidget(show_boundary, 1, 0, 1, 4)
+            left_title = QLabel("L  xmin → x0")
+            set_fluent_property(left_title, "appRole", "regionTitle")
+            grid.addWidget(left_title, 2, 0, 1, 3)
+            grid.addWidget(auto_left, 2, 3)
+            grid.addWidget(QLabel("min"), 3, 0)
+            grid.addWidget(split_spins["left_vmin"], 3, 1, 1, 2)
+            grid.addWidget(split_fix_checks["left_vmin"], 3, 3)
+            grid.addWidget(QLabel("max"), 4, 0)
+            grid.addWidget(split_spins["left_vmax"], 4, 1, 1, 2)
+            grid.addWidget(split_fix_checks["left_vmax"], 4, 3)
+            right_title = QLabel("R  x0 → xmax")
+            set_fluent_property(right_title, "appRole", "regionTitle")
+            grid.addWidget(right_title, 5, 0, 1, 3)
+            grid.addWidget(auto_right, 5, 3)
+            grid.addWidget(QLabel("min"), 6, 0)
+            grid.addWidget(split_spins["right_vmin"], 6, 1, 1, 2)
+            grid.addWidget(split_fix_checks["right_vmin"], 6, 3)
+            grid.addWidget(QLabel("max"), 7, 0)
+            grid.addWidget(split_spins["right_vmax"], 7, 1, 1, 2)
+            grid.addWidget(split_fix_checks["right_vmax"], 7, 3)
+        else:
+            grid.addWidget(QLabel("Split position (x0)"), 0, 0, 1, 2)
+            grid.addWidget(split_spins["x0"], 0, 2, 1, 2)
+            grid.addWidget(split_fix_checks["x0"], 0, 4)
+            grid.addWidget(show_boundary, 0, 5)
+            left_title = QLabel("Region 1: xmin → x0")
+            set_fluent_property(left_title, "appRole", "regionTitle")
+            grid.addWidget(left_title, 1, 0, 1, 4)
+            grid.addWidget(auto_left, 1, 4, 1, 2)
+            grid.addWidget(QLabel("vmin"), 2, 0)
+            grid.addWidget(split_spins["left_vmin"], 2, 1, 1, 2)
+            grid.addWidget(split_fix_checks["left_vmin"], 2, 3)
+            grid.addWidget(QLabel("vmax"), 3, 0)
+            grid.addWidget(split_spins["left_vmax"], 3, 1, 1, 2)
+            grid.addWidget(split_fix_checks["left_vmax"], 3, 3)
+            right_title = QLabel("Region 2: x0 → xmax")
+            set_fluent_property(right_title, "appRole", "regionTitle")
+            grid.addWidget(right_title, 4, 0, 1, 4)
+            grid.addWidget(auto_right, 4, 4, 1, 2)
+            grid.addWidget(QLabel("vmin"), 5, 0)
+            grid.addWidget(split_spins["right_vmin"], 5, 1, 1, 2)
+            grid.addWidget(split_fix_checks["right_vmin"], 5, 3)
+            grid.addWidget(QLabel("vmax"), 6, 0)
+            grid.addWidget(split_spins["right_vmax"], 6, 1, 1, 2)
+            grid.addWidget(split_fix_checks["right_vmax"], 6, 3)
+            grid.setColumnStretch(4, 1)
         panel.setVisible(False)
 
         setattr(self, f"{prefix}_split_scale_chk", toggle)
@@ -1672,6 +2095,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         v.setSpacing(4)
         head = QToolButton()
         head.setCheckable(True)
+        workflow = getattr(self, "_expander_workflow_context", "common")
+        state_key = "ui/expanders/" + str(workflow) + "/" + (content.objectName() or title).replace(" ", "_")
+        stored = self.settings.value(state_key, None) if hasattr(self, "settings") else None
+        if stored is not None:
+            expanded = str(stored).strip().casefold() in {"1", "true", "yes", "on"}
         head.setChecked(bool(expanded))
         head.setAutoRaise(True)
         head.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
@@ -1695,6 +2123,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             )
             head.setText(title)
             content.setVisible(bool(on))
+            if hasattr(self, "settings"):
+                self.settings.setValue(state_key, bool(on))
 
         _update(bool(expanded))
         head.toggled.connect(_update)
@@ -1926,6 +2356,20 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
     def _run_scheduled_plot_redraw(self, mode: str) -> None:
         if getattr(self, "_is_closing", False):
             return
+        active_mode = self._active_mode() if callable(getattr(self, "_active_mode", None)) else None
+        # The Peak Shift page intentionally has no standalone active-mode
+        # controller; ``None`` there still means the shared canvas is owned by
+        # that page.  Hidden redraws must remain dirty for every workflow.
+        if active_mode is None:
+            tabs = getattr(self, "tabs", None)
+            tab_text = tabs.tabText(tabs.currentIndex()) if tabs is not None else None
+            if tabs is None or tab_text == "MCD Peak Shift":
+                active_mode = "MCD Peak Shift"
+        if active_mode != mode:
+            # Keep the dirty request until its page is visible.  A hidden
+            # controller must never draw into a shared canvas owned by the
+            # currently visible page.
+            return
         self._plot_redraw_pending.discard(mode)
         if self._load_in_progress or not self.loaded or self.loaded.mode != mode:
             return
@@ -1934,24 +2378,211 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._power_pending_range_refresh = False
             self._power_pending_center_split = False
             self._refresh_automatic_ranges(mode, refresh_split=True, center_split=center)
+        elif mode in self._pending_range_refresh:
+            center = self._pending_range_refresh.pop(mode)
+            self._refresh_automatic_ranges(mode, refresh_split=True, center_split=center)
         self._plot_mode(mode)
 
+    def _on_drr_plot_view_changed(self, view: str, *, redraw: bool = True) -> None:
+        view = str(view)
+        if view not in {"raw", "second"}:
+            return
+        self._capture_drr_view_limits()
+        if view != self._drr_plot_view:
+            self.drr_controller._invalidate_drr_analysis_product()
+        self._drr_plot_view = view
+        buttons = {"raw": self.drr_view_raw_btn, "second": self.drr_view_second_btn}
+        for key, button in buttons.items():
+            blocked = button.blockSignals(True)
+            button.setChecked(key == view)
+            button.blockSignals(blocked)
+        if redraw and self.last_plotted_mode == "DRR" and self.loaded and self.loaded.mode == "DRR":
+            self._plot_mode("DRR")
+
+    def _drr_gate_input_value(self) -> float:
+        return float(self.drr_spins["gate"].value())
+
+    def _set_drr_gate_toolbar_value(self, value: float) -> None:
+        toolbar = getattr(self, "drr_gate_toolbar_spin", None)
+        if toolbar is None:
+            return
+        blocked = toolbar.blockSignals(True)
+        try:
+            toolbar.setValue(float(value))
+        finally:
+            toolbar.blockSignals(blocked)
+
+    def _on_drr_sidebar_gate_changed(self, spin) -> None:
+        self._set_drr_gate_toolbar_value(float(spin.value()))
+        self.drr_controller._on_drr_plot_param_changed(spin)
+
+    def _on_drr_toolbar_gate_changed(self, value: float) -> None:
+        sidebar = self.drr_spins["gate"]
+        blocked = sidebar.blockSignals(True)
+        try:
+            sidebar.setValue(float(value))
+        finally:
+            sidebar.blockSignals(blocked)
+        self.drr_controller._on_drr_plot_param_changed(self.drr_gate_toolbar_spin)
+        self._sync_drr_gate_toolbar_state()
+
+    def _step_drr_gate(self, direction: int) -> None:
+        cube = getattr(self, "_last_plot_cube", None)
+        if self.loaded is None or self.loaded.mode != "DRR" or cube is None:
+            return
+        gate = np.asarray(cube.gate, float).ravel()
+        finite = np.flatnonzero(np.isfinite(gate))
+        if finite.size == 0:
+            return
+        current = self._drr_gate_input_value()
+        nearest = int(finite[np.argmin(np.abs(gate[finite] - current))])
+        target = nearest + (1 if int(direction) > 0 else -1)
+        if target < 0 or target >= gate.size or not np.isfinite(gate[target]):
+            self._sync_drr_gate_toolbar_state()
+            return
+        target_gate = float(gate[target])
+        self._set_drr_gate_toolbar_value(target_gate)
+        sidebar = self.drr_spins["gate"]
+        blocked = sidebar.blockSignals(True)
+        try:
+            sidebar.setValue(target_gate)
+        finally:
+            sidebar.blockSignals(blocked)
+        self.drr_controller._on_drr_plot_param_changed(self.drr_gate_toolbar_spin)
+        self._sync_drr_gate_toolbar_state()
+
+    def _sync_drr_gate_toolbar_state(self, drr_loaded: bool | None = None) -> None:
+        toolbar = getattr(self, "drr_gate_toolbar_spin", None)
+        prev = getattr(self, "drr_gate_prev_btn", None)
+        nxt = getattr(self, "drr_gate_next_btn", None)
+        if toolbar is None or prev is None or nxt is None:
+            return
+        if drr_loaded is None:
+            drr_loaded = bool(self.loaded is not None and self.loaded.mode == "DRR")
+        cube = getattr(self, "_last_plot_cube", None)
+        gate = np.asarray(cube.gate, float).ravel() if cube is not None else np.empty(0)
+        finite = np.flatnonzero(np.isfinite(gate))
+        enabled = bool(drr_loaded and finite.size)
+        toolbar.setEnabled(enabled)
+        if not enabled:
+            prev.setEnabled(False)
+            nxt.setEnabled(False)
+            return
+        current = self._drr_gate_input_value()
+        index = int(finite[np.argmin(np.abs(gate[finite] - current))])
+        prev.setEnabled(index > int(finite[0]))
+        nxt.setEnabled(index < int(finite[-1]))
+
+    def _on_drr_side_by_side_changed(self, checked: bool) -> None:
+        self._capture_drr_view_limits()
+        self._drr_side_by_side = bool(checked)
+        # Side-by-side is a layout preference.  Keep the selected product
+        # independent so switching it never changes what Save exports.
+        if self.last_plotted_mode == "DRR" and self.loaded and self.loaded.mode == "DRR":
+            self._plot_mode("DRR")
+
+    def _on_drr_second_scale_changed(self) -> None:
+        self.drr_second_auto_scale = False
+        self._on_drr_plot_view_changed(self._drr_plot_view, redraw=True)
+
+    def _update_drr_advanced_derivative_label(self) -> None:
+        label = getattr(self, "drr_advanced_derivative_label", None)
+        if label is None:
+            return
+        text = self.drr_derivative_combo.currentText()
+        label.setText("Advanced: first derivative (dE)" if text == "dE" else f"Advanced: {text}")
+
+    def _auto_drr_second_vrange(self) -> None:
+        if not self.loaded or self.loaded.mode != "DRR":
+            return
+        try:
+            cube, _derivative, _window, _poly = self.drr_controller._drr_cube_with_metadata(2)
+            limits = compute_auto_limits(cube, log_scale=False)
+        except (TypeError, ValueError) as exc:
+            self._status(f"State: Auto d2E vmin/vmax skipped ({exc}).")
+            return
+        for spin, value in (
+            (self.drr_second_vmin_spin, limits.vmin),
+            (self.drr_second_vmax_spin, limits.vmax),
+        ):
+            blocked = spin.blockSignals(True)
+            try:
+                spin.setValue(float(value))
+            finally:
+                spin.blockSignals(blocked)
+        self.drr_second_auto_scale = True
+        self._status(f"State: Auto d2E vmin/vmax = {limits.vmin:.4g}, {limits.vmax:.4g}")
+        self._schedule_plot_redraw("DRR")
+
+    def _sync_drr_second_auto_scale(self, cube: DataCube) -> None:
+        if not getattr(self, "drr_second_auto_scale", True):
+            return
+        try:
+            limits = compute_auto_limits(cube, log_scale=False)
+        except (TypeError, ValueError):
+            return
+        for spin, value in (
+            (self.drr_second_vmin_spin, limits.vmin),
+            (self.drr_second_vmax_spin, limits.vmax),
+        ):
+            blocked = spin.blockSignals(True)
+            try:
+                spin.setValue(float(value))
+            finally:
+                spin.blockSignals(blocked)
+
+    def _capture_drr_view_limits(self) -> None:
+        """Snapshot the shared map viewport before a DRR layout rebuild."""
+        current_axes = set(getattr(self.figure, "axes", ()))
+        axes = getattr(self, "_drr_heatmap_axes", {}) or {}
+        axis = getattr(self, "_drr_heatmap_ax", None)
+        if axis not in current_axes:
+            axis = next((candidate for candidate in axes.values() if candidate in current_axes), None)
+        if axis is None:
+            return
+        self._drr_view_limits = (
+            tuple(float(value) for value in axis.get_xlim()),
+            tuple(float(value) for value in axis.get_ylim()),
+        )
+
     def _update_plot_view_bar_visibility(self) -> None:
+        if hasattr(self, "drr_plot_view_bar"):
+            drr_active = self._active_mode() == "DRR"
+            self.drr_plot_view_bar.setVisible(drr_active)
+            mcd_active = self._active_mode() == "MCD" and hasattr(self, "mcd_unified_view")
+            self.save_action.setText(
+                "Save both · PNG + DAT" if drr_active else
+                "Save unified MCD results" if mcd_active else "Save PNG + DAT"
+            )
+            self.save_action.setToolTip(
+                "Export both ΔR/R and second-derivative PNG + DAT products"
+                if drr_active else
+                "Export the frozen unified MCD snapshot, spectra, tracks, slopes, and retained windows"
+                if mcd_active else "Export for the active tab"
+            )
         if hasattr(self, "cmp_plot_view_bar"):
             self.cmp_plot_view_bar.setVisible(self._active_mode() == "Compare")
         if hasattr(self, "power_plot_view_bar"):
             self.power_plot_view_bar.setVisible(self._active_mode() == "Power Dependent")
+        unified_active = self._active_mode() == "MCD" and getattr(self, "loaded", None) is not None and getattr(self.loaded, "mode", None) == "MCD"
+        if hasattr(self, "mcd_unified_view"):
+            self.mcd_unified_view.setVisible(unified_active)
         if hasattr(self, "mcd_candidate_bar"):
-            active = self._active_mode() == "MCD"
+            # The unified surface owns the only visible MCD candidate bar.
+            # Keep the legacy controls alive for compatibility with old
+            # controllers and tests, but never show a second selector row.
+            active = self._active_mode() == "MCD" and not hasattr(self, "mcd_unified_view")
             self.mcd_candidate_bar.setVisible(active)
             self.mcd_find_centers_btn.setEnabled(
-                active
+                self._active_mode() == "MCD"
                 and self.loaded is not None
                 and self.loaded.mode == "MCD"
                 and self.loaded.mcd_result is not None
             )
         if hasattr(self, "mcd_peak_candidate_bar"):
-            peak_active = self.tabs.tabText(self.tabs.currentIndex()) == "MCD Peak Shift"
+            peak_active = (
+                self.tabs.tabText(self.tabs.currentIndex()) == "MCD Peak Shift"
+            )
             self.mcd_peak_candidate_bar.setVisible(peak_active)
             if hasattr(self, "_update_mcd_peak_candidate_buttons"):
                 self._update_mcd_peak_candidate_buttons()
@@ -1989,6 +2620,59 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.canvas = ThemeAwareFigureCanvasQTAgg(self.figure)
         self.toolbar = _PlotToolbar(self.canvas, box)
         layout.addWidget(self.toolbar)
+        self.drr_plot_view_bar = QFrame()
+        self.drr_plot_view_bar.setFrameShape(QFrame.NoFrame)
+        self.drr_plot_view_bar.setVisible(False)
+        set_fluent_property(self.drr_plot_view_bar, "fluentRole", "panel")
+        drr_view_layout = QHBoxLayout(self.drr_plot_view_bar)
+        drr_view_layout.setContentsMargins(8, 4, 8, 4)
+        drr_view_layout.setSpacing(0)
+        self.drr_view_raw_btn = QToolButton()
+        self.drr_view_raw_btn.setText("ΔR/R")
+        self.drr_view_raw_btn.setToolTip("Show the baseline-corrected ΔR/R product")
+        self.drr_view_raw_btn.setCheckable(True)
+        self.drr_view_raw_btn.setChecked(True)
+        self.drr_view_second_btn = QToolButton()
+        self.drr_view_second_btn.setText("Second derivative")
+        self.drr_view_second_btn.setToolTip("Show the energy second derivative of ΔR/R")
+        self.drr_view_second_btn.setCheckable(True)
+        self.drr_view_side_btn = QToolButton()
+        self.drr_view_side_btn.setText("Side by side")
+        self.drr_view_side_btn.setToolTip("Arrange the two DRR products side by side")
+        self.drr_view_side_btn.setCheckable(True)
+        for button in (self.drr_view_raw_btn, self.drr_view_second_btn):
+            drr_view_layout.addWidget(button)
+        drr_view_layout.addSpacing(8)
+        drr_view_layout.addWidget(self.drr_view_side_btn)
+        drr_view_layout.addSpacing(12)
+        drr_gate_label = QLabel("Gate")
+        drr_gate_label.setToolTip("Gate voltage used for the DRR spectrum linecut")
+        self.drr_gate_toolbar_spin = QDoubleSpinBox()
+        self.drr_gate_toolbar_spin.setObjectName("drr_gate_toolbar_spin")
+        self.drr_gate_toolbar_spin.setDecimals(3)
+        self.drr_gate_toolbar_spin.setRange(-1e12, 1e12)
+        self.drr_gate_toolbar_spin.setSingleStep(0.1)
+        self.drr_gate_toolbar_spin.setMaximumWidth(160)
+        self.drr_gate_toolbar_spin.setSuffix(" V")
+        self.drr_gate_toolbar_spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
+        self.drr_gate_toolbar_spin.setKeyboardTracking(False)
+        self.drr_gate_toolbar_spin.setEnabled(False)
+        self.drr_gate_prev_btn = QToolButton()
+        self.drr_gate_prev_btn.setObjectName("drr_gate_prev_btn")
+        self.drr_gate_prev_btn.setText("Prev")
+        self.drr_gate_prev_btn.setToolTip("Select the previous sampled gate")
+        self.drr_gate_prev_btn.setEnabled(False)
+        self.drr_gate_next_btn = QToolButton()
+        self.drr_gate_next_btn.setObjectName("drr_gate_next_btn")
+        self.drr_gate_next_btn.setText("Next")
+        self.drr_gate_next_btn.setToolTip("Select the next sampled gate")
+        self.drr_gate_next_btn.setEnabled(False)
+        drr_view_layout.addWidget(drr_gate_label)
+        drr_view_layout.addWidget(self.drr_gate_toolbar_spin)
+        drr_view_layout.addWidget(self.drr_gate_prev_btn)
+        drr_view_layout.addWidget(self.drr_gate_next_btn)
+        drr_view_layout.addStretch(1)
+        layout.addWidget(self.drr_plot_view_bar)
         self.cmp_plot_view_bar = QFrame()
         self.cmp_plot_view_bar.setFrameShape(QFrame.NoFrame)
         self.cmp_plot_view_bar.setVisible(False)
@@ -2115,6 +2799,25 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         peak_candidate_layout.addWidget(self.mcd_peak_next_btn)
         peak_candidate_layout.addStretch(1)
         layout.addWidget(self.mcd_peak_candidate_bar)
+        self.mcd_unified_view = McdUnifiedView(
+            self, figure=self.figure, canvas=self.canvas, embed_canvas=False
+        )
+        self.mcd_unified_view.candidate_combo.currentIndexChanged.connect(
+            self._on_unified_candidate_selected
+        )
+        self.mcd_unified_view.candidate_selection_changed.connect(
+            self._on_unified_candidate_selection_changed
+        )
+        self.mcd_unified_view.candidate_filter_combo.currentTextChanged.connect(
+            self._on_unified_candidate_filter_changed
+        )
+        self.mcd_unified_view.detection_mode_changed.connect(self._on_unified_detection_mode_changed)
+        self.mcd_unified_view.window_center_changed.connect(self.mcd_window_center_spin.setValue)
+        self.mcd_unified_view.manual_candidate_added.connect(
+            lambda _item: self._queue_unified_selected_feature_analysis()
+        )
+        self.mcd_unified_view.setVisible(False)
+        layout.addWidget(self.mcd_unified_view)
         canvas_host = QWidget()
         canvas_host.setObjectName("plotCanvasHost")
         canvas_layout = QGridLayout(canvas_host)
@@ -2122,7 +2825,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         canvas_layout.setSpacing(0)
         canvas_layout.addWidget(self.canvas, 0, 0)
         self.empty_canvas_overlay = QLabel(
-            "Load data to begin\nThen choose Plot / Update"
+            "Choose a valid source to display it automatically"
         )
         self.empty_canvas_overlay.setObjectName("emptyCanvasOverlay")
         self.empty_canvas_overlay.setAlignment(Qt.AlignCenter)
@@ -2133,11 +2836,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         apply_accessible_identity(
             self.empty_canvas_overlay,
             name="Plot canvas guidance",
-            description="Load data, then choose Plot / Update to show a scientific plot.",
+            description="Choose a valid source to load and show a scientific plot.",
         )
         canvas_layout.addWidget(self.empty_canvas_overlay, 0, 0)
         self.canvas.mpl_connect("draw_event", self._sync_empty_canvas_overlay)
         self._sync_empty_canvas_overlay()
+        self._mcd_unified_canvas_host = canvas_host
         layout.addWidget(canvas_host, 1)
         return box
 
@@ -2176,7 +2880,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             for key in ("a", "b", "c"):
                 spin: QDoubleSpinBox = getattr(self, f"{prefix}_yaxis_{key}_spin")
                 spin.valueChanged.connect(lambda _value, p=prefix: self._update_y_axis_controls(p))
-        for prefix in ("pl", "drr", "cmp", "power"):
+        for prefix in ("pl", "drr", "drr_second", "cmp", "power"):
             toggle: QCheckBox = getattr(self, f"{prefix}_split_scale_chk")
             toggle.toggled.connect(
                 lambda checked, p=prefix: self._on_split_scale_toggled(p, checked)
@@ -2212,12 +2916,18 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.pl_yaxis_b_spin.valueChanged.connect(self.pl_controller._on_pl_plot_param_changed)
         self.pl_yaxis_c_spin.valueChanged.connect(self.pl_controller._on_pl_plot_param_changed)
         for key in ("vmin", "vmax", "xmin", "xmax", "ymin", "ymax"):
-            self.pl_spins[key].valueChanged.connect(self.pl_controller._on_pl_plot_param_changed)
+            self.pl_spins[key].valueChanged.connect(
+                lambda _value, widget=self.pl_spins[key]:
+                self.pl_controller._on_pl_plot_param_changed(widget)
+            )
         self.pl_spins["gate"].valueChanged.connect(self.pl_controller._on_pl_gate_changed)
         self.pl_cmap.currentTextChanged.connect(self.pl_controller._on_pl_plot_param_changed)
-        self.pl_log_chk.toggled.connect(self.pl_controller._on_pl_plot_param_changed)
+        self.pl_log_chk.toggled.connect(
+            lambda _checked: self.pl_controller._on_pl_plot_param_changed(self.pl_log_chk)
+        )
         self.pl_clip_chk.toggled.connect(self.pl_controller._on_pl_plot_param_changed)
         self.cmp_in_k_angle_spin.valueChanged.connect(self.compare_controller._on_cmp_angle_reference_changed)
+        self.cmp_rotation_mapping_combo.currentIndexChanged.connect(self.compare_controller._on_cmp_rotation_mapping_changed)
         self.cmp_in_kp_angle_spin.valueChanged.connect(self.compare_controller._on_cmp_angle_reference_changed)
         self.cmp_out_k_angle_spin.valueChanged.connect(self.compare_controller._on_cmp_angle_reference_changed)
         self.cmp_out_kp_angle_spin.valueChanged.connect(self.compare_controller._on_cmp_angle_reference_changed)
@@ -2253,7 +2963,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.cmp_auto_v_btn.clicked.connect(self.compare_controller._auto_cmp_vrange)
         self.cmp_auto_x_btn.clicked.connect(self.compare_controller._auto_cmp_xrange)
         self.cmp_auto_y_btn.clicked.connect(self.compare_controller._auto_cmp_yrange)
-        self.power_refresh_groups_btn.clicked.connect(self.power_controller._power_refresh_groups)
+        self.power_refresh_groups_btn.clicked.connect(lambda: self._refresh_file_lists(mode="Power Dependent"))
         self.power_group_combo.currentIndexChanged.connect(self.power_controller._on_power_plot_param_changed)
         self.power_kk_group_combo.currentIndexChanged.connect(self.power_controller._on_power_source_assignment_changed)
         self.power_kkp_group_combo.currentIndexChanged.connect(self.power_controller._on_power_source_assignment_changed)
@@ -2279,6 +2989,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.power_auto_x_btn.clicked.connect(self.power_controller._auto_power_xrange)
         self.power_auto_y_btn.clicked.connect(self.power_controller._auto_power_yrange)
         self.shg_files.itemSelectionChanged.connect(self.shg_controller._on_shg_source_changed)
+        self.shg_source_filter_combo.currentIndexChanged.connect(self.shg_controller._on_shg_source_filter_changed)
+        self.shg_refresh_sources_btn.clicked.connect(lambda: self._refresh_file_lists(auto=False))
         self.shg_background_combo.currentIndexChanged.connect(lambda _idx: self.shg_controller._on_shg_source_changed())
         self.shg_workflow_tabs.currentChanged.connect(lambda _idx: self.shg_controller._on_shg_workflow_changed())
         for combo in (
@@ -2294,7 +3006,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.shg_compare_display_combo.currentTextChanged.connect(lambda _text: self.shg_controller._on_shg_spectrum_view_changed())
         self.shg_angle_wrap_combo.currentTextChanged.connect(lambda _text: self.shg_controller._on_shg_param_changed())
         self.shg_include_failed_chk.toggled.connect(lambda _checked: self.shg_controller._on_shg_param_changed())
-        self.shg_angle_cursor_spin.valueChanged.connect(lambda _value: self.shg_controller._on_shg_param_changed())
+        self.shg_angle_cursor_spin.valueChanged.connect(lambda _value: self.shg_controller._on_shg_angle_cursor_changed())
         for spin in (
             self.shg_peak_center_spin,
             self.shg_gate_half_range_spin,
@@ -2332,6 +3044,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.drr_baseline_combo.currentTextChanged.connect(
             lambda _value: self.drr_controller._on_drr_plot_param_changed(self.drr_baseline_combo)
         )
+        self.drr_view_raw_btn.clicked.connect(lambda: self._on_drr_plot_view_changed("raw"))
+        self.drr_view_second_btn.clicked.connect(lambda: self._on_drr_plot_view_changed("second"))
+        self.drr_view_side_btn.toggled.connect(lambda checked: self._on_drr_side_by_side_changed(bool(checked)))
+        self.drr_gate_toolbar_spin.valueChanged.connect(self._on_drr_toolbar_gate_changed)
+        self.drr_gate_prev_btn.clicked.connect(lambda: self._step_drr_gate(-1))
+        self.drr_gate_next_btn.clicked.connect(lambda: self._step_drr_gate(1))
         self.drr_derivative_combo.currentTextChanged.connect(self.drr_controller._on_drr_derivative_changed)
         self.drr_sg_window_spin.valueChanged.connect(self.drr_controller._on_drr_derivative_changed)
         self.drr_sg_poly_spin.valueChanged.connect(self.drr_controller._on_drr_derivative_changed)
@@ -2342,13 +3060,19 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.drr_pin_baseline_chk.toggled.connect(self.drr_controller._on_drr_pin_baseline_toggled)
         self.drr_baseline_combine_combo.currentTextChanged.connect(self.drr_controller._on_drr_baseline_mode_changed)
         self.drr_auto_v_btn.clicked.connect(self.drr_controller._auto_drr_vrange)
+        self.drr_second_auto_v_btn.clicked.connect(self._auto_drr_second_vrange)
         self.drr_auto_x_btn.clicked.connect(self.drr_controller._auto_drr_xrange)
         self.drr_auto_y_btn.clicked.connect(self.drr_controller._auto_drr_yrange)
         for key in ("vmin", "vmax", "xmin", "xmax", "ymin", "ymax", "gate"):
             spin = self.drr_spins[key]
-            spin.valueChanged.connect(
-                lambda _value, widget=spin: self.drr_controller._on_drr_plot_param_changed(widget)
-            )
+            if key == "gate":
+                spin.valueChanged.connect(
+                    lambda _value, widget=spin: self._on_drr_sidebar_gate_changed(widget)
+                )
+            else:
+                spin.valueChanged.connect(
+                    lambda _value, widget=spin: self.drr_controller._on_drr_plot_param_changed(widget)
+                )
         self.drr_cmap.currentTextChanged.connect(
             lambda _value: self.drr_controller._on_drr_plot_param_changed(self.drr_cmap)
         )
@@ -2361,6 +3085,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.drr_center_zero_chk.toggled.connect(
             lambda _value: self.drr_controller._on_drr_plot_param_changed(self.drr_center_zero_chk)
         )
+        self.drr_second_vmin_spin.valueChanged.connect(self._on_drr_second_scale_changed)
+        self.drr_second_vmax_spin.valueChanged.connect(self._on_drr_second_scale_changed)
+        self.drr_second_cmap.currentTextChanged.connect(lambda _text: self._on_drr_plot_view_changed(self._drr_plot_view, redraw=True))
         self.drr_peak_find_btn.clicked.connect(self.drr_controller._on_drr_find_peaks)
         self.drr_peak_show_chk.toggled.connect(self.drr_controller._on_drr_analysis_view_changed)
         self.drr_peak_mode_combo.currentTextChanged.connect(self.drr_controller._on_drr_analysis_view_changed)
@@ -2409,6 +3136,38 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.mcd_previous_candidate_btn.clicked.connect(lambda: self.mcd_controller._step_mcd_center_candidate(-1))
         self.mcd_next_candidate_btn.clicked.connect(lambda: self.mcd_controller._step_mcd_center_candidate(1))
         self.mcd_clear_candidates_btn.clicked.connect(self.mcd_controller._return_to_manual_mcd_center)
+        unified_controls = getattr(self, "mcd_unified_controls", None)
+        if unified_controls is not None:
+            self.mcd_retention.set_current_provider("window", self._current_unified_window_snapshot)
+            self.mcd_retention.set_current_provider("feature", self._current_unified_feature_snapshot)
+            self.mcd_retention.bind(
+                window_list=unified_controls.retained_window_list,
+                feature_list=unified_controls.retained_feature_list,
+            )
+            self.mcd_retention.inspect_requested.connect(self._inspect_retained_snapshot)
+            self.mcd_retention.message_requested.connect(self._status)
+            self.mcd_retention.changed.connect(self._update_unified_mcd_save_controls)
+            unified_controls.retain_window_btn.clicked.connect(self._retain_unified_mcd_window)
+            unified_controls.update_retained_btn.clicked.connect(self._update_unified_mcd_window)
+            unified_controls.retain_feature_btn.clicked.connect(self._retain_unified_mcd_feature)
+            unified_controls.update_feature_btn.clicked.connect(self._update_unified_mcd_feature)
+            unified_controls.save_results_btn.clicked.connect(lambda _checked=False: self._queue_unified_mcd_export(scope="retained"))
+            unified_controls.change_save_folder_btn.clicked.connect(self._change_unified_mcd_export_folder)
+            unified_controls.feature_method_combo.currentTextChanged.connect(self._queue_unified_selected_feature_analysis)
+            unified_controls.feature_source_combo.currentTextChanged.connect(self._queue_unified_selected_feature_analysis)
+            unified_controls.feature_search_low_spin.valueChanged.connect(self._queue_unified_selected_feature_analysis)
+            unified_controls.feature_search_high_spin.valueChanged.connect(self._queue_unified_selected_feature_analysis)
+            unified_controls.reference_mode_combo.currentTextChanged.connect(self._queue_unified_selected_feature_analysis)
+            unified_controls.manual_reference_spin.valueChanged.connect(self._queue_unified_selected_feature_analysis)
+            unified_controls.manual_link_btn.clicked.connect(self._add_unified_manual_link)
+            unified_controls.prominence_spin.valueChanged.connect(self._queue_unified_selected_feature_analysis)
+            unified_controls.slope_details_btn.clicked.connect(self._show_unified_slope_details)
+            for name in (
+                "slope_low_spin", "slope_low_end_spin", "slope_high_positive_spin",
+                "slope_high_positive_end_spin", "slope_high_negative_spin",
+                "slope_high_negative_end_spin",
+            ):
+                getattr(unified_controls, name).valueChanged.connect(self._on_unified_feature_display_changed)
         self.pl_peak_find_btn.clicked.connect(self.pl_controller._on_pl_find_peaks)
         self.pl_peak_show_chk.toggled.connect(self.pl_controller._on_pl_analysis_view_changed)
         self.pl_peak_mode_combo.currentTextChanged.connect(self.pl_controller._on_pl_analysis_view_changed)
@@ -2422,11 +3181,13 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._gate_click_cid = self.canvas.mpl_connect("button_press_event", self._on_canvas_click)
         self._mcd_window_release_cid = self.canvas.mpl_connect("button_release_event", self._on_canvas_release)
         self._mcd_blit_draw_cid = self.canvas.mpl_connect("draw_event", self.mcd_controller._on_canvas_draw)
+        self._cmp_blit_draw_cid = self.canvas.mpl_connect("draw_event", self.compare_controller._on_compare_canvas_draw)
         for prefix in ("pl", "drr", "cmp"):
             self._update_y_axis_controls(prefix)
         self.compare_controller._cmp_apply_display_preset()
         self.compare_controller._cmp_update_view_mode()
         self.compare_controller._cmp_set_channel_combo_items()
+        self.compare_controller._cmp_refresh_history_cache(force=True)
         self.compare_controller._cmp_update_assignment_summary()
         self.power_controller._power_refresh_groups()
         self.power_controller._power_update_view_mode()
@@ -2442,6 +3203,620 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
     def _clear_log(self) -> None:
         self.log_lines.clear()
         self.log_text.clear()
+
+    def _unified_mcd_settings_snapshot(self) -> dict[str, Any]:
+        return {
+            "window_metric": str(self.mcd_window_metric_combo.currentText()),
+            "feature_method": str(self.mcd_unified_controls.feature_method_combo.currentText()),
+            "feature_source": str(self.mcd_unified_controls.feature_source_combo.currentText()),
+            "feature_search_low_ev": float(self.mcd_unified_controls.feature_search_low_spin.value()),
+            "feature_search_high_ev": float(self.mcd_unified_controls.feature_search_high_spin.value()),
+            "reference_mode": str(self.mcd_unified_controls.reference_mode_combo.currentText()),
+            "manual_reference_ev": float(self.mcd_unified_controls.manual_reference_spin.value()),
+            "prominence_fraction": float(self.mcd_unified_controls.prominence_spin.value()),
+            "channel_mapping": str(self.mcd_unified_view.channel_mapping_combo.currentText()) if hasattr(self, "mcd_unified_view") else "",
+            "feature_metric": self.mcd_unified_view.display_metric_label if hasattr(self, "mcd_unified_view") else "Shift (meV)",
+            "feature_overlay": bool(self.mcd_unified_view.state.feature_overlay) if hasattr(self, "mcd_unified_view") else False,
+            "slope_low_t": float(self.mcd_unified_controls.slope_low_spin.value()),
+            "slope_low_end_t": float(self.mcd_unified_controls.slope_low_end_spin.value()),
+            "slope_high_positive_t": float(self.mcd_unified_controls.slope_high_positive_spin.value()),
+            "slope_high_positive_end_t": float(self.mcd_unified_controls.slope_high_positive_end_spin.value()),
+            "slope_high_negative_t": float(self.mcd_unified_controls.slope_high_negative_spin.value()),
+            "slope_high_negative_end_t": float(self.mcd_unified_controls.slope_high_negative_end_spin.value()),
+        }
+
+    def _current_unified_window_snapshot(self) -> dict[str, Any] | None:
+        """Build a complete numerical snapshot for the retention store."""
+        if self.loaded is None or self.loaded.mode != "MCD" or self.loaded.mcd_result is None:
+            return None
+        result = self.loaded.mcd_result
+        energy = np.asarray(result.energy_ev, dtype=float).ravel()
+        values = np.asarray(getattr(result, "pair_mcd_corrected", ()), dtype=float)
+        try:
+            order = np.asarray(spectrum_energy_order(result), dtype=int)
+        except (AttributeError, TypeError, ValueError):
+            order = np.argsort(energy, kind="stable")
+        if values.ndim == 2 and order.size == values.shape[1]:
+            values = values[:, order]
+        half = float(self.mcd_unified_view.state.window_width_mev) * 0.0005
+        mask = (energy >= self.mcd_unified_view.state.window_center_ev - half) & (energy <= self.mcd_unified_view.state.window_center_ev + half)
+        selected = values[:, mask] if values.ndim == 2 and np.any(mask) else np.empty((values.shape[0], 0))
+        metric_label = str(self.mcd_window_metric_combo.currentText())
+        metric = self.mcd_controller._mcd_window_metric()
+        # Keep the retained trace identical to the branch-aware renderer and
+        # slope fitter.  Rebuilding one joined nanmean here loses the signed
+        # metric and can merge increasing/decreasing rows.
+        try:
+            branch_traces = pair_window_trace_by_branch(
+                result,
+                float(self.mcd_unified_view.state.window_center_ev),
+                float(self.mcd_unified_view.state.window_width_mev),
+                metrics=(metric,), include_raw=False,
+            )
+            labels = np.asarray(getattr(result, "pair_labels", ()), dtype=str).ravel()
+            trace = np.full(len(getattr(result, "pair_b", ())), np.nan, dtype=float)
+            values_key = f"corrected_{metric}"
+            for branch, data in branch_traces.items():
+                branch_mask = labels == branch
+                branch_values = data.get(values_key, ((), ()))
+                values = np.asarray(branch_values[1], dtype=float)
+                if values.size == int(np.count_nonzero(branch_mask)):
+                    trace[branch_mask] = values
+        except (AttributeError, TypeError, ValueError, IndexError):
+            if selected.shape[1] == 0:
+                trace = np.full(len(getattr(result, "pair_b", ())), np.nan)
+            elif metric == "integral":
+                trace = np.trapezoid(selected, x=energy[mask], axis=1)
+            elif metric in {"absolute_mean", "field_signed_absolute_mean"}:
+                trace = np.nanmean(np.abs(selected), axis=1)
+                if metric == "field_signed_absolute_mean":
+                    trace *= np.sign(np.asarray(getattr(result, "pair_b", ()), dtype=float))
+            else:
+                trace = np.nanmean(selected, axis=1)
+        if metric == "integral" and selected.shape[1] and not np.isfinite(trace).any():
+            # Duplicate/degenerate energy columns have zero area, not an
+            # unknown metric. Preserve the integral semantic for all branches.
+            trace = np.trapezoid(np.nan_to_num(selected, nan=0.0), x=energy[mask], axis=1)
+        return {
+            "id": f"window-{self.mcd_unified_view.state.source_generation}-{self.mcd_unified_view.state.window_center_ev:.9g}",
+            "identity": {"source": str(getattr(result, "source_file", "")), "kind": "mcd-window"},
+            "source_generation": int(self.mcd_unified_view.state.source_generation),
+            "original_b": np.asarray(getattr(result, "pair_b", ()), dtype=float).copy(),
+            "branches": np.asarray(getattr(result, "pair_labels", ()), dtype=str).copy(),
+            "trace_values": np.asarray(trace, dtype=float).copy(),
+            "metric": metric_label,
+            "center_ev": float(self.mcd_unified_view.state.window_center_ev),
+            "width_mev": float(self.mcd_unified_view.state.window_width_mev),
+            "slopes": self._mcd_unified_slopes.to_dict() if getattr(self, "_mcd_unified_slopes", None) is not None else {},
+            "settings": self._unified_mcd_settings_snapshot(),
+            "status": "complete",
+        }
+
+    def _current_unified_feature_snapshot(self) -> dict[str, Any] | None:
+        view = getattr(self, "mcd_unified_view", None)
+        result = self.loaded.mcd_result if self.loaded is not None and self.loaded.mode == "MCD" else None
+        selected = view.selected_candidate if view is not None else None
+        payload = getattr(self, "_mcd_unified_track_payload", None)
+        if view is None or result is None or selected is None or not isinstance(payload, Mapping):
+            return None
+        return {
+            "id": str(selected.get("id", "feature")),
+            "identity": {"source": str(getattr(result, "source_file", "")), "label": selected.get("label", selected.get("id", "feature"))},
+            "source_generation": int(view.state.source_generation),
+            "track_payload": dict(payload),
+            "original_b": np.asarray(getattr(result, "pair_b", ()), dtype=float).copy(),
+            "branches": np.asarray(getattr(result, "pair_labels", ()), dtype=str).copy(),
+            "trace_values": np.asarray([point.get("energy_ev") for track in payload.get("tracks", ()) for point in track.get("points", ()) if isinstance(point, Mapping) and point.get("energy_ev") is not None], dtype=float),
+            "analysis_results": payload.get("analysis_results", {}),
+            "links": payload.get("links", ()),
+            "splitting": payload.get("splitting", ()),
+            "mapping": payload.get("mapping", {}),
+            "settings": self._unified_mcd_settings_snapshot(),
+            "status": "complete" if payload.get("status") == "ok" else str(payload.get("status", "uncomputed")),
+        }
+
+    def _refresh_unified_retained_list(self) -> None:
+        controls = getattr(self, "mcd_unified_controls", None)
+        view = getattr(self, "mcd_unified_view", None)
+        if controls is None or view is None:
+            return
+        self.mcd_retention.refresh()
+        self._update_unified_mcd_save_controls()
+
+    def _update_unified_mcd_save_controls(self) -> None:
+        controls = getattr(self, "mcd_unified_controls", None)
+        if controls is None:
+            return
+        busy = self._mcd_unified_export_worker is not None
+        has_selection = any(item.included for kind in ("window", "feature") for item in self.mcd_retention.store.items(kind))
+        loaded = self.loaded is not None and self.loaded.mode == "MCD" and self.loaded.mcd_result is not None
+        controls.save_results_btn.setEnabled(bool(loaded and has_selection and not busy))
+        controls.change_save_folder_btn.setEnabled(not busy)
+
+    def _retain_unified_mcd_window(self) -> None:
+        view = getattr(self, "mcd_unified_view", None)
+        if view is None:
+            return
+        snapshot = self._current_unified_window_snapshot()
+        if snapshot is None:
+            return
+        self.mcd_retention.add_window(snapshot, included=True)
+        # Keep the legacy state as a read-only compatibility mirror for
+        # callers that still inspect UnifiedMcdState directly.
+        view.retain_current_window(settings=self._unified_mcd_settings_snapshot())
+        self._refresh_unified_retained_list()
+
+    def _retain_unified_mcd_feature(self) -> None:
+        view = getattr(self, "mcd_unified_view", None)
+        controls = getattr(self, "mcd_unified_controls", None)
+        selected = view.selected_candidate if view is not None else None
+        if view is None or controls is None or selected is None:
+            return
+        snapshot = {
+            "id": str(selected.get("id", "feature")),
+            "identity": {"source": str(getattr(self.loaded.mcd_result, "source_file", "")), "label": selected.get("label", selected.get("id", "feature"))},
+            "source_generation": int(view.state.source_generation),
+            "track_payload": dict(getattr(self, "_mcd_unified_track_payload", {}) or {}),
+            "original_b": np.asarray(getattr(self.loaded.mcd_result, "pair_b", ()), dtype=float).copy(),
+            "branches": np.asarray(getattr(self.loaded.mcd_result, "pair_labels", ()), dtype=str).copy(),
+            "trace_values": np.asarray([], dtype=float),
+            "analysis_results": (getattr(self, "_mcd_unified_track_payload", {}) or {}).get("analysis_results", {}),
+            "links": (getattr(self, "_mcd_unified_track_payload", {}) or {}).get("links", ()),
+            "splitting": (getattr(self, "_mcd_unified_track_payload", {}) or {}).get("splitting", ()),
+            "mapping": (getattr(self, "_mcd_unified_track_payload", {}) or {}).get("mapping", {}),
+            "settings": self._unified_mcd_settings_snapshot(),
+            "status": "complete" if (getattr(self, "_mcd_unified_track_payload", {}) or {}).get("status") == "ok" else "uncomputed",
+        }
+        self.mcd_retention.add_feature(snapshot, included=True)
+        view.retain_selected_feature(
+            selected, settings=self._unified_mcd_settings_snapshot(),
+            analysis_payload=getattr(self, "_mcd_unified_track_payload", None),
+        )
+        self.mcd_retention.refresh()
+
+    def _update_unified_mcd_feature(self) -> None:
+        view = getattr(self, "mcd_unified_view", None)
+        controls = getattr(self, "mcd_unified_controls", None)
+        selected = view.selected_candidate if view is not None else None
+        row = controls.retained_feature_list.currentRow() if controls is not None else -1
+        if view is None or controls is None or selected is None or row < 0 or row >= len(view.state.retained_features):
+            return
+        identifier = str(controls.retained_feature_list.currentItem().data(Qt.ItemDataRole.UserRole) or selected.get("id", ""))
+        snapshot = self._current_unified_feature_snapshot()
+        if snapshot is None:
+            return
+        try:
+            self.mcd_retention.store.update_feature(identifier, snapshot, source_generation=view.state.source_generation)
+        except RetainedResultError as exc:
+            self._status(str(exc))
+            return
+        updated = dict(selected)
+        updated["source_generation"] = view.state.source_generation
+        updated["settings"] = self._unified_mcd_settings_snapshot()
+        updated["analysis_payload"] = dict(self._mcd_unified_track_payload or {})
+        view.state.retained_features[row] = updated
+        self._retain_unified_mcd_feature_refresh()
+
+    def _retain_unified_mcd_feature_refresh(self) -> None:
+        view = getattr(self, "mcd_unified_view", None)
+        controls = getattr(self, "mcd_unified_controls", None)
+        if view is None or controls is None:
+            return
+        self.mcd_retention.refresh()
+
+    def _inspect_unified_mcd_feature(self, row: int) -> None:
+        """Restore one retained feature's measured payload for inspection."""
+        view = getattr(self, "mcd_unified_view", None)
+        controls = getattr(self, "mcd_unified_controls", None)
+        if view is None or controls is None or row < 0 or row >= len(view.state.retained_features):
+            return
+        item = view.state.retained_features[row]
+        generation = int(item.get("source_generation", view.state.source_generation))
+        if generation not in {0, int(view.state.source_generation)}:
+            self._status("Retained feature belongs to an older MCD source; update it before inspection.")
+            return
+        selected_id = str(item.get("id", ""))
+        for index in range(view.candidate_combo.count()):
+            if str(view.candidate_combo.itemData(index, Qt.UserRole) or "") == selected_id:
+                view.candidate_combo.setCurrentIndex(index)
+                break
+        payload = item.get("analysis_payload")
+        if isinstance(payload, Mapping):
+            self._mcd_unified_track_payload_key = None
+            self._mcd_unified_track_payload = dict(payload)
+            self._plot_mcd_unified(auto=True)
+            self._status(f"Inspecting retained feature {item.get('label', selected_id)}.")
+
+    def _inspect_retained_snapshot(self, kind: str, snapshot: Any) -> None:
+        """Display a typed retained snapshot without mutating its arrays."""
+        if self.loaded is None or self.loaded.mode != "MCD":
+            return
+        current_generation = int(getattr(self.mcd_unified_view.state, "source_generation", 0))
+        if int(getattr(snapshot, "source_generation", -1)) not in {0, current_generation}:
+            self._status("Retained result belongs to an older MCD source generation.")
+            return
+        if kind == "window":
+            center = getattr(snapshot, "center_ev", None)
+            width = getattr(snapshot, "width_mev", None)
+            if center is not None and width is not None:
+                self.mcd_unified_view.set_window(float(center), float(width))
+                self.mcd_window_center_spin.setValue(float(center))
+                self.mcd_window_width_spin.setValue(float(width))
+            self._status(f"Inspecting retained MCD window {getattr(snapshot, 'id', '')}.")
+            return
+        payload = getattr(snapshot, "track_payload", None)
+        if isinstance(payload, Mapping):
+            self._mcd_unified_track_payload_key = None
+            self._mcd_unified_track_payload = dict(payload)
+            selected_id = str(getattr(snapshot, "id", ""))
+            view = self.mcd_unified_view
+            for index in range(view.candidate_combo.count()):
+                if str(view.candidate_combo.itemData(index, Qt.ItemDataRole.UserRole) or "") == selected_id:
+                    view.candidate_combo.setCurrentIndex(index)
+                    break
+            self._plot_mcd_unified(auto=True)
+            self._status(f"Inspecting retained feature {selected_id}.")
+
+    def _update_unified_mcd_window(self) -> None:
+        view = getattr(self, "mcd_unified_view", None)
+        controls = getattr(self, "mcd_unified_controls", None)
+        if view is None or controls is None:
+            return
+        row = controls.retained_window_list.currentRow()
+        if row < 0 or row >= len(view.state.retained_windows):
+            return
+        current = view.state.retained_windows[row]
+        item = controls.retained_window_list.currentItem()
+        identifier = str(item.data(Qt.ItemDataRole.UserRole) or "") if item is not None else ""
+        snapshot = self._current_unified_window_snapshot()
+        if snapshot is not None and identifier:
+            try:
+                self.mcd_retention.store.update_window(identifier, snapshot, source_generation=view.state.source_generation)
+            except RetainedResultError as exc:
+                self._status(str(exc))
+                return
+        view.state.retained_windows[row] = type(current)(
+            current.label, view.state.window_center_ev, view.state.window_width_mev,
+            view.state.source_generation, tuple(sorted(self._unified_mcd_settings_snapshot().items())),
+        )
+        self._refresh_unified_retained_list()
+
+    def _on_unified_feature_display_changed(self, *_args: Any) -> None:
+        # Slope bounds are derived from the current window trace, so update
+        # their fit metadata when the user edits a bound.  Feature processing
+        # controls use the separate selected-feature worker path.
+        view = getattr(self, "mcd_unified_view", None)
+        if view is not None and view.axes and self.loaded is not None and self.loaded.mode == "MCD":
+            self._plot_mcd_unified(auto=True)
+
+    def _show_unified_slope_details(self) -> None:
+        view = getattr(self, "mcd_unified_view", None)
+        details = str(getattr(view, "_slope_details_text", "No slope fits available."))
+        QMessageBox.information(self, "Unified MCD slope fits", details)
+
+    def _unified_window_analysis_key(self) -> tuple[Any, ...]:
+        settings = self._unified_mcd_settings_snapshot()
+        return (
+            id(self.loaded.mcd_result) if self.loaded is not None else None,
+            self.mcd_unified_view.state.source_generation,
+            float(self.mcd_window_center_spin.value()),
+            float(self.mcd_window_width_spin.value()),
+            str(self.mcd_window_metric_combo.currentText()),
+            tuple((key, value) for key, value in settings.items() if key.startswith("slope_")),
+        )
+
+    def _select_unified_mcd_export_items(self, *, scope: str) -> dict[str, Any]:
+        if scope == "retained":
+            return self.mcd_retention.store.get_included(
+                source_generation=int(self.mcd_unified_view.state.source_generation),
+            )
+        if scope != "current":
+            raise ValueError(f"Unknown MCD save scope: {scope}")
+        view = self.mcd_unified_view
+        if (getattr(self, "_mcd_unified_slopes_key", None) != self._unified_window_analysis_key()
+                or view.state.window_center_ev != self.mcd_window_center_spin.value()
+                or view.state.window_width_mev != self.mcd_window_width_spin.value()):
+            raise ValueError("Current window is updating. Save again after the plot refreshes.")
+        window = self._current_unified_window_snapshot()
+        if window is None:
+            raise ValueError("Current window is unavailable.")
+        feature = None
+        omission = ""
+        if self.mcd_unified_controls.include_feature_chk.isChecked():
+            key = self._unified_feature_analysis_key()
+            if (self._mcd_unified_track_worker is None and key is not None
+                    and getattr(self, "_mcd_unified_track_payload_key", None) == (view.state.source_generation, key)):
+                feature = self._current_unified_feature_snapshot()
+            if feature is None or feature.get("status") != "complete":
+                feature = None
+                omission = "Selected feature omitted: analysis is unavailable or updating."
+        return {"window": (window,), "feature": (feature,) if feature else (), "omission": omission}
+
+    def _default_unified_mcd_export_folder(self) -> str | None:
+        loaded = self.loaded
+        result = getattr(loaded, "mcd_result", None)
+        source = str(getattr(result, "source_file", "") or "")
+        folder = getattr(loaded, "folder", None) or self.current_folder
+        if source:
+            source_path = Path(source).expanduser()
+            if not source_path.is_absolute() and folder:
+                source_path = Path(folder) / source_path
+            source_folder = source_path.resolve().parent
+        elif folder:
+            source_folder = Path(folder).expanduser().resolve()
+        else:
+            return None
+        # Acquisition files live in <dataset>/mcd; exports belong beside it.
+        if source_folder.name.casefold() == "mcd":
+            source_folder = source_folder.parent
+        return str(source_folder / "Processed Data" / "MCD")
+
+    def _change_unified_mcd_export_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose MCD results folder", str(getattr(self, "_mcd_export_output_root", None) or self._default_unified_mcd_export_folder() or Path.home())
+        )
+        if folder and self._unified_mcd_export_folder_writable(folder):
+            self._mcd_export_output_root = str(folder)
+            self.mcd_unified_controls.save_folder_label.setText(f"Save to: {folder}")
+            self.mcd_unified_controls.save_folder_label.setToolTip(str(folder))
+        elif folder:
+            self._status("Choose a writable MCD results folder.")
+
+    @staticmethod
+    def _unified_mcd_export_folder_writable(folder: str | None) -> bool:
+        if not folder or not Path(folder).is_dir():
+            return False
+        try:
+            with tempfile.TemporaryFile(dir=folder):
+                pass
+            return True
+        except OSError:
+            return False
+
+    def _queue_unified_mcd_export(self, output_root: str | None = None, *, scope: str = "current") -> None:
+        """Queue an explicit immutable unified MCD results snapshot."""
+        if self.loaded is None or self.loaded.mode != "MCD" or self.loaded.mcd_result is None:
+            self._status("Save Results needs a loaded MCD source.")
+            return
+        if self._mcd_unified_export_worker is not None:
+            self._status("MCD Save Results is already running.")
+            return
+        try:
+            from core.mcd_unified_export import build_mcd_export_snapshot
+            view = self.mcd_unified_view
+            selected_retained = self._select_unified_mcd_export_items(scope=scope)
+            retained_windows = tuple(
+                _plain_retained(item)
+                for item in selected_retained.get("window", ())
+            )
+            retained_features = tuple(_plain_retained(item) for item in selected_retained.get("feature", ()))
+            result = self.loaded.mcd_result
+            try:
+                spectrum_order = np.asarray(spectrum_energy_order(result), dtype=int)
+            except (AttributeError, TypeError, ValueError):
+                spectrum_order = np.argsort(np.asarray(result.energy_ev, dtype=float), kind="stable")
+            spectrum_energy = np.asarray(result.energy_ev, dtype=float).ravel()
+            spectra_snapshot: dict[str, Any] = {}
+            mapping_label = view.channel_mapping_combo.currentText()
+            if mapping_label.startswith("K = −"):
+                channel_names = (("pos", "K′"), ("neg", "K"))
+            elif mapping_label.startswith("K = +"):
+                channel_names = (("pos", "K"), ("neg", "K′"))
+            else:
+                channel_names = (("pos", "+ channel"), ("neg", "− channel"))
+            for channel, label in channel_names:
+                raw = np.asarray(getattr(result, f"pair_raw_{channel}"), dtype=float)
+                corrected = np.asarray(getattr(result, f"pair_corrected_{channel}"), dtype=float)
+                fields = np.asarray(getattr(result, f"pair_b_{channel}", result.pair_b), dtype=float).ravel()
+                if raw.ndim == 2 and corrected.ndim == 2 and spectrum_order.size == raw.shape[1]:
+                    raw, corrected = raw[:, spectrum_order], corrected[:, spectrum_order]
+                spectra_snapshot[label] = {
+                    "energy_ev": spectrum_energy.copy(), "fields_t": fields.copy(),
+                    "values": corrected.copy(), "corrected_values": corrected.copy(),
+                    "raw_values": raw.copy(),
+                }
+            selected_map_snapshot: dict[str, Any] = {}
+            map_name = str(self.mcd_map_combo.currentText())
+            try:
+                map_cube = result.cube(map_name)
+                selected_map_snapshot = {
+                    "name": map_name,
+                    "energy_ev": np.asarray(map_cube.energy, dtype=float).copy(),
+                    "fields_t": np.asarray(map_cube.gate, dtype=float).copy(),
+                    "values": np.asarray(map_cube.Z, dtype=float).copy(),
+                }
+            except (AttributeError, KeyError, TypeError, ValueError):
+                selected_map_snapshot = {"name": map_name}
+            visible_branches = []
+            if view.show_inc_chk.isChecked(): visible_branches.append("B increasing")
+            if view.show_dec_chk.isChecked(): visible_branches.append("B decreasing")
+            # Only checked retained feature snapshots are numerical export
+            # inputs.  The current worker payload is a display cache and must
+            # not be duplicated into exports when a retained item exists.
+            numerical_results = [
+                item.get("track_payload") for item in retained_features
+                if isinstance(item, Mapping) and isinstance(item.get("track_payload"), Mapping)
+            ]
+            splitting_rows = []
+            link_rows = []
+            for payload in numerical_results:
+                splitting_rows.extend(payload.get("splitting", ()) or ())
+                link_rows.extend(payload.get("links", ()) or ())
+            for mcd_id, spectrum_ids in self._mcd_unified_manual_links.items():
+                for spectrum_id in spectrum_ids:
+                    link_rows.append({"mcd_id": mcd_id, "spectrum_id": spectrum_id, "status": "manual", "kind": "manual_ui"})
+
+            # The XLSX/PNG exporter consumes flat fit records.  Flatten each
+            # selected window independently while carrying its identity and
+            # requested metric; passing a list of nested SlopeAnalysis
+            # dictionaries would otherwise produce blank slope cells.
+            slope_rows: list[dict[str, Any]] = []
+            for window_index, window in enumerate(retained_windows, start=1):
+                slopes = window.get("slopes", {}) if isinstance(window, Mapping) else {}
+                metadata = {
+                    "window_id": window.get("window_id", window.get("id", f"window-{window_index}")),
+                    "center_ev": window.get("center_ev"),
+                    "width_mev": window.get("width_mev"),
+                    "metric": window.get("metric", "mean"),
+                }
+                if isinstance(slopes, Mapping) and ("fits" in slopes or "differences" in slopes):
+                    for category in ("fits", "differences"):
+                        entries = slopes.get(category, ())
+                        if isinstance(entries, Mapping):
+                            entries = entries.values()
+                        for entry_index, entry in enumerate(entries or (), start=1):
+                            plain_entry = _plain_retained(entry)
+                            record = dict(plain_entry) if isinstance(plain_entry, Mapping) else {"value": plain_entry}
+                            record.update({key: value for key, value in metadata.items() if key not in record})
+                            record.setdefault("category", category)
+                            record.setdefault("fit_id", f"{category}-{entry_index}")
+                            slope_rows.append(record)
+                elif isinstance(slopes, Mapping) and slopes:
+                    record = dict(_plain_retained(slopes))
+                    record.update({key: value for key, value in metadata.items() if key not in record})
+                    slope_rows.append(record)
+            snapshot = build_mcd_export_snapshot(
+                self.loaded.mcd_result,
+                analysis_results=numerical_results,
+                windows=retained_windows,
+                slopes=slope_rows,
+                links=link_rows,
+                features=tuple(retained_features),
+                splitting=splitting_rows,
+                spectra=spectra_snapshot,
+                maps={map_name: selected_map_snapshot} if selected_map_snapshot.get("values") is not None else None,
+                selected_map=map_name,
+                settings=self._unified_mcd_settings_snapshot(),
+                source_descriptor=self.mcd_controller._mcd_peak_source_descriptor(),
+                provenance={"source_generation": view.state.source_generation,
+                            "save_scope": scope,
+                            "selected_window_ids": [item.get("window_id", item.get("id")) for item in retained_windows],
+                            "feature_omission": selected_retained.get("omission", "")},
+                plot_state={
+                    "selected_b_index": view.state.selected_b_index,
+                    "selected_field_t": float(result.pair_b[view.state.selected_b_index]) if len(result.pair_b) else None,
+                    "spectra_source": view.spectra_source_combo.currentText(),
+                    "selected_spectrum": "",
+                    "show_corrected": view.spectra_source_combo.currentText().casefold().startswith("correct"),
+                    "show_raw": view.spectra_source_combo.currentText().casefold().startswith("raw"),
+                    "visible_branches": visible_branches,
+                    "window_center_ev": view.state.window_center_ev,
+                    "window_width_mev": view.state.window_width_mev,
+                    "window_metric": view.state.window_metric,
+                    "feature_metric": view.display_metric_label,
+                    "feature_overlay": bool(view.state.feature_overlay),
+                    "channel_mapping": mapping_label,
+                    # Export protocol expects this plot-state value to be a
+                    # map name.  The numerical cube is passed through
+                    # ``maps`` above; a dict here becomes an unhashable lookup
+                    # key in the worker.
+                    "selected_map": map_name,
+                },
+            )
+            # Freeze the complete request before a modal dialog can process
+            # control changes or background analysis completions.
+            output_root = output_root or getattr(self, "_mcd_export_output_root", None)
+            custom_output = bool(output_root)
+            if not output_root:
+                output_root = self._default_unified_mcd_export_folder()
+                if output_root:
+                    try:
+                        Path(output_root).mkdir(parents=True, exist_ok=True)
+                    except OSError:
+                        pass  # Offer another destination if the default is unavailable.
+            if not self._unified_mcd_export_folder_writable(output_root):
+                output_root = QFileDialog.getExistingDirectory(
+                    self, "Choose MCD results folder", str(self.current_folder or Path.home())
+                )
+                custom_output = True
+            if not output_root:
+                return
+            if not self._unified_mcd_export_folder_writable(output_root):
+                raise ValueError("Choose a writable results folder.")
+            if custom_output:
+                self._mcd_export_output_root = str(output_root)
+            self.mcd_unified_controls.save_folder_label.setText(f"Save to: {output_root}")
+            self.mcd_unified_controls.save_folder_label.setToolTip(str(output_root))
+            worker = Worker(_run_unified_mcd_export, snapshot, str(output_root))
+            worker.mcd_history_source = self.loaded
+            if scope == "current":
+                item = retained_windows[0]
+                description = f"current center {item['center_ev']:.6g} eV, width {item['width_mev']:.6g} meV, {item['metric']}"
+            else:
+                description = f"retained results ({len(retained_windows)} windows, {len(retained_features)} features)"
+            worker.mcd_save_description = description
+            worker.mcd_feature_omission = selected_retained.get("omission", "")
+        except (ImportError, AttributeError, TypeError, ValueError, OSError) as exc:
+            self._status(f"MCD Save Results could not be prepared: {exc}")
+            return
+        self._mcd_unified_export_worker = worker
+        self.mcd_unified_controls.save_results_btn.setEnabled(False)
+        self.mcd_unified_controls.change_save_folder_btn.setEnabled(False)
+        self._update_action_states()
+        self._status(f"Saving {description}… {worker.mcd_feature_omission}".strip())
+        worker.signals.result.connect(lambda payload, w=worker: self._on_unified_mcd_export_done(w, payload))
+        worker.signals.error.connect(lambda message, w=worker: self._on_unified_mcd_export_error(w, message))
+        worker.signals.finished.connect(lambda w=worker: self._on_unified_mcd_export_finished(w))
+        self.thread_pool.start(worker)
+
+    def _on_unified_mcd_export_done(self, worker: Worker, payload: Any) -> None:
+        if worker is self._mcd_unified_export_worker:
+            action = "Already saved (unchanged)" if payload.get("reused") else "Saved"
+            self._status(f"{action} {worker.mcd_save_description}: {payload.get('export_id', '')} · {payload.get('revision_dir', worker.args[1])}. {worker.mcd_feature_omission}".strip())
+            saved = getattr(worker, "mcd_history_source", None)
+            if saved is not None:
+                roots = self._mcd_history_search_roots(saved.folder)
+                roots = tuple(dict.fromkeys((*roots, str(worker.args[1]))))
+                self.settings.setValue(self._mcd_history_settings_key(saved.folder), list(roots))
+                if self.loaded is saved:
+                    self._refresh_saved_mcd_centers(roots)
+
+    @staticmethod
+    def _mcd_history_settings_key(folder: str) -> str:
+        import hashlib
+        key = str(Path(folder).resolve()).casefold().encode("utf-8")
+        return "mcd/history_roots/" + hashlib.sha256(key).hexdigest()
+
+    def _mcd_history_search_roots(self, folder: str) -> tuple[str, ...]:
+        roots = self.settings.value(self._mcd_history_settings_key(folder), [])
+        roots = [roots] if isinstance(roots, str) else list(roots or [])
+        current = getattr(self, "_mcd_export_output_root", None)
+        if current:
+            roots.append(str(current))
+        return tuple(dict.fromkeys(roots))
+
+    def _refresh_saved_mcd_centers(self, roots) -> None:
+        loaded = self.loaded
+        if loaded is None or loaded.mode != "MCD" or not loaded.primary_file:
+            return
+        worker = Worker(_read_mcd_history_worker, loaded.folder, loaded.primary_file, roots)
+        self._mcd_history_worker = worker
+        worker.signals.result.connect(lambda rows, w=worker, state=loaded: self._publish_saved_mcd_centers(w, state, rows))
+        worker.signals.error.connect(lambda message: self._status(f"Saved MCD center history could not be read: {str(message).splitlines()[0]}"))
+        self.thread_pool.start(worker)
+
+    def _publish_saved_mcd_centers(self, worker, loaded, rows) -> None:
+        if (getattr(self, "_is_closing", False) or worker is not getattr(self, "_mcd_history_worker", None)
+                or loaded is not self.loaded):
+            return
+        loaded.mcd_center_history = tuple(rows)
+        view = self.mcd_unified_view
+        if view._owns_current_figure() and view._result is loaded.mcd_result:
+            from core.mcd_center_history import merge_center_candidates
+            recommendations = [item for item in view._candidates
+                               if not item.get("history") or item.get("recommended")
+                               or item.get("metadata", {}).get("suggestion")]
+            view.refresh_catalog(merge_center_candidates(recommendations, rows), view.analysis_payload)
+
+    def _on_unified_mcd_export_error(self, worker: Worker, message: str) -> None:
+        if worker is self._mcd_unified_export_worker:
+            self._status(f"Unified MCD export failed: {str(message).splitlines()[0]}")
+
+    def _on_unified_mcd_export_finished(self, worker: Worker) -> None:
+        if worker is self._mcd_unified_export_worker:
+            self._mcd_unified_export_worker = None
+            if not getattr(self, "_is_closing", False):
+                self._update_action_states()
 
     def _selected(self, widget: QListWidget) -> List[str]:
         return [i.text() for i in widget.selectedItems()]
@@ -2485,6 +3860,31 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
     def _status(self, text: str) -> None:
         self.statusBar().showMessage(text)
 
+    def _invalidate_active_load(self, mode: str | None = None) -> None:
+        """Prevent completion after its source selection became invalid."""
+        self._load_lifecycle_generation = getattr(self, "_load_lifecycle_generation", 0) + 1
+        active = getattr(self, "_active_load_mode", None)
+        if active and (mode is None or active == mode):
+            self._invalidated_load_modes.add(active)
+        pending = getattr(self, "_pending_load_mode", None)
+        if pending and (mode is None or pending == mode):
+            self._invalidated_load_modes.add(pending)
+            self._pending_load_mode = None
+            self._pending_load_options = None
+
+    def _record_workflow_event(self, *, workflow: str, request_id: int,
+                               phase: str, source_key: Any = ()) -> None:
+        """Record opt-in workflow events without changing normal behavior."""
+        if not getattr(self, "_workflow_metrics_enabled", False):
+            return
+        self._workflow_metrics.append({
+            "workflow": str(workflow),
+            "request_id": int(request_id),
+            "phase": str(phase),
+            "source_key": source_key,
+            "elapsed_ms": None,
+        })
+
     def _append_log(self, text: str) -> None:
         self.log_lines.append(text)
         self.log_text.setPlainText("\n".join(self.log_lines))
@@ -2493,6 +3893,110 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
     def _set_stage(self, stage: str) -> None:
         self._status(f"State: {stage}")
         self._status_progress.setVisible(stage == "Loading...")
+        self._data_state_loading = stage == "Loading..."
+        label = getattr(self, "data_state_label", None)
+        if label is not None:
+            if stage == "Loading...":
+                self._data_state_error = None
+                self._refresh_data_state_label()
+            elif stage == "No data":
+                self._data_state_error = None
+                self._refresh_data_state_label()
+            elif stage in {"Loaded", "Plotted"}:
+                self._data_state_error = None
+                self._refresh_data_state_label()
+            else:
+                self._refresh_data_state_label()
+
+    def _refresh_data_state_label(self) -> None:
+        """Refresh source selection against the identity on the shared canvas."""
+        label = getattr(self, "data_state_label", None)
+        if label is None:
+            return
+        mode = self._active_mode() if hasattr(self, "tabs") else None
+        selected = self._selected_identity_for_status(mode)
+        shown = tuple(getattr(self, "_shown_draw_identity", ()))
+        selected_lines = "\n".join(str(name) for name in selected) or "none"
+        shown_lines = "\n".join(str(name) for name in shown) or "none"
+        tooltip = "Selected sources:\n" + selected_lines + "\n\nShown sources:\n" + shown_lines
+        label.setToolTip(tooltip)
+        for widget_name in ("recent_folder_combo", "folder_edit"):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.setToolTip("Data source status\n\n" + tooltip)
+        if getattr(self, "_data_state_loading", False):
+            label.show()
+            label.setText("Loading…")
+            return
+        state = getattr(self, "_data_state_error", None)
+        if state:
+            label.show()
+            label.setText("Load failed")
+            return
+        if not shown:
+            if selected:
+                label.show()
+                label.setText("Plot not updated")
+            else:
+                label.hide()
+            return
+        shown_mode = getattr(self, "_shown_draw_mode", None)
+        shown_selection = tuple(getattr(self, "_shown_selection_identity", ()))
+        if shown_mode != mode or shown_selection != selected:
+            label.show()
+            label.setText("Plot not updated")
+        else:
+            label.hide()
+
+    def _shown_source_identity_for_loaded(self, loaded: Any) -> tuple[str, ...]:
+        """Return every source contributing to a successfully rendered state."""
+        names: list[str] = []
+
+        def add(values: Any) -> None:
+            if isinstance(values, str):
+                values = (values,)
+            for value in values or ():
+                value = getattr(value, "file_name", value)
+                text = str(value or "")
+                if text and text not in names:
+                    names.append(text)
+
+        add(getattr(loaded, "selected_files", ()))
+        add(getattr(loaded, "baseline_files", ()))
+        compare_sources = getattr(loaded, "compare_sources", {}) or {}
+        add(compare_sources.values() if hasattr(compare_sources, "values") else ())
+        add(getattr(loaded, "power_records", ()))
+        for result in (getattr(loaded, "power_results", {}) or {}).values():
+            add(getattr(result, "records", ()))
+        return tuple(names)
+
+    def _clear_shown_draw_identity(self, mode: str | None = None) -> None:
+        if mode is None or getattr(self, "_shown_draw_mode", None) == mode:
+            self._shown_draw_mode = None
+            self._shown_draw_identity = ()
+            self._shown_selection_identity = ()
+            self._refresh_data_state_label()
+
+    def _selected_identity_for_status(self, mode: str | None) -> tuple[str, ...]:
+        if mode == "PL":
+            return tuple(self._selected(self.pl_files))
+        if mode == "DRR":
+            return tuple(self.drr_selected_files)
+        if mode == "Compare":
+            return tuple(self.compare_controller._cmp_current_mapping().values())
+        if mode == "Power Dependent":
+            keys = [self.power_controller._power_selected_group_key()]
+            if self.power_compare_chk.isChecked():
+                keys.extend((self.power_controller._power_role_group_key("KK"), self.power_controller._power_role_group_key("KKp")))
+            return tuple(key for key in dict.fromkeys(keys) if key)
+        if mode == "SHG Processing":
+            if self.shg_controller._shg_compare_mode():
+                return tuple(key for key in self.shg_controller._shg_compare_files() if key)
+            key = self.shg_controller._shg_selected_file()
+            return (key,) if key else ()
+        if mode == "MCD" and hasattr(self, "mcd_files"):
+            return tuple(self._selected(self.mcd_files))
+        return ()
 
     def _active_mode(self) -> str | None:
         text = self.tabs.tabText(self.tabs.currentIndex())
@@ -2507,6 +4011,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         }.get(text)
 
     def _on_central_tab_changed(self, _index: int) -> None:
+        mode = self._active_mode()
+        if mode in getattr(self, "_plot_redraw_pending", set()):
+            timer = getattr(self, "_plot_redraw_timers", {}).get(mode)
+            if timer is not None:
+                timer.start(0)
+        if (self.current_folder and mode is not None and mode not in self._catalog_ready_modes
+                and mode != self._catalog_active_scan):
+            self._refresh_file_lists(auto=True)
         label = self.tabs.tabText(int(_index))
         if label == "MCD Peak Shift":
             self._plot_mode("MCD Peak Shift")
@@ -2517,7 +4029,29 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             and self.loaded.mode == "MCD"
             and self.loaded.mcd_result is not None
         ):
-            self._plot_mode("MCD")
+            if not self._can_reuse_unified_mcd_view():
+                self._plot_mode("MCD")
+            if self._unified_catalog_needed():
+                self._queue_mcd_unified_analysis()
+
+    def _can_reuse_unified_mcd_view(self) -> bool:
+        """Return whether an MCD tab reentry can retain its existing Figure."""
+        view = getattr(self, "mcd_unified_view", None)
+        loaded = getattr(self, "loaded", None)
+        if view is None or loaded is None or loaded.mode != "MCD" or loaded.mcd_result is None:
+            return False
+        owns = getattr(view, "_owns_current_figure", None)
+        if not callable(owns) or not owns() or not getattr(view, "axes", None):
+            return False
+        signature = (
+            id(loaded), id(loaded.mcd_result),
+            tuple(self._selected(self.mcd_files)) if hasattr(self, "mcd_files") else (),
+            float(self.mcd_window_center_spin.value()),
+            float(self.mcd_window_width_spin.value()),
+            str(self.mcd_window_metric_combo.currentText()),
+            getattr(self, "_mcd_unified_analysis_generation", 0),
+        )
+        return signature == getattr(self, "_mcd_unified_last_published_signature", None)
 
     def _toolbar_load(self) -> None:
         mode = self._active_mode()
@@ -2541,7 +4075,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
     def _toolbar_save(self) -> None:
         mode = self._active_mode()
         if mode:
-            self._start_export(mode)
+            if mode == "MCD" and hasattr(self, "mcd_unified_view"):
+                self._queue_unified_mcd_export(scope="current")
+            else:
+                self._start_export(mode)
 
 
 
@@ -2630,6 +4167,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._update_action_states()
         self._update_plot_view_bar_visibility()
         self._update_results_dock_page()
+        self._refresh_data_state_label()
         if (
             self._active_mode() == "DRR"
             and self.drr_selected_files
@@ -2688,6 +4226,16 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         first = message.splitlines()[0] if message else "Unknown error"
         self._append_log(f"ERROR: {first}")
         self._status(f"Error: {first}")
+        label = getattr(self, "data_state_label", None)
+        if (
+            label is not None
+            and (getattr(self, "_load_in_progress", False)
+                 or getattr(self, "_active_load_mode", None)
+                 or getattr(self, "_data_state_loading", False))
+        ):
+            self._data_state_loading = False
+            self._data_state_error = "failed"
+            self._refresh_data_state_label()
         QMessageBox.critical(self, "Error", message)
 
     def _on_recent_folder_selected(self, index: int) -> None:
@@ -2752,16 +4300,27 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
     def _restore_list_selection(self, widget: QListWidget, names: List[str]) -> None:
         widget.clearSelection()
         for name in names:
-            for match in widget.findItems(name, Qt.MatchExactly):
+            matches = widget.findItems(name, Qt.MatchExactly)
+            if not matches:
+                matches = [
+                    widget.item(index)
+                    for index in range(widget.count())
+                    if str(widget.item(index).data(Qt.UserRole) or "") == str(name)
+                ]
+            for match in matches:
                 match.setSelected(True)
 
-    def _refresh_file_lists(self, *, auto: bool = False) -> None:
+    def _run_pending_catalog_refresh(self) -> None:
+        if not self._catalog_pending_requests:
+            return
+        active = self._active_mode()
+        mode = active if active in self._catalog_pending_requests else next(iter(self._catalog_pending_requests))
+        force = self._catalog_pending_requests.pop(mode)
+        self._refresh_file_lists(auto=not force, mode=mode)
+
+    def _refresh_file_lists(self, *, auto: bool = False, mode: str | None = None) -> None:
         """Queue a folder catalog refresh and apply it only if still current."""
         if self._is_closing:
-            return
-        if self._file_refresh_running:
-            self._file_refresh_pending = True
-            self._file_refresh_pending_auto = self._file_refresh_pending_auto or auto
             return
         old_files = set(self.available_files)
         old_pl_files = set(self.pl_available_files)
@@ -2776,23 +4335,62 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self.pl_available_files = []
             self._pl_source_mtime_cache.clear()
             self.pl_processed_status = {}
+            self.pl_processing_ambiguous = set()
             self.mcd_available_files = []
             self.mcd_processed_status = {}
+            self.mcd_processing_ambiguous = set()
+            self.shg_processed_status = {}
+            self.shg_processing_ambiguous = set()
+            self.shg_processing_roles = {}
+            self._shg_source_mtime_cache.clear()
             self._power_sources_cache = None
             self._power_sources_cache_files = ()
+            self._power_catalog_folder = ""
+            self._power_catalog_include_legacy = False
+            self._power_catalog_candidates = ()
+            self._power_catalog_signatures = ()
+            self._power_catalog_processed_names = set()
+            self._power_catalog_combined_names = set()
+            self._power_catalog_pending = False
+            self._power_pending_open_name = ""
+            self._power_pending_open_generation = None
+            self._power_pending_measurement_selection = None
+            self._power_pending_measurement_validation = {}
+            self._power_pending_measurement_generation = None
             self._power_result_cache.clear()
             self._drr_refresh_pending = False
             self._drr_refresh_pending_auto = False
             self._drr_refresh_pending_old_sources = None
+            self._drr_refresh_pending_selected_sources = None
             self.drr_available_sources = []
             self._drr_source_cache.clear()
             return
+        mode = mode or self._active_mode()
+        if mode == "DRR":
+            self._queue_drr_catalog_refresh(auto=auto, old_source_files=old_source_files)
+            return
+        if mode not in {"PL", "Compare", "Power Dependent", "MCD", "SHG Processing"}:
+            return
+        if self._file_refresh_running:
+            self._catalog_pending_requests[mode] = self._catalog_pending_requests.get(mode, False) or not auto
+            self._file_refresh_pending = True
+            self._file_refresh_pending_auto = self._file_refresh_pending_auto or auto
+            return
         self._status("Loading data source catalog…")
         self._file_refresh_running = True
+        self._file_refresh_pending = bool(self._catalog_pending_requests)
+        self._catalog_active_scan = mode
+        if mode == "Power Dependent":
+            self._power_catalog_pending = True
         self._file_refresh_generation += 1
         generation = self._file_refresh_generation
         folder = self.current_folder
-        worker = Worker(_scan_folder_sources_worker, folder)
+        worker = Worker(
+            _cached_folder_sources_worker,
+            folder, mode=mode, force=not auto, publish_cached=None,
+            power_include_legacy=bool(getattr(self, "_power_include_legacy", False)),
+        )
+        worker.kwargs["publish_cached"] = worker.signals.result.emit
         self._file_refresh_workers.append(worker)
         worker.signals.result.connect(
             lambda result, generation=generation, auto=auto, old_files=set(old_files),
@@ -2813,36 +4411,189 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                               old_source_files: set[str], pl_selected: list[str]) -> None:
         if generation != self._file_refresh_generation:
             return
-        folder, available_files, map_files, pl_files, pl_status, mcd_files, mcd_status = result
+        folder, available_files, map_files, pl_files, pl_status, mcd_files, mcd_status, *extra = result
+        scope = next((item for item in extra if isinstance(item, dict) and item.get("tag") == "catalog_scope"), {})
+        mode = scope.get("mode", "all")
+        preview = bool(scope.get("preview"))
+        if preview and mode in self._catalog_displayed_modes:
+            return
+        if len(extra) >= 6:
+            pl_unknown, mcd_unknown, shg_status, shg_unknown, shg_mtimes, shg_roles = extra[:6]
+        elif len(extra) >= 5:
+            pl_unknown, mcd_unknown, shg_status, shg_unknown, shg_mtimes = extra[:5]
+            shg_roles = {}
+        else:
+            pl_unknown, mcd_unknown = extra if len(extra) == 2 else (set(), set())
+            shg_status, shg_unknown, shg_mtimes, shg_roles = {}, set(), {}, {}
+        power_snapshot = next(
+            (item for item in extra if isinstance(item, dict) and item.get("tag") == "power_catalog"),
+            None,
+        )
+        source_metadata = next(
+            (item for item in extra if isinstance(item, dict) and item.get("tag") == "source_metadata"),
+            None,
+        )
         if str(folder).casefold() != str(self.current_folder).casefold():
             self._file_refresh_running = False
             if self._file_refresh_pending:
                 pending_auto = self._file_refresh_pending_auto
                 self._file_refresh_pending = False
                 self._file_refresh_pending_auto = False
-                QTimer.singleShot(0, lambda: self._refresh_file_lists(auto=pending_auto))
+                QTimer.singleShot(0, self._run_pending_catalog_refresh)
             return
-        self._file_refresh_running = False
+        if not preview:
+            self._file_refresh_running = False
+            self._catalog_active_scan = None
+            self._catalog_ready_modes.add(mode)
+            if mode in {"all", "Compare"}:
+                self._cmp_history_published_generation = generation
+                self._cmp_history_published_folder = str(folder)
+        shared_rows_displayed = bool({"PL", "Compare"} & self._catalog_displayed_modes)
+        self._catalog_displayed_modes.add(mode)
+        if preview and mode in {"PL", "Compare"} and shared_rows_displayed:
+            pl_files = self.pl_available_files
+        if mode not in {"all", "PL", "Compare"}:
+            pl_files = self.pl_available_files
+        if mode not in {"all", "PL"}:
+            pl_status, pl_unknown = self.pl_processed_status, self.pl_processing_ambiguous
+        if mode not in {"all", "MCD"}:
+            mcd_files, mcd_status, mcd_unknown = self.mcd_available_files, self.mcd_processed_status, self.mcd_processing_ambiguous
+        if mode not in {"all", "SHG Processing"}:
+            shg_status, shg_unknown = self.shg_processed_status, self.shg_processing_ambiguous
+            shg_mtimes, shg_roles = self._shg_source_mtime_cache, self.shg_processing_roles
+        if mode not in {"all", "Compare"}:
+            map_files = self.available_map_files
         self.available_files = list(available_files)
         self.available_map_files = list(map_files)
         self.pl_available_files = list(pl_files)
-        self._pl_source_mtime_cache.clear()
-        self._power_sources_cache = None
-        self._power_sources_cache_files = ()
-        self._power_result_cache.clear()
+        if source_metadata is not None and str(source_metadata.get("folder", "")).casefold() == str(self.current_folder).casefold():
+            published_modes = set(source_metadata.get("modes", ()))
+            if "PL" in published_modes:
+                self._pl_source_mtime_cache = {
+                    str(source): float(value or 0.0)
+                    for source, value in dict(source_metadata.get("pl_mtimes", {})).items()
+                }
+            if "MCD" in published_modes:
+                self._mcd_source_mtime_cache = {
+                    str(source): float(value or 0.0)
+                    for source, value in dict(source_metadata.get("mcd_mtimes", {})).items()
+                }
+        else:
+            self._pl_source_mtime_cache.clear()
+            self._mcd_source_mtime_cache.clear()
+        if mode in {"all", "Power Dependent"}:
+            if power_snapshot is not None and str(power_snapshot.get("folder", "")).casefold() == str(self.current_folder).casefold():
+                self._power_sources_cache = dict(power_snapshot.get("sources", {}))
+                self._power_sources_cache_files = tuple(power_snapshot.get("signatures", ()))
+                self._power_catalog_folder = str(power_snapshot.get("folder", ""))
+                self._power_catalog_include_legacy = bool(power_snapshot.get("include_legacy", False))
+                self._power_catalog_candidates = tuple(str(value) for value in power_snapshot.get("candidates", ()))
+                self._power_catalog_signatures = tuple(power_snapshot.get("signatures", ()))
+                self._power_catalog_processed_names = {
+                    str(value).replace("\\", "/").casefold()
+                    for value in power_snapshot.get("processed_names", ())
+                }
+                self._power_catalog_combined_names = {
+                    str(value).replace("\\", "/").casefold()
+                    for value in power_snapshot.get("combined_names", ())
+                }
+                self._power_saved_assignments_cache = dict(power_snapshot.get("saved_assignments", {}))
+                self._power_catalog_pending = False
+            else:
+                self._power_catalog_pending = False
+                self._power_sources_cache = None
+                self._power_sources_cache_files = ()
+                self._power_catalog_folder = ""
+                self._power_catalog_include_legacy = False
+                self._power_catalog_candidates = ()
+                self._power_catalog_signatures = ()
+                self._power_catalog_processed_names = set()
+                self._power_catalog_combined_names = set()
+                self._power_saved_assignments_cache = {}
+            self._power_result_cache.clear()
         self.pl_processed_status = dict(pl_status)
+        self.pl_processing_ambiguous = set(pl_unknown)
         self.mcd_available_files = list(mcd_files)
-        self._mcd_status_from_refresh = dict(mcd_status)
-        self.pl_files.clear()
-        self.pl_files.addItems(self.pl_available_files)
-        retained_pl = [f for f in pl_selected if f in self.pl_available_files]
-        self._restore_list_selection(self.pl_files, retained_pl)
+        if mode in {"all", "MCD"}:
+            self._mcd_status_from_refresh = dict(mcd_status)
+            self._mcd_ambiguous_from_refresh = set(mcd_unknown)
+        self.shg_processed_status = dict(shg_status)
+        self.shg_processing_ambiguous = set(shg_unknown)
+        self._shg_source_mtime_cache = dict(shg_mtimes)
+        self.shg_processing_roles = {
+            str(source): tuple(roles) for source, roles in dict(shg_roles).items()
+        }
+        pl_selected = self._selected(self.pl_files)
+        if [self.pl_files.item(i).text() for i in range(self.pl_files.count())] != self.pl_available_files:
+            self.pl_files.clear()
+            self.pl_files.addItems(self.pl_available_files)
+            retained_pl = [f for f in pl_selected if f in self.pl_available_files]
+            self._restore_list_selection(self.pl_files, retained_pl)
         self.pl_controller._update_pl_selection_summary()
-        self.compare_controller._cmp_set_channel_combo_items()
-        self.power_controller._power_refresh_groups()
-        self.mcd_controller._mcd_refresh_sources()
-        self.shg_controller._shg_refresh_sources()
-        self.compare_controller._cmp_auto_assign_channels()
+        if mode in {"all", "Compare"}:
+            self.compare_controller._cmp_set_channel_combo_items()
+            if mode == "Compare":
+                self._cmp_history_records = list(scope.get("compare_history", ()))
+                self._cmp_history_cache_folder = str(self.current_folder)
+                self._cmp_source_mtime_cache = dict((source_metadata or {}).get("compare_mtimes", {}))
+                self._cmp_source_mtime_cache_folder = str(self.current_folder)
+            else:
+                self._cmp_history_records = list(scope.get("compare_history", ()))
+                self._cmp_history_cache_folder = str(self.current_folder)
+                self._cmp_source_mtime_cache = dict((source_metadata or {}).get("compare_mtimes", {}))
+                self._cmp_source_mtime_cache_folder = str(self.current_folder)
+        if mode in {"all", "Power Dependent"} and not preview:
+            self.power_controller._power_refresh_groups()
+            pending_measurement = getattr(self, "_power_pending_measurement_selection", None)
+            pending_measurement_generation = getattr(self, "_power_pending_measurement_generation", None)
+            if (
+                pending_measurement is not None
+                and (pending_measurement_generation is None or generation >= int(pending_measurement_generation))
+                and bool(pending_measurement.get("legacy", False)) == bool(getattr(self, "_power_catalog_include_legacy", False))
+            ):
+                required = ([pending_measurement.get("single")]
+                            if pending_measurement.get("action") == "Single intensity"
+                            else [pending_measurement.get("KK"), pending_measurement.get("KKp")])
+                sources = self._power_sources_cache if isinstance(self._power_sources_cache, dict) else {}
+                missing = [str(key) for key in required if not key or key not in sources]
+                self._power_pending_measurement_selection = None
+                validation = getattr(self, "_power_pending_measurement_validation", {})
+                self._power_pending_measurement_validation = {}
+                self._power_pending_measurement_generation = None
+                if missing:
+                    self._show_error(
+                        "The selected Power source is no longer available after refresh: "
+                        + ", ".join(missing)
+                    )
+                else:
+                    self.power_controller._apply_power_measurement_group_from_selection(
+                        pending_measurement, validation
+                    )
+            pending_power_name = str(getattr(self, "_power_pending_open_name", "") or "")
+            pending_power_generation = getattr(self, "_power_pending_open_generation", None)
+            if pending_power_name and (pending_power_generation is None or generation >= int(pending_power_generation)):
+                self._power_pending_open_name = ""
+                self._power_pending_open_generation = None
+                pending_key = data_io.power_sweep_source_key(pending_power_name)
+                index = self.power_group_combo.findData(pending_key)
+                if index >= 0:
+                    self.power_group_combo.setCurrentIndex(index)
+                    self._start_load("Power Dependent")
+                else:
+                    self._show_error(
+                        f"The combined sweep was saved but could not be discovered: {pending_power_name}"
+                    )
+        elif mode == "Power Dependent":
+            self.power_controller._power_refresh_groups()
+        if mode in {"all", "MCD"}:
+            self.mcd_controller._mcd_refresh_sources()
+        if mode in {"all", "SHG Processing"}:
+            self.shg_controller._shg_refresh_sources()
+        if mode in {"all", "Compare"}:
+            self.compare_controller._cmp_auto_assign_channels()
+        if preview:
+            self._status(f"Showing cached {mode} files; checking for changes…")
+            return
         if self._pending_open_file:
             pending = self._pending_open_file
             self._pending_open_file = ""
@@ -2868,24 +4619,37 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self.drr_controller._update_drr_selection_labels()
         old_source_files |= old_pl_files | old_mcd_files
         self._status(f"Data source catalog ready: {len(self.available_files)} CSV files.")
-        self._queue_drr_catalog_refresh(auto=auto, old_source_files=old_source_files)
+        # A dialog waiting on Refresh must observe the final catalog in a
+        # coalesced refresh chain. Intermediate results are already applied
+        # to the owner, but emitting them would let a picker rebuild from the
+        # stale first scan before the queued scan starts.
+        emit_catalog_completion = not self._file_refresh_pending
+        if emit_catalog_completion:
+            self.file_catalog_refresh_finished.emit(str(self.current_folder), True)
         if self._file_refresh_pending:
             pending_auto = self._file_refresh_pending_auto
             self._file_refresh_pending = False
             self._file_refresh_pending_auto = False
-            QTimer.singleShot(0, lambda: self._refresh_file_lists(auto=pending_auto))
+            QTimer.singleShot(0, self._run_pending_catalog_refresh)
 
     def _on_file_lists_error(self, message: str, generation: int, folder: str) -> None:
         if generation != self._file_refresh_generation:
             return
         self._file_refresh_running = False
+        self._catalog_active_scan = None
         if str(folder).casefold() == str(self.current_folder).casefold():
+            self._power_catalog_pending = False
+            if getattr(self, "_power_pending_open_name", ""):
+                self._power_pending_open_name = ""
+                self._power_pending_open_generation = None
             self._status(f"Folder refresh failed: {str(message).splitlines()[0]}")
+            if not self._file_refresh_pending:
+                self.file_catalog_refresh_finished.emit(str(folder), False)
         if self._file_refresh_pending:
             pending_auto = self._file_refresh_pending_auto
             self._file_refresh_pending = False
             self._file_refresh_pending_auto = False
-            QTimer.singleShot(0, lambda: self._refresh_file_lists(auto=pending_auto))
+            QTimer.singleShot(0, self._run_pending_catalog_refresh)
 
     def _finish_file_refresh_worker(self, worker: Worker) -> None:
         try:
@@ -2893,19 +4657,30 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         except ValueError:
             pass
 
-    def _queue_drr_catalog_refresh(self, *, auto: bool, old_source_files: set[str]) -> None:
+    def _queue_drr_catalog_refresh(self, *, auto: bool, old_source_files: set[str],
+                                   selected_sources=()) -> None:
         """Coalesce DRR scans while keeping unrelated file-list refreshes synchronous."""
         if self._is_closing:
             return
         if self._drr_refresh_running:
+            if not self._drr_refresh_pending:
+                self._drr_refresh_pending_auto = auto
+            else:
+                self._drr_refresh_pending_auto = self._drr_refresh_pending_auto and auto
             self._drr_refresh_pending = True
-            self._drr_refresh_pending_auto = self._drr_refresh_pending_auto or auto
             if self._drr_refresh_pending_old_sources is None:
                 self._drr_refresh_pending_old_sources = set(old_source_files)
+            pending_selected = self._drr_refresh_pending_selected_sources or set()
+            pending_selected.update(str(value) for value in selected_sources)
+            self._drr_refresh_pending_selected_sources = pending_selected
             return
-        self._start_drr_catalog_refresh(auto=auto, old_source_files=old_source_files)
+        kwargs = {"auto": auto, "old_source_files": old_source_files}
+        if selected_sources:
+            kwargs["selected_sources"] = selected_sources
+        self._start_drr_catalog_refresh(**kwargs)
 
-    def _start_drr_catalog_refresh(self, *, auto: bool, old_source_files: set[str]) -> None:
+    def _start_drr_catalog_refresh(self, *, auto: bool, old_source_files: set[str],
+                                   selected_sources=()) -> None:
         if self._is_closing or not self.current_folder:
             return
         self._drr_refresh_running = True
@@ -2916,11 +4691,16 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             _scan_drr_catalog_worker,
             folder,
             self._drr_source_cache.clone(),
+            force=not auto, publish_cached=None,
+            include_all=bool(getattr(self, "_drr_include_all_sources", False)),
+            selected_sources=tuple(selected_sources),
         )
+        worker.kwargs["publish_cached"] = worker.signals.result.emit
         self._drr_refresh_workers.append(worker)
         worker.signals.result.connect(
-            lambda result, generation=generation, auto=auto, old_source_files=set(old_source_files):
-            self._on_drr_catalog_refresh_result(result, generation, auto, old_source_files)
+            lambda result, generation=generation, auto=auto, old_source_files=set(old_source_files),
+            selected_sources=tuple(selected_sources):
+            self._on_drr_catalog_refresh_result(result, generation, auto, old_source_files, selected_sources)
         )
         worker.signals.error.connect(
             lambda message, generation=generation, folder=folder: self._on_drr_catalog_refresh_error(
@@ -2932,16 +4712,56 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         )
         self.thread_pool.start(worker)
 
+    @staticmethod
+    def _drr_missing_result_is_terminal(missing_selected, current_selection,
+                                         request_selection, refresh_pending) -> bool:
+        """Only the still-current request may invalidate DRR selection."""
+        missing = {str(value) for value in missing_selected}
+        current = {str(value) for value in current_selection}
+        requested = {str(value) for value in request_selection}
+        return bool(missing and not refresh_pending and missing & current
+                    and (not requested or requested.issuperset(missing)))
+
     def _on_drr_catalog_refresh_result(
         self,
         result: tuple[str, List[DrrSource], DrrSourceCache],
         generation: int,
         auto: bool,
         old_source_files: set[str],
+        selected_sources: tuple[str, ...] = (),
     ) -> None:
         if generation != self._drr_refresh_generation:
             return
-        folder, sources, cache = result
+        folder, sources, cache = result[:3]
+        preview = len(result) > 3 and bool(result[3])
+        if len(result) > 4 and bool(result[4]) != bool(getattr(self, "_drr_include_all_sources", False)):
+            if not preview:
+                self._drr_refresh_running = False
+                self._finish_drr_catalog_refresh()
+            return
+        if preview:
+            if str(folder).casefold() == str(self.current_folder).casefold() and "DRR" not in self._catalog_displayed_modes:
+                self.drr_available_sources = sources
+                self._catalog_displayed_modes.add("DRR")
+                self.drr_controller._update_drr_selection_labels()
+                self._status("Showing cached DRR files; checking for changes…")
+                self.drr_catalog_preview_ready.emit(str(folder))
+            return
+        missing_selected = tuple(result[5]) if len(result) > 5 else ()
+        current_selection = set(str(value) for value in self.drr_selected_files)
+        request_selection = set(str(value) for value in selected_sources)
+        terminal_missing = self._drr_missing_result_is_terminal(
+            missing_selected, current_selection, request_selection,
+            bool(self._drr_refresh_pending),
+        )
+        if terminal_missing and str(folder).casefold() == str(self.current_folder).casefold():
+            self._invalidate_drr_for_background_selection(
+                "Selected DRR source is unavailable: " + ", ".join(missing_selected)
+            )
+            self._drr_refresh_running = False
+            self.drr_catalog_refresh_finished.emit(str(folder), False)
+            self._finish_drr_catalog_refresh()
+            return
         self._drr_refresh_running = False
         if str(folder).casefold() != str(self.current_folder).casefold():
             self._finish_drr_catalog_refresh()
@@ -2949,19 +4769,22 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
         old_drr_groups = group_drr_sources(self.drr_available_sources)
         selected_before = set(self.drr_selected_files)
+        selected_missing_before = set(self.drr_controller._drr_missing_sources(self.drr_selected_files))
         selected_complete_group_keys = {
             group.key
             for group in old_drr_groups
             if group.files
             and {source.source for source in group.files}.issubset(selected_before)
+            and not selected_missing_before
         }
         self.drr_available_sources = sources
+        self._catalog_ready_modes.add("DRR")
+        self._catalog_displayed_modes.add("DRR")
         self._drr_source_cache = cache
         drr_candidates = {source.source for source in sources}
-        self.drr_selected_files = [
-            f for f in self.drr_selected_files
-            if f in drr_candidates or (Path(f).is_absolute() and Path(f).is_file())
-        ]
+        # Preserve chosen identities, including files removed from the
+        # filtered catalog.  The dialog and load boundary display/block them.
+        self.drr_selected_files = list(dict.fromkeys(self.drr_selected_files))
         if selected_complete_group_keys:
             selected_now = set(self.drr_selected_files)
             for group in group_drr_sources(sources):
@@ -2982,10 +4805,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                         self.drr_selected_files.append(source.source)
                         selected_now.add(source.source)
         if not self._drr_assignments_automatic:
-            self.drr_baseline_files_manual = [
-                f for f in self.drr_baseline_files_manual
-                if f in drr_candidates or (Path(f).is_absolute() and Path(f).is_file())
-            ]
+            self.drr_baseline_files_manual = list(dict.fromkeys(self.drr_baseline_files_manual))
         self.drr_baseline_files_found = [
             f for f in self.drr_baseline_files_found if f in drr_candidates
         ]
@@ -3033,6 +4853,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             )
         elif not auto:
             self._status(f"Loaded file list: {len(new_source_files)} source files")
+        self.drr_catalog_refresh_finished.emit(str(folder), True)
         self._finish_drr_catalog_refresh()
 
     def _on_drr_catalog_refresh_error(
@@ -3043,6 +4864,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._drr_refresh_running = False
         if str(folder).casefold() == str(self.current_folder).casefold():
             self._status(f"DRR catalog refresh failed: {str(message).splitlines()[0]}")
+            self.drr_catalog_refresh_finished.emit(str(folder), False)
         self._finish_drr_catalog_refresh()
 
     def _on_drr_catalog_refresh_finished(self, worker: Worker) -> None:
@@ -3059,15 +4881,56 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         old_source_files = self._drr_refresh_pending_old_sources or set()
         self._drr_refresh_pending_auto = False
         self._drr_refresh_pending_old_sources = None
-        self._start_drr_catalog_refresh(auto=auto, old_source_files=old_source_files)
+        selected_sources = self._drr_refresh_pending_selected_sources or set()
+        self._drr_refresh_pending_selected_sources = None
+        kwargs = {"auto": auto, "old_source_files": old_source_files}
+        if selected_sources:
+            kwargs["selected_sources"] = selected_sources
+        self._start_drr_catalog_refresh(**kwargs)
 
     def _reset_workflow_state_for_folder_change(self) -> None:
         """Prevent selections and plots from one experiment leaking into another."""
+        self.available_files = []
+        self.available_map_files = []
+        self.pl_available_files = []
+        self.mcd_available_files = []
+        self.drr_available_sources = []
+        for name in ("pl_files", "mcd_files", "shg_files"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                previous = widget.blockSignals(True)
+                widget.clear()
+                widget.blockSignals(previous)
+        self._load_lifecycle_generation += 1
+        self._invalidated_load_modes.update(
+            mode for mode in (
+                getattr(self, "_active_load_mode", None),
+                getattr(self, "_pending_load_mode", None),
+            ) if mode
+        )
+        self._pending_load_mode = None
+        self._pending_load_options = None
         self.mcd_controller._invalidate_mcd_peak_shift(queue_reload=False)
         self.loaded = None
         self.last_plotted_mode = None
+        self._last_draw_identity.clear()
+        self._clear_shown_draw_identity()
         self._last_plot_cube = None
         self._last_plot_params_key = None
+        self._power_sources_cache = None
+        self._power_sources_cache_files = ()
+        self._power_catalog_folder = ""
+        self._power_catalog_include_legacy = False
+        self._power_catalog_candidates = ()
+        self._power_catalog_signatures = ()
+        self._power_catalog_processed_names = set()
+        self._power_catalog_combined_names = set()
+        self._power_catalog_pending = False
+        self._power_pending_open_name = ""
+        self._power_pending_open_generation = None
+        self._power_pending_measurement_selection = None
+        self._power_pending_measurement_validation = {}
+        self._power_pending_measurement_generation = None
         self.drr_selected_files = []
         self.drr_baseline_files_manual = []
         self.drr_baseline_files_found = []
@@ -3078,6 +4941,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._drr_source_cache.clear()
         self._pl_auto_next_queue = []
         self._pl_auto_next_active = False
+        object.__setattr__(self.shg_controller, "_shg_selected_source", "")
         for name in ("pl_files", "mcd_files", "shg_files"):
             widget = getattr(self, name, None)
             if widget is not None:
@@ -3103,6 +4967,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if hasattr(self, "figure"):
             self.figure.clear()
             self.canvas.draw_idle()
+        self._drr_heatmap_ax = None
+        self._drr_spectrum_ax = None
+        self._drr_heatmap_axes = {}
+        self._drr_spectrum_axes = {}
+        self._drr_plot_cubes = {}
+        self._drr_gate_lines = {}
         self._update_action_states()
 
     def _clear_loaded_drr_view(self) -> None:
@@ -3113,10 +4983,19 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self.last_plotted_mode = None
             self.figure.clear()
             self.canvas.draw_idle()
+            self._clear_shown_draw_identity("DRR")
+        self._drr_heatmap_ax = None
+        self._drr_spectrum_ax = None
+        self._drr_view_limits = None
+        self._drr_heatmap_axes = {}
+        self._drr_spectrum_axes = {}
+        self._drr_plot_cubes = {}
+        self._drr_gate_lines = {}
         self._last_plot_cube = None
         self._last_plot_params_key = None
 
     def _invalidate_drr_for_background_selection(self, message: str) -> None:
+        self._invalidate_active_load("DRR")
         self._clear_loaded_drr_view()
         self._set_stage("Background required")
         self._status(message)
@@ -3295,6 +5174,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
 
     def _update_action_states(self) -> None:
+        self._update_unified_mcd_save_controls()
         active_mode = self._active_mode()
         loaded_mode = self.loaded.mode if self.loaded else None
         plotted_mode = self.last_plotted_mode
@@ -3308,10 +5188,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             active_mode is not None
             and plotted_mode == active_mode
             and not self._export_in_progress
+            and (active_mode != "MCD" or self._mcd_unified_export_worker is None)
         )
         self._update_move_exported_sources_state()
         pl_loaded = loaded_mode == "PL"
         drr_loaded = loaded_mode == "DRR"
+        self._sync_drr_gate_toolbar_state(drr_loaded)
         cmp_loaded = loaded_mode == "Compare"
         power_loaded = loaded_mode == "Power Dependent"
         mcd_loaded = loaded_mode == "MCD"
@@ -3345,6 +5227,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         for prefix, enabled in (
             ("pl", pl_loaded),
             ("drr", drr_loaded),
+            ("drr_second", drr_loaded),
             ("cmp", cmp_loaded and not self.compare_controller._cmp_is_vp_view()),
             ("power", power_loaded and self.power_controller._power_view() != "VP"),
         ):
@@ -3372,30 +5255,121 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.cmp_split_scale_panel.setEnabled(cmp_split_available)
         self.power_split_scale_chk.setEnabled(power_split_available)
         self.power_split_scale_panel.setEnabled(power_split_available)
+        self.drr_second_split_scale_chk.setEnabled(drr_loaded)
+        self.drr_second_split_scale_panel.setEnabled(drr_loaded)
 
 
 
 
+
+    def _launch_load_options(self, options: LoadOptions) -> None:
+        """Launch an already captured immutable load request."""
+        mode = options.mode
+        trackers = getattr(self, "_load_requests", None)
+        if trackers is None:
+            trackers = {}
+            self._load_requests = trackers
+        tracker = trackers.setdefault(mode, LatestRequest())
+        token, should_start = tracker.submit(mode, str(options.folder).casefold(), options)
+        if not should_start:
+            self._pending_load_mode = mode
+            self._pending_load_options = options
+            self._invalidated_load_modes = {mode}
+            return
+        self._load_lifecycle_generation += 1
+        self._set_stage("Loading...")
+        self._load_in_progress = True
+        self._active_load_mode = mode
+        self._active_load_token = token
+        self._active_load_succeeded = False
+        recorder = getattr(self, "_record_workflow_event", None)
+        if callable(recorder):
+            recorder(workflow=mode, request_id=token.generation, phase="enqueue",
+                     source_key=tuple(options.selected_files))
+        worker = Worker(self._load_task, options)
+        worker.signals.log.connect(self._append_log)
+        load_generation = self._mcd_source_generation if mode == "MCD" else None
+        worker.signals.result.connect(
+            lambda loaded, token=token, generation=load_generation:
+            self._on_loaded(loaded, generation, request_token=token)
+        )
+        worker.signals.error.connect(lambda message, token=token: self._on_load_error(message, token))
+        worker.signals.finished.connect(lambda token=token: self._on_load_finished(request_token=token))
+        self.thread_pool.start(worker)
+
+    def _launch_pending_if_current(self, options: LoadOptions, generation: int,
+                                   folder: str) -> None:
+        """Run a deferred request only while its lifecycle snapshot remains valid."""
+        if (
+            getattr(self, "_is_closing", False)
+            or getattr(self, "_load_in_progress", False)
+            or generation != getattr(self, "_load_lifecycle_generation", 0)
+            or str(getattr(self, "current_folder", "")) != folder
+        ):
+            return
+        self._launch_load_options(options)
 
     def _start_load(self, mode: str) -> None:
         if self._is_closing:
             return
-        if self._load_in_progress:
-            self._status("State: Load already in progress.")
+        if self._load_in_progress and not getattr(self, "_capture_pending_load", False):
+            self._load_lifecycle_generation = getattr(self, "_load_lifecycle_generation", 0) + 1
+            active_mode = getattr(self, "_active_load_mode", None)
+            if active_mode:
+                self._invalidated_load_modes.add(active_mode)
+            self._pending_load_mode = mode
+            self._invalidated_load_modes.add(mode)
+            # Re-enter the option collection path while the worker remains
+            # active.  This snapshots the latest controls without starting a
+            # second worker or rereading them after completion.
+            self._capture_pending_load = True
+            try:
+                self._start_load(mode)
+            finally:
+                self._capture_pending_load = False
+            self._status("State: Load in progress; latest update queued.")
+            return
+        capturing_pending = bool(getattr(self, "_capture_pending_load", False))
+        has_pending_snapshot = (
+            not capturing_pending
+            and getattr(self, "_pending_load_mode", None) == mode
+            and getattr(self, "_pending_load_options", None) is not None
+        )
+        if has_pending_snapshot:
+            options = self._pending_load_options
+            self._pending_load_mode = None
+            self._pending_load_options = None
+            self._invalidated_load_modes.discard(mode)
+            self._launch_load_options(options)
             return
         prepared = getattr(self, '_power_prevalidated_load', None)
         self._power_prevalidated_load = None
-        if mode == 'Power Dependent' and prepared is not None:
+        if mode == 'Power Dependent' and prepared is not None and not capturing_pending and not has_pending_snapshot:
             folder, key, result = prepared
             if folder == self.current_folder and key == self.power_controller._power_selected_group_key():
                 loaded = LoadedState(mode=mode, folder=folder,
                     primary_file=result.records[0].file_name if result.records else None,
                     selected_files=list(dict.fromkeys(r.file_name for r in result.records)),
                     cube=result.cube, power_records=result.records,
-                    power_groups=result.groups, power_group_key=key)
+                    power_groups=result.groups, power_group_key=key,
+                    power_results={key: result})
+                trackers = getattr(self, "_load_requests", None)
+                if trackers is None:
+                    trackers = {}
+                    self._load_requests = trackers
+                tracker = trackers.setdefault(mode, LatestRequest())
+                token, should_start = tracker.submit(mode, str(folder).casefold(), (folder, key))
+                if not should_start:
+                    self._pending_load_mode = mode
+                    return
+                self._load_lifecycle_generation = getattr(self, "_load_lifecycle_generation", 0) + 1
                 self._load_in_progress = True
                 self._active_load_mode = mode
+                self._active_load_token = token
                 self._active_load_succeeded = False
+                recorder = getattr(self, "_record_workflow_event", None)
+                if callable(recorder):
+                    recorder(workflow=mode, request_id=token.generation, phase="enqueue", source_key=(key,))
                 self._set_stage('Loading...')
                 def finish_prevalidated_load():
                     if self._is_closing:
@@ -3405,13 +5379,13 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     try:
                         if self.current_folder == folder:
                             logger.info('Applying validated Power group on GUI thread: %s', key)
-                            self._on_loaded(loaded)
+                            self._on_loaded(loaded, request_token=token)
                             logger.info('Validated Power group applied: %s', key)
                     except Exception as exc:
                         import traceback
                         self._show_error(f'{exc}\n\n{traceback.format_exc()}')
                     finally:
-                        self._on_load_finished()
+                        self._on_load_finished(request_token=token)
                 # Leave the modal picker callback before touching plot widgets.
                 QTimer.singleShot(0, self, finish_prevalidated_load)
                 return
@@ -3452,6 +5426,25 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             drr_baseline_which = which_map.get(self.drr_baseline_combine_combo.currentText(), "last")
             y_axis_spec = self._selected_y_axis_spec("drr")
             power_group_key = ""
+            # Keep the existing automatic-unresolved branch reachable when a
+            # measurement itself is stale; its resolver supplies the precise
+            # saved-recipe diagnostic. Explicit baselines (and map inputs,
+            # which have no background-resolution step) must be rejected now.
+            required = list(selected) if (
+                not self._drr_assignments_automatic
+                or not selected
+                or data_io.is_xlsx_map_file(selected[0])
+            ) else []
+            if not self._drr_assignments_automatic:
+                required.extend(baselines)
+            for assignment in getattr(self, "_drr_assignments", ()):
+                required.extend(getattr(assignment, "baseline_files", ()) or ())
+            missing = self.drr_controller._drr_missing_sources(required)
+            if missing:
+                self._invalidate_drr_for_background_selection(
+                    "Missing DRR source(s): " + ", ".join(missing)
+                )
+                return
             if selected and not data_io.is_xlsx_map_file(selected[0]):
                 if self._drr_assignments_automatic and not self.drr_pin_baseline_chk.isChecked():
                     drr_assignments = tuple(self._drr_assignments)
@@ -3482,6 +5475,16 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     resolved = resolve_drr_background_assignments(
                         self.current_folder, self.drr_available_sources, selected,
                     )
+                    if resolved.self_fallback_allowed and drr_baseline in {"Self (first frame)", "Self (last frame)"}:
+                        # Keep saved/validated recipes when available. Otherwise
+                        # the visible default Self is a usable recipe, even if
+                        # no currentTextChanged signal has fired yet.
+                        resolved = resolve_drr_background_assignments(
+                            self.current_folder, self.drr_available_sources, selected,
+                            explicit_baseline_mode=drr_baseline,
+                            explicit_baseline_which=drr_baseline_which,
+                        )
+                        self._drr_baseline_user_selected = True
                 if resolved is None:
                     pass
                 elif resolved.resolved:
@@ -3501,6 +5504,19 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 elif baselines or drr_baseline in {"External", "Self (last frame)", "Self (first frame)"}:
                     self._invalidate_drr_for_background_selection(resolved.reason)
                     return
+            # Resolution can materialize baseline paths from saved metadata or
+            # automatic matching. Validate those resulting identities before
+            # constructing a worker; the pre-resolver guard cannot see them.
+            resolved_required = list(selected)
+            resolved_required.extend(baselines)
+            for assignment in drr_assignments:
+                resolved_required.extend(getattr(assignment, "baseline_files", ()) or ())
+            missing = self.drr_controller._drr_missing_sources(resolved_required)
+            if missing:
+                self._invalidate_drr_for_background_selection(
+                    "Missing DRR source(s): " + ", ".join(missing)
+                )
+                return
             if drr_baseline == "External" and not baselines:
                 self._invalidate_drr_for_background_selection(
                     "Select an external background before processing."
@@ -3602,6 +5618,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 "numerical_path": "pending",
                 "drr_background_assignments": [item.to_dict() for item in drr_assignments],
             }
+        pending_options = (
+            None
+            if capturing_pending or self._pending_load_mode != mode
+            else self._pending_load_options
+        )
         options = LoadOptions(
             mode=mode,
             folder=self.current_folder,
@@ -3614,10 +5635,19 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             y_axis_spec=y_axis_spec,
             compare_sources=compare_sources,
             power_group_key=power_group_key,
+            power_role_group_keys=(
+                tuple(dict.fromkeys((
+                    self.power_controller._power_role_group_key("KK"),
+                    self.power_controller._power_role_group_key("KKp"),
+                )))
+                if mode == "Power Dependent" and self.power_compare_chk.isChecked()
+                else ()
+            ),
             shg_settings=shg_settings,
             shg_fit_settings=shg_fit_settings,
             shg_compare=shg_compare,
             mcd_settings=mcd_settings,
+            mcd_history_roots=self._mcd_history_search_roots(self.current_folder) if mode == "MCD" else (),
             mcd_candidate_width_mev=(
                 float(self.mcd_window_width_spin.value()) if mode == "MCD" else 5.0
             ),
@@ -3659,18 +5689,51 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 },
             })
 
+        if pending_options is not None:
+            options = pending_options
+            self._pending_load_mode = None
+            self._pending_load_options = None
+            self._invalidated_load_modes.discard(mode)
+
+        if capturing_pending:
+            self._pending_load_mode = mode
+            self._pending_load_options = options
+            return
+
         self._set_stage("Loading...")
+        trackers = getattr(self, "_load_requests", None)
+        if trackers is None:
+            trackers = {}
+            self._load_requests = trackers
+        tracker = trackers.setdefault(mode, LatestRequest())
+        token, should_start = tracker.submit(mode, str(options.folder).casefold(), options)
+        if not should_start:
+            self._pending_load_mode = mode
+            self._invalidated_load_modes = {mode}
+            return
+        self._load_lifecycle_generation = getattr(self, "_load_lifecycle_generation", 0) + 1
         self._load_in_progress = True
         self._active_load_mode = mode
+        self._active_load_token = token
         self._active_load_succeeded = False
+        recorder = getattr(self, "_record_workflow_event", None)
+        if callable(recorder):
+            recorder(workflow=mode, request_id=token.generation, phase="enqueue", source_key=tuple(options.selected_files))
         worker = Worker(self._load_task, options)
         worker.signals.log.connect(self._append_log)
         load_generation = self._mcd_source_generation if mode == "MCD" else None
         if load_generation is not None:
             worker.signals.setProperty("mcd_source_generation", load_generation)
-        worker.signals.result.connect(self._on_loaded)
-        worker.signals.error.connect(self._show_error)
-        worker.signals.finished.connect(self._on_load_finished)
+        worker.signals.result.connect(
+            lambda loaded, token=token, generation=load_generation:
+            self._on_loaded(loaded, generation, request_token=token)
+        )
+        worker.signals.error.connect(
+            lambda message, token=token: self._on_load_error(message, token)
+        )
+        worker.signals.finished.connect(
+            lambda token=token: self._on_load_finished(request_token=token)
+        )
         self.thread_pool.start(worker)
 
     def _drr_provenance_records(
@@ -3855,6 +5918,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
         if mode == "MCD":
             source_path = resolve_source_path(folder, options.selected_files[0])
+            from core.mcd_center_history import read_center_history
+            history = read_center_history(folder, options.selected_files[0],
+                extra_roots=options.mcd_history_roots)
             settings = options.mcd_settings or McdSettings()
             if settings.dark_pos_file:
                 settings = McdSettings(**{**settings.__dict__, "dark_pos_file": str(resolve_source_path(folder, settings.dark_pos_file))})
@@ -3885,6 +5951,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 mode="MCD", folder=folder, primary_file=options.selected_files[0],
                 selected_files=options.selected_files, mcd_result=result, mcd_settings=settings,
                 mcd_center_candidates=candidates,
+                mcd_center_history=tuple(history),
                 mcd_candidate_search_range=candidate_range,
                 mcd_cache_hit=cache_hit,
             )
@@ -3896,6 +5963,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 group_key=options.power_group_key,
                 y_axis="auto",
             )
+            power_results = {result.group_key: result}
+            for role_key in options.power_role_group_keys:
+                if role_key and role_key not in power_results:
+                    power_results[role_key] = data_io.load_power_series_cube(
+                        folder, options.selected_files, group_key=role_key, y_axis="auto"
+                    )
             return LoadedState(
                 mode="Power Dependent",
                 folder=folder,
@@ -3904,6 +5977,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 cube=result.cube,
                 power_records=result.records,
                 power_groups=result.groups,
+                power_results=power_results,
                 power_group_key=result.group_key,
                 y_axis_spec="auto",
             )
@@ -3979,7 +6053,27 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             provenance_records=provenance_records,
         )
 
-    def _on_loaded(self, loaded: LoadedState, load_generation: int | None = None) -> None:
+    def _on_load_error(self, message: str, request_token: RequestToken | None = None) -> None:
+        if request_token is not None:
+            mode = request_token.workflow
+            tracker = self._load_requests.get(mode)
+            if tracker is None or not tracker.accepts(request_token, str(self.current_folder).casefold()):
+                return
+            if mode in self._invalidated_load_modes:
+                return
+        self._show_error(message)
+
+    def _on_loaded(self, loaded: LoadedState, load_generation: int | None = None,
+                   *, request_token: RequestToken | None = None) -> None:
+        if request_token is not None:
+            tracker = self._load_requests.get(request_token.workflow)
+            if (
+                tracker is None
+                or request_token != self._active_load_token
+                or not tracker.accepts(request_token, str(self.current_folder).casefold())
+                or request_token.workflow in self._invalidated_load_modes
+            ):
+                return
         if loaded.mode == "MCD" and load_generation is None:
             sender = self.sender()
             if sender is not None:
@@ -4022,6 +6116,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self.pl_dat_yaxis_unit_edit.setText(str(getattr(loaded.cube, "gate_unit", "")))
             self.pl_controller._on_pl_dat_y_axis_changed(choice)
         if loaded.mode == "Power Dependent":
+            self._power_result_cache.update(getattr(loaded, "power_results", {}))
             self.power_controller._power_refresh_groups()
             idx = self.power_group_combo.findData(loaded.power_group_key)
             if idx >= 0 and not self.power_compare_chk.isChecked():
@@ -4155,7 +6250,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._status(f"Loaded {loaded.mode}.")
         current_tab = self.tabs.tabText(self.tabs.currentIndex())
         plot_mode = "MCD Peak Shift" if loaded.mode == "MCD" and current_tab == "MCD Peak Shift" else loaded.mode
-        self._plot_mode(plot_mode, auto=True)
+        # A worker may finish after the user switched pages.  Publishing the
+        # small LoadedState is useful, but only the active page may redraw the
+        # shared canvas.
+        active_mode = self._active_mode()
+        if request_token is None or active_mode == plot_mode:
+            self._plot_mode(plot_mode, auto=True)
+        else:
+            self._status(f"Loaded {loaded.mode}; switch to its page to display it.")
         if plot_mode == "MCD Peak Shift" and loaded.mcd_result is not None:
             self._ensure_mcd_peak_analysis()
         if (
@@ -4167,13 +6269,46 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             # the first center trace refresh is not consumed during plotting.
             self.mcd_controller._mcd_center_refresh_timer.start(200)
 
-    def _on_load_finished(self, load_generation: int | None = None) -> None:
+    def _on_load_finished(self, load_generation: int | None = None,
+                          *, request_token: RequestToken | None = None) -> None:
+        if request_token is not None and request_token != self._active_load_token:
+            return
         finished_mode = self._active_load_mode
         succeeded = self._active_load_succeeded
         self._load_in_progress = False
+        self._data_state_loading = False
         self._active_load_mode = None
+        self._active_load_token = None
         self._active_load_succeeded = False
         self._status_progress.setVisible(False)
+        if not succeeded and (finished_mode or getattr(self, "_data_state_error", None)):
+            self._data_state_error = "failed"
+            self._refresh_data_state_label()
+        elif succeeded:
+            self._data_state_error = None
+            self._refresh_data_state_label()
+        if request_token is not None and finished_mode:
+            tracker = self._load_requests.get(finished_mode)
+            if tracker is not None:
+                tracker.finish(request_token)
+            pending_mode = self._pending_load_mode
+            pending_options = self._pending_load_options
+            if pending_mode is not None and not self._is_closing:
+                self._pending_load_mode = None
+                self._pending_load_options = None
+                self._invalidated_load_modes.clear()
+                if pending_options is not None:
+                    launch_generation = getattr(self, "_load_lifecycle_generation", 0)
+                    launch_folder = str(getattr(pending_options, "folder", getattr(self, "current_folder", "")))
+                    QTimer.singleShot(
+                        0, self,
+                        lambda options=pending_options, generation=launch_generation, folder=launch_folder:
+                        MainWindow._launch_pending_if_current(self, options, generation, folder),
+                    )
+                else:
+                    QTimer.singleShot(0, self, lambda mode=pending_mode: self._start_load(mode))
+            elif pending_mode is None:
+                self._invalidated_load_modes.clear()
         if finished_mode == "PL" and self._pl_auto_next_active:
             if succeeded:
                 self._pl_auto_next_active = False
@@ -4200,11 +6335,20 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self.mcd_controller._request_mcd_load()
             elif succeeded and self.tabs.tabText(self.tabs.currentIndex()) == "MCD Peak Shift":
                 self._ensure_mcd_peak_analysis()
+            elif succeeded and self.tabs.tabText(self.tabs.currentIndex()) == "MCD":
+                self._mcd_unified_track_generation += 1
+                self._mcd_unified_track_pending = None
+                self._mcd_unified_track_payload = None
+                self._mcd_unified_track_cache.clear()
+                self._mcd_unified_analysis_pending = False
+                if self._unified_catalog_needed():
+                    self._queue_mcd_unified_analysis()
 
     def _split_prefix_mode(self, prefix: str) -> str:
         return {
             "pl": "PL",
             "drr": "DRR",
+            "drr_second": "DRR",
             "cmp": "Compare",
             "power": "Power Dependent",
         }[prefix]
@@ -4213,18 +6357,32 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         panel: QWidget = getattr(self, f"{prefix}_split_scale_panel")
         panel.setVisible(bool(checked))
         spins = self._mode_spins(self._split_prefix_mode(prefix))
-        checks: Dict[str, QCheckBox] = getattr(self, f"{prefix}_fix_checks")
-        spins["vmin"].setEnabled(not checked)
-        spins["vmax"].setEnabled(not checked)
-        checks["vmin"].setEnabled(not checked)
-        checks["vmax"].setEnabled(not checked)
+        # The d2E product has its own split ranges.  Toggling them must not
+        # disable the raw DRR limits shown in the row above.
+        if prefix != "drr_second":
+            checks: Dict[str, QCheckBox] = getattr(self, f"{prefix}_fix_checks")
+            spins["vmin"].setEnabled(not checked)
+            spins["vmax"].setEnabled(not checked)
+            checks["vmin"].setEnabled(not checked)
+            checks["vmax"].setEnabled(not checked)
 
         split_spins: Dict[str, QDoubleSpinBox] = getattr(self, f"{prefix}_split_spins")
         xlo, xhi = sorted((float(spins["xmin"].value()), float(spins["xmax"].value())))
         split_fix_checks: Dict[str, QCheckBox] = getattr(
             self, f"{prefix}_split_fix_checks"
         )
-        if checked:
+        if checked and prefix == "drr_second":
+            self._set_spin_value_silent(
+                split_spins["x0"], float(self.drr_split_spins["x0"].value())
+            )
+            self._refresh_drr_second_split_ranges(center_split=True)
+        elif checked:
+            if prefix == "drr":
+                second_toggle = self.drr_second_split_scale_chk
+                blocked = second_toggle.blockSignals(True)
+                second_toggle.setChecked(True)
+                second_toggle.blockSignals(blocked)
+                self.drr_second_split_scale_panel.setVisible(True)
             values: Dict[str, float] = {}
             if not xlo < float(split_spins["x0"].value()) < xhi:
                 values["x0"] = 0.5 * (xlo + xhi)
@@ -4248,13 +6406,19 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 refresh_split=True,
                 center_split=True,
             )
-        else:
+        elif prefix != "drr_second":
+            if prefix == "drr":
+                second_toggle = self.drr_second_split_scale_chk
+                blocked = second_toggle.blockSignals(True)
+                second_toggle.setChecked(False)
+                second_toggle.blockSignals(blocked)
+                self.drr_second_split_scale_panel.setVisible(False)
             self._refresh_automatic_ranges(
                 self._split_prefix_mode(prefix), refresh_split=False
             )
         if prefix == "pl":
             self.pl_controller._on_pl_plot_param_changed()
-        elif prefix == "drr":
+        elif prefix in {"drr", "drr_second"}:
             self.drr_controller._on_drr_plot_param_changed()
         elif prefix == "cmp":
             self.compare_controller._on_cmp_plot_param_changed()
@@ -4266,12 +6430,18 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         toggle: QCheckBox = getattr(self, f"{prefix}_split_scale_chk")
         if not toggle.isChecked():
             return
-        self._refresh_automatic_ranges(
-            self._split_prefix_mode(prefix), refresh_split=True
-        )
+        if prefix == "drr_second":
+            self._set_spin_value_silent(
+                self.drr_split_spins["x0"], float(self.drr_second_split_spins["x0"].value())
+            )
+            self._refresh_drr_second_split_ranges()
+        else:
+            self._refresh_automatic_ranges(
+                self._split_prefix_mode(prefix), refresh_split=True
+            )
         if prefix == "pl":
             self.pl_controller._on_pl_plot_param_changed()
-        elif prefix == "drr":
+        elif prefix in {"drr", "drr_second"}:
             self.drr_controller._on_drr_plot_param_changed()
         elif prefix == "cmp":
             self.compare_controller._on_cmp_plot_param_changed()
@@ -4288,13 +6458,22 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if mode == "Power Dependent" and self.power_controller._power_view() == "VP":
             return None
         prefix = "pl" if mode == "PL" else "drr" if mode == "DRR" else "power" if mode == "Power Dependent" else "cmp"
+        return self._split_scale_for_prefix(prefix, mode)
+
+    def _split_scale_for_prefix(self, prefix: str, mode: str = "DRR") -> SplitColorScale | None:
+        """Build a validated split scale for one product's controls."""
         toggle: QCheckBox = getattr(self, f"{prefix}_split_scale_chk")
-        if not toggle.isChecked():
+        enabled = toggle.isChecked() or (
+            prefix == "drr_second"
+            and getattr(self, "drr_split_scale_chk", toggle).isChecked()
+        )
+        if not enabled:
             return None
         spins = self._mode_spins(mode)
         split_spins: Dict[str, QDoubleSpinBox] = getattr(self, f"{prefix}_split_spins")
         xmin, xmax = sorted((float(spins["xmin"].value()), float(spins["xmax"].value())))
-        x0 = float(split_spins["x0"].value())
+        shared_boundary = prefix == "drr_second" and hasattr(self, "drr_split_spins")
+        x0 = float(self.drr_split_spins["x0"].value()) if shared_boundary else float(split_spins["x0"].value())
         left_vmin = float(split_spins["left_vmin"].value())
         left_vmax = float(split_spins["left_vmax"].value())
         right_vmin = float(split_spins["right_vmin"].value())
@@ -4311,31 +6490,52 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             left_vmax=left_vmax,
             right_vmin=right_vmin,
             right_vmax=right_vmax,
-            show_boundary=bool(getattr(self, f"{prefix}_split_boundary_chk").isChecked()),
+            show_boundary=bool(
+                getattr(
+                    self,
+                    "drr_split_boundary_chk" if shared_boundary else f"{prefix}_split_boundary_chk",
+                ).isChecked()
+            ),
         )
 
     def _split_scale_key(self, prefix: str) -> tuple[object, ...]:
-        enabled = bool(getattr(self, f"{prefix}_split_scale_chk").isChecked())
+        toggle = getattr(self, f"{prefix}_split_scale_chk")
+        enabled = bool(toggle.isChecked()) or (
+            prefix == "drr_second"
+            and bool(getattr(self, "drr_split_scale_chk", toggle).isChecked())
+        )
         if not enabled:
             return (False,)
         spins: Dict[str, QDoubleSpinBox] = getattr(self, f"{prefix}_split_spins")
+        shared_boundary = prefix == "drr_second" and hasattr(self, "drr_split_spins")
+        shared_spins = self.drr_split_spins if shared_boundary else spins
         return (
             True,
-            float(spins["x0"].value()),
+            float(shared_spins["x0"].value()),
             float(spins["left_vmin"].value()),
             float(spins["left_vmax"].value()),
             float(spins["right_vmin"].value()),
             float(spins["right_vmax"].value()),
-            bool(getattr(self, f"{prefix}_split_boundary_chk").isChecked()),
+            bool(
+                getattr(
+                    self,
+                    "drr_split_boundary_chk" if shared_boundary else f"{prefix}_split_boundary_chk",
+                ).isChecked()
+            ),
         )
 
-    def _split_auto_cubes(self, mode: str) -> list[DataCube]:
+    def _split_auto_cubes(self, mode: str, prefix: str | None = None) -> list[DataCube]:
         if not self.loaded or self.loaded.mode != mode:
             return []
         if mode == "PL" and self.loaded.cube is not None:
             return [self.loaded.cube]
         if mode == "DRR" and self.loaded.cube is not None:
-            return [self.drr_controller._drr_cube_for_display()]
+            try:
+                if prefix == "drr_second":
+                    return [self.drr_controller._drr_cube_with_metadata(2)[0]]
+                return [self.drr_controller._drr_cube_for_display()]
+            except (TypeError, ValueError):
+                return []
         if mode == "Compare" and self.loaded.compare_cubes:
             if self.compare_controller._cmp_is_vp_view():
                 return []
@@ -4398,6 +6598,65 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 except (KeyError, ValueError):
                     pass
         return self._split_auto_cubes(mode)
+
+    def _refresh_drr_second_split_ranges(self, *, center_split: bool = False) -> bool:
+        """Refresh unlocked d2E split limits from the current derivative cube."""
+        toggle = getattr(self, "drr_second_split_scale_chk", None)
+        if toggle is None or (
+            not toggle.isChecked()
+            and not getattr(self, "drr_split_scale_chk", toggle).isChecked()
+        ):
+            return False
+        if not self.loaded or self.loaded.mode != "DRR" or self.loaded.cube is None:
+            return False
+        try:
+            second_cube = self.drr_controller._drr_cube_with_metadata(2)[0]
+        except (TypeError, ValueError):
+            return False
+        spins = self.drr_spins
+        split_spins: Dict[str, QDoubleSpinBox] = self.drr_second_split_spins
+        split_fixes: Dict[str, QCheckBox] = self.drr_second_split_fix_checks
+        xmin, xmax = sorted((float(spins["xmin"].value()), float(spins["xmax"].value())))
+        x0 = float(self.drr_split_spins["x0"].value())
+        self._set_spin_value_silent(split_spins["x0"], x0)
+        changed = False
+        if (center_split and not self.drr_split_fix_checks["x0"].isChecked()) or not xmin < x0 < xmax:
+            requested = 0.5 * (xmin + xmax)
+            try:
+                _index, x0 = resolve_split_boundary(np.asarray(second_cube.energy, float), requested)
+            except ValueError:
+                x0 = requested
+            self._set_spin_value_silent(split_spins["x0"], x0)
+            self._set_spin_value_silent(self.drr_split_spins["x0"], x0)
+            changed = True
+        # Seed a newly enabled panel from the current whole d2E limits.  This
+        # keeps the first toggle valid while the percentile refresh below
+        # still supplies independent values for each region.
+        for side in ("left", "right"):
+            vmin_key, vmax_key = f"{side}_vmin", f"{side}_vmax"
+            if split_spins[vmax_key].value() <= split_spins[vmin_key].value():
+                if not split_fixes[vmin_key].isChecked():
+                    self._set_spin_value_silent(split_spins[vmin_key], float(self.drr_second_vmin_spin.value()))
+                if not split_fixes[vmax_key].isChecked():
+                    self._set_spin_value_silent(split_spins[vmax_key], float(self.drr_second_vmax_spin.value()))
+        for side in ("left", "right"):
+            bounds = self._color_bounds_for_cubes(
+                "DRR", [second_cube], side=side, split_x=x0
+            )
+            if bounds is None:
+                continue
+            vmin_key, vmax_key = f"{side}_vmin", f"{side}_vmax"
+            candidate_min = float(split_spins[vmin_key].value()) if split_fixes[vmin_key].isChecked() else bounds[0]
+            candidate_max = float(split_spins[vmax_key].value()) if split_fixes[vmax_key].isChecked() else bounds[1]
+            if candidate_max <= candidate_min:
+                continue
+            if not split_fixes[vmin_key].isChecked():
+                self._set_spin_value_silent(split_spins[vmin_key], candidate_min)
+                changed = True
+            if not split_fixes[vmax_key].isChecked():
+                self._set_spin_value_silent(split_spins[vmax_key], candidate_max)
+                changed = True
+        return changed
 
     def _color_bounds_for_cubes(
         self,
@@ -4513,6 +6772,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 return changed
             prefix = "pl" if mode == "PL" else "drr" if mode == "DRR" else "power" if mode == "Power Dependent" else "cmp"
             if not bool(getattr(self, f"{prefix}_split_scale_chk").isChecked()):
+                if mode == "DRR":
+                    return changed or self._refresh_drr_second_split_ranges(center_split=center_split)
                 return changed
             split_spins: Dict[str, QDoubleSpinBox] = getattr(self, f"{prefix}_split_spins")
             split_fixes: Dict[str, QCheckBox] = getattr(self, f"{prefix}_split_fix_checks")
@@ -4541,13 +6802,15 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     if not split_fixes[key].isChecked():
                         self._set_spin_value_silent(split_spins[key], value)
                         changed = True
+            if mode == "DRR":
+                changed = self._refresh_drr_second_split_ranges(center_split=center_split) or changed
             return changed
         finally:
             self._automatic_range_update = False
 
     def _auto_split_vrange(self, prefix: str, side: str) -> None:
         mode = self._split_prefix_mode(prefix)
-        cubes = self._split_auto_cubes(mode)
+        cubes = self._split_auto_cubes(mode, prefix)
         if not cubes:
             self._status("Split auto scale is available after loading an intensity heatmap.")
             return
@@ -4721,23 +6984,20 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             if not desired_key:
                 raise ValueError("Select a power sweep before plotting.")
             if desired_key == self.loaded.power_group_key and list(self.loaded.selected_files):
+                required_result_keys = [desired_key]
+                if self.power_compare_chk.isChecked():
+                    required_result_keys.append(self.power_controller._power_role_group_key("KKp"))
+                missing_result_keys = [
+                    key for key in required_result_keys
+                    if key and key not in self._power_result_cache
+                ]
+                if missing_result_keys:
+                    self._start_load(mode)
+                    self._status("Power source data is updating in the background.")
                 return False
-            result = self.power_controller._power_load_group_result(desired_key)
-            self.loaded = LoadedState(
-                mode="Power Dependent",
-                folder=self.current_folder,
-                primary_file=(result.records[0].file_name if result.records else None),
-                selected_files=list(dict.fromkeys(record.file_name for record in result.records)),
-                cube=result.cube,
-                power_records=result.records,
-                power_groups=result.groups,
-                power_group_key=result.group_key,
-                y_axis_spec="auto",
-            )
-            self._last_plot_cube = None
-            self._last_plot_params_key = None
-            self._apply_auto_limits_for_loaded()
-            return True
+            self._start_load(mode)
+            self._status("Power source changed; waiting for the current load to finish.")
+            return False
         if mode == "Compare":
             selection = self.compare_controller._cmp_selection_from_ui()
             desired_sources = selection.as_pairs()
@@ -4749,41 +7009,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         elif current_spec == getattr(self.loaded, "y_axis_spec", "auto"):
             return False
 
-        if mode == "PL":
-            if not self.loaded.primary_file:
-                raise ValueError("No PL file loaded.")
-            cube = data_io.load_pl_cube(
-                self.current_folder,
-                self.loaded.primary_file,
-                log_scale=bool(self.pl_log_chk.isChecked()),
-                y_axis=current_spec,
-            )
-            self.loaded = LoadedState(
-                mode="PL",
-                folder=self.current_folder,
-                primary_file=self.loaded.primary_file,
-                selected_files=list(self.loaded.selected_files),
-                cube=cube,
-                y_axis_spec=current_spec,
-            )
-        elif mode == "Compare":
-            selection = self.compare_controller._cmp_selection_from_ui()
-            cubes = data_io.load_compare_cubes(
-                self.current_folder,
-                selection,
-                log_scale=bool(self.cmp_log_chk.isChecked()),
-                y_axis=current_spec,
-            )
-            self.loaded = LoadedState(
-                mode="Compare",
-                folder=self.current_folder,
-                selected_files=list(selection.as_pairs().values()),
-                compare_cubes=cubes,
-                compare_sources=selection.as_pairs(),
-                y_axis_spec=current_spec,
-            )
-        else:
-            return self._ensure_loaded_matches_drr_params()
+        # Source and processing changes are submitted through the worker
+        # request path.  Redraws stay display-only and never read a CSV.
+        self._start_load(mode)
+        self._status(f"{mode} input changed; reloading in the background.")
+        return False
 
         self._last_plot_cube = None
         self._last_plot_params_key = None
@@ -4905,6 +7135,27 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             clip_outliers=self._mode_clip(mode),
             split_scale=self._split_scale_for_mode(mode),
         )
+
+    def _make_drr_params(self, cube: DataCube, derivative_order: int | None) -> HeatmapParams:
+        """Build display parameters with a product-specific color range."""
+        params = self._make_params("DRR", cube)
+        if derivative_order == 2 and hasattr(self, "drr_second_vmin_spin"):
+            params = HeatmapParams(
+                **{
+                    **params.__dict__,
+                    "cmap": self._resolved_cmap(self.drr_second_cmap),
+                    "vmin": float(self.drr_second_vmin_spin.value()),
+                    "vmax": float(self.drr_second_vmax_spin.value()),
+                    "split_scale": self._split_scale_for_prefix("drr_second", "DRR"),
+                }
+            )
+        return params
+
+    def _drr_params_with_view_limits(self, params: HeatmapParams) -> HeatmapParams:
+        limits = self._drr_view_limits
+        if limits is None:
+            return params
+        return HeatmapParams(**{**params.__dict__, "xlim": limits[0], "ylim": limits[1]})
 
     def _auto_scale_spectrum_y(self, ax, x: np.ndarray, y: np.ndarray, xlim: tuple[float, float]) -> None:
         x = np.asarray(x, float).ravel()
@@ -6249,7 +8500,541 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.mcd_controller._on_canvas_release(event)
 
 
+    def _unified_mcd_candidates(self) -> list[dict[str, Any]]:
+        """Adapt completed legacy worker results into the unified catalog."""
+        output: list[dict[str, Any]] = []
+        for feature in getattr(self, "_mcd_unified_features", ()):
+            if isinstance(feature, dict):
+                item = dict(feature)
+            elif hasattr(feature, "to_dict"):
+                try:
+                    item = dict(feature.to_dict())
+                except (TypeError, ValueError):
+                    item = {}
+            else:
+                item = {
+                    name: getattr(feature, name)
+                    for name in ("id", "domain", "kind", "source", "energy_ev", "field_t", "branch", "prominence", "width_ev", "confidence")
+                    if hasattr(feature, name)
+                }
+            if "energy_ev" in item and "center_ev" not in item:
+                item["center_ev"] = item["energy_ev"]
+            output.append(item)
+        if output:
+            return output
+        method_results = getattr(self, "_mcd_peak_method_results", {})
+        selected = method_results.get("Raw spectrum", {}) if isinstance(method_results, dict) else {}
+        for channel, analysis in selected.items() if isinstance(selected, dict) else ():
+            for track in getattr(analysis, "tracks", ()):
+                kind = str(getattr(track, "feature_kind", "peak"))
+                output.append({
+                    "id": f"{channel}:{getattr(track, 'peak_id', len(output) + 1)}:{kind}",
+                    "label": f"{'P' if kind == 'peak' else 'D'}{getattr(track, 'peak_id', len(output) + 1)}",
+                    "domain": "spectrum", "source": "spectrum", "kind": kind,
+                    "center_ev": getattr(track, "reference_energy_ev", None),
+                })
+        return output
+
+    def _unified_window_candidates(self) -> list[dict[str, Any]]:
+        """Return advisory fixed-width MCD windows for the Center selector."""
+        result = self.loaded.mcd_result if self.loaded is not None and self.loaded.mode == "MCD" else None
+        if result is None:
+            return []
+        energy = np.asarray(result.energy_ev, dtype=float)
+        finite = energy[np.isfinite(energy)]
+        if finite.size < 2:
+            return []
+        try:
+            width = float(self.mcd_window_width_spin.value())
+            search_range = (float(self.mcd_spins["xmin"].value()), float(self.mcd_spins["xmax"].value()))
+            if search_range[1] <= search_range[0]:
+                search_range = (float(np.min(finite)), float(np.max(finite)))
+            metric = self.mcd_controller._mcd_window_metric()
+            suggestions = suggest_mcd_window_centers(result, width, metric=metric, energy_range=search_range, max_candidates=None)
+        except (AttributeError, TypeError, ValueError, FloatingPointError):
+            return []
+        suggestions = tuple(candidate for candidate in suggestions if np.isfinite(candidate.snr) and float(candidate.snr) >= 3.0)
+        return [{
+            "id": f"mcd-window-{index + 1}-{candidate.center_ev:.9f}", "label": str(index + 1),
+            "display_id": str(index + 1), "domain": "mcd", "source": "MCD window", "kind": "window",
+            "center_ev": float(candidate.center_ev), "energy_ev": float(candidate.center_ev), "width_mev": width,
+            "metadata": {"suggestion": True, "score": float(candidate.score), "snr": float(candidate.snr),
+                          "branch_agreement": float(candidate.branch_agreement), "quality_gate": "SNR >= 3"},
+            "recommended": candidate.score_rank <= 6,
+        } for index, candidate in enumerate(sorted(suggestions, key=lambda item: item.center_ev))]
+
+    def _unified_display_candidates(self) -> list[dict[str, Any]]:
+        """Use high-field MCD peak windows; retain separate spectrum diagnostics."""
+        spectra = [item for item in self._unified_mcd_candidates()
+                   if str(item.get("domain", "")).casefold() == "spectrum"]
+        from core.mcd_center_history import merge_center_candidates
+        history = getattr(self.loaded, "mcd_center_history", ()) if self.loaded is not None else ()
+        return merge_center_candidates(self._unified_window_candidates(), history) + spectra
+
+    def _queue_mcd_unified_analysis(self) -> None:
+        """Run pure candidate detection in the owned pool with a generation guard."""
+        if not self.loaded or self.loaded.mode != "MCD" or self.loaded.mcd_result is None:
+            return
+        try:
+            from core.mcd_analysis import detect_analysis_features  # noqa: F401 - import check for optional core module
+        except ImportError:
+            return
+        source = self.loaded.mcd_result
+        mode = str(getattr(getattr(self, "mcd_unified_view", None), "state", None).detection_mode if getattr(getattr(self, "mcd_unified_view", None), "state", None) is not None else getattr(self, "_mcd_unified_detection_mode", "raw"))
+        self._mcd_unified_detection_mode = mode
+        request_key = self._unified_catalog_request_key()
+        self._mcd_unified_catalog_requested_key = request_key
+        active = getattr(self, "_mcd_unified_analysis_worker", None)
+        if active is not None:
+            if getattr(active, "_mcd_catalog_key", None) != request_key:
+                self._mcd_unified_analysis_pending = True
+            return
+        if self._mcd_unified_catalog_completed_key == request_key:
+            return
+        self._mcd_unified_analysis_generation += 1
+        generation = self._mcd_unified_analysis_generation
+        worker = Worker(_run_unified_mcd_analysis, source, detection_mode=mode)
+        worker._mcd_source = source
+        worker._mcd_catalog_key = request_key
+        self._mcd_unified_analysis_worker = worker
+        self._mcd_unified_analysis_source = source
+        worker.signals.result.connect(
+            lambda payload, w=worker, g=generation, s=source, k=request_key: self._on_mcd_unified_analysis_result(w, g, s, payload, k)
+        )
+        worker.signals.error.connect(
+            lambda message, w=worker, g=generation, k=request_key: self._on_mcd_unified_analysis_error(w, g, message, k)
+        )
+        worker.signals.finished.connect(
+            lambda w=worker, g=generation: self._on_mcd_unified_analysis_finished(w, g)
+        )
+        self.thread_pool.start(worker)
+
+    def _unified_catalog_request_key(self) -> tuple[Any, ...]:
+        result = self.loaded.mcd_result if self.loaded is not None and self.loaded.mode == "MCD" else None
+        view = getattr(self, "mcd_unified_view", None)
+        mode = str(getattr(getattr(view, "state", None), "detection_mode", getattr(self, "_mcd_unified_detection_mode", "raw")))
+        return (id(result), int(getattr(self, "_mcd_source_generation", 0)), mode, int(getattr(self, "_mcd_unified_detector_settings_version", 1)))
+
+    def _on_unified_detection_mode_changed(self, mode: str) -> None:
+        self._mcd_unified_detection_mode = str(mode).casefold()
+        self._mcd_unified_features = ()
+        self._mcd_unified_catalog_completed_key = None
+        self._mcd_unified_track_payload = None
+        self._mcd_unified_track_cache.clear()
+        if not getattr(self, "_is_closing", False):
+            self._queue_mcd_unified_analysis()
+
+    def _unified_catalog_needed(self) -> bool:
+        view = getattr(self, "mcd_unified_view", None)
+        if view is None:
+            return False
+        filter_mode = str(view.candidate_filter_combo.currentText()).casefold()
+        detection_mode = str(getattr(view.state, "detection_mode", "raw")).casefold()
+        return filter_mode in {"spectrum", "all"} or detection_mode != "raw"
+
+    def _on_unified_candidate_filter_changed(self, value: str) -> None:
+        if str(value).casefold() in {"spectrum", "all"} and not getattr(self, "_is_closing", False):
+            self._queue_mcd_unified_analysis()
+
+    def _on_unified_candidate_selected(self, _index: int) -> None:
+        """Start the existing cancellable tracker for an explicit selection."""
+        view = getattr(self, "mcd_unified_view", None)
+        if view is None or view.selected_candidate is None:
+            return
+        selected = view.selected_candidate
+        if str(selected.get("kind", "")).casefold() == "window":
+            center = selected.get("center_ev", selected.get("energy_ev"))
+            try:
+                self._mcd_candidate_applying = True
+                if selected.get("history"):
+                    self.mcd_window_width_spin.setValue(float(selected["width_mev"]))
+                self.mcd_window_center_spin.setValue(float(center))
+            finally:
+                self._mcd_candidate_applying = False
+            self._mcd_unified_track_payload = None
+            view.candidate_status.setText(f"Window {float(center):.6f} eV · fixed {float(selected.get('width_mev', 0.0)):.4g} meV")
+            return
+        self._queue_unified_selected_feature_analysis()
+
+    def _on_unified_candidate_selection_changed(self, _identifier: Any) -> None:
+        """Queue only spectral feature tracking; window suggestions are cursors."""
+        view = getattr(self, "mcd_unified_view", None)
+        selected = view.selected_candidate if view is not None else None
+        if selected is None or str(selected.get("kind", "")).casefold() == "window":
+            return
+        QTimer.singleShot(0, self._queue_unified_selected_feature_analysis)
+
+    def _add_unified_manual_link(self) -> None:
+        """Create one explicit MCD↔spectrum association for selected tracking."""
+        view = getattr(self, "mcd_unified_view", None)
+        if view is None:
+            return
+        catalog = self._unified_mcd_candidates()
+        mcd = [item for item in catalog if str(item.get("domain", "")).casefold() == "mcd"]
+        spectra = [item for item in catalog if str(item.get("domain", "")).casefold() == "spectrum"]
+        if not mcd or not spectra:
+            self._status("Manual connection needs both an MCD and spectrum candidate.")
+            return
+        existing_pairs = [
+            (mcd_id, spectrum_id)
+            for mcd_id, spectrum_ids in self._mcd_unified_manual_links.items()
+            for spectrum_id in spectrum_ids
+        ]
+        if existing_pairs:
+            action, accepted = QInputDialog.getItem(
+                self, "MCD ↔ spectrum connections", "Action",
+                ["Add connection", "Remove connection"], 0, False,
+            )
+            if not accepted:
+                return
+        else:
+            action = "Add connection"
+        mcd_labels = [f"{item.get('label', item.get('id', 'MCD'))} · {float(item.get('center_ev', 0.0)):.6f} eV" for item in mcd]
+        spectrum_labels = [f"{item.get('label', item.get('id', 'spectrum'))} · {float(item.get('center_ev', 0.0)):.6f} eV" for item in spectra]
+        if action == "Remove connection":
+            labels = [f"{left} ↔ {right}" for left, right in existing_pairs]
+            selected_pair, accepted = QInputDialog.getItem(self, "Manual feature connection", "Remove", labels, 0, False)
+            if not accepted:
+                return
+            left_id, right_id = existing_pairs[labels.index(selected_pair)]
+            values = [value for value in self._mcd_unified_manual_links.get(left_id, []) if value != right_id]
+            if values:
+                self._mcd_unified_manual_links[left_id] = values
+            else:
+                self._mcd_unified_manual_links.pop(left_id, None)
+            self._mcd_unified_track_cache.clear()
+            self._status(f"Removed connection {left_id} ↔ {right_id}; reprocessing the selected feature.")
+            self._queue_unified_selected_feature_analysis()
+            return
+        left, accepted = QInputDialog.getItem(self, "Manual feature connection", "MCD candidate", mcd_labels, 0, False)
+        if not accepted:
+            return
+        right, accepted = QInputDialog.getItem(self, "Manual feature connection", "Spectrum candidate", spectrum_labels, 0, False)
+        if not accepted:
+            return
+        left_id = str(mcd[mcd_labels.index(left)].get("id", ""))
+        right_id = str(spectra[spectrum_labels.index(right)].get("id", ""))
+        self._mcd_unified_manual_links.setdefault(left_id, [])
+        if right_id not in self._mcd_unified_manual_links[left_id]:
+            self._mcd_unified_manual_links[left_id].append(right_id)
+        self._mcd_unified_track_cache.clear()
+        self._status(f"Connected {left_id} to {right_id}; reprocessing the selected feature.")
+        self._queue_unified_selected_feature_analysis()
+
+    def _unified_feature_analysis_key(self) -> tuple[Any, ...] | None:
+        view = getattr(self, "mcd_unified_view", None)
+        selected = view.selected_candidate if view is not None else None
+        if selected is None or selected.get("center_ev") is None or self.loaded is None:
+            return None
+        controls = self.mcd_unified_controls
+        method = str(controls.feature_method_combo.currentText())
+        source = str(controls.feature_source_combo.currentText())
+        low = float(controls.feature_search_low_spin.value())
+        high = float(controls.feature_search_high_spin.value())
+        half_width = max(abs(high - low) * 0.5, 0.005)
+        return (
+            id(self.loaded.mcd_result), str(selected.get("id", "")), method,
+            source, round(low, 9), round(high, 9),
+            str(controls.reference_mode_combo.currentText()), round(float(controls.manual_reference_spin.value()), 9),
+            round(float(controls.prominence_spin.value()), 6),
+            str(view.channel_mapping_combo.currentText()),
+            tuple((key, tuple(values)) for key, values in sorted(self._mcd_unified_manual_links.items())),
+            tuple(str(item.get("id", "")) for item in self._unified_mcd_candidates()),
+            self._mcd_unified_catalog_requested_key or self._unified_catalog_request_key(),
+        )
+
+    def _queue_unified_selected_feature_analysis(self, *_args: Any) -> None:
+        """Queue selected-feature tracking with latest-result/source guards."""
+        if self.loaded is None or self.loaded.mode != "MCD" or self.loaded.mcd_result is None:
+            return
+        view = getattr(self, "mcd_unified_view", None)
+        selected = view.selected_candidate if view is not None else None
+        key = self._unified_feature_analysis_key()
+        if selected is None or key is None:
+            if view is not None:
+                view.candidate_status.setText("Select a valid candidate to start measured tracking.")
+            return
+        active = getattr(self, "_mcd_unified_track_worker", None)
+        if active is not None:
+            if key != self._mcd_unified_track_key:
+                self._mcd_unified_track_pending = key
+                self._mcd_unified_track_payload = None
+                if view is not None:
+                    view.candidate_status.setText("Waiting for the latest selected feature…")
+            return
+        cached = self._mcd_unified_track_cache.get(key)
+        if cached is not None:
+            self._mcd_unified_track_payload = dict(cached)
+            self._mcd_unified_track_payload_key = (view.state.source_generation, key)
+            self._plot_mcd_unified(auto=True)
+            return
+        try:
+            method = str(self.mcd_unified_controls.feature_method_combo.currentText())
+            method = "Local fit" if method.casefold().startswith("local") else method
+            source = str(self.mcd_unified_controls.feature_source_combo.currentText())
+            low = float(self.mcd_unified_controls.feature_search_low_spin.value())
+            high = float(self.mcd_unified_controls.feature_search_high_spin.value())
+            if high <= low and (low != 0.0 or high != 0.0):
+                view.candidate_status.setText("Search bounds must be finite and increasing.")
+                self._status("Selected feature analysis was not queued: search bounds must be increasing.")
+                return
+            half_width = max(abs(high - low) * 0.5, 0.005)
+            feature = dict(selected)
+            candidates = tuple(self._mcd_unified_features)
+            mapping_label = str(view.channel_mapping_combo.currentText())
+            if mapping_label.startswith("K = −"):
+                mapping_mode, k_channel = "fixed", "neg"
+            elif mapping_label.startswith("K = +"):
+                mapping_mode, k_channel = "fixed", "pos"
+            elif "infer" in mapping_label.casefold() or "energy" in mapping_label.casefold():
+                mapping_mode, k_channel = "energy_based", None
+            else:
+                mapping_mode, k_channel = "unknown", None
+            reference_mode = str(self.mcd_unified_controls.reference_mode_combo.currentText())
+            reference_energy = (
+                float(self.mcd_unified_controls.manual_reference_spin.value())
+                if reference_mode.casefold().startswith("manual") else None
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            self._status(f"Selected feature analysis could not be queued: {exc}")
+            return
+        self._mcd_unified_track_generation += 1
+        generation = self._mcd_unified_track_generation
+        source_result = self.loaded.mcd_result
+        worker = Worker(
+            _run_unified_selected_feature_analysis, source_result, feature, candidates,
+            method=method, source=source, half_width_ev=half_width,
+            search_window_ev=(low, high) if high > low else None,
+            prominence_fraction=float(self.mcd_unified_controls.prominence_spin.value()),
+            reference_energy_ev=reference_energy,
+            mapping_mode=mapping_mode,
+            k_channel=k_channel,
+            reference_id=str(selected.get("id", "")) or None,
+            manual_links=dict(self._mcd_unified_manual_links),
+        )
+        self._mcd_unified_track_payload = {"tracks": [], "status": "processing"}
+        self._mcd_unified_track_worker = worker
+        self._mcd_unified_track_key = key
+        worker.signals.result.connect(
+            lambda payload, w=worker, g=generation, s=source_result, k=key: self._on_unified_feature_analysis_result(w, g, s, k, payload)
+        )
+        worker.signals.error.connect(
+            lambda message, w=worker, g=generation, k=key: self._on_unified_feature_analysis_error(w, g, message, k)
+        )
+        worker.signals.finished.connect(
+            lambda w=worker, g=generation: self._on_unified_feature_analysis_finished(w, g)
+        )
+        # Keep the current combo/catalog stable while the worker runs.  A
+        # pre-result full render can rebuild the filtered list during a Qt
+        # selection signal and associate the caller's index with another
+        # candidate.
+        view.candidate_status.setText(f"Analyzing {selected.get('id', 'feature')}…")
+        self.thread_pool.start(worker)
+
+    def _on_unified_feature_analysis_result(self, worker: Worker, generation: int, source: Any, key: tuple[Any, ...], payload: Any) -> None:
+        if worker is not self._mcd_unified_track_worker or generation != self._mcd_unified_track_generation:
+            return
+        if self._mcd_unified_track_pending is not None or key != self._mcd_unified_track_key:
+            return
+        if self.loaded is None or self.loaded.mcd_result is not source:
+            return
+        value = dict(payload) if isinstance(payload, dict) else {}
+        self._mcd_unified_track_cache[key] = value
+        self._mcd_unified_track_payload = value
+        self._mcd_unified_track_payload_key = (self.mcd_unified_view.state.source_generation, key)
+        self._plot_mcd_unified(auto=True)
+
+    def _on_unified_feature_analysis_error(self, worker: Worker, generation: int, message: str, key: Any = None) -> None:
+        if worker is self._mcd_unified_track_worker and generation == self._mcd_unified_track_generation:
+            if key is not None and key != self._unified_feature_analysis_key():
+                return
+            self._mcd_unified_track_payload = {"tracks": [], "status": "unsupported", "reason": str(message).splitlines()[0]}
+            self._status(f"Selected MCD feature analysis failed: {str(message).splitlines()[0]}")
+
+    def _on_unified_feature_analysis_finished(self, worker: Worker, generation: int) -> None:
+        if worker is not self._mcd_unified_track_worker:
+            return
+        self._mcd_unified_track_worker = None
+        pending = self._mcd_unified_track_pending
+        self._mcd_unified_track_pending = None
+        if pending is not None and not getattr(self, "_is_closing", False):
+            QTimer.singleShot(0, self._queue_unified_selected_feature_analysis)
+
+    def _on_mcd_unified_analysis_result(self, worker: Worker, generation: int, source: Any, payload: Any, request_key: Any = None) -> None:
+        if worker is not self._mcd_unified_analysis_worker or generation != self._mcd_unified_analysis_generation:
+            return
+        if self.loaded is None or self.loaded.mcd_result is not source:
+            return
+        request_key = request_key if request_key is not None else getattr(worker, "_mcd_catalog_key", None)
+        if request_key != getattr(self, "_mcd_unified_catalog_requested_key", request_key):
+            return
+        self._mcd_unified_features = tuple(getattr(payload, "features", payload if isinstance(payload, (list, tuple)) else ()))
+        self._mcd_unified_catalog_completed_key = request_key
+        if hasattr(self, "mcd_unified_view"):
+            self.mcd_unified_view.set_source_generation(generation)
+            view = self.mcd_unified_view
+            view.refresh_catalog(self._unified_display_candidates(), self._unified_analysis_payload(view))
+            # Catalog completion is the normal load path.  Queue the selected
+            # candidate after the redraw so the first measured track appears
+            # without requiring a second user click.
+            QTimer.singleShot(0, self._queue_unified_selected_feature_analysis)
+
+    def _on_mcd_unified_analysis_error(self, worker: Worker, generation: int, message: str = "", request_key: Any = None) -> None:
+        if worker is self._mcd_unified_analysis_worker and generation == self._mcd_unified_analysis_generation:
+            request_key = request_key if request_key is not None else getattr(worker, "_mcd_catalog_key", None)
+            if request_key != getattr(self, "_mcd_unified_catalog_requested_key", request_key):
+                return
+            self._mcd_unified_features = ()
+            detail = str(message).splitlines()[0] if message else "feature detection failed"
+            self._status(f"Unified MCD feature detection failed: {detail}")
+
+    def _on_mcd_unified_analysis_finished(self, worker: Worker, generation: int) -> None:
+        if worker is self._mcd_unified_analysis_worker:
+            self._mcd_unified_analysis_worker = None
+            if self._mcd_unified_analysis_pending and not getattr(self, "_is_closing", False):
+                self._mcd_unified_analysis_pending = False
+                QTimer.singleShot(0, self._queue_mcd_unified_analysis)
+
+    def _compute_unified_mcd_slopes(self, view: McdUnifiedView) -> Any:
+        try:
+            from core.mcd_analysis import fit_mcd_slopes
+            result = self.loaded.mcd_result
+            energy = np.asarray(result.energy_ev, float)
+            # McdResult.energy_ev is already sorted, whereas paired spectra
+            # retain wavelength-column order. Construct the energy axis in
+            # that same raw order before applying the spectral permutation.
+            wavelength = np.asarray(getattr(result, "wavelength_nm", ()), float)
+            column_energy = 1239.841984 / wavelength if wavelength.shape == energy.shape else energy
+            values = np.asarray(result.pair_mcd_corrected, float)
+            cached_order = getattr(result, "_unified_energy_order", None)
+            order_signature = (column_energy.shape, column_energy.tobytes())
+            if getattr(result, "_unified_energy_order_signature", None) != order_signature:
+                cached_order = None
+            ordered_columns = np.asarray(
+                spectrum_energy_order(result) if cached_order is None else cached_order,
+                dtype=int,
+            )
+            try:
+                result._unified_energy_order = ordered_columns
+                result._unified_energy_order_signature = order_signature
+            except AttributeError:
+                pass
+            half = float(view.state.window_width_mev) * 0.0005
+            ordered_energy = column_energy[ordered_columns] if ordered_columns.size == energy.size else column_energy
+            mask = np.abs(ordered_energy - view.state.window_center_ev) <= half
+            # Match pair_window_trace_by_branch for sub-sample windows.
+            if ordered_energy.size and not np.any(mask):
+                mask[int(np.argmin(np.abs(ordered_energy - view.state.window_center_ev)))] = True
+            metric = str(self.mcd_window_metric_combo.currentText()).casefold().replace(" ", "_")
+            if values.ndim == 2 and ordered_columns.size == values.shape[1] and np.any(mask):
+                # Select the window in energy order before copying columns;
+                # center movement no longer duplicates the whole matrix.
+                selected = values[:, ordered_columns[mask]]
+                selected_energy = ordered_energy[mask]
+            else:
+                selected = None
+                selected_energy = energy[mask]
+            if selected is None:
+                trace = np.full(np.asarray(result.pair_b).shape, np.nan)
+            elif "integral" in metric:
+                trace = np.trapezoid(selected, x=selected_energy, axis=1)
+            elif "field" in metric and "absolute" in metric:
+                trace = np.sign(np.asarray(result.pair_b, dtype=float)) * np.nanmean(np.abs(selected), axis=1)
+            elif "absolute" in metric:
+                trace = np.nanmean(np.abs(selected), axis=1)
+            else:
+                trace = np.nanmean(selected, axis=1)
+            controls = self.mcd_unified_controls
+            ranges = {
+                "low": (controls.slope_low_spin.value(), controls.slope_low_end_spin.value()),
+                "high_positive": (controls.slope_high_positive_spin.value(), controls.slope_high_positive_end_spin.value()),
+                "high_negative": (controls.slope_high_negative_spin.value(), controls.slope_high_negative_end_spin.value()),
+            }
+            return fit_mcd_slopes(result.pair_b, trace, result.pair_labels, ranges=ranges)
+        except (AttributeError, ImportError, TypeError, ValueError, FloatingPointError):
+            return None
+
+    def _unified_analysis_payload(self, view: McdUnifiedView) -> dict[str, Any]:
+        """Build the result-panel payload without rebuilding the MCD plots."""
+        selected_payload = getattr(self, "_mcd_unified_track_payload", None) or {}
+        tracks = list(selected_payload.get("tracks", ())) if isinstance(selected_payload, dict) else []
+        status = str(selected_payload.get("status", "Select a candidate to show measured tracking points."))
+        selected = view.selected_candidate
+        if selected is not None and not selected_payload:
+            status = f"Select {selected.get('id', 'candidate')} to start measured tracking."
+        elif selected is not None and tracks:
+            status = f"Showing {len(tracks)} measured track(s) for {selected.get('id', 'candidate')}."
+        elif selected is not None and selected_payload:
+            status = f"{selected.get('id', 'candidate')} · {status}."
+        reason = str(selected_payload.get("reason", "")).strip() if isinstance(selected_payload, Mapping) else ""
+        if reason and reason not in status:
+            status = f"{status} {reason}"
+        self._mcd_unified_slopes = self._compute_unified_mcd_slopes(view)
+        self._mcd_unified_slopes_key = self._unified_window_analysis_key()
+        slope_payload = self._mcd_unified_slopes.to_dict() if self._mcd_unified_slopes is not None else None
+        return {
+            "generation": self._mcd_unified_analysis_generation,
+            "tracks": tracks,
+            "status": status,
+            "slopes": slope_payload,
+            "mapping": selected_payload.get("mapping", {}) if isinstance(selected_payload, Mapping) else {},
+            "splitting": selected_payload.get("splitting", ()) if isinstance(selected_payload, Mapping) else (),
+            "analysis_results": selected_payload.get("analysis_results", {}) if isinstance(selected_payload, Mapping) else {},
+            "selected_feature": selected_payload.get("selected_feature") if isinstance(selected_payload, Mapping) else None,
+            "reason": reason,
+        }
+
+    def _plot_mcd_unified(self, *, auto: bool = False) -> None:
+        view = getattr(self, "mcd_unified_view", None)
+        if view is None:
+            return
+        if not self.loaded or self.loaded.mode != "MCD" or self.loaded.mcd_result is None:
+            view.setVisible(False)
+            self._show_error("Load data for this tab before plotting.")
+            return
+        # The unified surface is a presentation adapter over the existing
+        # loaded result.  It never invokes feature detection synchronously.
+        view.setVisible(True)
+        output_folder = self._mcd_export_output_root or self._default_unified_mcd_export_folder()
+        self.mcd_unified_controls.save_folder_label.setText(f"Save to: {output_folder}")
+        self.mcd_unified_controls.save_folder_label.setToolTip(str(output_folder or ""))
+        if hasattr(self, "mcd_candidate_bar"):
+            self.mcd_candidate_bar.setVisible(False)
+        if hasattr(self, "mcd_peak_candidate_bar"):
+            self.mcd_peak_candidate_bar.setVisible(False)
+        view.state.window_center_ev = float(self.mcd_window_center_spin.value())
+        view.state.window_width_mev = float(self.mcd_window_width_spin.value())
+        view.state.window_metric = str(self.mcd_window_metric_combo.currentText())
+        view.set_source_generation(self._mcd_unified_analysis_generation)
+        view.render(
+            self.loaded.mcd_result,
+            candidates=self._unified_display_candidates(),
+            analysis=self._unified_analysis_payload(view),
+        )
+        self._mcd_unified_last_published_signature = (
+            id(self.loaded), id(self.loaded.mcd_result),
+            tuple(self._selected(self.mcd_files)) if hasattr(self, "mcd_files") else (),
+            float(self.mcd_window_center_spin.value()),
+            float(self.mcd_window_width_spin.value()),
+            str(self.mcd_window_metric_combo.currentText()),
+            getattr(self, "_mcd_unified_analysis_generation", 0),
+        )
+        self._mcd_heatmap_ax = view.axes.get("mcd_map")
+        self._mcd_pair_ax = view.axes.get("spectra")
+        self._mcd_spectrum_ax = view.axes.get("mcd_spectra")
+        self._mcd_trace_ax = view.axes.get("mcd_vs_b")
+        self._mcd_integral_ax = None
+        self.last_plotted_mode = "MCD"
+        self._set_stage("Plotted")
+        self._update_action_states()
+
     def _plot_mode(self, mode: str, *, auto: bool = False) -> None:
+        if mode != "MCD" and hasattr(self, "mcd_unified_view"):
+            self.mcd_unified_view.deactivate()
+            self.mcd_unified_view.setVisible(False)
+        if mode == "MCD" and hasattr(self, "mcd_unified_view"):
+            self._plot_mcd_unified(auto=auto)
+            return
         if mode == "MCD Peak Shift":
             self._plot_mcd_peak_shift()
             return
@@ -6258,7 +9043,15 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self._show_error("Load data for this tab before plotting.")
                 return
 
+            request_before = getattr(self, "_active_load_token", None)
+            busy_before = bool(getattr(self, "_load_in_progress", False))
+            lifecycle_before = getattr(self, "_load_lifecycle_generation", 0)
             self._ensure_loaded_matches_ui_params(mode)
+            request_changed = request_before != getattr(self, "_active_load_token", None)
+            lifecycle_changed = lifecycle_before != getattr(self, "_load_lifecycle_generation", 0)
+            pending_changed = bool(getattr(self, "_pending_load_options", None))
+            if self._load_in_progress and (not auto or request_changed or lifecycle_changed or pending_changed or not busy_before):
+                return
             plot_key = self._current_plot_params_key(mode)
             gate_only_update = mode == "DRR" and self.drr_controller._is_drr_gate_only_change(plot_key)
             if gate_only_update and self._last_plot_cube is not None:
@@ -6269,8 +9062,21 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self._update_action_states()
                 self._status(f"Plotted DRR (gate update).")
                 return
+            if mode == "Compare" and self.compare_controller._update_cmp_gate_only():
+                self._last_plot_params_key = plot_key
+                self.last_plotted_mode = mode
+                self._set_stage("Plotted")
+                self._update_action_states()
+                self._status("Plotted Compare (gate update).")
+                return
 
+            if mode == "DRR" and not self._drr_limits_from_controls:
+                self._capture_drr_view_limits()
+            self._drr_limits_from_controls = False
+            self.compare_controller._disable_cmp_blitting()
             self.figure.clear()
+            self._drr_heatmap_ax = None
+            self._drr_spectrum_ax = None
             self._cmp_heatmap_axes = {}
             self._cmp_gate_lines = {}
             self._cmp_linecut_ax = None
@@ -6315,6 +9121,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self._pl_spectrum_ax = ax2
                 self._pl_last_plot_cube = plot_cube
                 self._pl_gate_line = None
+                for helper in (getattr(self.pl_controller, "_pl_region_blitters", None) or ()):
+                    try:
+                        helper.disconnect()
+                    except (AttributeError, RuntimeError):
+                        pass
+                self.pl_controller._pl_region_blitters = None
                 self._pl_heatmap_peak_artist = None
                 self._pl_heatmap_fit_artist = None
                 self.pl_controller._update_pl_spectrum_and_gate_line(plot_cube)
@@ -6323,30 +9135,139 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self._pl_spectrum_ax = None
                 self._pl_last_plot_cube = None
                 self._pl_gate_line = None
-                plot_cube = self.drr_controller._drr_cube_for_display()
-                self.loaded.drr_derivative_label = self.drr_derivative_combo.currentText()
-                params = self._make_params(mode, plot_cube)
-                gs = self.figure.add_gridspec(
-                    nrows=2,
-                    ncols=2,
-                    width_ratios=[1.0, 0.035],
-                    height_ratios=[1.0, 1.0],
-                    wspace=0.12,
-                    hspace=0.28,
+                raw_cube, _, raw_win, raw_poly = self.drr_controller._drr_cube_with_metadata(None)
+                second_cube = None
+                second_win = second_poly = 0
+                view = "both" if self._drr_side_by_side else self._drr_plot_view
+                products: list[tuple[str, DataCube, HeatmapParams, int | None, int, int]] = []
+                raw_params = self._make_drr_params(raw_cube, None)
+                advanced_derivative = self.drr_controller._drr_derivative_value()
+                if view in {"raw", "both"}:
+                    display_raw_cube = raw_cube
+                    display_raw_derivative = None
+                    if view == "raw" and advanced_derivative == 1:
+                        display_raw_cube, _, raw_win, raw_poly = self.drr_controller._drr_cube_with_metadata(1)
+                        raw_params = self._make_drr_params(display_raw_cube, 1)
+                        raw_params = HeatmapParams(**{
+                            **raw_params.__dict__,
+                            "title": f"{raw_cube.title} (Advanced first derivative, dE)",
+                            "cbar_label": "d(DR/R)/dE",
+                        })
+                        display_raw_derivative = 1
+                    products.append(("raw", display_raw_cube, raw_params, display_raw_derivative, raw_win, raw_poly))
+                if view in {"second", "both"}:
+                    second_cube, _, second_win, second_poly = self.drr_controller._drr_cube_with_metadata(2)
+                    self._sync_drr_second_auto_scale(second_cube)
+                    second_params = self._make_drr_params(second_cube, 2)
+                    products.append(("second", second_cube, second_params, 2, second_win, second_poly))
+                if not products:
+                    products.append(("raw", raw_cube, raw_params, None, raw_win, raw_poly))
+                self.loaded.drr_derivative_label = (
+                    "Advanced first derivative (dE)"
+                    if advanced_derivative == 1 and self._drr_plot_view == "raw"
+                    else {"raw": "None", "second": "d2E"}.get(self._drr_plot_view, "None")
                 )
-                ax1 = self.figure.add_subplot(gs[0, 0])
-                cax = self.figure.add_subplot(gs[0, 1])
-                ax2 = self.figure.add_subplot(gs[1, 0], sharex=ax1)
-                render = plot_drr(ax1, downsample_cube_for_display(plot_cube), params)
-                self._add_heatmap_colorbar(render, cax, label=params.cbar_label)
+                self._drr_plot_cubes = {key: cube for key, cube, *_rest in products}
+                self._drr_heatmap_axes = {}
+                self._drr_spectrum_axes = {}
+                both = len(products) == 2
+                if both:
+                    # Keep one compact filename header for the paired view;
+                    # the full source name remains available in the UI.
+                    source_label = Path(self.loaded.primary_file or raw_cube.title).name
+                    max_chars = 56 if self.figure.get_figwidth() < 11.0 else 82
+                    if len(source_label) > max_chars:
+                        half = max(12, (max_chars - 1) // 2)
+                        source_label = source_label[:half] + "…" + source_label[-half:]
+                    self.figure.suptitle(source_label, fontsize=9, y=0.985)
+                    figure_width_px = max(
+                        1.0, float(self.figure.get_figwidth() * self.figure.dpi)
+                    )
+                    left_margin_px = float(np.clip(80.0, 70.0, 85.0))
+                    right_margin_px = 55.0
+                    gs = self.figure.add_gridspec(
+                        nrows=1, ncols=2,
+                        left=left_margin_px / figure_width_px,
+                        right=1.0 - right_margin_px / figure_width_px,
+                        bottom=0.105, top=0.90,
+                        wspace=0.24 if figure_width_px < 1050.0 else 0.16,
+                    )
+                else:
+                    gs = self.figure.add_gridspec(
+                        nrows=2, ncols=2,
+                        width_ratios=[1.0, 0.035],
+                        height_ratios=[1.0, 1.0], wspace=0.12, hspace=0.28,
+                    )
                 gate_val = float(self._mode_spins(mode)["gate"].value())
-                gate_used = self._plot_spectrum_with_roi(
-                    ax2, plot_cube, gate_val, ylabel=params.cbar_label, xlim=params.xlim
-                )
-                self._drr_heatmap_ax = ax1
-                self._drr_spectrum_ax = ax2
+                shared_heat_ax = None
+                for index, (key, product_cube, product_params, _deriv, _used_win, _poly) in enumerate(products):
+                    if both:
+                        product_gs = gs[0, index].subgridspec(
+                            nrows=2, ncols=2,
+                            width_ratios=[1.0, 0.035],
+                            height_ratios=[1.0, 1.0],
+                            wspace=0.08, hspace=0.27,
+                        )
+                        map_slot, cbar_slot, spectrum_slot = product_gs[0, 0], product_gs[0, 1], product_gs[1, 0]
+                    else:
+                        map_slot, cbar_slot, spectrum_slot = gs[0, 0], gs[0, 1], gs[1, 0]
+                    if shared_heat_ax is None:
+                        ax1 = self.figure.add_subplot(map_slot)
+                    else:
+                        ax1 = self.figure.add_subplot(map_slot, sharex=shared_heat_ax, sharey=shared_heat_ax)
+                    cax = self.figure.add_subplot(cbar_slot)
+                    ax2 = self.figure.add_subplot(spectrum_slot, sharex=ax1)
+                    if both:
+                        short_title = "ΔR/R" if key == "raw" else "Second derivative"
+                        product_params = HeatmapParams(
+                            **{
+                                **product_params.__dict__,
+                                "title": short_title,
+                                "xlabel": "",
+                            }
+                        )
+                    render = plot_drr(ax1, downsample_cube_for_display(product_cube), product_params)
+                    self._add_heatmap_colorbar(
+                        render, cax,
+                        label="" if both else product_params.cbar_label,
+                    )
+                    if both and index > 0:
+                        ax1.tick_params(axis="y", labelleft=False)
+                        ax1.set_ylabel("")
+                    if both:
+                        ax1.set_xlabel("")
+                        ax1.tick_params(axis="x", labelbottom=False)
+                        if key == "second" and isinstance(
+                            cax.yaxis.get_major_formatter(), ScalarFormatter
+                        ):
+                            cax.ticklabel_format(
+                                axis="y", style="sci", scilimits=(-2, 2), useMathText=True,
+                            )
+                    spectrum_ylabel = (
+                        "d²(DR/R)/dE²"
+                        if both and key == "second"
+                        else product_params.cbar_label
+                    )
+                    self._plot_spectrum_with_roi(
+                        ax2, product_cube, gate_val, ylabel=spectrum_ylabel,
+                        xlim=product_params.xlim,
+                    )
+                    self._drr_heatmap_axes[key] = ax1
+                    self._drr_spectrum_axes[key] = ax2
+                    if shared_heat_ax is None:
+                        shared_heat_ax = ax1
+                active_key = "second" if self._drr_plot_view == "second" and "second" in self._drr_plot_cubes else "raw"
+                plot_cube = self._drr_plot_cubes[active_key]
+                self._drr_heatmap_ax = self._drr_heatmap_axes[active_key]
+                self._drr_spectrum_ax = self._drr_spectrum_axes[active_key]
+                if self._drr_view_limits is not None:
+                    old_xlim, old_ylim = self._drr_view_limits
+                    for axis in self._drr_heatmap_axes.values():
+                        axis.set_xlim(old_xlim)
+                        axis.set_ylim(old_ylim)
                 self._drr_heatmap_peak_artist = None
                 self._drr_heatmap_fit_artist = None
+                gate_used, _, _ = self.drr_controller._current_drr_spectrum(plot_cube)
                 self.drr_controller._set_drr_gate_spin_value(gate_used)
                 self.drr_controller._update_drr_spectrum_and_gate_line(plot_cube)
             elif mode == "MCD" and self.loaded.mcd_result is not None:
@@ -6883,9 +9804,30 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             if mode == "Compare":
                 self.figure.tight_layout()
             self.canvas.draw_idle()
-            self._last_plot_params_key = plot_key
+            self._last_plot_params_key = (
+                self._current_plot_params_key(mode) if mode == "DRR" else plot_key
+            )
             self._last_plot_cube = plot_cube if mode == "DRR" else None
             self.last_plotted_mode = mode
+            shown_identity = self._shown_source_identity_for_loaded(self.loaded)
+            self._shown_draw_mode = mode
+            self._shown_draw_identity = shown_identity
+            self._shown_selection_identity = self._selected_identity_for_status(mode)
+            self._last_draw_identity[mode] = shown_identity
+            if mode == "Compare":
+                self._cmp_rendered_loaded_marker = (
+                    id(self.loaded),
+                    id(getattr(self.loaded, "compare_cubes", None)),
+                    str(getattr(self.loaded, "folder", "")),
+                    tuple(getattr(self.loaded, "selected_files", ()) or ()),
+                )
+            token = self._active_load_token
+            self._record_workflow_event(
+                workflow=mode,
+                request_id=token.generation if token is not None and token.workflow == mode else 0,
+                phase="first_draw",
+                source_key=tuple(self.loaded.selected_files),
+            )
             self._set_stage("Plotted")
             self._update_action_states()
             if mode == "DRR":
@@ -6997,7 +9939,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             "DRR", p["baseline_mode"], p["baseline_which"], p["baseline_files"], p["selected_files"], p.get("drr_assignments", ()),
             p["y_axis_spec"], p["derivative"], p["sg_window"], p["sg_poly"], p["cmap"], p["vmin"], p["vmax"],
             p["xmin"], p["xmax"], p["ymin"], p["ymax"], p["gate"], p["log"], p["clip"], p["center_zero"],
+            self._drr_plot_view, bool(self._drr_side_by_side),
+            float(self.drr_second_vmin_spin.value()), float(self.drr_second_vmax_spin.value()),
+            self._resolved_cmap(self.drr_second_cmap), bool(getattr(self, "drr_second_auto_scale", True)),
             self._split_scale_key("drr"),
+            self._split_scale_key("drr_second"),
         )
 
     def _ensure_loaded_matches_drr_params(self) -> bool:
@@ -7020,23 +9966,49 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 resolved = resolve_drr_background_assignments(
                     self.current_folder, self.drr_available_sources, selected,
                 )
+                if not resolved.resolved:
+                    raise ValueError(resolved.reason or "DRR background assignment is unresolved.")
+                assignments = resolved.assignments
             else:
                 explicit_mode = baseline_text if baseline_text in {
                     "Self (first frame)", "Self (last frame)", "External",
                 } else "Self (last frame)"
-                resolved = resolve_drr_background_assignments(
-                    self.current_folder, self.drr_available_sources, selected,
-                    explicit_baseline_files=baselines,
-                    explicit_baseline_mode=explicit_mode,
-                    explicit_baseline_which={
-                        "Last frame from each file, then average": "last",
-                        "First frame from each file, then average": "first",
-                        "Average all frames in each file, then average files": "all",
-                    }.get(str(p["baseline_which"]), "last"),
+                explicit_which = {
+                    "Last frame from each file, then average": "last",
+                    "First frame from each file, then average": "first",
+                    "Average all frames in each file, then average files": "all",
+                }.get(str(p["baseline_which"]), "last")
+                # Explicit UI choices already identify the recipe.  Materialize
+                # the per-measurement assignments without re-reading the source
+                # catalog; the load worker remains responsible for CSV parsing.
+                try:
+                    template = DrrMeasurementAssignment(
+                        measurement_file=selected[0],
+                        baseline_mode=explicit_mode,
+                        baseline_files=tuple(baselines),
+                        baseline_which=explicit_which,
+                        selection_reason="explicit user baseline selection",
+                    )
+                except ValueError as exc:
+                    raise ValueError(str(exc)) from exc
+                missing = tuple(
+                    source for source in template.baseline_files
+                    if not resolve_source_path(self.current_folder, source).is_file()
                 )
-            if not resolved.resolved:
-                raise ValueError(resolved.reason or "DRR background assignment is unresolved.")
-            assignments = resolved.assignments
+                if missing:
+                    raise ValueError(
+                        "Explicit DRR baseline is unavailable: " + ", ".join(missing)
+                    )
+                assignments = tuple(
+                    DrrMeasurementAssignment(
+                        measurement_file=name,
+                        baseline_mode=template.baseline_mode,
+                        baseline_files=template.baseline_files,
+                        baseline_which=template.baseline_which,
+                        selection_reason=template.selection_reason,
+                    )
+                    for name in selected
+                )
         which_map = {
             "Last frame from each file, then average": "last",
             "First frame from each file, then average": "first",
@@ -7052,6 +10024,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             or y_axis_spec != getattr(self.loaded, "y_axis_spec", "auto")
         )
         if needs_reload:
+            # A redraw must never turn a source or processing change into a
+            # synchronous CSV read.  Reuse the same latest-request worker
+            # path as explicit DRR selection changes.
+            self._start_load("DRR")
+            return False
+        if False:  # retained below as a local reference for the worker path
             self.drr_controller._reject_mixed_xlsx_selection(selected)
             if selected and data_io.is_xlsx_map_file(selected[0]):
                 cube = data_io.load_drr_map_cube(self.current_folder, selected[0], y_axis=y_axis_spec)
@@ -7251,9 +10229,18 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if self.last_plotted_mode == "DRR":
             if self._drr_heatmap_ax is None or self._last_plot_cube is None:
                 return
-            if event.inaxes is not self._drr_heatmap_ax or event.ydata is None:
+            clicked_cube = self._last_plot_cube
+            heatmap_axes = getattr(self, "_drr_heatmap_axes", {}) or {}
+            for key, axis in heatmap_axes.items():
+                if event.inaxes is axis:
+                    clicked_cube = getattr(self, "_drr_plot_cubes", {}).get(key, clicked_cube)
+                    break
+            else:
+                if event.inaxes is not self._drr_heatmap_ax:
+                    return
+            if event.ydata is None:
                 return
-            ygrid = np.asarray(self._last_plot_cube.gate, float).ravel()
+            ygrid = np.asarray(clicked_cube.gate, float).ravel()
             idx = int(np.argmin(np.abs(ygrid - float(event.ydata))))
             gate = float(ygrid[idx])
             self.drr_spins["gate"].setValue(gate)
@@ -7276,7 +10263,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             ygrid = np.asarray(cube.gate, float).ravel()
             idx = int(np.argmin(np.abs(ygrid - float(event.ydata))))
             self.compare_controller._set_cmp_gate_spin_value(float(ygrid[idx]))
-            self._plot_mode("Compare")
+            if not self.compare_controller._update_cmp_gate_only():
+                self._plot_mode("Compare")
             return
 
         if self.last_plotted_mode == "Power Dependent":
@@ -7329,12 +10317,31 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if self.last_plotted_mode != mode:
             self._show_error("Plot/Update before exporting.")
             return
-        if mode == "Power Dependent":
-            try:
-                self._ensure_loaded_matches_ui_params(mode)
-            except Exception as exc:
-                self._show_error(str(exc))
-                return
+        try:
+            self._ensure_loaded_matches_ui_params(mode)
+        except Exception as exc:
+            self._show_error(str(exc))
+            return
+        # Consistency checks may invalidate a stale DRR view when a selected
+        # source is missing.  They can therefore clear ``self.loaded`` while
+        # returning control here; stop before building an export snapshot.
+        if not self.loaded or self.loaded.mode != mode:
+            self._status(f"{mode} data is no longer loaded; resolve the current selection before saving.")
+            return
+        if mode == "SHG Processing" and self.shg_controller._shg_reprocess_pending_for_export():
+            self._status("SHG processing is updating; save is available after the update finishes.")
+            return
+        if (
+            self._load_in_progress
+            or getattr(self, "_pending_load_mode", None) == mode
+        ):
+            self._status(f"{mode} is updating; save is available after the current selection is displayed.")
+            return
+        if mode == "DRR" and not self._drr_limits_from_controls:
+            # A user may zoom or pan and save immediately, without causing a
+            # tab/layout rebuild.  Freeze that shared viewport in both export
+            # parameter snapshots before the worker starts.
+            self._capture_drr_view_limits()
         self._invalidate_export_move_sources()
         if mode == "PL":
             self._pl_last_export_source = str(self.loaded.primary_file or "")
@@ -7348,6 +10355,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         drr_deriv: int | None = None
         drr_used_win = 0
         drr_poly = 0
+        drr_raw_cube = None
+        drr_second_cube = None
+        drr_raw_params = None
+        drr_second_params = None
+        drr_raw_win = drr_raw_poly = drr_second_win = drr_second_poly = 0
         if mode == "SHG Processing" and self.loaded.shg_result is not None:
             params = None
             export_cube = None
@@ -7356,8 +10368,38 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             params = self._make_params(mode, export_cube)
         elif mode in {"PL", "DRR", "Power Dependent"} and self.loaded.cube is not None:
             if mode == "DRR":
-                export_cube, drr_deriv, drr_used_win, drr_poly = self.drr_controller._drr_cube_with_metadata()
-                params = self._make_params(mode, export_cube)
+                try:
+                    drr_raw_cube, _raw_deriv, drr_raw_win, drr_raw_poly = self.drr_controller._drr_cube_with_metadata(None)
+                except ValueError as exc:
+                    self._show_error(f"Cannot prepare the DRR export pair: {exc}")
+                    return
+                drr_raw_params = self._drr_params_with_view_limits(
+                    self._make_drr_params(drr_raw_cube, None)
+                )
+                # The second derivative is deliberately computed by the
+                # owned export worker from this frozen SG snapshot.  Build its
+                # presentation snapshot here without touching scientific Z.
+                drr_second_win = int(self.drr_sg_window_spin.value())
+                drr_second_poly = int(self.drr_sg_poly_spin.value())
+                drr_second_params = HeatmapParams(
+                    **{
+                        **drr_raw_params.__dict__,
+                        "title": f"{drr_raw_cube.title} (d2E)",
+                        "cbar_label": "d2(DR/R)/dE2",
+                        "cmap": self._resolved_cmap(self.drr_second_cmap),
+                        "vmin": float(self.drr_second_vmin_spin.value()),
+                        "vmax": float(self.drr_second_vmax_spin.value()),
+                        "split_scale": self._split_scale_for_prefix("drr_second", "DRR"),
+                    }
+                )
+                drr_second_params = self._drr_params_with_view_limits(drr_second_params)
+                # Keep the active visible product available to compatibility
+                # paths, while the paired fields below are authoritative.
+                export_cube = drr_raw_cube
+                params = drr_second_params if self._drr_plot_view == "second" else drr_raw_params
+                drr_deriv = 2 if self._drr_plot_view == "second" else None
+                drr_used_win = drr_second_win if drr_deriv == 2 else drr_raw_win
+                drr_poly = drr_second_poly if drr_deriv == 2 else drr_raw_poly
             elif mode == "Power Dependent":
                 if self.power_controller._power_view() == "VP":
                     power_vp_payload = self.power_controller._power_vp_payload()
@@ -7469,6 +10511,15 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 mode=mode,
                 params=params,
                 drr_cube=export_cube,
+                drr_raw_cube=drr_raw_cube,
+                drr_second_cube=drr_second_cube,
+                drr_raw_params=drr_raw_params,
+                drr_second_params=drr_second_params,
+                drr_raw_sg_window=drr_raw_win,
+                drr_raw_sg_polyorder=drr_raw_poly,
+                drr_second_sg_window=drr_second_win,
+                drr_second_sg_polyorder=drr_second_poly,
+                drr_second_auto_scale=bool(getattr(self, "drr_second_auto_scale", True)),
                 drr_derivative_order=drr_deriv,
                 drr_sg_window=drr_used_win,
                 drr_sg_polyorder=drr_poly,
@@ -7564,7 +10615,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 options,
             )
         )
-        if request_key == self._last_export_request_key:
+        paired_drr_request = (
+            mode == "DRR"
+            and getattr(options, "drr_raw_cube", None) is not None
+            and getattr(options, "drr_raw_params", None) is not None
+        )
+        if request_key == self._last_export_request_key and not paired_drr_request:
             self._status("This unchanged result is already saved; no duplicate created.")
             return
 
@@ -7611,15 +10667,6 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             out_folder = str(paths["png_linear"].parent)
             files_to_move = [loaded.primary_file]
         elif mode == "DRR" and options.drr_cube is not None and loaded.primary_file:
-            base = build_drr_export_base(
-                loaded.primary_file,
-                len(loaded.selected_files),
-                loaded.drr_mode_label,
-                options.drr_derivative_order,
-                options.drr_sg_window,
-                options.drr_sg_polyorder,
-                options.drr_sg_mode_label,
-            )
             drr_inputs = [("measurement", name) for name in loaded.selected_files]
             drr_inputs.extend(("background", name) for name in loaded.baseline_files)
             # The loaded assignments and numerical path are authoritative.
@@ -7670,10 +10717,6 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     if export_numerical_path == "heterogeneous"
                     else "per-file dR/R, then nanmean"
                 ),
-                "derivative_order": options.drr_derivative_order,
-                "savgol_window": options.drr_sg_window,
-                "savgol_polyorder": options.drr_sg_polyorder,
-                "derivative_grid": options.drr_sg_mode_label,
                 "y_axis": loaded.y_axis_spec,
             }
             if not is_precomputed_map:
@@ -7687,25 +10730,105 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     "numerical_path": export_numerical_path,
                     **current_selection,
                 })
-            paths = export_drr_png_and_dat(
-                folder,
-                cube=options.drr_cube,
-                params=options.params,
-                export_base=base,
-                processed_name=str(Path("Processed Data") / "DRR"),
-                metadata_input_files=drr_inputs,
-                metadata_processing=drr_processing,
-                metadata_extra=metadata_extra,
-            )
-            save_status = getattr(paths, "save_status", "created")
-            if save_status == "reused":
-                log.emit(f"Already saved; reused {paths['dat'].name} and {paths['png'].name}")
-            elif save_status == "updated":
-                log.emit(f"Updated existing DRR result: {paths['dat'].name}, {paths['png'].name}")
-            else:
-                log.emit(f"Exported PNG: {paths['png'].name}")
-                log.emit(f"Exported DAT: {paths['dat'].name}")
-            out_folder = str(paths["png"].parent)
+            pair_requested = options.drr_raw_cube is not None and options.drr_raw_params is not None
+            if pair_requested:
+                raw_product = options.drr_raw_cube
+                raw_params = options.drr_raw_params
+                second_product = options.drr_second_cube
+                second_window = int(options.drr_second_sg_window or options.drr_sg_window)
+                second_poly = int(options.drr_second_sg_polyorder or options.drr_sg_polyorder)
+                if second_product is None:
+                    # Export receives immutable SG settings and performs the
+                    # expensive transform off the GUI thread.
+                    second_product, second_window = apply_sg_derivative_energy(
+                        loaded.cube, derivative=2, window_length=second_window,
+                        polyorder=second_poly,
+                    )
+                    second_product.gate_unit = getattr(loaded.cube, "gate_unit", "")
+                    second_product.y_axis_semantic = getattr(loaded.cube, "y_axis_semantic", "")
+                second_params = options.drr_second_params
+                if second_params is None:
+                    second_params = HeatmapParams(
+                        **{
+                            **raw_params.__dict__,
+                            "title": f"{second_product.title}",
+                            "cbar_label": "d2(DR/R)/dE2",
+                            "split_scale": None,
+                        }
+                    )
+                if options.drr_second_auto_scale and second_params.split_scale is None:
+                    try:
+                        second_limits = compute_auto_limits(second_product, log_scale=False)
+                        second_params = HeatmapParams(
+                            **{
+                                **second_params.__dict__,
+                                "vmin": float(second_limits.vmin),
+                                "vmax": float(second_limits.vmax),
+                            }
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                raw_base = build_drr_export_base(
+                    loaded.primary_file, len(loaded.selected_files), loaded.drr_mode_label,
+                    None, int(options.drr_raw_sg_window or options.drr_sg_window),
+                    int(options.drr_raw_sg_polyorder or options.drr_sg_polyorder), options.drr_sg_mode_label,
+                )
+                second_base = build_drr_export_base(
+                    loaded.primary_file, len(loaded.selected_files), loaded.drr_mode_label,
+                    2, int(second_window), second_poly, options.drr_sg_mode_label,
+                )
+                raw_processing = {
+                    **drr_processing, "derivative_order": None,
+                    "savgol_window": int(options.drr_raw_sg_window or options.drr_sg_window),
+                    "savgol_polyorder": int(options.drr_raw_sg_polyorder or options.drr_sg_polyorder),
+                    "derivative_grid": options.drr_sg_mode_label,
+                }
+                second_processing = {
+                    **drr_processing, "derivative_order": 2,
+                    "savgol_window": int(second_window), "savgol_polyorder": int(second_poly),
+                    "derivative_grid": options.drr_sg_mode_label,
+                }
+                pair_paths = export_drr_pair_pngs_and_dat(
+                    folder, raw_cube=raw_product, second_cube=second_product,
+                    raw_params=raw_params, second_params=second_params,
+                    raw_export_base=raw_base, second_export_base=second_base,
+                    processed_name=str(Path("Processed Data") / "DRR"),
+                    metadata_input_files=drr_inputs,
+                    metadata_processing_raw=raw_processing,
+                    metadata_processing_second=second_processing,
+                    metadata_extra=metadata_extra,
+                )
+                save_status = getattr(pair_paths, "save_status", "created")
+                log.emit(
+                    f"DRR pair: {pair_paths['raw_dat'].name}, {pair_paths['raw_png'].name}; "
+                    f"{pair_paths['second_dat'].name}, {pair_paths['second_png'].name}"
+                )
+                out_folder = str(pair_paths["raw_png"].parent)
+                paths = pair_paths
+            elif options.drr_cube is not None and options.params is not None:
+                # Compatibility for direct callers that still request one
+                # DRR product. Normal GUI saves always use the pair fields.
+                base = build_drr_export_base(
+                    loaded.primary_file, len(loaded.selected_files), loaded.drr_mode_label,
+                    options.drr_derivative_order, options.drr_sg_window,
+                    options.drr_sg_polyorder, options.drr_sg_mode_label,
+                )
+                paths = export_drr_png_and_dat(
+                    folder, cube=options.drr_cube, params=options.params, export_base=base,
+                    processed_name=str(Path("Processed Data") / "DRR"),
+                    metadata_input_files=drr_inputs,
+                    metadata_processing={
+                        **drr_processing,
+                        "derivative_order": options.drr_derivative_order,
+                        "savgol_window": int(options.drr_sg_window),
+                        "savgol_polyorder": int(options.drr_sg_polyorder),
+                        "derivative_grid": options.drr_sg_mode_label,
+                    },
+                    metadata_extra=metadata_extra,
+                )
+                save_status = getattr(paths, "save_status", "created")
+                out_folder = str(paths["png"].parent)
+                log.emit(f"DRR: {paths['dat'].name} and {paths['png'].name}")
             # Canonical Initial Data and historical background files are never
             # offered for archival. Only verified legacy root working copies are.
             files_to_move = [
@@ -7763,6 +10886,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 show_integral=options.mcd_show_integral,
                 fit_near_zero=options.mcd_fit_near_zero,
                 fit_window_t=options.mcd_fit_window_t,
+                experiment_root=folder,
                 package_outputs=(
                     paths["png"],
                     paths["dat"],
@@ -8077,11 +11201,18 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._invalidate_export_move_sources()
         self._set_stage("Already saved" if save_status == "reused" else "Exported")
         if exported_mode in {"PL", "DRR"} and self.current_folder:
-            self._refresh_file_lists(auto=True)
+            self._refresh_file_lists(auto=True, mode=exported_mode)
+        elif exported_mode == "SHG Processing" and self.current_folder:
+            # SHG history lives in export metadata; rescan it after a
+            # successful save so the source selector reflects this package.
+            self._refresh_file_lists(auto=True, mode=exported_mode)
         elif exported_mode == "MCD" and self.current_folder:
             # Center-only saves do not change raw source discovery. Refreshing
             # just the MCD saved-state avoids rescanning every workflow.
             self.mcd_controller._mcd_refresh_sources()
+        elif exported_mode == "Compare" and self.current_folder:
+            self.compare_controller._cmp_refresh_history_cache(force=True)
+            self.compare_controller._cmp_update_group_badge()
         suffix = f"; cleaned {cleaned} verified source copy(s)" if cleaned else ""
         if save_status == "reused":
             self._status(f"Already saved—no duplicate created: {out_folder}{suffix}")

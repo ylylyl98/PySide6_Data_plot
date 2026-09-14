@@ -339,7 +339,7 @@ class McdExtractTests(unittest.TestCase):
             paths = export_mcd_extract(records, root / "extracts", energy_tolerance_mev=5.0)
             self.assertEqual(
                 set(paths),
-                {"origin_xlsx", "summary_xlsx", "increasing_png", "decreasing_png", "slope_png", "settings"},
+                {"origin_xlsx", "summary_xlsx", "increasing_png", "decreasing_png", "slope_png", "slope_near_zero_png", "slope_low_minus_negative_png", "slope_low_minus_positive_png", "settings"},
             )
             self.assertIn("D2V", paths["origin_xlsx"].name)
             self.assertIn("F0.1V", paths["origin_xlsx"].name)
@@ -363,7 +363,7 @@ class McdExtractTests(unittest.TestCase):
             self.assertEqual(summary["Slopes"]["A1"].fill.fill_type, None)
             manifest = json.loads(paths["settings"].read_text(encoding="utf-8"))
             self.assertEqual(manifest["plot"]["order_resolved"], "Energy")
-            self.assertEqual(manifest["plot"]["palette"], "viridis")
+            self.assertEqual(manifest["plot"]["palette"], "tab10")
             self.assertFalse(list((root / "extracts").glob("*.csv")))
             self.assertTrue(all(path.is_file() for path in paths.values()))
 
@@ -395,7 +395,7 @@ class McdExtractTests(unittest.TestCase):
             workbook = load_workbook(paths["summary_xlsx"], data_only=True)
             self.assertEqual(workbook.sheetnames, ["Slopes", "Conditions"])
             headers = [cell.value for cell in workbook["Conditions"][1]]
-            energy_column = headers.index("Energy (eV)") + 1
+            energy_column = headers.index("Window center (eV)") + 1
             energies = {
                 workbook["Conditions"].cell(row, energy_column).value
                 for row in range(2, workbook["Conditions"].max_row + 1)

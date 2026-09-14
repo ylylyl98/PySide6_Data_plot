@@ -15,13 +15,14 @@ import numpy as np
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QLabel, QLineEdit, QListWidget, QMessageBox, QPushButton, QScrollArea, QSplitter, QStyle, QStyleOptionSpinBox, QToolButton, QWidget
 
 from core.loader import DataCube
 from core.drr_sources import DrrSource
 from ui_qt.main_window import LoadedState, MainWindow, UI_METRICS
-from ui_qt.theme import install_theme
+from ui_qt.theme import alias as theme_alias, install_theme
 from tests.ui_test_helpers import wait_for_file_catalog
 from tests.profile_phases import profile_phase
 
@@ -513,6 +514,50 @@ class SplitScaleControlTests(unittest.TestCase):
             "manual_REF_760nmc_rep1_2.csv",
         ])
         self.assertEqual(observed["question_calls"], 1)
+
+    def test_drr_member_and_chosen_rows_use_state_colors_with_missing_priority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "new_REF.csv").write_text("placeholder", encoding="utf-8")
+            (root / "processed_REF.csv").write_text("placeholder", encoding="utf-8")
+            self.window.current_folder = str(root)
+            self.window.drr_available_sources = [
+                self._manual_drr_source("new_REF.csv"),
+                DrrSource(
+                    source="processed_REF.csv", filename="processed_REF.csv",
+                    group_key="manual_REF_760nmc", session_date="2026-08-26",
+                    modified_time=2.0, is_background=False, processed=True,
+                ),
+            ]
+            observed = {}
+
+            def fake_exec(dialog: QDialog) -> int:
+                group_list = dialog.findChild(QListWidget, "drr_source_group_list")
+                group_list.setCurrentRow(0)
+                self.app.processEvents()
+                file_list = dialog.findChild(QListWidget, "drr_source_file_list")
+                chosen = dialog.findChild(QListWidget, "drr_source_chosen_list")
+                observed["members"] = [
+                    (file_list.item(i).data(Qt.UserRole), file_list.item(i).foreground().color())
+                    for i in range(file_list.count())
+                ]
+                observed["chosen"] = [
+                    (chosen.item(i).text(), chosen.item(i).foreground().color())
+                    for i in range(chosen.count())
+                ]
+                return QDialog.Rejected
+
+            with patch.object(QDialog, "exec", fake_exec):
+                self.window.drr_controller._open_drr_source_dialog(
+                    title="Choose DRR files", selected=["new_REF.csv", "missing_REF.csv"], baseline_mode=False
+                )
+
+            members = dict(observed["members"])
+            self.assertEqual(members["new_REF.csv"], QColor(theme_alias("source_new_foreground")))
+            self.assertEqual(members["processed_REF.csv"], QColor(theme_alias("source_processed_foreground")))
+            chosen = dict(observed["chosen"])
+            self.assertEqual(chosen["new_REF.csv"], QColor(theme_alias("source_new_foreground")))
+            self.assertEqual(chosen["Missing · missing_REF.csv"], QColor(theme_alias("danger_foreground")))
 
     def test_drr_unknown_single_file_adds_without_confirmation(self) -> None:
         self.window.drr_available_sources = [self._manual_drr_source("manual_REF_760nmc_single.csv")]

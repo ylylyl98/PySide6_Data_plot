@@ -8,12 +8,63 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import datetime
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QObject, QRunnable, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFormLayout,
     QLabel, QListWidget, QListWidgetItem, QSplitter, QVBoxLayout,
     QWidget, QPushButton, QHBoxLayout)
 
 from ui_qt.source_picker_dialog import SourcePickerDialog
+from ui_qt.theme import alias as theme_alias
+
+
+class _PowerValidationSignals(QObject):
+    result = Signal(object)
+    error = Signal(str)
+    finished = Signal()
+
+
+class _PowerValidationWorker(QRunnable):
+    """Read and validate the selected Power sources away from the dialog."""
+
+    def __init__(self, folder, sources):
+        super().__init__()
+        self.folder = str(folder)
+        self.sources = tuple(sources)
+        self.signals = _PowerValidationSignals()
+
+    @staticmethod
+    def _files(source):
+        return ([source.file_name] if source.file_name else
+                [r.file_name for r in source.records])
+
+    def run(self):
+        try:
+            from core import data_io
+            results = {}
+            signatures = []
+            for key, source in self.sources:
+                files = self._files(source)
+                for name in files:
+                    path = Path(self.folder, str(name))
+                    stat = path.stat()
+                    signatures.append((str(name), int(stat.st_size), int(stat.st_mtime_ns)))
+                results[key] = data_io.load_power_series_cube(
+                    self.folder, files, group_key=key, y_axis="auto"
+                )
+                # A file can change during a slow decode.  Never let a result
+                # produced from that race authorize acceptance.
+                for name in files:
+                    path = Path(self.folder, str(name))
+                    stat = path.stat()
+                    current = (str(name), int(stat.st_size), int(stat.st_mtime_ns))
+                    if current not in signatures:
+                        raise RuntimeError(f"selected source changed during validation: {name}")
+            self.signals.result.emit({"results": results, "signatures": tuple(signatures)})
+        except Exception as exc:
+            self.signals.error.emit(str(exc))
+        finally:
+            self.signals.finished.emit()
 
 
 class PowerGroupDialog(SourcePickerDialog):
@@ -33,6 +84,23 @@ class PowerGroupDialog(SourcePickerDialog):
         self._files = []
         self._folder = controller.current_folder
         self._validation_results = {}
+        self._validation_cache = {}
+        self._validation_jobs = {}
+        # Every worker is bound to the catalog generation that created it.
+        # This applies to prefetch workers as well as accept workers; a late
+        # prefetch callback must never repaint or clear a newer accept state.
+        self._validation_job_generations = {}
+        self._validation_errors = {}
+        self._accept_after_validation = False
+        self._accept_validation_key = None
+        self._accept_validation_group_key = None
+        self._accept_validation_token = None
+        self._accept_validation_generation = None
+        self._accept_validation_signatures = ()
+        self._accept_validation_results = None
+        self._catalog_generation = 0
+        self._accept_token_counter = 0
+        self._dialog_closed = False
         self._drafts = {}
         self._saved_assignments = {}
         self._manual_edits = set()
@@ -140,7 +208,23 @@ class PowerGroupDialog(SourcePickerDialog):
                     return str(value)
         return ""
 
+    @staticmethod
+    def _group_status_text(status):
+        return {
+            "New": "● NEW",
+            "Partly processed": "◐ PARTLY PROCESSED",
+            "Processed": "✓ PROCESSED",
+        }.get(str(status), "● NEW")
+
+    @staticmethod
+    def _group_status_color(status):
+        return QColor(theme_alias(
+            "source_processed_foreground"
+            if str(status) == "Processed" else "source_new_foreground"
+        ))
+
     def _group_row_text(self, group):
+        status = getattr(group, "status", "New")
         modified = self._group_modified(group)
         identity = getattr(group, "context", "") or getattr(group, "label", group.key)
         identity = str(identity).split(" · ")[0]
@@ -148,7 +232,8 @@ class PowerGroupDialog(SourcePickerDialog):
         if not channels:
             channels = "Single sweep" if len(group.sources) == 1 else "Needs pairing"
         power = f" · {group.power_min:.6g}–{group.power_max:.6g} uW" if group.power_min is not None else ""
-        return f"{modified + ' · ' if modified else ''}{identity} · {channels}{power}"
+        detail = f"{modified + ' · ' if modified else ''}{identity} · {channels}{power}"
+        return f"{self._group_status_text(status)} · {detail}"
 
     def _set_details_visible(self, visible):
         self._details_panel.setVisible(bool(visible))
@@ -229,12 +314,16 @@ class PowerGroupDialog(SourcePickerDialog):
         try: self.button_box.accepted.disconnect(self.accept)
         except (TypeError, RuntimeError): pass
         self.button_box.accepted.connect(self._accept_checked)
-        self.ok_button.setText("Load")
+        self.ok_button.setText("Open and display")
 
     def _legacy_changed(self, value):
         self._legacy_value = bool(value); self.refresh()
 
-    def _group_changed(self, *_):
+    def _group_changed(self, *_, preserve_accept=False):
+        if not preserve_accept:
+            self._accept_after_validation = False
+            self._accept_validation_key = None
+            self._accept_validation_group_key = None
         item = self.source_list.currentItem()
         if item is None:
             message = "Selected group is missing or hidden by the current filters." if self._selected_group_key else "Select a measurement group."
@@ -271,6 +360,11 @@ class PowerGroupDialog(SourcePickerDialog):
         combo.setCurrentIndex(max(0, combo.findData(wanted))); combo.blockSignals(False)
 
     def _controls_changed(self, *_):
+        controls = (self.action_combo, self.single_combo, self.kk_combo, self.kkp_combo, self.pair_combo)
+        if self.sender() in controls:
+            self._accept_after_validation = False
+            self._accept_validation_key = None
+            self._accept_validation_group_key = None
         item = self.source_list.currentItem()
         if item is None: return
         draft = self._drafts.setdefault(str(item.data(Qt.UserRole)), {})
@@ -315,6 +409,12 @@ class PowerGroupDialog(SourcePickerDialog):
         self._update_action_button()
 
     def _validate(self, item, action):
+        """Perform cheap catalog validation; full CSV loading stays in the worker.
+
+        The dialog only decides whether the selected records can be paired.
+        Axis and spectrum validation is repeated by the Power load worker,
+        which keeps this modal UI responsive for large sweeps.
+        """
         self._validation_results = {}
         if self.controller.current_folder != self._folder:
             return 'The experiment folder changed. Reopen the Power group picker.'
@@ -323,40 +423,193 @@ class PowerGroupDialog(SourcePickerDialog):
         if any(not x for x in required): return "Assign every required source before loading."
         if any(x not in self._sources for x in required): return "A selected source is missing after refresh. Choose another source."
         if action != "Single intensity" and d.get("KK") == d.get("KKp"): return "KK and KKp must use distinct sources."
-        try:
-            from core import data_io
-            results = []
-            for key in required:
-                source = self._sources[key]
-                files = [source.file_name] if source.file_name else [record.file_name for record in source.records]
-                results.append(data_io.load_power_series_cube(self.controller.current_folder, files, group_key=key, y_axis='auto'))
-            self._validation_results = dict(zip(required, results))
-        except Exception as exc: return f"Cannot load selected source: {exc}"
-        if action != "Single intensity" and not self._pairing_manual:
-            from core.power_workflow import validate_power_vp_pairing
-            for label, mode in (("Pair by Stage", "stage"), ("Power Interpolation", "power")):
-                if validate_power_vp_pairing(results[0], results[1], mode=mode) is None:
-                    self.pair_combo.blockSignals(True); self.pair_combo.setCurrentText(label); self.pair_combo.blockSignals(False)
-                    break
-        if action == "VP":
-            from core.power_workflow import validate_power_vp_pairing
-            err = validate_power_vp_pairing(results[0], results[1], mode="power" if self.pair_combo.currentText() == "Power Interpolation" else "stage")
-            if err: return err
+        cache_key = self._validation_key(action, required)
+        cached = self._validation_cache.get(cache_key)
+        if cached is not None:
+            self._validation_results = dict(cached)
+            if action == "VP":
+                from core.power_workflow import validate_power_vp_pairing
+                return validate_power_vp_pairing(
+                    self._validation_results[required[0]], self._validation_results[required[1]],
+                    mode="power" if self.pair_combo.currentText() == "Power Interpolation" else "stage",
+                ) or ""
+            return ""
+        if cache_key in self._validation_errors:
+            return self._validation_errors[cache_key]
+        if action != "Single intensity":
+            first, second = (self._sources[key].records for key in required)
+
+            def pair_error(mode):
+                a = [r for r in first if r.power_uW is not None]
+                b = [r for r in second if r.power_uW is not None]
+                if not a:
+                    a = [type("PowerMeta", (), {"power_uW": value, "stage": None})()
+                         for value in getattr(self._sources[required[0]], "power_values", ())]
+                if not b:
+                    b = [type("PowerMeta", (), {"power_uW": value, "stage": None})()
+                         for value in getattr(self._sources[required[1]], "power_values", ())]
+                if not a or not b:
+                    return None
+                if mode == "stage":
+                    sa = {float(r.stage) for r in a if r.stage is not None}
+                    sb = {float(r.stage) for r in b if r.stage is not None}
+                    return None if sa & sb else "KK and KKp have no shared stage_pos values."
+                pa = [float(r.power_uW) for r in a]
+                pb = [float(r.power_uW) for r in b]
+                lo, hi = max(min(pa), min(pb)), min(max(pa), max(pb))
+                if hi < lo:
+                    return "KK and KKp have no overlapping power range."
+                common = {p for p in pa + pb if lo <= p <= hi}
+                return None if len(common) >= 2 else "Power interpolation needs at least two overlapping power values."
+
+            if not self._pairing_manual:
+                for label, mode in (("Pair by Stage", "stage"), ("Power Interpolation", "power")):
+                    if pair_error(mode) is None:
+                        self.pair_combo.blockSignals(True); self.pair_combo.setCurrentText(label); self.pair_combo.blockSignals(False)
+                        break
+            if action == "VP":
+                error = pair_error("power" if self.pair_combo.currentText() == "Power Interpolation" else "stage")
+                if error:
+                    return error
         return ""
 
+    def _validation_key(self, action, required):
+        catalog_signatures = {
+            str(name): (size, mtime)
+            for name, size, mtime in getattr(self.controller, "_power_catalog_signatures", ())
+        }
+        signatures = []
+        for key in required:
+            source = self._sources.get(key)
+            name = getattr(source, "file_name", None) if source is not None else None
+            names = [name] if name else [r.file_name for r in getattr(source, "records", ())]
+            member_signatures = []
+            for member in names:
+                size, mtime = catalog_signatures.get(str(member), (None, None))
+                member_signatures.append((member, size, mtime))
+            signatures.append((key, tuple(member_signatures)))
+        return (str(self._folder), str(action), tuple(signatures), self.pair_combo.currentText())
+
+    def _start_async_validation(self, cache_key, required):
+        """Prefetch the exact selection so completed validation can be reused."""
+        if cache_key in self._validation_jobs:
+            return False
+        owner = getattr(self.controller, "_owner", None)
+        pool = getattr(owner, "thread_pool", None)
+        # Test/detached dialogs have no lifecycle owner.  The real MainWindow
+        # supplies its owned pool; falling back to the global pool would keep
+        # temporary CSV handles alive after the dialog is closed.
+        if pool is None:
+            return False
+        worker = _PowerValidationWorker(
+            self._folder, tuple((key, self._sources[key]) for key in required)
+        )
+        self._validation_jobs[cache_key] = worker
+        self._validation_job_generations[cache_key] = self._catalog_generation
+        worker.signals.result.connect(
+            lambda results, key=cache_key, generation=self._catalog_generation:
+                self._on_async_validation_result(key, results, generation)
+        )
+        worker.signals.error.connect(
+            lambda message, key=cache_key, generation=self._catalog_generation:
+                self._on_async_validation_error(key, message, generation)
+        )
+        worker.signals.finished.connect(lambda key=cache_key: self._validation_jobs.pop(key, None))
+        pool.start(worker)
+        return True
+
+    def _on_async_validation_result(self, cache_key, results, worker_generation=None):
+        if self.controller.current_folder != self._folder or self._dialog_closed:
+            return
+        if (worker_generation is not None
+                and worker_generation != self._catalog_generation):
+            return
+        # Acceptance callbacks carry a unique tokenized request key.  A late
+        # result from an older attempt must not touch caches or call
+        # _group_changed, which could cancel the newer acceptance.
+        if self._accept_after_validation and cache_key != self._accept_validation_key:
+            return
+        payload = results if isinstance(results, dict) and "results" in results else {"results": results, "signatures": ()}
+        results = payload.get("results", {})
+        returned_signatures = tuple(payload.get("signatures", ()))
+        item = self.source_list.currentItem()
+        current_group_key = str(item.data(Qt.UserRole)) if item is not None else None
+        attempt_token = self._accept_validation_token
+        accept_after_validation = (
+            self._accept_after_validation
+            and self._accept_validation_key == cache_key
+            and self._accept_validation_group_key == current_group_key
+            and attempt_token is not None
+            and self._accept_validation_generation == self._catalog_generation
+        )
+        self._validation_cache[cache_key] = dict(results)
+        self._validation_cache[(cache_key, "signatures")] = returned_signatures
+        self._validation_results = dict(results)
+        self._validation_errors.pop(cache_key, None)
+        self._group_changed(preserve_accept=accept_after_validation)
+        if (
+            accept_after_validation
+            and self._accept_after_validation
+            and self._accept_validation_key == cache_key
+            and self._accept_validation_group_key == current_group_key
+        ):
+            expected = self._accept_validation_signatures
+            # An acceptance result must carry the worker's physical-file
+            # signatures.  Untagged legacy callbacks are valid for prefetch
+            # display only and can never authorize opening the dialog.
+            if not returned_signatures or (expected and returned_signatures != expected):
+                self._accept_after_validation = False
+                self._accept_validation_token = None
+                self._accept_validation_generation = None
+                self.set_details("Selected Power source could not be verified; please try again.")
+                return
+            self._accept_after_validation = False
+            self._accept_validation_key = None
+            self._accept_validation_group_key = None
+            self._accept_validation_token = None
+            self._accept_validation_generation = None
+            # Complete the normal persistence/acceptance path exactly once;
+            # the token prevents this handoff from launching another worker.
+            self._accept_validation_results = dict(results)
+            self._accept_checked(_validated_token=attempt_token)
+            self._accept_validation_results = None
+
+    def _on_async_validation_error(self, cache_key, message, worker_generation=None):
+        if self.controller.current_folder != self._folder or self._dialog_closed:
+            return
+        if (worker_generation is not None
+                and worker_generation != self._catalog_generation):
+            return
+        if self._accept_after_validation and cache_key != self._accept_validation_key:
+            return
+        self._validation_errors[cache_key] = f"Cannot load selected source: {message}"
+        self._validation_results = {}
+        self._group_changed()
+        self._accept_after_validation = False
+        self._accept_validation_key = None
+        self._accept_validation_group_key = None
+        self._accept_validation_token = None
+        self._accept_validation_generation = None
+
     def refresh(self):
+        self._catalog_generation += 1
+        self._accept_after_validation = False
+        self._accept_validation_key = None
+        self._accept_validation_group_key = None
+        self._validation_cache.clear()
+        self._validation_errors.clear()
         try: sources = self._catalog(); self._sources = sources
         except Exception as exc:
             self._groups = []
             self.set_details(str(exc))
             self.ok_button.setEnabled(False)
             return
-        try:
-            from core.power_selection_store import load_power_selections
-            self._saved_assignments = load_power_selections(self.controller.current_folder, sources)
-        except (ImportError, OSError, ValueError, TypeError) as exc:
+        cached_assignments = getattr(self.controller, "_power_saved_assignments_cache", None)
+        if isinstance(cached_assignments, dict):
+            self._saved_assignments = dict(cached_assignments)
+        else:
             self._saved_assignments = {}
-            self._manifest_warning = f"Saved pairing preferences could not be read: {exc}"
+            self._manifest_warning = "Saved pairing preferences are pending background catalog refresh."
         groups = self._group_fn(self.controller.current_folder, sources, angle_refs=self._refs(), angle_tolerance=self._tolerance(), processed_names=self._processed_fn(self.controller.current_folder))
         self._catalog_groups = groups
         if self._restore_initial:
@@ -390,10 +643,24 @@ class PowerGroupDialog(SourcePickerDialog):
                     self._groups.append(selected)
         self.show_older_button.setVisible(total > 20 and not self._show_all)
         wanted = self._selected_group_key
-        self.source_list.blockSignals(True); self.source_list.clear()
-        for g in self._groups:
-            it = QListWidgetItem(self._group_row_text(g)); it.setData(Qt.UserRole, g.key); it.setToolTip("\n".join(g.sources)); self.source_list.addItem(it)
-        self.source_list.blockSignals(False)
+        def populate(widget):
+            for g in self._groups:
+                it = QListWidgetItem(self._group_row_text(g))
+                it.setData(Qt.UserRole, g.key)
+                it.setToolTip("\n".join(g.sources))
+                widget.addItem(it)
+                it.setForeground(self._group_status_color(getattr(g, "status", "New")))
+                font = it.font()
+                font.setBold(str(getattr(g, "status", "New")) != "Processed")
+                it.setFont(font)
+        blocked = self.source_list.blockSignals(True)
+        try:
+            changed = self.replace_rows_if_changed(self.source_list, populate)
+        finally:
+            self.source_list.blockSignals(blocked)
+        if not changed:
+            self._group_changed()
+            return
         for i in range(self.source_list.count()):
             if str(self.source_list.item(i).data(Qt.UserRole)) == str(wanted): self.source_list.setCurrentRow(i); break
         else:
@@ -401,7 +668,7 @@ class PowerGroupDialog(SourcePickerDialog):
                 self.source_list.setCurrentRow(0)
         self._group_changed()
 
-    def _accept_checked(self):
+    def _accept_checked(self, _validated_token=None):
         # Validate only the chosen sources. The loader checks modification
         # signatures, so changed/deleted files remain detectable without
         # rescanning every unrelated sweep on the UI thread.
@@ -416,11 +683,60 @@ class PowerGroupDialog(SourcePickerDialog):
             self.set_details("Choose the KK and KKp sweeps, then load the comparison.")
             self._update_action_button()
             return
-        error = self._validate(item, self.action_combo.currentText())
+        action = self.action_combo.currentText()
+        fresh_results = dict(self._accept_validation_results or {}) if _validated_token is not None else None
+        error = self._validate(item, action)
         if error:
             self.set_details(error)
             self.ok_button.setEnabled(False)
             return
+        if fresh_results:
+            # _group_changed refreshes display state and may clear the normal
+            # catalog cache key. Preserve the exact worker-decoded snapshot
+            # for this one acceptance handoff.
+            self._validation_results = fresh_results
+            if action == "VP":
+                from core.power_workflow import validate_power_vp_pairing
+                required_now = [draft.get("KK"), draft.get("KKp")]
+                pair_error = validate_power_vp_pairing(
+                    fresh_results.get(required_now[0]), fresh_results.get(required_now[1]),
+                    mode="power" if self.pair_combo.currentText() == "Power Interpolation" else "stage",
+                ) if all(fresh_results.get(k) is not None for k in required_now) else "Fresh validation result is incomplete."
+                if pair_error:
+                    self.set_details(pair_error)
+                    return
+        required = [draft.get("single")] if action == "Single intensity" else [draft.get("KK"), draft.get("KKp")]
+        cache_key = self._validation_key(action, required)
+        # Acceptance always gets a new worker attempt.  Prefetch cache entries
+        # are memory-only hints and cannot establish file freshness.
+        owner = getattr(self.controller, "_owner", None)
+        pool = getattr(owner, "thread_pool", None) if owner is not None else None
+        if pool is None:
+            self.set_details("Background validation is unavailable; the source remains pending.")
+            self.ok_button.setEnabled(False)
+            return
+        if owner is not None and _validated_token is None:
+            self._accept_token_counter += 1
+            token = self._accept_token_counter
+            self._accept_after_validation = True
+            self._accept_validation_key = cache_key
+            self._accept_validation_group_key = str(item.data(Qt.UserRole))
+            self._accept_validation_token = token
+            self._accept_validation_generation = self._catalog_generation
+            self._accept_validation_signatures = tuple()
+            self.ok_button.setEnabled(False)
+            self.ok_button.setText("Validating…")
+            request_key = ("accept", token, cache_key)
+            self._accept_request_key = request_key
+            # Keep the catalog identity (used to derive this request) out of
+            # the callback guard: each acceptance has its own unique token.
+            self._accept_validation_key = request_key
+            if self._start_async_validation(request_key, required) or request_key in self._validation_jobs:
+                self.set_details("Validating selected Power source in the background…")
+                return
+            self._accept_after_validation = False
+            self._accept_validation_key = None
+            self._accept_validation_group_key = None
         # Persist only an explicit advanced assignment. The normal automatic
         # choice remains ephemeral and Cancel never writes a manifest.
         if str(item.data(Qt.UserRole)) in self._manual_edits:
@@ -435,6 +751,20 @@ class PowerGroupDialog(SourcePickerDialog):
                 self.set_details(f"Could not save this pairing: {exc}")
                 return
         self.accept()
+
+    def closeEvent(self, event):  # noqa: N802 - Qt API
+        self._dialog_closed = True
+        self._accept_after_validation = False
+        self._accept_validation_token = None
+        self._accept_validation_generation = None
+        super().closeEvent(event)
+
+    def reject(self):
+        self._dialog_closed = True
+        self._accept_after_validation = False
+        self._accept_validation_token = None
+        self._accept_validation_generation = None
+        super().reject()
 
     def selection(self):
         item = self.source_list.currentItem(); key = str(item.data(Qt.UserRole))

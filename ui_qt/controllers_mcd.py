@@ -161,6 +161,19 @@ class McdController:
 
     def _on_mcd_source_changed(self) -> None:
         self._mcd_background_suggestion = None
+        # Invalidate the unified candidate worker immediately.  Its callback
+        # must not publish results from the previous source while the normal
+        # MCD load/angle detection pipeline is settling.
+        if hasattr(self._owner, "_mcd_unified_analysis_generation"):
+            self._owner._mcd_unified_analysis_generation += 1
+            self._owner._mcd_unified_features = ()
+            self._owner._mcd_unified_analysis_pending = True
+        if hasattr(self._owner, "_mcd_unified_track_generation"):
+            self._owner._mcd_unified_track_generation += 1
+            self._owner._mcd_unified_track_pending = None
+            self._owner._mcd_unified_track_payload = None
+        if hasattr(self._owner, "_mcd_unified_manual_links"):
+            self._owner._mcd_unified_manual_links.clear()
         self._mcd_center_refresh_timer.stop()
         self._invalidate_mcd_peak_shift(queue_reload=True)
         self._update_mcd_selection_summary()
@@ -239,7 +252,9 @@ class McdController:
             and self.loaded.mode == "MCD"
             and self.loaded.mcd_result is not None
         ):
-            self.loaded.mcd_result.summary["window_center_selection"] = {"method": "manual"}
+            summary = getattr(self.loaded.mcd_result, "summary", None)
+            if isinstance(summary, dict):
+                summary["window_center_selection"] = {"method": "manual"}
         if self.loaded and self.loaded.mode == "MCD":
             if sender in (self.mcd_map_combo, self.mcd_center_zero_chk):
                 self._refresh_automatic_ranges("MCD", refresh_split=False)
@@ -265,10 +280,40 @@ class McdController:
             }
             if sender in trace_only_controls and self._refresh_mcd_trace_panel():
                 return
-            self._plot_mode("MCD")
+            self._schedule_plot_redraw("MCD")
 
     def _apply_pending_mcd_center_refresh(self) -> None:
         if not self.loaded or self.loaded.mode != "MCD":
+            return
+        # The unified page owns a separate four-panel trace model.  Reuse its
+        # artists for center/width edits so the legacy 40 ms coalescing timer
+        # does not reconstruct the heatmap or rerun feature detection.
+        owner = self._owner
+        unified = getattr(owner, "mcd_unified_view", None)
+        if unified is not None and unified._window_drag_active and unified._owns_current_figure():
+            # A queued spin-box update must not overwrite an in-progress
+            # map gesture with its earlier center or start expensive fitting.
+            self._mcd_center_refresh_timer.start()
+            return
+        if unified is not None and unified.axes and getattr(owner, "loaded", None) is not None and owner.loaded.mcd_result is getattr(unified, "_result", None) and getattr(unified, "_owns_current_figure", lambda: False)():
+            unified.set_window(
+                float(self.mcd_window_center_spin.value()),
+                float(self.mcd_window_width_spin.value()),
+                redraw=False,
+            )
+            try:
+                slopes = owner._compute_unified_mcd_slopes(unified)
+                owner._mcd_unified_slopes = slopes
+                if isinstance(getattr(unified, "analysis_payload", None), dict):
+                    unified.analysis_payload["slopes"] = slopes.to_dict() if slopes is not None else None
+                unified.update_mcd_slope_readout(slopes.to_dict() if slopes is not None else None)
+                # Match the full-render path: saving can use these refreshed slopes.
+                owner._mcd_unified_slopes_key = owner._unified_window_analysis_key()
+                if not unified._blit_update():
+                    unified.canvas.draw_idle()
+            except (AttributeError, TypeError, ValueError):
+                pass
+            owner._status("Updated unified MCD window.")
             return
         if not self._refresh_mcd_center_trace():
             self._plot_mode("MCD")
@@ -357,6 +402,21 @@ class McdController:
         finite = energy[np.isfinite(energy)]
         if finite.size == 0:
             return
+        history = getattr(self.loaded, "mcd_center_history", ())
+        source_key = (str(getattr(self.loaded, "folder", "")).casefold(),
+                      str(getattr(self.loaded, "primary_file", None) or
+                          getattr(self.loaded.mcd_result, "source_file", "")).casefold())
+        first_for_source = source_key != getattr(self._owner, "_mcd_history_loaded_source", None)
+        self._owner._mcd_history_loaded_source = source_key
+        eligible = [item for item in history if
+                    float(np.min(finite)) <= float(item["center_ev"]) - float(item["width_mev"]) * .0005
+                    and float(item["center_ev"]) + float(item["width_mev"]) * .0005 <= float(np.max(finite))]
+        if eligible and first_for_source:
+            latest = max(eligible, key=lambda item: str(item.get("last_used", "")))
+            self._set_spin_value_silent(self.mcd_window_center_spin, float(latest["center_ev"]))
+            self._set_spin_value_silent(self.mcd_window_width_spin, float(latest["width_mev"]))
+            self._mcd_center_refresh_timer.start()
+            return
         current = float(self.mcd_window_center_spin.value())
         if float(np.nanmin(finite)) <= current <= float(np.nanmax(finite)):
             return
@@ -399,7 +459,7 @@ class McdController:
         self._status(
             f"Candidate {index + 1}/{len(self._mcd_center_candidates)}: "
             f"E = {format_mcd_energy(candidate.center_ev)} eV; SNR {candidate.snr:.3g}; "
-            f"branch agreement {100.0 * candidate.branch_agreement:.0f}%."
+            f"high-field group support {100.0 * candidate.branch_agreement:.0f}%."
         )
 
     def _step_mcd_center_candidate(self, direction: int) -> None:
@@ -460,12 +520,16 @@ class McdController:
         """Draw a low-obstruction fixed-width MCD energy band."""
         left = float(center_ev - half_width_ev)
         right = float(center_ev + half_width_ev)
-        patch = axis.axvspan(left, right, color="#2f80c9", alpha=0.12, linewidth=0, zorder=20)
+        patch = axis.axvspan(left, right, ymin=.985 if draggable else 0, ymax=1,
+                            color="#2f80c9", alpha=.65 if draggable else .08, linewidth=0, zorder=20)
         edge_effect = [path_effects.Stroke(linewidth=2.4, foreground="#242424", alpha=0.55), path_effects.Normal()]
-        left_line = axis.axvline(left, color="white", lw=0.9, alpha=0.95, zorder=22)
-        right_line = axis.axvline(right, color="white", lw=0.9, alpha=0.95, zorder=22)
-        left_line.set_path_effects(edge_effect)
-        right_line.set_path_effects(edge_effect)
+        left_line = axis.axvline(left, color="#666666" if draggable else "white",
+                                   ls=(0, (4, 3)) if draggable else "-", lw=.85, alpha=.55 if draggable else .8, zorder=22)
+        right_line = axis.axvline(right, color="#666666" if draggable else "white",
+                                    ls=(0, (4, 3)) if draggable else "-", lw=.85, alpha=.55 if draggable else .8, zorder=22)
+        if not draggable:
+            left_line.set_path_effects(edge_effect)
+            right_line.set_path_effects(edge_effect)
         marker = None
         if draggable:
             (marker,) = axis.plot(
@@ -544,41 +608,42 @@ class McdController:
             return
         selected = self._selected(self.mcd_files)
         if not selected and hasattr(self, "mcd_selection_summary"):
-            self.mcd_selection_summary.set_status(
-                "No MCD CSV selected.", tooltip="", app_role=None, badge_state=None
-            )
+            self.mcd_selection_summary.set_source(status="No MCD CSV selected.", filename="", saved_at="", tooltip="", badge_state=None)
         elif selected:
             source = selected[0]
-            display_name = Path(source).name.replace("_", "_\u200b").replace("-", "-\u200b")
+            display_name = Path(source).name
             processed_at = self.mcd_processed_status.get(source, "")
-            if processed_at:
-                state = f"✓ PROCESSED\nLast saved: {processed_at[:16].replace('T', ' ')}"
+            if source in getattr(self, "mcd_processing_ambiguous", set()):
+                state = "History unknown"
+                badge_state = "unknown"
+            elif processed_at:
+                state = "Processed"
                 badge_state = "processed"
             else:
-                state = "● NEW — No saved analysis"
+                state = "New"
                 badge_state = "new"
             if hasattr(self, "mcd_selection_summary"):
-                self.mcd_selection_summary.set_status(
-                    f"{state}\nSelected: {display_name}",
-                    tooltip=source,
-                    app_role="sourceBadge",
-                    badge_state=badge_state,
-                )
+                self.mcd_selection_summary.set_source(status=state, filename=display_name,
+                    saved_at=(processed_at[:16].replace("T", " ") if processed_at else ""),
+                    tooltip=source, badge_state=badge_state)
         peak_summary = getattr(self, "mcd_peak_source_selection_summary", None)
         if peak_summary is not None:
             if selected:
                 source = selected[0]
-                display_name = Path(source).name.replace("_", "_\u200b").replace("-", "-\u200b")
-                peak_summary.set_status(
-                    f"Selected: {display_name}",
-                    tooltip=source,
-                    app_role="sourceBadge",
-                    badge_state="selected",
+                display_name = Path(source).name
+                processed = source in self.mcd_processed_status
+                unknown = source in getattr(self, "mcd_processing_ambiguous", set())
+                history_state = (
+                    "History unknown" if unknown else
+                    "Saved history" if processed else
+                    "New source"
                 )
+                peak_summary.set_source(status=history_state, filename=display_name,
+                    saved_at=(self.mcd_processed_status.get(source, "")[:16].replace("T", " ") if processed else ""),
+                    tooltip=f"{source}\nMCD source history; saved history does not verify current settings.",
+                    badge_state="unknown" if unknown else "processed" if processed else "new")
             else:
-                peak_summary.set_status(
-                    "No MCD CSV selected.", tooltip="", app_role=None, badge_state=None
-                )
+                peak_summary.set_source(status="No MCD CSV selected.", filename="", saved_at="", tooltip="", badge_state=None)
 
     def _invalidate_mcd_peak_shift(self, *, queue_reload: bool) -> None:
         """Drop peak-shift state whenever the shared raw MCD source changes."""
@@ -602,10 +667,7 @@ class McdController:
         self._update_action_states()
 
     def _mcd_source_modified(self, source: str) -> float:
-        try:
-            return resolve_source_path(self.current_folder, source).stat().st_mtime
-        except OSError:
-            return 0.0
+        return float(getattr(self._owner, "_mcd_source_mtime_cache", {}).get(source, 0.0))
 
     def _mcd_sources_newest_first(self) -> list[str]:
         return sorted(
@@ -615,17 +677,23 @@ class McdController:
 
     def _mcd_saved_source_filter(self) -> str:
         value = str(getattr(self, "_mcd_source_filter_preference", "all")).casefold()
-        return value if value in {"all", "unprocessed", "processed"} else "all"
+        return value if value in {"all", "unprocessed", "processed", "unknown"} else "all"
 
     def _mcd_source_filter_counts(self) -> dict[str, int]:
         processed = sum(
-            1 for source in self.mcd_available_files if source in self.mcd_processed_status
+            1 for source in self.mcd_available_files
+            if source not in getattr(self, "mcd_processing_ambiguous", set())
+            and source in self.mcd_processed_status
         )
-        return {
+        unknown = sum(1 for source in self.mcd_available_files if source in getattr(self, "mcd_processing_ambiguous", set()))
+        counts = {
             "all": len(self.mcd_available_files),
-            "unprocessed": len(self.mcd_available_files) - processed,
+            "unprocessed": len(self.mcd_available_files) - processed - unknown,
             "processed": processed,
         }
+        if unknown:
+            counts["unknown"] = unknown
+        return counts
 
     def _open_mcd_source_dialog(self, selected: str) -> str | None:
         """Choose exactly one raw MCD CSV with DRR-style processing filters."""
@@ -636,12 +704,12 @@ class McdController:
             title="Choose MCD CSV",
             hint=(
                 "Choose one raw B-sweep CSV from the experiment's mcd folder. "
-                "Processed means a saved MCD analysis already exists; selecting it again allows reprocessing."
+                "The scan scope is mcd/** CSV files, with root CSV fallback when no dedicated MCD CSVs exist. "
+                "Processed means saved MCD history; selecting it again allows reprocessing."
             ),
             selected=selected,
             filter_controls=(("Status", state_filter),),
-            # Preserve MCD's synchronous pre-extraction filtering behavior.
-            filter_interval=0,
+            filter_interval=140,
         )
         file_list = dlg.source_list
         details = dlg.details_label
@@ -656,6 +724,7 @@ class McdController:
             state_filter.addItem(f"All ({counts['all']})", "all")
             state_filter.addItem(f"Unprocessed ({counts['unprocessed']})", "unprocessed")
             state_filter.addItem(f"Processed ({counts['processed']})", "processed")
+            state_filter.addItem(f"History unknown ({counts.get('unknown', 0)})", "unknown")
             index = state_filter.findData(current)
             state_filter.setCurrentIndex(index if index >= 0 else 0)
             state_filter.blockSignals(blocked)
@@ -666,42 +735,40 @@ class McdController:
             needle = filter_edit.text().strip().casefold()
             wanted = str(state_filter.currentData() or "all")
             candidates = self._mcd_sources_newest_first()
-            def _populate(widget) -> None:
-                for source in candidates:
-                    processed_at = self.mcd_processed_status.get(source, "")
-                    if wanted == "unprocessed" and processed_at:
-                        continue
-                    if wanted == "processed" and not processed_at:
-                        continue
-                    if needle and needle not in source.casefold():
-                        continue
-                    modified = self._mcd_source_modified(source)
-                    modified_text = (
-                        datetime.fromtimestamp(modified).strftime("%Y-%m-%d %H:%M")
-                        if modified
-                        else "date unavailable"
-                    )
-                    if processed_at:
-                        text = (
-                            f"✓ PROCESSED — {Path(source).name}\n"
-                            f"Modified {modified_text} · Saved {processed_at[:16].replace('T', ' ')}"
-                        )
-                        color = QColor(theme_alias("source_processed_foreground"))
-                    else:
-                        text = (
-                            f"● NEW — {Path(source).name}\n"
-                            f"Modified {modified_text} · No saved analysis"
-                        )
-                        color = QColor(theme_alias("source_new_foreground"))
+            rows = []
+            def _populate_rows(widget) -> None:
+                for source, text, color_name, bold in rows:
                     item = QListWidgetItem(text)
                     item.setData(Qt.UserRole, source)
                     item.setToolTip(source)
-                    item.setForeground(color)
+                    item.setForeground(QColor(color_name))
                     font = item.font()
-                    font.setBold(not bool(processed_at))
+                    font.setBold(bold)
                     item.setFont(font)
                     widget.addItem(item)
-            dlg.repopulate(_populate, fallback_selection=selected)
+            # Build immutable visible rows once; the query itself is not part
+            # of the key, so equivalent query results reuse the live rows.
+            rows.clear()
+            for source in candidates:
+                processed_at = self.mcd_processed_status.get(source, "")
+                is_unknown = source in getattr(self, "mcd_processing_ambiguous", set())
+                if wanted == "unknown" and not is_unknown or wanted == "unprocessed" and (processed_at or is_unknown) or wanted == "processed" and not processed_at:
+                    continue
+                if needle and needle not in source.casefold():
+                    continue
+                modified = self._mcd_source_modified(source)
+                modified_text = datetime.fromtimestamp(modified).strftime("%Y-%m-%d %H:%M") if modified else "date unavailable"
+                if is_unknown:
+                    text = f"? HISTORY UNKNOWN — {Path(source).name}\nModified {modified_text} · Legacy metadata matches multiple files"
+                    color = QColor(theme_alias("source_new_foreground")); bold = True
+                elif processed_at:
+                    text = f"✓ PROCESSED — {Path(source).name}\nModified {modified_text} · Saved {processed_at[:16].replace('T', ' ')}"
+                    color = QColor(theme_alias("source_processed_foreground")); bold = False
+                else:
+                    text = f"● NEW — {Path(source).name}\nModified {modified_text} · No saved analysis"
+                    color = QColor(theme_alias("source_new_foreground")); bold = True
+                rows.append((str(source), text, str(color.name(QColor.HexArgb)), bold))
+            dlg.repopulate(_populate_rows, fallback_selection=selected, content_key=("mcd-rows", tuple(rows)))
 
         def _update_details() -> None:
             item = file_list.currentItem()
@@ -712,6 +779,8 @@ class McdController:
             source = str(item.data(Qt.UserRole))
             processed_at = self.mcd_processed_status.get(source, "")
             state = (
+                "? HISTORY UNKNOWN — Legacy metadata matches multiple files"
+                if source in getattr(self, "mcd_processing_ambiguous", set()) else
                 f"✓ PROCESSED — Last saved {processed_at[:16].replace('T', ' ')}"
                 if processed_at
                 else "● NEW — No saved MCD analysis was found."
@@ -719,7 +788,7 @@ class McdController:
             details.setText(f"{source}\n{state}")
 
         def _reload_catalog() -> None:
-            self._refresh_file_lists(auto=True)
+            self._refresh_file_lists(auto=False, mode="MCD")
             _populate_filter_counts()
             _refresh_view()
             _update_details()
@@ -782,9 +851,13 @@ class McdController:
         if pending_status is not None:
             self.mcd_processed_status = dict(pending_status)
             self._mcd_status_from_refresh = None
+            self.mcd_processing_ambiguous = set(getattr(self, "_mcd_ambiguous_from_refresh", set()))
+            self._mcd_ambiguous_from_refresh = None
         else:
+            self.mcd_processing_ambiguous = set()
             self.mcd_processed_status = discover_mcd_processing_status(
-                self.current_folder, self.mcd_available_files
+                self.current_folder, self.mcd_available_files,
+                ambiguous_sources=self.mcd_processing_ambiguous,
             )
         selected = self._selected(self.mcd_files)
         dark_pos = str(self.mcd_dark_pos_combo.currentData() or "")
@@ -792,16 +865,18 @@ class McdController:
         widgets = (self.mcd_files, self.mcd_dark_pos_combo, self.mcd_dark_neg_combo)
         blocked = [widget.blockSignals(True) for widget in widgets]
         try:
-            self.mcd_files.clear()
-            for file_name in self.mcd_available_files:
-                item = QListWidgetItem(file_name)
-                item.setToolTip(file_name)
-                self.mcd_files.addItem(item)
+            def populate(widget):
+                for file_name in self.mcd_available_files:
+                    item = QListWidgetItem(file_name)
+                    item.setToolTip(file_name)
+                    widget.addItem(item)
+            rows_changed = SourcePickerDialog.replace_rows_if_changed(self.mcd_files, populate)
             retained = [
                 file_name for file_name in selected
                 if file_name in self.mcd_available_files
             ]
-            self._restore_list_selection(self.mcd_files, retained)
+            if rows_changed:
+                self._restore_list_selection(self.mcd_files, retained)
             if (
                 not retained
                 and len(self.mcd_available_files) == 1
@@ -2095,7 +2170,7 @@ class McdController:
             button.setToolTip(
                 f"Candidate {index + 1}: {format_mcd_energy(candidate.center_ev)} eV\n"
                 f"Signal rank {candidate.score_rank}; SNR {candidate.snr:.3g}; "
-                f"branch agreement {100.0 * candidate.branch_agreement:.0f}%\n"
+                f"high-field group support {100.0 * candidate.branch_agreement:.0f}%\n"
                 "Click to preview this fixed-width center."
             )
             button.setChecked(index == self._mcd_candidate_active_index)
@@ -2143,6 +2218,9 @@ class McdController:
 
     def _on_mcd_canvas_motion(self, event: Any) -> None:
         """Handle MCD-only motion behavior from the shared canvas dispatcher."""
+        unified = getattr(self._owner, "mcd_unified_view", None)
+        if unified is not None and unified._owns_current_figure():
+            return
         if self._mcd_window_dragging:
             if event.xdata is None or self.loaded is None or self.loaded.mcd_result is None:
                 return
@@ -2174,6 +2252,9 @@ class McdController:
 
     def _on_mcd_canvas_click(self, event: Any) -> None:
         """Handle MCD-only click behavior from the shared canvas dispatcher."""
+        unified = getattr(self._owner, "mcd_unified_view", None)
+        if unified is not None and unified._owns_current_figure():
+            return
         if event.button != 1:
             return
         if event.inaxes is not self._mcd_heatmap_ax or event.ydata is None:

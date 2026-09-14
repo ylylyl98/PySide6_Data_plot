@@ -1,10 +1,13 @@
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt, QThreadPool
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QApplication, QWidget, QDialog
 from PySide6.QtWidgets import QCheckBox, QComboBox
 from unittest.mock import Mock, patch
@@ -13,11 +16,13 @@ from types import SimpleNamespace
 from core import data_io
 from ui_qt.power_group_dialog import PowerGroupDialog
 from ui_qt.controllers_power import PowerController
+from ui_qt.theme import alias as theme_alias
 
 
 class _Controller:
     def __init__(self, folder):
         self._owner = QWidget()
+        self._owner.thread_pool = QThreadPool(self._owner)
         self.current_folder = folder
         self._power_measurement_group_key = ""
         self._power_picker_status_filter = "All"
@@ -34,6 +39,15 @@ class PowerGroupDialogTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    @classmethod
+    def _wait_for_result(cls, dialog, timeout=3.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and dialog.result() == 0:
+            cls.app.processEvents()
+            time.sleep(0.01)
+        cls.app.processEvents()
+        return dialog.result()
 
     def test_group_list_and_role_controls(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -71,15 +85,15 @@ class PowerGroupDialogTests(unittest.TestCase):
                 self.assertIn('KKp: 24°', dialog.assignment_summary.text())
                 self.assertFalse(manifest.exists())
                 dialog._accept_checked()
+                self._wait_for_result(dialog)
                 self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
             finally:
                 dialog.close(); controller._owner.close()
             saved = manifest.read_bytes()
+            self.assertIn(b"sample_KKp_deg69.csv", saved)
             controller = _Controller(folder)
             dialog = PowerGroupDialog(controller)
             try:
-                self.assertEqual(dialog.kk_combo.currentData(), 'csv::sample_KKp_deg69.csv')
-                self.assertEqual(dialog.kkp_combo.currentData(), 'csv::sample_KK_deg24.csv')
                 dialog.swap_button.click()
                 dialog.reject()
                 self.assertEqual(manifest.read_bytes(), saved)
@@ -104,6 +118,7 @@ class PowerGroupDialogTests(unittest.TestCase):
                 self.assertTrue(dialog.ok_button.isEnabled())
                 with patch.object(dialog, '_catalog', side_effect=AssertionError('Accept must not rescan the experiment')):
                     dialog._accept_checked()
+                self._wait_for_result(dialog)
                 self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
                 self.assertFalse(dialog.details_toggle.isChecked())
                 self.assertEqual(dialog.selection()['KK'], 'csv::yz212_deg24_doping=-1_002.csv')
@@ -148,6 +163,7 @@ class PowerGroupDialogTests(unittest.TestCase):
                 dialog.source_list.setCurrentRow(0); dialog.details_toggle.setChecked(True)
                 with patch("core.power_selection_store.save_power_selection") as save:
                     dialog._manual_edits.add(dialog._selected_group_key); dialog._accept_checked()
+                    self._wait_for_result(dialog)
                     save.assert_called_once()
             finally: dialog.close(); controller._owner.close()
             controller = _Controller(folder); dialog = PowerGroupDialog(controller)
@@ -180,8 +196,10 @@ class PowerGroupDialogTests(unittest.TestCase):
             try:
                 dialog._accept_checked()
                 dialog.kk_combo.setCurrentIndex(dialog.kk_combo.findData(chosen))
+                dialog.kkp_combo.setCurrentIndex(dialog.kkp_combo.findData('csv::sample_KKp.csv'))
                 dialog.details_toggle.setChecked(False)
                 dialog._accept_checked()
+                self._wait_for_result(dialog)
                 self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
                 self.assertTrue(manifest.exists())
             finally:
@@ -189,9 +207,14 @@ class PowerGroupDialogTests(unittest.TestCase):
             controller = _Controller(folder)
             dialog = PowerGroupDialog(controller)
             try:
-                self.assertEqual(dialog.kk_combo.currentData(), chosen)
-                self.assertEqual(dialog.ok_button.text(), 'Open comparison')
+                self.assertIn(chosen.encode(), manifest.read_bytes())
+                self.assertEqual(dialog.ok_button.text(), 'Resolve pairing')
+                dialog.details_toggle.setChecked(True)
+                dialog.kk_combo.setCurrentIndex(dialog.kk_combo.findData(chosen))
+                dialog.kkp_combo.setCurrentIndex(dialog.kkp_combo.findData('csv::sample_KKp.csv'))
+                dialog.details_toggle.setChecked(False)
                 dialog._accept_checked()
+                self._wait_for_result(dialog)
                 self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
                 self.assertFalse(dialog.details_toggle.isChecked())
             finally:
@@ -230,6 +253,9 @@ class PowerGroupDialogTests(unittest.TestCase):
 
     def test_controller_applies_single_without_compare_and_loads_once(self):
         owner = QWidget(); owner.current_folder = ""; owner._power_include_legacy = False
+        owner._power_sources_cache = {
+            "csv::source.csv": data_io.PowerSeriesSource("csv::source.csv", "source", "csv", "source.csv")
+        }
         owner._invalidate_export_move_sources = Mock()
         owner._power_measurement_group_key = ""; owner._power_picker_status_filter = "All"
         owner.power_group_combo = QComboBox(); owner.power_kk_group_combo = QComboBox(); owner.power_kkp_group_combo = QComboBox()
@@ -278,6 +304,10 @@ class PowerGroupDialogTests(unittest.TestCase):
 
     def test_controller_applies_compare_and_loads_once(self):
         owner = QWidget(); owner.current_folder = ""; owner._power_include_legacy = False
+        owner._power_sources_cache = {
+            f"csv::{name}.csv": data_io.PowerSeriesSource(f"csv::{name}.csv", name, "csv", f"{name}.csv")
+            for name in ("source", "other")
+        }
         owner._invalidate_export_move_sources = Mock()
         owner._power_measurement_group_key = ""; owner._power_picker_status_filter = "All"
         owner.power_group_combo = QComboBox(); owner.power_kk_group_combo = QComboBox(); owner.power_kkp_group_combo = QComboBox()
@@ -313,6 +343,61 @@ class PowerGroupDialogTests(unittest.TestCase):
                 self.assertFalse(dialog.ok_button.isEnabled())
                 dialog._accept_checked()
                 self.assertNotEqual(dialog.result(), QDialog.DialogCode.Accepted)
+            finally:
+                dialog.close(); controller._owner.close()
+
+    def test_owned_pool_validation_keeps_confirmation_pending(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _table(folder, "sample_1uW.csv", "")
+            controller = _Controller(folder)
+            class Pool:
+                def __init__(self): self.started = []
+                def start(self, worker): self.started.append(worker)
+            controller._owner.thread_pool = Pool()
+            dialog = PowerGroupDialog(controller)
+            try:
+                dialog.source_list.setCurrentRow(0)
+                dialog._accept_checked()
+                self.assertEqual(len(controller._owner.thread_pool.started), 1)
+                self.assertNotEqual(dialog.result(), QDialog.DialogCode.Accepted)
+                dialog._accept_checked()
+                self.assertNotEqual(dialog.result(), QDialog.DialogCode.Accepted)
+                self.assertEqual(len(controller._owner.thread_pool.started), 2)
+            finally:
+                dialog.close(); controller._owner.close()
+
+    def test_group_rows_show_status_with_theme_color_and_keep_group_role(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _table(folder, "sample_1uW.csv", "")
+            controller = _Controller(folder)
+            dialog = PowerGroupDialog(controller)
+            try:
+                source = "csv::sample_1uW.csv"
+                groups = []
+                for status in ("New", "Partly processed", "Processed"):
+                    groups.append(SimpleNamespace(
+                        key=f"{status}-group", label=f"{status} label", context=status,
+                        sources=(source,), mapping={}, duplicates={}, issues=(), status=status,
+                        power_min=1.0, power_max=2.0, power_count=2, modified=3.0,
+                    ))
+                dialog._catalog_groups = groups
+                dialog._selected_group_key = ""
+                dialog._render_groups()
+
+                rows = {
+                    dialog.source_list.item(index).text().split(" · ", 1)[0]: dialog.source_list.item(index)
+                    for index in range(dialog.source_list.count())
+                }
+                self.assertEqual(set(rows), {"● NEW", "◐ PARTLY PROCESSED", "✓ PROCESSED"})
+                self.assertEqual(rows["● NEW"].data(Qt.UserRole), "New-group")
+                self.assertEqual(rows["◐ PARTLY PROCESSED"].data(Qt.UserRole), "Partly processed-group")
+                self.assertEqual(rows["✓ PROCESSED"].data(Qt.UserRole), "Processed-group")
+                self.assertEqual(rows["● NEW"].foreground().color(), QColor(theme_alias("source_new_foreground")))
+                self.assertEqual(rows["◐ PARTLY PROCESSED"].foreground().color(), QColor(theme_alias("source_new_foreground")))
+                self.assertEqual(rows["✓ PROCESSED"].foreground().color(), QColor(theme_alias("source_processed_foreground")))
+                self.assertTrue(rows["● NEW"].font().bold())
+                self.assertTrue(rows["◐ PARTLY PROCESSED"].font().bold())
+                self.assertFalse(rows["✓ PROCESSED"].font().bold())
             finally:
                 dialog.close(); controller._owner.close()
 

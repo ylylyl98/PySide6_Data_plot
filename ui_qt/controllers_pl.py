@@ -20,6 +20,7 @@ from core.processing import nearest_gate_spectrum
 from ui_qt.common import QComboBox
 from ui_qt.theme import alias as theme_alias
 from ui_qt.source_picker_dialog import SourcePickerDialog
+from ui_qt.axes_region_blitter import AxesRegionBlitter
 
 
 def _multi_lorentz_model_worker(x: np.ndarray, *p: float) -> np.ndarray:
@@ -112,7 +113,10 @@ class PlController:
         return data_io.classify_pl_source(source)
 
     def _pl_source_is_processed(self, source: str) -> bool:
-        return self._pl_is_saved_dat(source) or source in self.pl_processed_status
+        return self._pl_is_saved_dat(source) or (
+            source not in getattr(self, "pl_processing_ambiguous", set())
+            and source in self.pl_processed_status
+        )
 
     def _update_pl_selection_summary(self) -> None:
         if not hasattr(self, "pl_selection_summary"):
@@ -135,6 +139,9 @@ class PlController:
         elif processed_at:
             state = f"✓ PROCESSED\nLast saved: {processed_at[:16].replace('T', ' ')}"
             badge_state = "processed"
+        elif source in getattr(self, "pl_processing_ambiguous", set()):
+            state = "? HISTORY UNKNOWN — Legacy metadata matches multiple files"
+            badge_state = "unknown"
         else:
             state = "● NEW — No saved analysis"
             badge_state = "new"
@@ -146,15 +153,7 @@ class PlController:
         )
 
     def _pl_source_modified(self, source: str) -> float:
-        cached = self._pl_source_mtime_cache.get(source)
-        if cached is not None:
-            return cached
-        try:
-            modified = resolve_source_path(self.current_folder, source).stat().st_mtime
-        except OSError:
-            modified = 0.0
-        self._pl_source_mtime_cache[source] = modified
-        return modified
+        return float(self._pl_source_mtime_cache.get(source, 0.0))
 
     def _pl_sources_newest_first(self) -> list[str]:
         return sorted(
@@ -164,7 +163,7 @@ class PlController:
 
     def _pl_saved_source_filter(self) -> str:
         value = str(getattr(self, "_pl_source_filter_preference", "all")).casefold()
-        return value if value in {"all", "unprocessed", "processed"} else "all"
+        return value if value in {"all", "unprocessed", "processed", "unknown"} else "all"
 
     def _pl_source_filter_counts(self, source_kind: str | None = None) -> dict[str, int]:
         wanted = source_kind or str(getattr(self, "_pl_source_type_preference", "PL"))
@@ -173,12 +172,16 @@ class PlController:
             if not self._pl_is_saved_dat(source)
             and (wanted == "All" or self._pl_source_kind(source) == wanted)
         ]
+        unknown = sum(1 for source in sources if source in getattr(self, "pl_processing_ambiguous", set()))
         processed = sum(1 for source in sources if self._pl_source_is_processed(source))
-        return {
+        counts = {
             "all": len(sources),
-            "unprocessed": len(sources) - processed,
+            "unprocessed": len(sources) - processed - unknown,
             "processed": processed,
         }
+        if unknown:
+            counts["unknown"] = unknown
+        return counts
 
     def _open_pl_source_dialog(self, selected: str, *, saved_only: bool = False) -> str | None:
         state_filter = QComboBox()
@@ -209,6 +212,7 @@ class PlController:
             state_filter.addItem(f"All ({counts['all']})", "all")
             state_filter.addItem(f"New ({counts['unprocessed']})", "unprocessed")
             state_filter.addItem(f"Processed ({counts['processed']})", "processed")
+            state_filter.addItem(f"History unknown ({counts.get('unknown', 0)})", "unknown")
             index = state_filter.findData(current)
             state_filter.setCurrentIndex(index if index >= 0 else 0)
             state_filter.blockSignals(blocked)
@@ -231,8 +235,8 @@ class PlController:
             needle = filter_edit.text().strip().casefold()
             wanted = str(state_filter.currentData() or "all")
             wanted_type = str(type_filter.currentData() or "PL")
-            def _populate(widget) -> None:
-                for source in self._pl_sources_newest_first():
+            rows = []
+            for source in self._pl_sources_newest_first():
                     is_saved = self._pl_is_saved_dat(source)
                     if saved_only and not is_saved:
                         continue
@@ -241,7 +245,10 @@ class PlController:
                     if not saved_only and wanted_type != "All" and self._pl_source_kind(source) != wanted_type:
                         continue
                     is_processed = self._pl_source_is_processed(source)
-                    if not saved_only and wanted == "unprocessed" and is_processed:
+                    is_unknown = source in getattr(self, "pl_processing_ambiguous", set())
+                    if not saved_only and wanted == "unknown" and not is_unknown:
+                        continue
+                    if not saved_only and wanted == "unprocessed" and (is_processed or is_unknown):
                         continue
                     if not saved_only and wanted == "processed" and not is_processed:
                         continue
@@ -263,6 +270,10 @@ class PlController:
                         text = f"? UNKNOWN — {Path(source).name}\nModified {modified_text} · Unclassified raw data"
                         color = QColor(theme_alias("source_new_foreground"))
                         bold = True
+                    elif is_unknown:
+                        text = f"? HISTORY UNKNOWN — {Path(source).name}\nModified {modified_text} · Legacy metadata matches multiple files"
+                        color = QColor(theme_alias("source_new_foreground"))
+                        bold = True
                     elif processed_at:
                         text = f"✓ PROCESSED — {Path(source).name}\nModified {modified_text} · Saved {processed_at[:16].replace('T', ' ')}"
                         color = QColor(theme_alias("source_processed_foreground"))
@@ -271,13 +282,20 @@ class PlController:
                         text = f"● NEW — {Path(source).name}\nModified {modified_text} · No saved analysis"
                         color = QColor(theme_alias("source_new_foreground"))
                         bold = True
+                    rows.append((str(source), text, str(color.name(QColor.HexArgb)), bool(bold)))
+
+            def _populate(widget) -> None:
+                for source, text, color_name, bold in rows:
                     item = QListWidgetItem(text)
                     item.setData(Qt.UserRole, source)
                     item.setToolTip(source)
-                    item.setForeground(color)
+                    item.setForeground(QColor(color_name))
                     font = item.font(); font.setBold(bold); item.setFont(font)
                     widget.addItem(item)
-            dlg.repopulate(_populate, fallback_selection=selected)
+            # The key describes only the resulting visible rows.  Query text
+            # is deliberately excluded so equivalent filters reuse rows.
+            key = ("pl-rows", tuple(rows))
+            dlg.repopulate(_populate, fallback_selection=selected, content_key=key)
 
         def _update_details() -> None:
             item = file_list.currentItem()
@@ -297,12 +315,14 @@ class PlController:
                 state = "? UNKNOWN — Unclassified raw data; choose All raw data to view by default."
             elif source in self.pl_processed_status:
                 state = f"✓ PROCESSED — Last saved {self.pl_processed_status[source][:16].replace('T', ' ')}"
+            elif source in getattr(self, "pl_processing_ambiguous", set()):
+                state = "? HISTORY UNKNOWN — Legacy metadata matches multiple files"
             else:
                 state = "● NEW — No saved PL analysis was found."
             details.setText(f"{source}\n{state}")
 
         def _reload_catalog() -> None:
-            self._refresh_file_lists(auto=True)
+            self._refresh_file_lists(auto=False, mode="PL")
             _populate_type_filter(); _populate_filter_counts(); _refresh_view(); _update_details()
 
         def _on_filter_changed() -> None:
@@ -353,6 +373,9 @@ class PlController:
         self._start_load("PL")
 
     def _clear_pl_source(self) -> None:
+        invalidate = getattr(self, "_invalidate_active_load", None)
+        if callable(invalidate):
+            invalidate("PL")
         self._pl_auto_next_queue = []
         self._pl_auto_next_active = False
         self.pl_files.clearSelection()
@@ -362,6 +385,7 @@ class PlController:
         if self.last_plotted_mode == "PL":
             self.last_plotted_mode = None
             self.figure.clear(); self.canvas.draw_idle()
+            self._clear_shown_draw_identity("PL")
         self._set_stage("No PL source")
         self._update_action_states()
 
@@ -378,6 +402,7 @@ class PlController:
             if not self._pl_is_saved_dat(source)
             and self._pl_source_kind(source) == completed_kind
             and source not in self.pl_processed_status
+            and source not in getattr(self, "pl_processing_ambiguous", set())
             and source != completed_source
         ]
         if not self._pl_auto_next_queue:
@@ -556,20 +581,19 @@ class PlController:
         self.pl_fit_status.setText(f"Peaks: {int(self._pl_peak_indices.size)}")
         self._update_pl_spectrum_with_analysis(self._pl_last_plot_cube)
         return True
-    def _on_pl_plot_param_changed(self) -> None:
+    def _on_pl_plot_param_changed(self, source=None) -> None:
         self._invalidate_pending_pl_fit("Fit discarded: plot range or display settings changed.")
         self._invalidate_export_move_sources()
         self._apply_dat_y_axis_selection()
         if self.loaded and self.loaded.mode == "PL":
-            sender = self.sender()
+            sender = source if source is not None else self.sender()
             if sender in (
                 self.pl_spins["xmin"], self.pl_spins["xmax"],
                 self.pl_spins["ymin"], self.pl_spins["ymax"], self.pl_log_chk,
             ):
-                self._refresh_automatic_ranges(
-                    "PL",
-                    refresh_split=True,
-                    center_split=sender in (self.pl_spins["xmin"], self.pl_spins["xmax"]),
+                self._pending_range_refresh["PL"] = (
+                    bool(self._pending_range_refresh.get("PL", False))
+                    or sender in (self.pl_spins["xmin"], self.pl_spins["xmax"])
                 )
             self._schedule_plot_redraw("PL")
 
@@ -644,6 +668,12 @@ class PlController:
             except Exception:
                 pass
             self._pl_heatmap_fit_artist = None
+        for artist in getattr(self, "_pl_spectrum_overlay_artists", ()):
+            try:
+                artist.remove()
+            except (AttributeError, ValueError):
+                pass
+        self._pl_spectrum_overlay_artists = []
         if self._pl_peak_gate is not None and abs(float(gate_used) - float(self._pl_peak_gate)) > 1e-9:
             self._pl_peak_gate = None
             self._pl_peak_indices = None
@@ -661,7 +691,7 @@ class PlController:
             and self._pl_peak_indices.size > 0
         ):
             pidx = np.asarray(self._pl_peak_indices, dtype=int)
-            self._pl_spectrum_ax.scatter(x[pidx], y[pidx], s=26, marker="o", facecolor="#ffd84d", edgecolor="#222", zorder=30)
+            self._pl_spectrum_overlay_artists.append(self._pl_spectrum_ax.scatter(x[pidx], y[pidx], s=26, marker="o", facecolor="#ffd84d", edgecolor="#222", zorder=30))
             self._pl_heatmap_peak_artist = self._pl_heatmap_ax.scatter(
                 x[pidx],
                 np.full(pidx.size, float(gate_used)),
@@ -678,7 +708,7 @@ class PlController:
             and self._pl_fit_y is not None
             and abs(float(gate_used) - float(self._pl_fit_gate)) <= 1e-9
         ):
-            self._pl_spectrum_ax.plot(self._pl_fit_x, self._pl_fit_y, color="#f28e2b", linewidth=1.6, zorder=28)
+            self._pl_spectrum_overlay_artists.append(self._pl_spectrum_ax.plot(self._pl_fit_x, self._pl_fit_y, color="#f28e2b", linewidth=1.6, zorder=28)[0])
             if self._pl_fit_centers is not None and self._pl_fit_centers.size:
                 self._pl_heatmap_fit_artist = self._pl_heatmap_ax.scatter(
                     np.asarray(self._pl_fit_centers, float),
@@ -695,8 +725,20 @@ class PlController:
         gate_value = float(self.pl_spins["gate"].value())
         gate_used, y = nearest_gate_spectrum(cube, gate_value)
         x = np.asarray(cube.energy, float).ravel()
-        self._pl_spectrum_ax.clear()
-        self._pl_spectrum_ax.plot(x, np.asarray(y, float), linewidth=1.3)
+        spectrum_line = getattr(self, "_pl_spectrum_line", None)
+        if spectrum_line is None or getattr(spectrum_line, "axes", None) is not self._pl_spectrum_ax:
+            spectrum_line, = self._pl_spectrum_ax.plot(x, np.asarray(y, float), linewidth=1.3)
+            self._pl_spectrum_line = spectrum_line
+        else:
+            spectrum_line.set_data(x, np.asarray(y, float))
+        for line in list(self._pl_spectrum_ax.lines):
+            if line is not spectrum_line and line is not getattr(self, "_pl_gate_line", None):
+                line.remove()
+        # Drop only transient analysis overlays owned by this controller;
+        # retain the spectrum and gate artists across gate-only updates.
+        for line in list(self._pl_spectrum_ax.lines):
+            if line not in {spectrum_line, getattr(self, "_pl_gate_line", None)}:
+                line.remove()
         self._pl_spectrum_ax.set_title(f"Spectrum @ {gate_used:.6g} V")
         self._pl_spectrum_ax.set_xlabel("Photon Energy (eV)")
         self._pl_spectrum_ax.set_ylabel(cube.cbar_label)
@@ -730,8 +772,12 @@ class PlController:
         gate_value = float(self.pl_spins["gate"].value())
         gate_used, y = nearest_gate_spectrum(cube, gate_value)
         x = np.asarray(cube.energy, float).ravel()
-        self._pl_spectrum_ax.clear()
-        self._pl_spectrum_ax.plot(x, np.asarray(y, float), linewidth=1.3)
+        spectrum_line = getattr(self, "_pl_spectrum_line", None)
+        if spectrum_line is None or getattr(spectrum_line, "axes", None) is not self._pl_spectrum_ax:
+            spectrum_line, = self._pl_spectrum_ax.plot(x, np.asarray(y, float), linewidth=1.3)
+            self._pl_spectrum_line = spectrum_line
+        else:
+            spectrum_line.set_data(x, np.asarray(y, float))
         self._pl_spectrum_ax.set_title(f"Spectrum @ {gate_used:.6g} V")
         self._pl_spectrum_ax.set_xlabel("Photon Energy (eV)")
         self._pl_spectrum_ax.set_ylabel(cube.cbar_label)
@@ -746,7 +792,37 @@ class PlController:
         self._ensure_pl_gate_line(cube, gate_used)
         self._draw_pl_analysis_overlays(gate_used, x, np.asarray(y, float))
         self._update_pl_analysis_text(gate_used, x, np.asarray(y, float))
-        self.canvas.draw_idle()
+        self._draw_pl_regions()
+
+    def _draw_pl_regions(self) -> None:
+        """Draw PL dynamic artists locally when the static layout is valid."""
+        line = getattr(self, "_pl_spectrum_line", None)
+        gate = getattr(self, "_pl_gate_line", None)
+        if line is None or gate is None:
+            self.canvas.draw_idle()
+            return
+        helpers = getattr(self, "_pl_region_blitters", None)
+        if helpers is None:
+            helpers = (
+                AxesRegionBlitter(self.canvas), AxesRegionBlitter(self.canvas)
+            )
+            self._pl_region_blitters = helpers
+        spectrum_blit, heatmap_blit = helpers
+        for helper, axis, artist in (
+            (spectrum_blit, self._pl_spectrum_ax, line),
+            (heatmap_blit, self._pl_heatmap_ax, gate),
+        ):
+            bbox = tuple(round(float(v), 3) for v in axis.bbox.bounds)
+            if (
+                getattr(helper, "_layout_bbox", None) != bbox
+                or helper.axes is not axis
+                or helper.artists != (artist,)
+            ):
+                helper.configure(axis, [artist])
+                helper._layout_bbox = bbox
+                helper.restore_interactive_drawing()
+            elif not helper.draw():
+                helper.restore_interactive_drawing()
     def _update_pl_analysis_text(self, gate_used: float, x: np.ndarray, y: np.ndarray) -> None:
         lines: list[str] = []
         if (

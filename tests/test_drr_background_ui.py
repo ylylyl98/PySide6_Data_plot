@@ -114,10 +114,22 @@ class DrrBackgroundUiTests(unittest.TestCase):
         with (
             patch("ui_qt.main_window.resolve_drr_background_assignments", return_value=resolved) as resolve,
             patch("ui_qt.main_window.data_io.load_drr_resolved_cube", return_value=replacement) as load,
+            patch("ui_qt.controllers_drr.DrrController._drr_missing_sources", return_value=[]),
+            patch.object(self.window.thread_pool, "start") as start,
         ):
-            self.assertTrue(self.window._ensure_loaded_matches_drr_params())
+            self.assertFalse(self.window._ensure_loaded_matches_drr_params())
+            self.assertEqual(start.call_count, 1)
+            options = start.call_args.args[0].args[0]
+            refreshed = self.window._load_task(
+                options,
+                progress=SimpleNamespace(emit=lambda *_args: None),
+                log=SimpleNamespace(emit=lambda *_args: None),
+            )
+            token = self.window._active_load_token
+            self.window._on_loaded(refreshed, request_token=token)
+            self.window._on_load_finished(request_token=token)
 
-        resolve.assert_called_once()
+        self.assertGreaterEqual(resolve.call_count, 1)
         load.assert_called_once()
         self.assertEqual(tuple(self.window.loaded.drr_assignments), (assignment,))
         self.assertEqual(
@@ -157,14 +169,43 @@ class DrrBackgroundUiTests(unittest.TestCase):
             captured.update(kwargs)
             return paths
 
-        with patch("ui_qt.main_window.export_drr_png_and_dat", side_effect=fake_export):
+        class FakePairPaths(dict):
+            save_status = "created"
+
+        pair_paths = FakePairPaths(
+            raw_png=Path.cwd() / "result_DR_R.png",
+            raw_dat=Path.cwd() / "result_DR_R.dat",
+            second_png=Path.cwd() / "result_d2E.png",
+            second_dat=Path.cwd() / "result_d2E.dat",
+        )
+        with patch(
+            "ui_qt.main_window.export_drr_pair_pngs_and_dat",
+            side_effect=lambda *_args, **kwargs: captured.update(kwargs) or pair_paths,
+        ):
             MainWindow._export_task(
-                self.window, loaded, ExportOptions(mode="DRR", params=None, drr_cube=self._cube()),
+                self.window,
+                loaded,
+                ExportOptions(
+                    mode="DRR", params=HeatmapParams(
+                        "DRR", "Energy", "Gate", "DR/R", -1.0, 1.0,
+                        (0.0, 2.0), (0.0, 0.0),
+                    ),
+                    drr_cube=self._cube(), drr_raw_cube=self._cube(),
+                    drr_second_cube=self._cube(),
+                    drr_raw_params=HeatmapParams(
+                        "DRR", "Energy", "Gate", "DR/R", -1.0, 1.0,
+                        (0.0, 2.0), (0.0, 0.0),
+                    ),
+                    drr_second_params=HeatmapParams(
+                        "DRR", "Energy", "Gate", "d2(DR/R)/dE2", -1.0, 1.0,
+                        (0.0, 2.0), (0.0, 0.0),
+                    ),
+                ),
                 progress=SimpleNamespace(emit=lambda *_args: None),
                 log=SimpleNamespace(emit=lambda *_args: None),
             )
 
-        processing = captured["metadata_processing"]
+        processing = captured["metadata_processing_raw"]
         self.assertEqual(processing["drr_background_assignments"], [assignment.to_dict()])
         self.assertEqual(processing["selection_method"], "explicit_per_measurement")
         self.assertEqual(processing["numerical_path"], "heterogeneous")
@@ -218,10 +259,159 @@ class DrrBackgroundUiTests(unittest.TestCase):
                 "First frame from each file, then average"
             )
             self.assertEqual(self.window._drr_assignments, ())
-            self.window._ensure_loaded_matches_drr_params()
+            captured = []
+            with patch.object(self.window.thread_pool, "start", captured.append):
+                self.assertFalse(self.window._ensure_loaded_matches_drr_params())
+            self.assertEqual(len(captured), 1)
+            options = captured[0].args[0]
+            refreshed = self.window._load_task(
+                options,
+                progress=SimpleNamespace(emit=lambda *_args: None),
+                log=SimpleNamespace(emit=lambda *_args: None),
+            )
+            token = self.window._active_load_token
+            self.window._on_loaded(refreshed, request_token=token)
+            self.window._on_load_finished(request_token=token)
             first = self.window.loaded.cube
 
             self.assertTrue(np.allclose(first.Z, 1.0))
+
+    def test_default_self_load_and_reload_plot_without_external_background(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            measurement = root / "measurement.csv"
+            self._write_csv(measurement, [(0.0, 20.0), (1.0, 40.0)])
+            w = self.window
+            blocked = w.drr_baseline_combo.blockSignals(True)
+            w.drr_baseline_combo.setCurrentText("Self (last frame)")
+            w.drr_baseline_combo.blockSignals(blocked)
+            w.current_folder = str(root)
+            w.drr_selected_files = [measurement.name]
+            w.drr_available_sources = discover_drr_sources(root)
+            w.tabs.setCurrentIndex(next(i for i in range(w.tabs.count()) if w.tabs.tabText(i) == "DRR"))
+            self.assertEqual(w.drr_baseline_combo.currentText(), "Self (last frame)")
+            self.assertFalse(w._drr_baseline_user_selected)
+            for _ in range(2):
+                captured = []
+                with patch.object(w.thread_pool, "start", captured.append):
+                    w._start_load("DRR")
+                self.assertTrue(captured, w.statusBar().currentMessage())
+                options = captured[0].args[0]
+                loaded = w._load_task(
+                    options, progress=SimpleNamespace(emit=lambda *_: None),
+                    log=SimpleNamespace(emit=lambda *_: None),
+                )
+                np.testing.assert_allclose(loaded.cube.Z, [[-0.5] * 10, [0.0] * 10])
+                self.assertFalse(w._drr_assignments_automatic)
+                token = w._active_load_token
+                w._on_loaded(loaded, request_token=token)
+                w._on_load_finished(request_token=token)
+                self.assertEqual(w.last_plotted_mode, "DRR")
+                self.assertTrue(w._drr_heatmap_axes)
+
+    def test_default_self_does_not_replace_missing_saved_background(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            measurement = root / "measurement.csv"
+            self._write_csv(measurement, [(0.0, 20.0), (1.0, 40.0)])
+            processed = root / "Processed Data" / "DRR"
+            processed.mkdir(parents=True)
+            (processed / "saved.metadata.json").write_text(json.dumps({
+                "operation": "DR/R",
+                "sources": [{"role": "measurement", "source_path": str(measurement)}],
+                "processing": {"drr_background_assignments": [{
+                    "measurement": measurement.name, "baseline_mode": "External",
+                    "baseline_files": ["missing_back.csv"], "baseline_which": "last",
+                }]},
+            }), encoding="utf-8")
+            w = self.window
+            w.current_folder = str(root)
+            w.drr_selected_files = [measurement.name]
+            w.drr_available_sources = discover_drr_sources(root)
+            captured = []
+            with patch.object(w.thread_pool, "start", captured.append):
+                w._start_load("DRR")
+            self.assertFalse(captured)
+            self.assertIn("missing", w.statusBar().currentMessage().lower())
+
+    def test_returning_to_self_after_empty_external_selection_reloads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            measurement = root / "measurement.csv"
+            self._write_csv(measurement, [(0.0, 20.0), (1.0, 40.0)])
+            w = self.window
+            blocked = w.drr_baseline_combo.blockSignals(True)
+            w.drr_baseline_combo.setCurrentText("Self (last frame)")
+            w.drr_baseline_combo.blockSignals(blocked)
+            w.current_folder = str(root)
+            w.drr_selected_files = [measurement.name]
+            w.drr_available_sources = discover_drr_sources(root)
+            w.loaded = LoadedState(
+                mode="DRR", folder=str(root), primary_file=measurement.name,
+                selected_files=[measurement.name], cube=self._cube(),
+                drr_baseline_text="Self (last frame)",
+            )
+
+            w.drr_baseline_combo.setCurrentText("External")
+            self.assertIsNone(w.loaded)
+
+            with patch.object(MainWindow, "_start_load") as start_load:
+                for baseline in ("Self (first frame)", "Self (last frame)"):
+                    w.drr_baseline_combo.setCurrentText(baseline)
+                    start_load.assert_called_once_with("DRR")
+                    start_load.reset_mock()
+
+    def test_empty_external_selection_invalidates_active_drr_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            measurement = root / "measurement.csv"
+            self._write_csv(measurement, [(0.0, 20.0), (1.0, 40.0)])
+            w = self.window
+            w.current_folder = str(root)
+            w.drr_selected_files = [measurement.name]
+            w.drr_available_sources = discover_drr_sources(root)
+            captured = []
+            with patch.object(w.thread_pool, "start", captured.append):
+                blocked = w.drr_baseline_combo.blockSignals(True)
+                w.drr_baseline_combo.setCurrentText("Self (last frame)")
+                w.drr_baseline_combo.blockSignals(blocked)
+                w._start_load("DRR")
+                token = w._active_load_token
+                w._pending_load_mode = "DRR"
+                w._pending_load_options = SimpleNamespace()
+                stale = LoadedState(
+                    mode="DRR", folder=str(root), primary_file=measurement.name,
+                    selected_files=[measurement.name], cube=self._cube(),
+                    drr_baseline_text="Self (last frame)",
+                )
+                w.drr_baseline_combo.setCurrentText("External")
+                w._on_loaded(stale, request_token=token)
+
+            self.assertIsNone(w.loaded)
+            self.assertIn("DRR", w._invalidated_load_modes)
+            self.assertIsNone(w._pending_load_mode)
+            self.assertIsNone(w._pending_load_options)
+            w._on_load_finished(request_token=token)
+            self.assertFalse(w._load_in_progress)
+
+    def test_returning_to_self_does_not_reload_when_suspended_or_unselected(self) -> None:
+        w = self.window
+        w.drr_baseline_combo.setCurrentText("External")
+        with patch.object(MainWindow, "_start_load") as start_load:
+            w.drr_baseline_combo.setCurrentText("Self (last frame)")
+            start_load.assert_not_called()
+
+            w.drr_selected_files = ["measurement.csv"]
+            w.current_folder = str(Path.cwd())
+            w._suspend_drr_autoplot = False
+            next_index = (w.drr_cmap.currentIndex() + 1) % max(1, w.drr_cmap.count())
+            w.drr_cmap.setCurrentIndex(next_index)
+            start_load.assert_not_called()
+
+            w._suspend_drr_autoplot = True
+            w.drr_baseline_combo.setCurrentText("External")
+            w.drr_baseline_combo.setCurrentText("Self (last frame)")
+            start_load.assert_not_called()
 
     def test_real_external_to_self_load_uses_self_frames(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -255,7 +445,19 @@ class DrrBackgroundUiTests(unittest.TestCase):
             self.window._drr_assignments_automatic = False
             self.window.drr_baseline_combo.setCurrentText("Self (last frame)")
             self.assertEqual(self.window._drr_assignments, ())
-            self.window._ensure_loaded_matches_drr_params()
+            captured = []
+            with patch.object(self.window.thread_pool, "start", captured.append):
+                self.assertFalse(self.window._ensure_loaded_matches_drr_params())
+            self.assertEqual(len(captured), 1)
+            options = captured[0].args[0]
+            refreshed = self.window._load_task(
+                options,
+                progress=SimpleNamespace(emit=lambda *_args: None),
+                log=SimpleNamespace(emit=lambda *_args: None),
+            )
+            token = self.window._active_load_token
+            self.window._on_loaded(refreshed, request_token=token)
+            self.window._on_load_finished(request_token=token)
             self_mode = self.window.loaded.cube
             external = data_io.load_drr_resolved_cube(
                 root, [measurement.name], (external_assignment,)
@@ -318,13 +520,26 @@ class DrrBackgroundUiTests(unittest.TestCase):
             self.assertEqual(loaded.cube.drr_numerical_path, "heterogeneous")
             self.assertTrue(np.allclose(loaded.cube.Z, 0.5))
             self.window._on_loaded(loaded)
+            self.window._on_load_finished(request_token=self.window._active_load_token)
 
             # Force a real reload through the current UI selection state and
             # verify controller and LoadedState assignment identity stay equal.
             self.window.drr_selected_files = [b_name, a_name]
             self.window._drr_assignments = tuple(reversed(loaded.drr_assignments))
             self.window._drr_assignments_automatic = True
-            self.assertTrue(self.window._ensure_loaded_matches_drr_params())
+            captured = []
+            with patch.object(self.window.thread_pool, "start", captured.append):
+                self.assertFalse(self.window._ensure_loaded_matches_drr_params())
+            self.assertEqual(len(captured), 1)
+            options = captured[0].args[0]
+            refreshed = self.window._load_task(
+                options,
+                progress=SimpleNamespace(emit=lambda *_args: None),
+                log=SimpleNamespace(emit=lambda *_args: None),
+            )
+            token = self.window._active_load_token
+            self.window._on_loaded(refreshed, request_token=token)
+            self.window._on_load_finished(request_token=token)
             self.assertEqual(tuple(self.window._drr_assignments), tuple(self.window.loaded.drr_assignments))
             self.assertEqual(self.window.loaded.drr_background_selection["numerical_path"], "heterogeneous")
 
@@ -337,6 +552,12 @@ class DrrBackgroundUiTests(unittest.TestCase):
                         (700.0, 709.0), (0.0, 1.0),
                     ),
                     drr_cube=self.window.loaded.cube,
+                    drr_raw_cube=self.window.loaded.cube,
+                    drr_raw_params=HeatmapParams(
+                        "DRR", "Energy", "Gate", "DR/R", -1.0, 1.0,
+                        (700.0, 709.0), (0.0, 1.0),
+                    ),
+                    drr_second_cube=self.window.loaded.cube,
                 ),
                 progress=SimpleNamespace(emit=lambda *_args: None),
                 log=SimpleNamespace(emit=lambda *_args: None),
@@ -368,13 +589,42 @@ class DrrBackgroundUiTests(unittest.TestCase):
         class FakePaths(dict):
             save_status = "created"
         fake_paths = FakePaths(png=Path.cwd() / "map.png", dat=Path.cwd() / "map.dat")
-        with patch("ui_qt.main_window.export_drr_png_and_dat", side_effect=lambda *_args, **kwargs: captured.update(kwargs) or fake_paths):
+        class FakePairPaths(dict):
+            save_status = "created"
+
+        pair_paths = FakePairPaths(
+            raw_png=Path.cwd() / "map_DR_R.png",
+            raw_dat=Path.cwd() / "map_DR_R.dat",
+            second_png=Path.cwd() / "map_d2E.png",
+            second_dat=Path.cwd() / "map_d2E.dat",
+        )
+        with patch(
+            "ui_qt.main_window.export_drr_pair_pngs_and_dat",
+            side_effect=lambda *_args, **kwargs: captured.update(kwargs) or pair_paths,
+        ):
             MainWindow._export_task(
-                self.window, loaded, ExportOptions(mode="DRR", params=None, drr_cube=self._cube()),
+                self.window,
+                loaded,
+                ExportOptions(
+                    mode="DRR", params=HeatmapParams(
+                        "DRR", "Energy", "Gate", "DR/R", -1.0, 1.0,
+                        (0.0, 2.0), (0.0, 0.0),
+                    ),
+                    drr_cube=self._cube(), drr_raw_cube=self._cube(),
+                    drr_second_cube=self._cube(),
+                    drr_raw_params=HeatmapParams(
+                        "DRR", "Energy", "Gate", "DR/R", -1.0, 1.0,
+                        (0.0, 2.0), (0.0, 0.0),
+                    ),
+                    drr_second_params=HeatmapParams(
+                        "DRR", "Energy", "Gate", "d2(DR/R)/dE2", -1.0, 1.0,
+                        (0.0, 2.0), (0.0, 0.0),
+                    ),
+                ),
                 progress=SimpleNamespace(emit=lambda *_args: None),
                 log=SimpleNamespace(emit=lambda *_args: None),
             )
-        self.assertNotIn("drr_background_assignments", captured["metadata_processing"])
+        self.assertNotIn("drr_background_assignments", captured["metadata_processing_raw"])
 
     def test_unresolved_automatic_reload_clears_old_view_and_never_uses_union(self) -> None:
         self.window.current_folder = str(Path.cwd())
@@ -403,6 +653,22 @@ class DrrBackgroundUiTests(unittest.TestCase):
         self.assertIsNone(self.window.loaded)
         self.assertTrue(self.window._drr_assignments_automatic)
         self.assertEqual(self.window.drr_baseline_files_manual, [])
+
+    def test_export_stops_when_reload_invalidates_loaded_drr_view(self) -> None:
+        """A missing source discovered during export preparation must not crash."""
+        self.window.current_folder = str(Path.cwd())
+        self.window.drr_selected_files = ["missing-measurement.csv"]
+        self.window.loaded = LoadedState(
+            mode="DRR", folder=self.window.current_folder,
+            primary_file="map.xlsx", selected_files=["map.xlsx"], cube=self._cube(),
+            drr_mode_label="DR/R Map", drr_baseline_text="None",
+        )
+        self.window.last_plotted_mode = "DRR"
+        with patch.object(self.window, "_show_error") as show_error:
+            self.window._start_export("DRR")
+        show_error.assert_not_called()
+        self.assertIsNone(self.window.loaded)
+        self.assertFalse(self.window._export_in_progress)
 
 
 if __name__ == "__main__":
