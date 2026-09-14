@@ -23,6 +23,9 @@ class _PowerOwner:
         self._power_sources_cache = None
         self._power_result_cache = {}
         self._power_sources_cache_files = ()
+        self._power_catalog_folder = self.current_folder
+        self._power_catalog_candidates = ("one.csv",)
+        self._power_catalog_pending = False
         self.available_files = ["one.csv"]
 
 
@@ -209,14 +212,13 @@ class ResponsivenessTests(unittest.TestCase):
         owner = _PowerOwner()
         controller = PowerController(owner)
         sentinel = {"group": object()}
-        with patch.object(PowerController, '_power_candidate_files', side_effect=lambda: list(owner.available_files)), \
-                patch("core.data_io.get_power_series_sources", return_value=sentinel) as discover:
-            self.assertIs(controller._power_current_sources(), sentinel)
-            self.assertIs(controller._power_current_sources(), sentinel)
-            self.assertEqual(discover.call_count, 1)
-            owner.available_files.append("two.csv")
-            self.assertIs(controller._power_current_sources(), sentinel)
-            self.assertEqual(discover.call_count, 2)
+        owner._power_sources_cache = sentinel
+        self.assertIs(controller._power_current_sources(), sentinel)
+        self.assertIs(controller._power_current_sources(), sentinel)
+        owner._power_catalog_candidates = ("one.csv", "two.csv")
+        # A changed folder catalog is accepted only from the next worker
+        # snapshot; GUI group refresh never discovers or stats files itself.
+        self.assertIs(controller._power_current_sources(), sentinel)
 
     def test_power_background_toggle_propagates_signal_source(self) -> None:
         owner = _PowerBackgroundOwner()

@@ -4,7 +4,12 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QListWidget, QListWidgetItem, QStyleOptionViewItem
 
 from core.drr_sources import (
     _read_drr_metadata,
@@ -14,6 +19,7 @@ from core.drr_sources import (
     group_drr_sources,
     is_background_name,
 )
+from ui_qt.controllers_drr import DrrSourceSummaryDelegate, format_drr_source_summary
 
 
 def _csv(path: Path, gates: list[tuple[float, float]], *, axis=(740, 760, 780)) -> None:
@@ -58,6 +64,71 @@ def _write_drr_recipe(
         ),
         encoding="utf-8",
     )
+
+
+class DrrSourceSummaryFormatterTests(unittest.TestCase):
+    def test_processing_status_precedes_time_in_file_summary(self):
+        from ui_qt.controllers_drr import _drr_source_aux
+        source = self._source("sample.csv", modified_time=1700000000)
+        self.assertTrue(_drr_source_aux(source).startswith("UNPROCESSED · "))
+        source.processed = True
+        self.assertTrue(_drr_source_aux(source).startswith("PROCESSED · "))
+
+    @staticmethod
+    def _source(filename, *, wavelength=720, labels=(), ranges=(), modified_time=0, frame_count=12):
+        return SimpleNamespace(
+            filename=filename,
+            wavelength_center_nm=wavelength,
+            gate_labels=labels,
+            gate_ranges=ranges,
+            gate_direction="",
+            modified_time=modified_time,
+            frame_count=frame_count,
+            processed=False,
+        )
+
+    def test_summary_keeps_identity_and_attached_ref_marker(self):
+        source = self._source(
+            "YZ365_p5n2_5T_1.67KREF_720nmc_Rot90deg_TG-1.087BG=0.csv",
+            wavelength=None,
+        )
+        summary = format_drr_source_summary(source)
+        self.assertIn("YZ365 · p5n2 · REF · 5 T · 1.67 K", summary)
+
+    def test_summary_keeps_all_conditions_and_prioritizes_changed_ones(self):
+        source = self._source("YZ365_p5n2_5T_1.67KREF_720nm_Rot90deg_TG-1BG=0.csv")
+        peer = self._source("YZ365_p5n2_5T_1.67KREF_720nm_Rot45deg_TG-2BG=1.csv")
+        line = format_drr_source_summary(source, (peer,)).splitlines()[1]
+        self.assertTrue(line.startswith("Rot 90° · TG -1 · BG 0"), line)
+        self.assertIn("λ 720 nm", line)
+
+    def test_summary_deduplicates_measured_gate_and_uses_two_decimals(self):
+        source = self._source(
+            "YZ365_p5n2_5T_1.67KREF_720nm.csv",
+            labels=("Vbg_meas", "Vbg_set", "Vtg"),
+            ranges=((-4.6, 11.5), (-4.6, 11.5), (-5, 12.5)),
+        )
+        line = format_drr_source_summary(source).splitlines()[-1]
+        self.assertEqual(line, "Vbg -4.60–11.50 V; Vtg -5.00–12.50 V")
+
+    def test_group_copy_role_and_summary_row_height_are_explicit(self):
+        app = QApplication.instance() or QApplication([])
+        widget = QListWidget()
+        item = QListWidgetItem("group\nsummary")
+        item.setData(Qt.UserRole, "group-key")
+        filenames = ("a.csv", "b.csv")
+        item.setData(Qt.UserRole + 4, filenames)
+        widget.addItem(item)
+        self.assertEqual(item.data(Qt.UserRole), "group-key")
+        self.assertEqual(tuple(item.data(Qt.UserRole + 4)), filenames)
+        item.setText("identity\nparameters\nranges\nauxiliary")
+        delegate = DrrSourceSummaryDelegate(widget)
+        self.assertGreater(
+            delegate.sizeHint(QStyleOptionViewItem(), widget.model().index(0, 0)).height(),
+            0,
+        )
+        widget.deleteLater()
+        app.processEvents()
 
 
 class DrrSourceMetadataAndGridTests(unittest.TestCase):
@@ -355,7 +426,12 @@ class DrrSourceMetadataAndGridTests(unittest.TestCase):
             initial.mkdir(parents=True)
             repeats = [initial / f"pe_760_rep1_{index}.csv" for index in range(1, 8)]
             for index, path in enumerate(repeats):
-                _csv(path, [(float(frame), 0.0) for frame in range(203 if index == 1 else 101)])
+                gates = (
+                    [(100.0 * frame / 202.0, 0.0) for frame in range(203)]
+                    if index == 1
+                    else [(float(frame), 0.0) for frame in range(101)]
+                )
+                _csv(path, gates)
             processed = root / "Processed Data" / "DRR"
             processed.mkdir(parents=True)
             (processed / "pe.metadata.json").write_text(json.dumps({

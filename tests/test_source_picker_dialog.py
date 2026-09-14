@@ -76,6 +76,40 @@ class SourcePickerDialogTests(unittest.TestCase):
             dialog.close()
             dialog.deleteLater()
 
+    def test_unchanged_repopulate_preserves_rows_scroll_and_selection(self):
+        dialog = SourcePickerDialog(title="Choose source")
+        self.addCleanup(dialog.close)
+        def populate(widget):
+            for i in range(60):
+                widget.addItem(self._item(f"long_measurement_filename_{i}.csv"))
+        dialog.repopulate(populate)
+        dialog.show()
+        self.app.processEvents()
+        dialog.source_list.setCurrentRow(25)
+        bar = dialog.source_list.verticalScrollBar()
+        bar.setValue(bar.maximum() // 2)
+        position = bar.value()
+        resets = QSignalSpy(dialog.source_list.model().modelReset)
+        dialog.repopulate(populate)
+        self.assertEqual(resets.count(), 0)
+        self.assertEqual(dialog.selected_source(), "long_measurement_filename_25.csv")
+        self.assertEqual(bar.value(), position)
+
+    def test_repopulate_updates_changed_status_and_flags_for_same_source(self):
+        dialog = SourcePickerDialog(title="Choose source", selected="a.csv")
+        self.addCleanup(dialog.close)
+        dialog.repopulate(lambda widget: widget.addItem(self._item("a.csv")))
+        def populate(widget):
+            item = self._item("a.csv")
+            item.setText("PROCESSED — a.csv")
+            item.setToolTip("Saved today")
+            item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
+            widget.addItem(item)
+        dialog.repopulate(populate)
+        self.assertEqual(dialog.source_list.item(0).text(), "PROCESSED — a.csv")
+        self.assertEqual(dialog.source_list.item(0).toolTip(), "Saved today")
+        self.assertFalse(dialog.source_list.item(0).flags() & Qt.ItemIsEnabled)
+
     def test_zero_interval_filter_emits_synchronously(self) -> None:
         dialog = SourcePickerDialog(title="Choose source", filter_interval=0)
         spy = QSignalSpy(dialog.filter_requested)

@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QRunnable, QThreadPool
+from PySide6.QtCore import QCoreApplication, QEvent, QRunnable, QThreadPool, Qt
 from PySide6.QtWidgets import QApplication
 
 from ui_qt.common import Worker
@@ -97,6 +97,29 @@ class WorkerLifecycleTests(unittest.TestCase):
         finally:
             global_release.set()
             self.assertTrue(global_done.wait(1.0))
+
+    def test_completed_worker_delivers_callbacks_and_destroys_signals_on_gui_thread(self) -> None:
+        callbacks = []
+        destroyed_on = []
+        gui_thread = threading.get_ident()
+
+        def start_unretained_worker():
+            worker = Worker(lambda **_kwargs: "loaded")
+            worker.signals.result.connect(lambda value: callbacks.append(value))
+            worker.signals.finished.connect(lambda: callbacks.append("finished"))
+            worker.signals.destroyed.connect(
+                lambda: destroyed_on.append(threading.get_ident()),
+                Qt.DirectConnection,
+            )
+            self.window.thread_pool.start(worker)
+
+        start_unretained_worker()
+        self.assertTrue(self.window.thread_pool.waitForDone(2000))
+        self.app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        self.assertEqual(callbacks, ["loaded", "finished"])
+        self.assertEqual(destroyed_on, [gui_thread])
+        self.assertFalse(self.window._owned_workers)
 
     def test_close_waits_for_owned_worker_before_window_teardown(self) -> None:
         entered = threading.Event()

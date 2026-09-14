@@ -5,6 +5,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import re
 import textwrap
 from functools import lru_cache
@@ -33,6 +34,10 @@ from app_version import __version__
 # Match the Streamlit-style export geometry used by the desktop app.
 EXPORT_FIGSIZE = (8.0, 6.2)
 EXPORT_DPI = 150
+EXPORT_AXES_RECT = (0.16, 0.12, 0.76, 0.72)
+# Bump when the PNG canvas/layout changes so cached analyses refresh their
+# figure while retaining the already computed DAT product.
+HEATMAP_PNG_RENDER_VERSION = 2
 DEFAULT_PROCESSED = "Processed Data"
 EXPORT_METADATA_SCHEMA_VERSION = 1
 
@@ -334,13 +339,20 @@ def _save_heatmap_png(path: Path, cube: DataCube, params: HeatmapParams, *, drr:
                         cube.gate_label, cube.title, cube.cbar_label)
     fig = _build_streamlit_style_heatmap_fig(cube, params, drr=drr)
     try:
+        # These exports use fixed axes positions, with no automatic layout.
+        # Keep the complete figure canvas so every heatmap has the same pixel
+        # dimensions and axes margins regardless of labels or colorbar text.
         fig.savefig(
             path,
             dpi=fig.dpi,
             facecolor=fig.get_facecolor(),
             edgecolor="none",
-            bbox_inches="tight",
-            pad_inches=0.005,
+            # Pass the full figure bounds explicitly so a user's
+            # ``savefig.bbox`` rcParam cannot reintroduce tight cropping.
+            bbox_inches=fig.bbox_inches,
+            pad_inches=0,
+            # Lower zlib effort changes file size, not the decoded pixels.
+            **({"pil_kwargs": {"compress_level": 1}} if drr else {}),
         )
     finally:
         plt.close(fig)
@@ -380,9 +392,12 @@ def _wrap_title_to_fig_span(
         return ""
     text = _prettify_title(text)
     try:
-        fig.canvas.draw()
-        renderer = fig.canvas.get_renderer()
-        wpx, _ = fig.canvas.get_width_height()
+        canvas = getattr(fig, "canvas", None)
+        get_renderer = getattr(canvas, "get_renderer", None)
+        if not callable(get_renderer):
+            raise RuntimeError("Figure canvas does not provide a renderer")
+        renderer = get_renderer()
+        wpx, _ = canvas.get_width_height()
     except Exception:
         renderer = None
         wpx = 800
@@ -457,7 +472,7 @@ def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *,
     z = np.asarray(cube.Z, float)
 
     fig = plt.figure(figsize=EXPORT_FIGSIZE, dpi=EXPORT_DPI, facecolor="white")
-    ax = fig.add_axes([0.08, 0.12, 0.84, 0.72])
+    ax = fig.add_axes(EXPORT_AXES_RECT)
     axpos = ax.get_position()
 
     split_render = None
@@ -513,7 +528,9 @@ def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *,
     cbar_x = axpos.x1 - cbar_w
     cbar_y = axpos.y1 + 0.004
     title_left = axpos.x0
-    title_right = cbar_x - 0.01
+    # Reserve a small fixed gap so long titles cannot run into the colorbar's
+    # left tick label while keeping the same canvas and axes rectangle.
+    title_right = cbar_x - 0.06
 
     title_wrapped = _wrap_title_to_fig_span(
         fig,
@@ -843,7 +860,12 @@ def export_drr_png_and_dat(
     analysis_fingerprint = _drr_analysis_fingerprint(
         sources, processing, operation=operation
     )
-    plot_fingerprint = _fingerprint_json(params)
+    plot_fingerprint = _fingerprint_json(
+        {
+            "render_version": HEATMAP_PNG_RENDER_VERSION,
+            "params": params,
+        }
+    )
     prior = (
         _existing_drr_result(
             out_dir,
@@ -903,6 +925,101 @@ def export_drr_png_and_dat(
         source_descriptors=sources,
     )
     return paths
+
+
+def _validate_drr_pair_product(cube: DataCube | None, params: HeatmapParams | None, *, label: str) -> None:
+    """Validate a paired product before either member of the pair is written."""
+    if cube is None:
+        raise ValueError(f"DRR {label} product is unavailable for export.")
+    if params is None:
+        raise ValueError(f"DRR {label} plot parameters are unavailable for export.")
+    try:
+        energy = np.asarray(cube.energy).ravel()
+        gate = np.asarray(cube.gate).ravel()
+        values = np.asarray(cube.Z)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(f"DRR {label} product has invalid data arrays.") from exc
+    if energy.size == 0 or gate.size == 0 or values.size == 0:
+        raise ValueError(f"DRR {label} product has empty energy, gate, or Z data.")
+    if values.ndim != 2 or values.shape not in {(gate.size, energy.size), (energy.size, gate.size)}:
+        raise ValueError(
+            f"DRR {label} product Z shape {values.shape} does not match "
+            f"gate ({gate.size}) and energy ({energy.size})."
+        )
+
+
+def export_drr_pair_pngs_and_dat(
+    folder: str,
+    *,
+    raw_cube: DataCube,
+    second_cube: DataCube,
+    raw_params: HeatmapParams,
+    second_params: HeatmapParams,
+    raw_export_base: str,
+    second_export_base: str,
+    metadata_input_files: Iterable[tuple[str, str]] = (),
+    metadata_processing_raw: dict | None = None,
+    metadata_processing_second: dict | None = None,
+    metadata_extra: dict | None = None,
+    processed_name: str = "Processed Data/DRR",
+) -> ExportPathResult:
+    """Export the raw DRR map and its energy second derivative as one pair.
+
+    Each product is handed to :func:`export_drr_png_and_dat`, retaining the
+    existing source fingerprint and artifact reuse behavior.  The upfront
+    validation prevents an invalid second product from leaving a seemingly
+    successful partial pair behind.
+    """
+    _validate_drr_pair_product(raw_cube, raw_params, label="raw")
+    _validate_drr_pair_product(second_cube, second_params, label="second")
+    input_files = tuple(metadata_input_files)
+    raw_processing = {
+        **(metadata_processing_raw or {}),
+        "derivative_order": None,
+    }
+    second_processing = {
+        **(metadata_processing_second or {}),
+        "derivative_order": 2,
+    }
+    raw_paths = export_drr_png_and_dat(
+        folder,
+        cube=raw_cube,
+        params=raw_params,
+        export_base=raw_export_base,
+        processed_name=processed_name,
+        metadata_input_files=input_files,
+        metadata_processing=raw_processing,
+        metadata_extra=metadata_extra,
+    )
+    second_paths = export_drr_png_and_dat(
+        folder,
+        cube=second_cube,
+        params=second_params,
+        export_base=second_export_base,
+        processed_name=processed_name,
+        metadata_input_files=input_files,
+        metadata_processing=second_processing,
+        metadata_extra=metadata_extra,
+    )
+    statuses = (
+        getattr(raw_paths, "save_status", "created"),
+        getattr(second_paths, "save_status", "created"),
+    )
+    if "updated" in statuses:
+        save_status = "updated"
+    elif "created" in statuses:
+        save_status = "created"
+    else:
+        save_status = "reused"
+    return ExportPathResult(
+        {
+            "raw_png": raw_paths["png"],
+            "raw_dat": raw_paths["dat"],
+            "second_png": second_paths["png"],
+            "second_dat": second_paths["dat"],
+        },
+        save_status=save_status,
+    )
 
 
 def power_series_export_base(group_key: str, *, y_axis_log: bool) -> str:
@@ -1108,7 +1225,7 @@ def export_shg_results(
             numeric = float(value)
         except (TypeError, ValueError):
             return value
-        return "" if not np.isfinite(numeric) else f"{numeric:.12g}"
+        return "" if not math.isfinite(numeric) else f"{numeric:.12g}"
 
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -1602,7 +1719,7 @@ def save_heatmap_dat_streamlit(
 
     def fmt(value: float) -> str:
         value = float(value)
-        if not np.isfinite(value):
+        if not math.isfinite(value):
             return "nan"
         return f"{value:.10g}"
 
@@ -1702,6 +1819,7 @@ def export_compare_panels(
                 "scale": scale_tag,
                 "background_constant": correction_background,
                 "clip_outliers": clip_outliers,
+                "compare_source_mapping": dict(source_files),
             },
             plot=panel_params,
         outputs=(png_path, dat_path),
@@ -1765,7 +1883,7 @@ def export_compare_panels(
                 ("source_KK", source_files.get("KK", "")),
                 ("source_KKp", source_files.get("KKp", "")),
             ],
-            processing={"background_constant": correction_background, "formula": "(KK_corr-KKp_corr)/(KK_corr+KKp_corr)"},
+            processing={"background_constant": correction_background, "formula": "(KK_corr-KKp_corr)/(KK_corr+KKp_corr)", "compare_source_mapping": dict(source_files)},
             plot=vp_params,
             outputs=(png_path, dat_path),
             extra=metadata_extra,

@@ -51,6 +51,7 @@ class SourcePickerDialog(QDialog):
         minimum_size: tuple[int, int] = (820, 520),
         size: tuple[int, int] = (980, 640),
         selection_mode: QAbstractItemView.SelectionMode = QAbstractItemView.SingleSelection,
+        auto_select_single: bool = True,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -59,6 +60,9 @@ class SourcePickerDialog(QDialog):
         self.setMinimumSize(*minimum_size)
         self.resize(*size)
         self._initial_selection = str(selected or "")
+        self._auto_select_single = bool(auto_select_single)
+        self._content_key = None
+        self._filter_pending = False
 
         layout = QVBoxLayout(self)
         self.hint_label = QLabel(hint)
@@ -92,6 +96,7 @@ class SourcePickerDialog(QDialog):
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel
         )
         self.ok_button = self.button_box.button(QDialogButtonBox.Ok)
+        self.ok_button.setText("Open and display")
         self.ok_button.setEnabled(False)
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
@@ -100,7 +105,7 @@ class SourcePickerDialog(QDialog):
         self._filter_timer = QTimer(self)
         self._filter_timer.setSingleShot(True)
         self._filter_timer.setInterval(max(0, int(filter_interval)))
-        self._filter_timer.timeout.connect(self.filter_requested)
+        self._filter_timer.timeout.connect(self._emit_filter_requested)
         self.filter_edit.textChanged.connect(self._on_filter_text_changed)
         self.source_list.currentItemChanged.connect(self._update_ok_state)
         self.source_list.itemDoubleClicked.connect(lambda _item: self.accept())
@@ -145,10 +150,36 @@ class SourcePickerDialog(QDialog):
         if self._filter_timer.interval() == 0:
             self.filter_requested.emit()
         else:
+            # Do not allow accepting a row that is about to disappear when
+            # the debounced query is still pending.
+            self._filter_pending = True
+            self.ok_button.setEnabled(False)
             self._filter_timer.start()
 
+    def _emit_filter_requested(self) -> None:
+        try:
+            self.filter_requested.emit()
+        finally:
+            self._filter_pending = False
+            self._update_ok_state()
+
     def _update_ok_state(self, _current: Any = None, _previous: Any = None) -> None:
-        self.ok_button.setEnabled(self.source_list.currentItem() is not None)
+        self.ok_button.setEnabled(
+            not self._filter_pending
+            and not self._filter_timer.isActive()
+            and self.source_list.currentItem() is not None
+        )
+
+    def accept(self) -> None:
+        """Accept only a settled, currently selected source row."""
+        if (
+            self._filter_pending
+            or self._filter_timer.isActive()
+            or self.source_list.currentItem() is None
+        ):
+            self._update_ok_state()
+            return
+        super().accept()
 
     def selected_source(self) -> str | None:
         """Return the current item's source role, or its display text."""
@@ -172,7 +203,7 @@ class SourcePickerDialog(QDialog):
                     break
         if selected_row >= 0:
             self.source_list.setCurrentRow(selected_row)
-        elif self.source_list.count() == 1:
+        elif self._auto_select_single and self.source_list.count() == 1:
             self.source_list.setCurrentRow(0)
         else:
             self.source_list.clearSelection()
@@ -184,19 +215,65 @@ class SourcePickerDialog(QDialog):
         populate: Callable[[QListWidget], Any],
         *,
         fallback_selection: str | None = None,
+        content_key: Any = None,
     ) -> None:
         """Clear and repopulate the list while preserving its source choice."""
         current = self.selected_source()
         wanted = current or (
             self._initial_selection if fallback_selection is None else fallback_selection
         )
-        self.source_list.setUpdatesEnabled(False)
+        if self.replace_rows_if_changed(self.source_list, populate, content_key=content_key):
+            self.restore_selection(wanted)
+
+    @staticmethod
+    def replace_rows_if_changed(
+        widget: QListWidget, populate: Callable[[QListWidget], Any], *, content_key: Any = None,
+    ) -> bool:
+        """Keep live rows intact when their data and interaction flags match.
+
+        Build offscreen so catalog validation cannot clear a user's selection
+        or scroll position unless the displayed content actually changes.
+        Compare every stored role, including status styling and source IDs.
+        """
+        remembered = getattr(widget, "_source_picker_content_key", None)
+        if content_key is not None and remembered == content_key:
+            return False
+        if content_key is not None:
+            try:
+                hash(content_key)
+            except TypeError:
+                content_key = repr(content_key)
+        staged = QListWidget(widget)
+        staged.hide()
         try:
-            self.source_list.clear()
-            populate(self.source_list)
+            populate(staged)
+            old_model, new_model = widget.model(), staged.model()
+            if widget.count() == staged.count() and all(
+                old_model.itemData(old_model.index(row, 0))
+                == new_model.itemData(new_model.index(row, 0))
+                and widget.item(row).flags() == staged.item(row).flags()
+                for row in range(widget.count())
+            ):
+                # An unkeyed population is an explicit fallback: it must
+                # invalidate a previously remembered key even when rows are
+                # equal and remain in place.
+                setattr(widget, "_source_picker_content_key", content_key)
+                return False
+            updates_enabled = widget.updatesEnabled()
+            widget.setUpdatesEnabled(False)
+            try:
+                widget.clear()
+                while staged.count():
+                    widget.addItem(staged.takeItem(0))
+            finally:
+                widget.setUpdatesEnabled(updates_enabled)
+            if content_key is not None:
+                setattr(widget, "_source_picker_content_key", content_key)
+            else:
+                setattr(widget, "_source_picker_content_key", None)
+            return True
         finally:
-            self.source_list.setUpdatesEnabled(True)
-        self.restore_selection(wanted)
+            staged.deleteLater()
 
     def set_details(self, text: str) -> None:
         self.details_label.setText(text)

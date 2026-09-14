@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QListWidgetItem, QDoubleSpinBox, QToolButton
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import QListWidgetItem, QComboBox, QDoubleSpinBox, QToolButton
 
 from core import data_io
+from core.compare_history import compare_history_for_selection
 from core.export import compare_source_title, vp_compare_export_base, vp_compare_title
 from core.plotting import COMPARE_PANEL_ORDER
+from core.source_identity import match_source_identity
 from core.processing import (
     background_correct_cube,
     classify_angle_state,
@@ -20,12 +24,14 @@ from core.processing import (
     coherent_compare_auto_assignment,
     estimate_constant_background,
     infer_compare_angle_references,
+    nearest_gate_spectrum,
     parse_compare_gate_condition,
     parse_compare_rotation_angles,
     valley_polarization_cube,
     group_compare_sources,
 )
 from ui_qt.source_picker_dialog import SourcePickerDialog
+from ui_qt.theme import alias as theme_alias
 
 
 class CompareController:
@@ -62,6 +68,10 @@ class CompareController:
             return raw_sources
         return [source for source in raw_sources if data_io.classify_pl_source(source) == "PL"]
 
+    def _cmp_rot1_is_output(self) -> bool:
+        combo = getattr(self, "cmp_rotation_mapping_combo", None)
+        return combo is not None and combo.currentData() == "rot1_output"
+
     def _cmp_source_filter(self) -> str:
         combo = getattr(self, "cmp_source_filter_combo", None)
         value = str(combo.currentData() if combo is not None else "pl")
@@ -87,8 +97,9 @@ class CompareController:
         helper = group_compare_sources
         if power_tolerance_fraction is None:
             power_tolerance_fraction = self._cmp_group_tolerance_fraction()
-        return list(helper(
+        groups = list(helper(
             candidates,
+            rot1_is_output=self._cmp_rot1_is_output(),
             in_k_angle=float(self.cmp_in_k_angle_spin.value()),
             out_k_angle=float(self.cmp_out_k_angle_spin.value()),
             in_kp_angle=float(self.cmp_in_kp_angle_spin.value()),
@@ -96,6 +107,155 @@ class CompareController:
             tolerance=float(self.cmp_angle_tolerance_spin.value()),
             power_tolerance_fraction=float(power_tolerance_fraction),
         ))
+        # PL presents newest sources first.  Compare groups use the newest
+        # member's source mtime as their recency while retaining helper order
+        # as the stable tie-breaker.
+        return [
+            group for _index, group in sorted(
+                enumerate(groups),
+                key=lambda pair: (-self._cmp_group_modified(pair[1]), pair[0]),
+            )
+        ]
+
+    def _cmp_source_modified(self, source: str) -> float:
+        root = str(getattr(self, "current_folder", "") or "")
+        cache_folder = str(getattr(self, "_cmp_source_mtime_cache_folder", "") or "")
+        cache = getattr(self, "_cmp_source_mtime_cache", None)
+        if not isinstance(cache, dict) or cache_folder != root:
+            cache = {}
+            self._cmp_source_mtime_cache = cache
+            self._cmp_source_mtime_cache_folder = root
+        cache_key = str(source)
+        # Missing metadata is intentionally unknown until the owner catalog
+        # worker publishes it.  Compare picker code must never stat files on
+        # the GUI thread.
+        try:
+            return float(cache.get(cache_key, 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _cmp_group_modified(self, group) -> float:
+        sources = tuple(self._cmp_group_value(group, "sources", ()) or ())
+        return max((self._cmp_source_modified(str(source)) for source in sources), default=0.0)
+
+    def _cmp_group_history_mapping(self, group) -> dict[str, str]:
+        mapping = self._cmp_group_mapping(group)
+        if self._cmp_is_vp_view():
+            return {key: mapping[key] for key in ("KK", "KKp") if key in mapping}
+        return {
+            key: mapping[key]
+            for key in self._cmp_visible_channels(mapping)
+            if key in mapping
+        }
+
+    def _cmp_group_history_matches(self, group) -> list[dict]:
+        folder = str(getattr(self, "current_folder", "") or "")
+        mapping = self._cmp_group_history_mapping(group)
+        if not folder or not mapping:
+            return []
+        return compare_history_for_selection(
+            getattr(self, "_cmp_history_records", ()),
+            folder,
+            mapping,
+            view="VP" if self._cmp_is_vp_view() else "Intensity",
+            sources=tuple(dict.fromkeys([
+                *map(str, getattr(self, "pl_available_files", ()) or ()),
+                *mapping.values(),
+            ])),
+        )
+
+    def _cmp_group_history_uncertain(self, group) -> bool:
+        """Detect legacy basename ambiguity without guessing a source identity."""
+        folder = str(getattr(self, "current_folder", "") or "")
+        mapping = self._cmp_group_history_mapping(group)
+        if not folder or not mapping:
+            return False
+        candidates = tuple(dict.fromkeys([
+            *map(str, getattr(self, "pl_available_files", ()) or ()),
+            *mapping.values(),
+            *map(str, self._cmp_group_value(group, "sources", ()) or ()),
+        ]))
+        wanted_view = "VP" if self._cmp_is_vp_view() else "Intensity"
+        for record in getattr(self, "_cmp_history_records", ()):
+            if not isinstance(record, dict):
+                continue
+            operation = str(record.get("operation", record.get("workflow", "")))
+            record_view = "VP" if operation.casefold() == "compare/vp" else "Intensity"
+            if not operation.casefold().startswith("compare/") or record_view != wanted_view:
+                continue
+            processing = record.get("processing", {})
+            combo = processing.get("compare_source_mapping") if isinstance(processing, dict) else None
+            if isinstance(combo, dict):
+                descriptors = {
+                    str(key): str(value)
+                    for key, value in combo.items()
+                    if value and str(key) in mapping
+                }
+            else:
+                channel = operation.split("/", 1)[1] if "/" in operation else ""
+                descriptors = {channel: ""} if channel in mapping else {}
+                raw_sources = record.get("sources", [])
+                if isinstance(raw_sources, list):
+                    for descriptor in raw_sources:
+                        if not isinstance(descriptor, dict):
+                            continue
+                        role = str(descriptor.get("role", ""))
+                        if wanted_view == "VP":
+                            role = role.removeprefix("source_")
+                        elif role == "source":
+                            role = channel
+                        if role in mapping:
+                            descriptors[role] = descriptor
+            for channel, recorded in descriptors.items():
+                expected = mapping.get(channel, "")
+                if not expected:
+                    continue
+                if isinstance(recorded, dict):
+                    matched, uncertain = match_source_identity(
+                        folder, candidates,
+                        relative_path=str(recorded.get("source_relative_path", "")),
+                        path=str(recorded.get("source_path", recorded.get("path", ""))),
+                        legacy_name=str(recorded.get("name", recorded.get("filename", ""))),
+                    )
+                else:
+                    matched, uncertain = match_source_identity(
+                        folder, candidates, legacy_name=str(recorded),
+                    )
+                if matched is None and expected in uncertain:
+                    return True
+        return False
+
+    def _cmp_group_status(self, group) -> str:
+        """Classify a group using the existing Compare history semantics."""
+        if not str(getattr(self, "current_folder", "") or ""):
+            return "unknown"
+        mapping = self._cmp_group_history_mapping(group)
+        if self._cmp_is_vp_view():
+            if set(mapping) != {"KK", "KKp"}:
+                return "unknown"
+        elif len(mapping) < 2:
+            return "unknown"
+        matches = self._cmp_group_history_matches(group)
+        if any(item.get("history_scope") == "combination" for item in matches):
+            return "processed"
+        if any(item.get("history_scope") == "individual_panel" for item in matches):
+            return "mixed"
+        if self._cmp_group_history_uncertain(group):
+            return "unknown"
+        return "new"
+
+    @staticmethod
+    def _cmp_group_status_text(status: str) -> str:
+        return {
+            "processed": "✓ PROCESSED",
+            "mixed": "◐ MIXED",
+            "unknown": "? HISTORY UNKNOWN",
+            "new": "● NEW",
+        }.get(status, "● NEW")
+
+    def _cmp_group_modified_text(self, group) -> str:
+        modified = self._cmp_group_modified(group)
+        return datetime.fromtimestamp(modified).strftime("%Y-%m-%d %H:%M") if modified else "date unavailable"
 
     def _cmp_update_group_badge(self) -> None:
         badge = getattr(self, "cmp_group_selection_summary", None)
@@ -108,7 +268,116 @@ class CompareController:
             badge.set_status("No compare group selected.", tooltip="Choose a coherent compare group.")
             return
         tooltip = "\n".join(str(source) for source in sources)
+        records = getattr(self, "_cmp_history_records", ())
+        folder = str(getattr(self, "current_folder", "") or "")
+        if folder:
+            view = "VP" if self._cmp_is_vp_view() else "Intensity"
+            # History freshness follows the channels currently shown.  Keep
+            # hidden combo assignments in the controller so they survive a
+            # preset change, but do not let a hidden channel invalidate the
+            # visible saved combination.
+            history_mapping = self._cmp_current_mapping()
+            if view == "VP":
+                history_mapping = {
+                    key: history_mapping[key]
+                    for key in ("KK", "KKp")
+                    if key in history_mapping
+                }
+            else:
+                visible = self._cmp_visible_channels(history_mapping)
+                history_mapping = {
+                    key: history_mapping[key]
+                    for key in visible
+                    if key in history_mapping
+                }
+            matches = compare_history_for_selection(
+                records, folder, history_mapping, view=view,
+                sources=tuple(getattr(self, "pl_available_files", ()) or ()),
+            )
+            if matches:
+                newest = max(matches, key=lambda item: str(item.get("created_utc", "")))
+                stamp = str(newest.get("created_utc", ""))[:16].replace("T", " ") or "date unavailable"
+                scope = str(newest.get("history_scope", "combination"))
+                text = f"Saved Compare {view} history: {stamp}"
+                if scope == "individual_panel":
+                    text += "\nIndividual panel history; combined selection not verified"
+                if scope == "individual_panel":
+                    details = "; ".join(
+                        f"{item.get('channel', 'panel')} {str(item.get('created_utc', ''))[:16].replace('T', ' ')}"
+                        for item in matches
+                    )
+                    text += f"\nMatched: {details}"
+                badge.set_status(text, tooltip=tooltip + "\nHistorical export; current settings not verified", badge_state="selected")
+                return
+            badge.set_status("No saved Compare history found", tooltip=tooltip, badge_state="new")
+            return
         badge.set_status(label or key, tooltip=tooltip, badge_state="selected")
+
+    def _cmp_refresh_history_cache(self, *, force: bool = False) -> None:
+        folder = str(getattr(self, "current_folder", "") or "")
+        ready = bool(getattr(self, "_cmp_history_cache_ready", False))
+        pending = bool(getattr(self, "_cmp_history_cache_pending", False))
+        cached_folder = str(getattr(self, "_cmp_history_cache_folder", "") or "")
+        owner_cache_folder = str(getattr(self._owner, "_cmp_history_cache_folder", "") or "")
+        owner_generation = getattr(self._owner, "_file_refresh_generation", None)
+        published_generation = getattr(self._owner, "_cmp_history_published_generation", None)
+        published_folder = str(getattr(self._owner, "_cmp_history_published_folder", "") or "")
+        requested_generation = getattr(self, "_cmp_history_cache_generation", None)
+        if not folder:
+            self._cmp_history_records = []
+            self._cmp_history_cache_folder = ""
+            self._cmp_history_cache_ready = False
+            self._cmp_history_cache_pending = False
+            return
+
+        if cached_folder != folder:
+            self._cmp_history_records = []
+            self._cmp_history_cache_folder = folder
+            ready = False
+            pending = False
+
+        owner_records = list(getattr(self._owner, "_cmp_history_records", ()) or ())
+        owner_ready_modes = getattr(self._owner, "_catalog_ready_modes", set())
+        if (
+            not force and pending and folder == owner_cache_folder
+            and "Compare" in owner_ready_modes
+            and published_folder.casefold() == folder.casefold()
+            and requested_generation is not None and published_generation is not None
+            # A force request queued behind an in-flight scan may publish at
+            # a later generation.  Once all coalesced work is drained, any
+            # accepted publication at or after the request satisfies it.
+            and int(published_generation) >= int(requested_generation)
+            and not bool(getattr(self._owner, "_file_refresh_pending", False))
+            and not bool(getattr(self._owner, "_catalog_pending_requests", {}).get("Compare", False))
+        ):
+            self._cmp_history_records = owner_records
+            self._cmp_history_cache_ready = True
+            self._cmp_history_cache_pending = False
+            return
+        # A forced request always reaches the owner worker, even with warm
+        # records.  Keep those records visible while the replacement is in
+        # flight, but never treat them as the fresh snapshot.
+        if not force and (ready or pending):
+            return
+        if not force and folder == owner_cache_folder and owner_records:
+            self._cmp_history_records = owner_records
+            self._cmp_history_cache_ready = True
+            self._cmp_history_cache_pending = False
+            self._cmp_history_cache_generation = getattr(self._owner, "_file_refresh_generation", None)
+            return
+
+        queue = getattr(self._owner, "_refresh_file_lists", None)
+        self._cmp_history_cache_pending = True
+        self._cmp_history_cache_ready = ready and cached_folder == folder
+        self._cmp_history_cache_generation = getattr(self._owner, "_file_refresh_generation", None)
+        # MainWindow marks the mode only after the worker result is accepted.
+        # Clear the previous publication token so a same-folder cold/forced
+        # request cannot certify itself from the request generation.
+        if isinstance(owner_ready_modes, set):
+            owner_ready_modes.discard("Compare")
+        if callable(queue):
+            queue(auto=not force, mode="Compare")
+            self._cmp_history_cache_generation = getattr(self._owner, "_file_refresh_generation", None)
 
     def _cmp_set_mapping(self, mapping: dict[str, str], *, update_summary: bool = True) -> None:
         """Set hidden combo state as one logical assignment transaction."""
@@ -135,45 +404,147 @@ class CompareController:
         tolerance_spin.setSingleStep(0.5)
         tolerance_spin.setSuffix(" %")
         tolerance_spin.setValue(float(getattr(self, "cmp_group_power_tolerance_percent", 5.0)))
+        status_filter = QComboBox()
+        status_filter.setObjectName("compare_group_status_filter")
+        style_combo = getattr(self, "_style_combo_popup", None)
+        if callable(style_combo):
+            style_combo(status_filter)
         dlg = SourcePickerDialog(
             self._owner,
             title="Choose Compare Group",
             hint=("Choose a coherent KK / KKp / KpK / KpKp source group. "
                   "Files are grouped by shared measurement context and nearby power."),
             selected=selected_key,
-            filter_controls=(("Power tolerance", tolerance_spin),),
+            filter_controls=(("Power tolerance", tolerance_spin), ("Status", status_filter)),
             filter_interval=100,
             minimum_size=(860, 520),
             size=(1040, 660),
+            auto_select_single=False,
         )
+        refresh_pending = False
+        dialog_alive = True
+        refresh_folder = str(getattr(self, "current_folder", "") or "")
 
         def _groups_for_dialog():
             return self._cmp_source_groups(
                 power_tolerance_fraction=float(tolerance_spin.value()) / 100.0
             )
 
+        def _populate_status_filter(groups) -> None:
+            current = str(status_filter.currentData() or "all")
+            counts = Counter(self._cmp_group_status(group) for group in groups)
+            blocked = status_filter.blockSignals(True)
+            try:
+                status_filter.clear()
+                status_filter.addItem(f"All ({len(groups)})", "all")
+                status_filter.addItem(f"New ({counts.get('new', 0)})", "new")
+                status_filter.addItem(f"Processed ({counts.get('processed', 0)})", "processed")
+                status_filter.addItem(f"Mixed ({counts.get('mixed', 0)})", "mixed")
+                status_filter.addItem(f"History unknown ({counts.get('unknown', 0)})", "unknown")
+                index = status_filter.findData(current)
+                status_filter.setCurrentIndex(index if index >= 0 else 0)
+            finally:
+                status_filter.blockSignals(blocked)
+
         def _refresh_view() -> None:
             needle = dlg.filter_edit.text().strip().casefold()
+            # History is populated by the catalog/export refresh lifecycle;
+            # search, status, and tolerance changes must remain cache-only.
+            self._cmp_refresh_history_cache()
             groups = _groups_for_dialog()
+            _populate_status_filter(groups)
+            wanted_status = str(status_filter.currentData() or "all")
+            row_descriptors = []
+            for group in groups:
+                key = str(self._cmp_group_value(group, "key", ""))
+                label = str(self._cmp_group_value(group, "label", key))
+                sources = tuple(self._cmp_group_value(group, "sources", ()) or ())
+                haystack = " ".join((key, label, *map(str, sources))).casefold()
+                if needle and needle not in haystack:
+                    continue
+                status = self._cmp_group_status(group)
+                if wanted_status != "all" and status != wanted_status:
+                    continue
+                status_text = self._cmp_group_status_text(status)
+                modified_text = self._cmp_group_modified_text(group)
+                foreground = str(theme_alias(
+                    "source_processed_foreground"
+                    if status == "processed" else "source_new_foreground"
+                ))
+                text = status_text + " — " + label + (
+                    "\nModified " + modified_text + " · " + " · ".join(Path(source).name for source in sources)
+                    if sources else "\nModified " + modified_text
+                )
+                row_descriptors.append((
+                    key, text, tuple(map(str, sources)), status, foreground,
+                    bool(status != "processed"), int((Qt.ItemIsEnabled | Qt.ItemIsSelectable).value),
+                ))
 
             def _populate(widget) -> None:
-                for group in groups:
-                    key = str(self._cmp_group_value(group, "key", ""))
-                    label = str(self._cmp_group_value(group, "label", key))
-                    sources = tuple(self._cmp_group_value(group, "sources", ()) or ())
-                    haystack = " ".join((key, label, *map(str, sources))).casefold()
-                    if needle and needle not in haystack:
-                        continue
+                for key, text, sources, status, foreground, bold, _flags in row_descriptors:
                     item = QListWidgetItem(
-                        label + ("\n" + " · ".join(Path(source).name for source in sources) if sources else "")
+                        text
                     )
                     item.setData(Qt.UserRole, key)
                     item.setToolTip("\n".join(map(str, sources)))
+                    item.setForeground(QColor(foreground))
+                    font = item.font()
+                    font.setBold(bold)
+                    item.setFont(font)
                     widget.addItem(item)
             dlg._cmp_groups = groups
-            dlg.repopulate(_populate, fallback_selection=selected_key)
+            key = ("compare-rows", tuple(row_descriptors))
+            dlg.repopulate(_populate, fallback_selection=selected_key, content_key=key)
             if not groups:
                 dlg.set_details("No coherent compare groups match the current source filter and angle rules.")
+
+        def _request_refresh() -> None:
+            nonlocal refresh_pending
+            refresh = getattr(self, "_refresh_file_lists", None)
+            if not callable(refresh):
+                self._cmp_refresh_history_cache(force=True)
+                _refresh_view()
+                return
+            refresh_pending = True
+            dlg.refresh_button.setEnabled(False)
+            refresh(auto=False, mode="Compare")
+
+        def _catalog_refresh_finished(folder: str, success: bool) -> None:
+            nonlocal refresh_pending
+            history_pending = bool(getattr(self, "_cmp_history_cache_pending", False))
+            if not dialog_alive or (not refresh_pending and not history_pending):
+                return
+            if str(folder).casefold() != refresh_folder.casefold():
+                return
+            # MainWindow emits completion for the scan that just finished
+            # before starting a queued follow-up scan. Keep this dialog's
+            # request pending until that final catalog is applied.
+            if success and bool(getattr(self, "_file_refresh_pending", False)):
+                return
+            if success and history_pending:
+                owner_folder = str(getattr(self._owner, "_cmp_history_cache_folder", "") or "")
+                owner_generation = getattr(self._owner, "_file_refresh_generation", None)
+                requested_generation = getattr(self, "_cmp_history_cache_generation", None)
+                if owner_folder.casefold() != refresh_folder.casefold():
+                    return
+                if (requested_generation is not None and owner_generation is not None
+                        and int(owner_generation) < int(requested_generation)):
+                    return
+                self._cmp_history_records = list(getattr(self._owner, "_cmp_history_records", ()) or ())
+                self._cmp_history_cache_folder = refresh_folder
+                self._cmp_history_cache_ready = True
+                self._cmp_history_cache_pending = False
+            was_refresh_pending = refresh_pending
+            if was_refresh_pending:
+                refresh_pending = False
+                dlg.refresh_button.setEnabled(True)
+            if success:
+                _refresh_view()
+                _update_details()
+            elif was_refresh_pending:
+                self._cmp_history_cache_pending = False
+                self._cmp_history_cache_ready = False
+                dlg.set_details("Refresh failed; existing Compare selection was retained.")
 
         def _update_details() -> None:
             item = dlg.source_list.currentItem()
@@ -186,6 +557,7 @@ class CompareController:
             sources = tuple(self._cmp_group_value(group, "sources", ()) or ()) if group else ()
             mapping = self._cmp_group_mapping(group) if group else {}
             duplicates = self._cmp_group_value(group, "duplicates", {}) if group else {}
+            status = self._cmp_group_status(group) if group else "unknown"
             detail_lines = [
                 f"{channel} → {Path(source).name}" for channel, source in mapping.items()
             ]
@@ -198,15 +570,44 @@ class CompareController:
                 detail_lines.append("Missing: " + ", ".join(missing))
             if sources:
                 detail_lines.append("Sources: " + ", ".join(Path(source).name for source in sources))
+            if group:
+                detail_lines.append(
+                    f"Status: {self._cmp_group_status_text(status)} · Modified {self._cmp_group_modified_text(group)}"
+                )
+                if status == "processed":
+                    detail_lines.append("Matched saved Compare history for the active view.")
+                elif status == "mixed":
+                    detail_lines.append("Individual panel history exists; combined selection is not verified.")
+                elif status == "unknown":
+                    detail_lines.append("History cannot verify this group with the available channel identities.")
+                else:
+                    detail_lines.append("No saved Compare history found for this group.")
             dlg.set_details("\n".join(detail_lines) or "No channel assignments in this group.")
+
+        def _dialog_finished(_result: int) -> None:
+            nonlocal dialog_alive
+            dialog_alive = False
 
         dlg.filter_requested.connect(_refresh_view)
         dlg.source_list.currentItemChanged.connect(lambda _current, _previous: _update_details())
         tolerance_spin.valueChanged.connect(lambda _value: _refresh_view())
-        dlg.refresh_button.clicked.connect(_refresh_view)
+        status_filter.currentIndexChanged.connect(lambda _index: _refresh_view())
+        dlg.refresh_button.clicked.connect(_request_refresh)
+        catalog_signal = getattr(self, "file_catalog_refresh_finished", None)
+        if catalog_signal is not None:
+            catalog_signal.connect(_catalog_refresh_finished)
+            dlg.finished.connect(_dialog_finished)
+            def _disconnect_catalog(_result: int) -> None:
+                try:
+                    catalog_signal.disconnect(_catalog_refresh_finished)
+                except (RuntimeError, TypeError):
+                    pass
+            dlg.finished.connect(_disconnect_catalog)
         _refresh_view()
         _update_details()
         if dlg.exec() != SourcePickerDialog.Accepted:
+            return
+        if str(getattr(self, "current_folder", "") or "").casefold() != refresh_folder.casefold():
             return
         chosen_key = str(dlg.selected_source() or "")
         group = next((entry for entry in getattr(dlg, "_cmp_groups", ())
@@ -222,8 +623,12 @@ class CompareController:
         # Re-run assignment after selecting a group so angle-bearing files can
         # be inferred from this group when the current references miss them.
         self._cmp_auto_assign_channels(preserve_existing=False)
+        self._cmp_maybe_auto_load()
 
     def _cmp_clear_group(self) -> None:
+        invalidate = getattr(self, "_invalidate_active_load", None)
+        if callable(invalidate):
+            invalidate("Compare")
         self.cmp_selected_group_key = ""
         self.cmp_selected_group_label = ""
         self.cmp_selected_group_sources = ()
@@ -260,10 +665,17 @@ class CompareController:
                             "Unknown raw data; choose All raw data for automatic detection.",
                             Qt.ToolTipRole,
                         )
-                if current and current not in candidates and current in all_sources:
+                if current and current not in candidates:
                     combo.addItem(current)
                     index = combo.findText(current)
-                    combo.setItemData(index, f"Currently assigned; outside {self._cmp_source_filter_label()}.", Qt.ToolTipRole)
+                    root = str(getattr(self, "current_folder", "") or "")
+                    path = Path(current) if Path(current).is_absolute() else Path(root) / current
+                    detail = (
+                        f"Missing source: {current}."
+                        if root and not path.is_file()
+                        else f"Currently assigned; outside {self._cmp_source_filter_label()}."
+                    )
+                    combo.setItemData(index, detail, Qt.ToolTipRole)
                 if current:
                     combo.setCurrentText(current)
             finally:
@@ -324,6 +736,15 @@ class CompareController:
         kk_pair = {key: cubes[key] for key in ("KK", "KKp") if key in cubes}
         return kk_pair if kk_pair else dict(cubes)
 
+    @staticmethod
+    def _cmp_background_cube_token(cube):
+        """Return mutable-data identity used to validate an auto-background cache."""
+        z_data = getattr(cube, "Z", None)
+        revision = getattr(cube, "revision", None)
+        if revision is None:
+            revision = getattr(cube, "_revision", getattr(cube, "source_revision", None))
+        return id(cube), id(z_data), revision
+
     def _cmp_set_background_spin_silent(self, value: float) -> None:
         if not hasattr(self, "cmp_vp_background_spin"):
             return
@@ -337,9 +758,34 @@ class CompareController:
         if not hasattr(self, "cmp_vp_background_spin"):
             return 0.0
         if self._cmp_background_auto_enabled() and cubes:
-            value = estimate_constant_background(
-                self._cmp_background_source_cubes(cubes), percentile=1.0
+            owner = object.__getattribute__(self, "_owner")
+            source_cubes = self._cmp_background_source_cubes(cubes)
+            cache_key = tuple(
+                (key, self._cmp_background_cube_token(cube))
+                for key, cube in sorted(source_cubes.items())
             )
+            cached = getattr(owner, "_cmp_background_cache", None)
+            cache_sources = ()
+            if isinstance(cached, tuple) and len(cached) == 3:
+                cache_sources = cached[1]
+            same_sources = (
+                isinstance(cache_sources, tuple)
+                and len(cache_sources) == len(source_cubes)
+                and all(
+                    key in source_cubes and source is source_cubes[key]
+                    for key, source in cache_sources
+                )
+            )
+            if (isinstance(cached, tuple) and len(cached) == 3
+                    and cached[0] == cache_key and same_sources):
+                value = float(cached[2])
+            else:
+                value = estimate_constant_background(source_cubes, percentile=1.0)
+                # Keep strong references so an old id cannot become a false hit
+                # after a load replaces the source cube.
+                owner._cmp_background_cache = (
+                    cache_key, tuple(sorted(source_cubes.items())), float(value)
+                )
             if update_spin:
                 self._cmp_set_background_spin_silent(value)
             return value
@@ -404,6 +850,17 @@ class CompareController:
             used.add(name)
         return mapping
 
+    def _cmp_maybe_auto_load(self) -> None:
+        """Start one load after a complete explicit channel assignment."""
+        start_load = getattr(self, "_start_load", None)
+        if not callable(start_load) or not getattr(self, "current_folder", ""):
+            return
+        try:
+            self._cmp_selection_from_ui()
+        except (ValueError, OSError):
+            return
+        start_load("Compare")
+
     def _cmp_visible_channels(self, mapping=None) -> list[str]:
         mapping = mapping or self._cmp_current_mapping()
         preset = self.cmp_display_preset_combo.currentText()
@@ -465,13 +922,31 @@ class CompareController:
             missing = [key for key in ("KK", "KKp") if key not in mapping]
             if missing:
                 raise ValueError("VP needs assigned KK and KKp channels.")
+            active_mapping = {key: mapping[key] for key in ("KK", "KKp")}
+            missing_sources = self._cmp_missing_sources(active_mapping)
+            if missing_sources:
+                raise ValueError("Compare source missing: " + ", ".join(missing_sources))
             return data_io.CompareSelection.from_mapping(mapping, visible_order=("KK", "KKp"))
         visible = self._cmp_visible_channels(mapping)
         if len(visible) < 1:
             raise ValueError("Assign at least one compare channel.")
         if len(visible) < 2:
             raise ValueError("Select at least two visible compare channels.")
+        missing_sources = self._cmp_missing_sources({key: mapping[key] for key in visible})
+        if missing_sources:
+            raise ValueError("Compare source missing: " + ", ".join(missing_sources))
         return data_io.CompareSelection.from_mapping(mapping, visible_order=visible)
+
+    def _cmp_missing_sources(self, mapping: dict[str, str]) -> list[str]:
+        root = str(getattr(self, "current_folder", "") or "")
+        if not root:
+            return []
+        missing: list[str] = []
+        for source in mapping.values():
+            path = Path(source) if Path(source).is_absolute() else Path(root) / source
+            if not path.is_file() and source not in missing:
+                missing.append(source)
+        return missing
 
     def _cmp_infer_angle_references(self) -> None:
         candidates = self._cmp_assign_candidate_files()
@@ -484,6 +959,7 @@ class CompareController:
                 candidates = scoped
         inference = infer_compare_angle_references(
             candidates,
+            rot1_is_output=self._cmp_rot1_is_output(),
             in_k_anchor=float(self.cmp_in_k_angle_spin.value()),
             out_k_anchor=float(self.cmp_out_k_angle_spin.value()),
             cluster_tolerance=float(self.cmp_angle_tolerance_spin.value()),
@@ -564,7 +1040,6 @@ class CompareController:
             had_selected_group
             and preserve_existing
             and len(current_mapping) >= 2
-            and all(value in candidates for value in current_mapping.values())
         )
         if allow_inference and selected_group is not None and not manual_mapping_is_usable:
             current_group_mapping = self._cmp_group_mapping(selected_group)
@@ -574,6 +1049,7 @@ class CompareController:
                 )
                 inference = infer_compare_angle_references(
                     selected_sources,
+                    rot1_is_output=self._cmp_rot1_is_output(),
                     in_k_anchor=in_k,
                     out_k_anchor=out_k,
                     cluster_tolerance=tolerance,
@@ -593,6 +1069,7 @@ class CompareController:
                 refs.update({key: float(value) for key, value in inferred_values.items() if value is not None})
                 inferred_groups = group_compare_sources(
                     selected_sources,
+                    rot1_is_output=self._cmp_rot1_is_output(),
                     in_k_angle=refs["in_k_angle"],
                     in_kp_angle=refs["in_kp_angle"],
                     out_k_angle=refs["out_k_angle"],
@@ -638,6 +1115,7 @@ class CompareController:
                     )
         found, duplicates, gate_group, gate_groups = coherent_compare_auto_assignment(
             candidates,
+            rot1_is_output=self._cmp_rot1_is_output(),
             in_k_angle=in_k,
             in_kp_angle=in_kp,
             out_k_angle=out_k,
@@ -651,13 +1129,12 @@ class CompareController:
                 # A folder refresh can temporarily omit a selected group. Keep
                 # the user's assignment intact instead of jumping to another
                 # measurement group.
-                found = current_mapping if all(value in candidates for value in current_mapping.values()) else {}
+                found = current_mapping
             elif (
                 had_selected_group
                 and preserve_existing
                 and current_mapping
                 and inferred_selected_mapping is None
-                and all(value in candidates for value in current_mapping.values())
             ):
                 found = current_mapping
             else:
@@ -690,6 +1167,7 @@ class CompareController:
         for fname in candidates:
             ch = classify_compare_channel(
                 fname,
+                rot1_is_output=self._cmp_rot1_is_output(),
                 in_k_angle=in_k,
                 in_kp_angle=in_kp,
                 out_k_angle=out_k,
@@ -701,13 +1179,13 @@ class CompareController:
                 gk = parse_compare_gate_condition(fname) or "__ungrouped__"
                 group_keys.setdefault(gk, set()).add(ch)
                 continue
-            angles = parse_compare_rotation_angles(fname)
+            angles = parse_compare_rotation_angles(fname, rot1_is_output=self._cmp_rot1_is_output())
             if angles.rot1 is None and angles.rot2 is None:
                 unlabeled_count += 1
             reasons: list[str] = []
             for arm, angle, k_angle, kp_angle in (
-                ("Rot1", angles.rot1, in_k, in_kp),
-                ("Rot2", angles.rot2, out_k, out_kp),
+                ("Rot1", angles.rot1, out_k if self._cmp_rot1_is_output() else in_k, out_kp if self._cmp_rot1_is_output() else in_kp),
+                ("Rot2", angles.rot2, in_k if self._cmp_rot1_is_output() else out_k, in_kp if self._cmp_rot1_is_output() else out_kp),
             ):
                 if angle is None:
                     continue
@@ -743,14 +1221,14 @@ class CompareController:
         if assigned:
             self._append_log(f"  assigned: {', '.join(assigned)}")
             for fname in dict.fromkeys(found[key] for key in assigned):
-                angles = parse_compare_rotation_angles(fname)
+                angles = parse_compare_rotation_angles(fname, rot1_is_output=self._cmp_rot1_is_output())
                 if (angles.rot1 is None) != (angles.rot2 is None):
                     detected = (
                         f"Rot1={angles.rot1:g} deg"
                         if angles.rot1 is not None
                         else f"Rot2={angles.rot2:g} deg"
                     )
-                    fixed = "output" if angles.rot1 is not None else "input"
+                    fixed = "input" if ((angles.rot1 is not None) == self._cmp_rot1_is_output()) else "output"
                     self._append_log(
                         f"  partial rotation: {detected}; missing fixed {fixed} arm treated as K"
                     )
@@ -816,11 +1294,207 @@ class CompareController:
                 line.set_ydata([gate_clamped, gate_clamped])
                 line.set_linestyle("--")
 
+    def _update_cmp_gate_only(self) -> bool:
+        """Update Compare linecut and gate markers while retaining heatmap axes."""
+        owner = object.__getattribute__(self, "_owner")
+        if getattr(owner, "last_plotted_mode", None) != "Compare":
+            return False
+        if getattr(owner, "_load_in_progress", False) or "Compare" in getattr(owner, "_plot_redraw_pending", set()):
+            return False
+        cubes = getattr(owner, "_cmp_active_cubes", None) or {}
+        heatmap_axes = getattr(owner, "_cmp_heatmap_axes", None) or {}
+        linecut_ax = getattr(owner, "_cmp_linecut_ax", None)
+        if not cubes or not heatmap_axes or linecut_ax is None:
+            return False
+        try:
+            current_key = owner._current_plot_params_key("Compare")
+            previous_key = getattr(owner, "_last_plot_params_key", None)
+        except (AttributeError, ValueError, TypeError):
+            return False
+        if not isinstance(current_key, tuple) or not isinstance(previous_key, tuple):
+            return False
+        if len(current_key) < 19 or len(previous_key) < 19:
+            return False
+        if current_key[:15] + current_key[16:] != previous_key[:15] + previous_key[16:]:
+            return False
+        shown_identity = getattr(owner, "_shown_draw_identity", None)
+        identity_for_loaded = getattr(owner, "_shown_source_identity_for_loaded", None)
+        if shown_identity is not None and callable(identity_for_loaded):
+            if shown_identity != identity_for_loaded(getattr(owner, "loaded", None)):
+                return False
+        rendered_marker = getattr(owner, "_cmp_rendered_loaded_marker", None)
+        if rendered_marker is not None:
+            loaded = getattr(owner, "loaded", None)
+            current_marker = (
+                id(loaded),
+                id(getattr(loaded, "compare_cubes", None)),
+                str(getattr(loaded, "folder", "")),
+                tuple(getattr(loaded, "selected_files", ()) or ()),
+            )
+            if current_marker != rendered_marker:
+                return False
+
+        gate_value = float(self.cmp_spins["gate"].value())
+        if self._cmp_is_vp_view():
+            if "VP" not in cubes or len(linecut_ax.lines) < 1:
+                return False
+            gate_used, y = nearest_gate_spectrum(cubes["VP"], gate_value)
+            linecut_ax.lines[0].set_data(np.asarray(cubes["VP"].energy, float).ravel(), np.asarray(y, float))
+            linecut_ax.set_title(f"VP Linecut @ {gate_used:.6g} V")
+            linecut_ax.set_ylim(-1.05, 1.05)
+        else:
+            keys = [key for key in COMPARE_PANEL_ORDER if key in cubes]
+            if not keys or len(linecut_ax.lines) < len(keys):
+                return False
+            used = []
+            for line, key in zip(linecut_ax.lines, keys):
+                gate, y = nearest_gate_spectrum(cubes[key], gate_value)
+                line.set_data(np.asarray(cubes[key].energy, float).ravel(), np.asarray(y, float))
+                used.append(float(gate))
+            gate_used = float(np.median(used))
+            linecut_ax.set_title(f"Compare Spectra @ {gate_used:.6g} V")
+            finite_lines = [
+                np.asarray(line.get_ydata(), float)
+                for line in linecut_ax.lines[:len(keys)]
+                if len(line.get_ydata())
+            ]
+            finite_values = np.concatenate([
+                values[np.isfinite(values)] for values in finite_lines
+                if np.any(np.isfinite(values))
+            ]) if any(np.any(np.isfinite(values)) for values in finite_lines) else np.array([])
+            if finite_values.size:
+                ymin, ymax = float(np.min(finite_values)), float(np.max(finite_values))
+                pad = max(1e-12, (ymax - ymin) * 0.08) if ymax != ymin else max(1e-12, abs(ymin) * 0.05, 1.0)
+                linecut_ax.set_ylim(ymin - pad, ymax + pad)
+        self._set_cmp_gate_spin_value(gate_used)
+        self._ensure_cmp_gate_lines(cubes, gate_used)
+        if self._configure_cmp_blitting():
+            canvas = getattr(owner, "canvas", None)
+            bbox = getattr(owner, "_cmp_blit_bbox", None)
+            if canvas is not None and bbox is not None:
+                canvas.restore_region(owner._cmp_blit_background)
+                owner.figure.draw_artist(owner._cmp_linecut_ax)
+                for line in (getattr(owner, "_cmp_gate_lines", {}) or {}).values():
+                    axis = getattr(line, "axes", None)
+                    if axis is not None:
+                        axis.draw_artist(line)
+                canvas.blit(bbox)
+                owner._last_plot_params_key = current_key
+                return True
+        xlim = linecut_ax.get_xlim()
+        if self._cmp_is_vp_view():
+            # VP linecuts deliberately keep the fixed normalized range.
+            linecut_ax.set_ylim(-1.05, 1.05)
+        else:
+            linecut_ax.relim()
+            linecut_ax.autoscale_view(scalex=False, scaley=True)
+        linecut_ax.set_xlim(xlim)
+        canvas = getattr(owner, "canvas", None)
+        if canvas is not None:
+            canvas.draw_idle()
+        owner._last_plot_params_key = current_key
+        return True
+
+    def _disable_cmp_blitting(self) -> None:
+        owner = object.__getattribute__(self, "_owner")
+        linecut = getattr(owner, "_cmp_linecut_ax", None)
+        if linecut is not None:
+            linecut.set_animated(False)
+        for line in (getattr(owner, "_cmp_gate_lines", {}) or {}).values():
+            line.set_animated(False)
+        owner._cmp_blit_enabled = False
+        owner._cmp_blit_bbox = None
+        owner._cmp_blit_background = None
+
+    def _configure_cmp_blitting(self) -> bool:
+        owner = object.__getattribute__(self, "_owner")
+        canvas = getattr(owner, "canvas", None)
+        linecut = getattr(owner, "_cmp_linecut_ax", None)
+        heat_axes = tuple((getattr(owner, "_cmp_heatmap_axes", {}) or {}).values())
+        required = ("draw", "copy_from_bbox", "restore_region", "blit")
+        if (canvas is None or linecut is None or not heat_axes
+                or not bool(getattr(canvas, "supports_blit", False))
+                or any(not callable(getattr(canvas, name, None)) for name in required)):
+            return False
+        if getattr(owner, "_cmp_blit_enabled", False):
+            bbox = getattr(owner, "_cmp_blit_bbox", None)
+            if bbox is not None and bbox.bounds == owner.figure.bbox.bounds:
+                return True
+            self._disable_cmp_blitting()
+        self._disable_cmp_blitting()
+        try:
+            # Exclude only dynamic linecut/gate artists while capturing a
+            # clean full-figure background. Heatmaps remain normal artists.
+            linecut.set_animated(True)
+            for line in (getattr(owner, "_cmp_gate_lines", {}) or {}).values():
+                line.set_animated(True)
+            canvas.draw()
+            bbox = owner.figure.bbox.frozen()
+            owner._cmp_blit_bbox = bbox
+            owner._cmp_blit_background = canvas.copy_from_bbox(bbox)
+            owner._cmp_blit_enabled = True
+            self._draw_cmp_blit_frame()
+            return True
+        except Exception:
+            self._disable_cmp_blitting()
+            return False
+
+    def _draw_cmp_blit_frame(self) -> None:
+        owner = object.__getattribute__(self, "_owner")
+        canvas = getattr(owner, "canvas", None)
+        bbox = getattr(owner, "_cmp_blit_bbox", None)
+        background = getattr(owner, "_cmp_blit_background", None)
+        linecut = getattr(owner, "_cmp_linecut_ax", None)
+        if canvas is None or bbox is None or background is None or linecut is None:
+            return
+        canvas.restore_region(background)
+        owner.figure.draw_artist(linecut)
+        for line in (getattr(owner, "_cmp_gate_lines", {}) or {}).values():
+            axis = getattr(line, "axes", None)
+            if axis is not None:
+                axis.draw_artist(line)
+        canvas.blit(bbox)
+
+    def _on_compare_canvas_draw(self, event=None) -> None:
+        owner = object.__getattribute__(self, "_owner")
+        if not getattr(owner, "_cmp_blit_enabled", False):
+            return
+        canvas = getattr(owner, "canvas", None)
+        linecut = getattr(owner, "_cmp_linecut_ax", None)
+        if canvas is None or linecut is None:
+            self._disable_cmp_blitting()
+            return
+        bbox = owner.figure.bbox.frozen()
+        owner._cmp_blit_bbox = bbox
+        owner._cmp_blit_background = canvas.copy_from_bbox(bbox)
+        self._draw_cmp_blit_frame()
+
+    def _prepare_cmp_toolbar_save(self) -> None:
+        owner = object.__getattribute__(self, "_owner")
+        if not getattr(owner, "_cmp_blit_enabled", False):
+            return
+        self._disable_cmp_blitting()
+        canvas = getattr(owner, "canvas", None)
+        if canvas is not None:
+            canvas.draw()
+
+    def _restore_cmp_toolbar_save(self) -> None:
+        owner = object.__getattribute__(self, "_owner")
+        if getattr(owner, "last_plotted_mode", None) != "Compare":
+            return
+        self._configure_cmp_blitting()
+
     def _on_cmp_auto_assign_requested(self) -> None:
         self._invalidate_export_move_sources()
         self.cmp_kk_swap_active = False
         self._cmp_auto_assign_channels(preserve_existing=False, allow_inference=True)
         self._on_cmp_plot_param_changed()
+
+    def _on_cmp_rotation_mapping_changed(self) -> None:
+        settings = getattr(self, "settings", None)
+        if settings is not None:
+            settings.setValue("compare/rotation_mapping", self.cmp_rotation_mapping_combo.currentData())
+        self._on_cmp_angle_reference_changed()
 
     def _on_cmp_angle_reference_changed(self) -> None:
         """Reclassify with edited references without re-inferring them."""
@@ -871,6 +1545,21 @@ class CompareController:
     def _on_cmp_plot_param_changed(self, source=None) -> None:
         self._invalidate_export_move_sources()
         self._cmp_update_assignment_summary()
+        if source in tuple(getattr(self, "cmp_channel_combos", {}).values()):
+            complete = True
+            try:
+                self._cmp_selection_from_ui()
+            except (ValueError, OSError):
+                complete = False
+                invalidate = getattr(self, "_invalidate_active_load", None)
+                if callable(invalidate):
+                    invalidate("Compare")
+            if self.loaded and self.loaded.mode == "Compare":
+                if complete:
+                    self._start_load("Compare")
+            elif complete:
+                self._cmp_maybe_auto_load()
+            return
         if self.loaded and self.loaded.mode == "Compare":
             sender = source
             if sender in (
@@ -879,11 +1568,12 @@ class CompareController:
                 self.cmp_log_chk, self.cmp_vp_background_spin,
                 self.cmp_vp_auto_background_chk,
             ) or sender in tuple(self.cmp_channel_combos.values()) or sender in tuple(self.cmp_show_checks.values()):
-                self._refresh_automatic_ranges(
-                    "Compare",
-                    refresh_split=True,
-                    center_split=sender in (self.cmp_spins["xmin"], self.cmp_spins["xmax"]),
+                self._pending_range_refresh["Compare"] = (
+                    bool(self._pending_range_refresh.get("Compare", False))
+                    or sender in (self.cmp_spins["xmin"], self.cmp_spins["xmax"])
                 )
+            if sender is self.cmp_spins["gate"] and self._update_cmp_gate_only():
+                return
             self._schedule_plot_redraw("Compare")
 
     def _cmp_vp_color_limits(self) -> tuple[float, float]:

@@ -99,18 +99,39 @@ class PowerWorkflowTests(unittest.TestCase):
     def test_filename_series_are_opt_in_and_hidden_selections_removed(self):
         from PySide6.QtWidgets import QCheckBox
         from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
         from ui_qt.source_picker_dialog import SourcePickerDialog
         with tempfile.TemporaryDirectory() as folder:
             self.window.current_folder = folder
             root = Path(folder)
-            (root / 'sweep.csv').write_text('Power_uW,1.4,1.5\n1,2,3\n2,4,5\n')
+            (root / 'sweep.csv').write_text('Power_uW,1.4 eV,1.5 eV\n1,2,3\n2,4,5\n')
             for power in (1, 2):
-                (root / f'PL_{power}uW.csv').write_text('Gate,1.4,1.5\n0,2,3\n')
+                (root / f'PL_{power}uW.csv').write_text('Gate,1.4 eV,1.5 eV\n0,2,3\n')
+            # Seed the same immutable catalog snapshot that the folder worker
+            # supplies in the application. Picker refreshes then exercise the
+            # asynchronous include-legacy transition instead of GUI discovery.
+            from ui_qt.main_window import _scan_folder_sources_worker
+            scan = _scan_folder_sources_worker(folder, progress=None, log=None)
+            snapshot = next(item for item in scan if isinstance(item, dict) and item.get('tag') == 'power_catalog')
+            self.window._power_sources_cache = dict(snapshot['sources'])
+            self.window._power_catalog_folder = folder
+            self.window._power_catalog_candidates = tuple(snapshot['candidates'])
+            self.window._power_catalog_signatures = tuple(snapshot['signatures'])
+            self.window._power_catalog_include_legacy = False
+            self.window._power_include_legacy = False
+            self.window._power_catalog_processed_names = set(snapshot['processed_names'])
+            self.window._power_catalog_combined_names = set(snapshot['combined_names'])
+            self.window._power_catalog_pending = False
+            self.app.processEvents()
             def inspect(dialog):
                 checkbox = next(c for c in dialog.findChildren(QCheckBox) if c.text() == 'Include filename-based series')
                 self.assertFalse(checkbox.isChecked())
                 self.assertEqual(dialog.source_list.count(), 1)
                 checkbox.setChecked(True)
+                for _ in range(300):
+                    QTest.qWait(10)
+                    if dialog.source_list.count() == 2:
+                        break
                 self.assertEqual(dialog.source_list.count(), 2)
                 for i in range(dialog.source_list.count()):
                     item = dialog.source_list.item(i)
@@ -118,6 +139,10 @@ class PowerWorkflowTests(unittest.TestCase):
                         item.setCheckState(Qt.Checked)
                 self.assertTrue(dialog.ok_button.isEnabled())
                 checkbox.setChecked(False)
+                for _ in range(300):
+                    QTest.qWait(10)
+                    if dialog.source_list.count() == 1:
+                        break
                 self.assertEqual(dialog.source_list.count(), 1)
                 self.assertFalse(dialog.ok_button.isEnabled())
                 return 0
@@ -438,18 +463,35 @@ class PowerWorkflowTests(unittest.TestCase):
         w.loaded = LoadedState(mode="Power Dependent", folder="", primary_file="low",
                                selected_files=["low"], cube=a.cube, power_records=a.records,
                                power_groups={}, power_group_key="low", y_axis_spec="auto")
-        w.power_axis_scale_combo.setCurrentText("Linear")
-        w.power_background_auto_chk.setChecked(False)
-        w.power_background_spin.setValue(0)
+        for widget, value in (
+            (w.power_axis_scale_combo, "Linear"),
+            (w.power_background_auto_chk, False),
+            (w.power_background_spin, 0),
+        ):
+            blocked = widget.blockSignals(True)
+            try:
+                if hasattr(widget, "setCurrentText"):
+                    widget.setCurrentText(value)
+                elif hasattr(widget, "setChecked"):
+                    widget.setChecked(value)
+                else:
+                    widget.setValue(value)
+            finally:
+                widget.blockSignals(blocked)
         with patch.object(type(c), "_power_current_sources", return_value={
             key: PowerSeriesSource(key, key, "table") for key in ("low", "high")
         }), patch.object(type(c), "_power_load_group_result", side_effect=lambda key: {"low": a, "high": b}[key]), \
+                patch.object(w, "_ensure_loaded_matches_ui_params", lambda _mode: None), \
                 patch.object(w, "_show_error") as error:
             w._apply_auto_limits_for_loaded()
             w._plot_mode("Power Dependent")
             self.assertEqual(set(w._power_active_cubes), {"Power"})
             single_key = w._current_plot_params_key("Power Dependent")
-            w.power_compare_chk.setChecked(True)
+            blocked_compare = w.power_compare_chk.blockSignals(True)
+            try:
+                w.power_compare_chk.setChecked(True)
+            finally:
+                w.power_compare_chk.blockSignals(blocked_compare)
             self.assertFalse(w.power_pair_mode_combo.model().item(0).isEnabled())
             self.assertEqual(c._power_pairing_mode(), "power")
             self.assertNotEqual(w._current_plot_params_key("Power Dependent"), single_key)
@@ -461,7 +503,12 @@ class PowerWorkflowTests(unittest.TestCase):
             c._power_set_view_mode("VP")
             w._plot_mode("Power Dependent")
             self.assertEqual(set(w._power_active_cubes), {"VP"})
-            w.power_compare_chk.setChecked(False)
+            blocked_compare = w.power_compare_chk.blockSignals(True)
+            try:
+                w.power_compare_chk.setChecked(False)
+            finally:
+                w.power_compare_chk.blockSignals(blocked_compare)
+            c._power_set_view_mode("Intensity")
             w._plot_mode("Power Dependent")
             self.assertEqual(set(w._power_active_cubes), {"Power"})
             error.assert_not_called()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
 import numpy as np
@@ -41,7 +42,6 @@ from core.mcd_extract import (
     concise_condition_labels,
     discover_processed_mcd,
     energy_cluster_centers,
-    export_mcd_extract,
     filter_processed_mcd,
     load_branch_traces,
     newest_mcd_versions,
@@ -51,6 +51,9 @@ from core.mcd_extract import (
 )
 from ui_qt.mcd_async import McdScanWorker
 from ui_qt.matplotlib_theme import ThemeAwareFigureCanvasQTAgg
+from ui_qt.common import Worker
+from ui_qt.export_workers import OwnedWorkerPool
+from core.mcd_extract_export import mcd_extract_export_worker
 
 
 def _number_text(value: float | None, decimals: int = 6) -> str:
@@ -89,7 +92,10 @@ class McdExtractDialog(QDialog):
         self._scan_workers: list[McdScanWorker] = []
         self._trace_array_cache: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
         self._trace_cache_limit = 128
+        parent_pool = getattr(parent, "thread_pool", None)
         self._thread_pool = QThreadPool.globalInstance()
+        self._export_pool = parent_pool or OwnedWorkerPool(self)
+        self._export_worker: Worker | None = None
         self._closing = False
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
@@ -384,6 +390,12 @@ class McdExtractDialog(QDialog):
         self._closing = True
         super().closeEvent(event)
 
+    def done(self, result: int) -> None:  # noqa: N802 - Qt API
+        # QDialog::accept/reject can bypass closeEvent; mark callbacks stale
+        # before the dialog is hidden or destroyed while an export runs.
+        self._closing = True
+        super().done(result)
+
     def _apply_version_preference(self, *, refresh: bool = True) -> None:
         newest, older = newest_mcd_versions(self.all_records)
         self.older_records = older
@@ -675,7 +687,7 @@ class McdExtractDialog(QDialog):
         axes = np.atleast_1d(
             self.figure.subplots(1, len(branches), sharey=True)
         ).tolist()
-        colors = assign_plot_colors(records, str(self.palette_combo.currentData() or "viridis"))
+        colors = assign_plot_colors(records, str(self.palette_combo.currentData() or "tab10"))
         plotted = 0
         legend_handles: list[Line2D] = []
         legend_labels: list[str] = []
@@ -743,6 +755,9 @@ class McdExtractDialog(QDialog):
         return arrays
 
     def _export(self) -> None:
+        if self._export_worker is not None:
+            self.status_label.setText("Export already running; wait for it to finish.")
+            return
         records = self._selected_records()
         branches = self._selected_branches()
         if not records or not branches:
@@ -754,24 +769,62 @@ class McdExtractDialog(QDialog):
         )
         if not folder:
             return
-        try:
-            paths = export_mcd_extract(
-                records,
-                folder,
-                branches=branches,
-                filters=self._current_filters(),
-                energy_tolerance_mev=self.energy_group_tolerance.value(),
-                order_by=str(self.order_combo.currentData() or "Auto"),
-                descending=bool(self.direction_combo.currentData()),
-                palette=str(self.palette_combo.currentData() or "viridis"),
-                export_csv=self.export_csv_chk.isChecked(),
-                series_groups=self.series_groups if self.grouped_export_chk.isChecked() else None,
-            )
-        except (OSError, ValueError) as exc:
-            QMessageBox.critical(self, "MCD Extract failed", str(exc))
+        snapshot = {
+            "records": tuple(copy.deepcopy(records)),
+            "folder": str(folder),
+            "branches": tuple(branches),
+            "filters": copy.deepcopy(self._current_filters()),
+            "energy_tolerance_mev": float(self.energy_group_tolerance.value()),
+            "order_by": str(self.order_combo.currentData() or "Auto"),
+            "descending": bool(self.direction_combo.currentData()),
+            "palette": str(self.palette_combo.currentData() or "tab10"),
+            "export_csv": bool(self.export_csv_chk.isChecked()),
+            "series_groups": (
+                tuple(copy.deepcopy(self.series_groups))
+                if self.grouped_export_chk.isChecked() else None
+            ),
+        }
+        worker = Worker(
+            mcd_extract_export_worker,
+            snapshot["records"],
+            snapshot["folder"],
+            branches=snapshot["branches"],
+            filters=snapshot["filters"],
+            energy_tolerance_mev=snapshot["energy_tolerance_mev"],
+            order_by=snapshot["order_by"],
+            descending=snapshot["descending"],
+            palette=snapshot["palette"],
+            export_csv=snapshot["export_csv"],
+            series_groups=snapshot["series_groups"],
+        )
+        self._export_worker = worker
+        self.export_btn.setEnabled(False)
+        self.status_label.setText("Exporting MCD organization…")
+        worker.signals.result.connect(self._on_export_done)
+        worker.signals.error.connect(self._on_export_error)
+        worker.signals.finished.connect(self._on_export_finished)
+        if hasattr(self._export_pool, "start_worker"):
+            self._export_pool.start_worker(worker)
+        else:
+            self._export_pool.start(worker)
+
+    def _on_export_done(self, paths: dict) -> None:
+        if self._export_worker is None or self._closing:
             return
+        self.status_label.setText("Export complete")
         QMessageBox.information(
-            self,
-            "MCD Extract complete",
+            self, "MCD Extract complete",
             "Created:\n" + "\n".join(path.name for path in paths.values()),
         )
+
+    def _on_export_error(self, message: str) -> None:
+        if self._export_worker is None or self._closing:
+            return
+        self.status_label.setText(f"MCD export failed: {str(message).splitlines()[0]}")
+
+    def _on_export_finished(self) -> None:
+        if self._export_worker is None:
+            return
+        self._export_worker = None
+        if not self._closing:
+            self.export_btn.setEnabled(bool(self._selected_records()) and bool(self._selected_branches()))

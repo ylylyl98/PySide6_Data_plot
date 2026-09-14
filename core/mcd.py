@@ -30,6 +30,7 @@ from scipy.signal import find_peaks, peak_widths, savgol_filter
 
 from app_version import __version__
 from core.loader import DataCube
+from core.source_identity import match_source_identity
 
 EV_NM = 1239.841984
 
@@ -397,16 +398,16 @@ def detect_angles(path: str) -> tuple[float, ...]:
 def discover_mcd_processing_status(
     experiment_root: str | Path,
     sources: list[str] | tuple[str, ...],
+    *, ambiguous_sources: set[str] | None = None,
 ) -> dict[str, str]:
     """Map raw MCD sources to the newest matching saved-analysis timestamp."""
     root = Path(experiment_root)
     metadata_root = root / "Processed Data" / "MCD"
     if not metadata_root.is_dir():
         return {}
-    by_filename: dict[str, list[str]] = {}
-    for source in sources:
-        by_filename.setdefault(Path(source).name.casefold(), []).append(str(source))
+    raw_sources = [str(source) for source in sources]
     status: dict[str, str] = {}
+    ambiguous: set[str] = set()
     try:
         settings_files = metadata_root.rglob("*_MCD_settings*.json")
         for settings_path in settings_files:
@@ -414,10 +415,23 @@ def discover_mcd_processing_status(
                 payload = json.loads(settings_path.read_text(encoding="utf-8"))
             except (OSError, UnicodeError, json.JSONDecodeError):
                 continue
+            if not isinstance(payload, dict):
+                continue
             if str(payload.get("workflow", "")).casefold() != "mcd":
                 continue
-            filename = Path(str(payload.get("source_file", ""))).name.casefold()
-            if not filename or filename not in by_filename:
+            descriptor = payload.get("sources", [])
+            if isinstance(descriptor, list) and descriptor:
+                descriptor = next((item for item in descriptor if isinstance(item, dict) and str(item.get("role", "")).casefold() == "measurement"), {})
+            elif not isinstance(descriptor, dict):
+                descriptor = {}
+            matched, uncertain = match_source_identity(
+                root, raw_sources,
+                relative_path=str(payload.get("source_relative_path", descriptor.get("source_relative_path", "") if descriptor else "")),
+                path=str(payload.get("source_path", descriptor.get("source_path", "") if descriptor else "")),
+                legacy_name=str(payload.get("source_file", descriptor.get("source_file", descriptor.get("filename", "")) if descriptor else payload.get("filename", ""))),
+            )
+            ambiguous.update(uncertain)
+            if matched is None:
                 continue
             created = str(payload.get("created_utc", "")).strip()
             if not created:
@@ -427,11 +441,13 @@ def discover_mcd_processing_status(
                     ).isoformat()
                 except OSError:
                     created = "processed"
-            for source in by_filename[filename]:
-                if created > status.get(source, ""):
-                    status[source] = created
+            if created > status.get(matched, ""):
+                status[matched] = created
     except OSError:
         return status
+    ambiguous.difference_update(status)
+    if ambiguous_sources is not None:
+        ambiguous_sources.update(ambiguous)
     return status
 
 
@@ -1301,6 +1317,8 @@ class McdCenterCandidate:
     branch_agreement: float
     window_signal: float
     score_rank: int
+    polarity: int = 1
+    peak_width_ev: float = 0.0
 
 
 def suggest_mcd_window_centers(
@@ -1309,163 +1327,147 @@ def suggest_mcd_window_centers(
     *,
     metric: WindowMetric = "mean",
     energy_range: tuple[float, float] | None = None,
-    max_candidates: int = 5,
+    max_candidates: int | None = 5,
 ) -> tuple[McdCenterCandidate, ...]:
-    """Rank distinct fixed-width centers using robust field-odd MCD signal.
+    """Locate repeated extrema in high-field MCD, then rank their quality.
 
-    Suggestions are deliberately advisory.  The score rewards high-field
-    field-odd signal and sweep-branch agreement, while its noise estimate
-    includes high-field scatter, near-zero-field residuals, and disagreement
-    between the two acquired sweep branches.
+    Each acquired branch/sign contributes up to five distinct highest-|B|
+    spectra. Negative fields are sign-aligned before smoothing and median
+    aggregation. Peak locations come from these signals, never from an SNR
+    maximum; field-dependent amplitude is not treated as random noise.
+    ``metric`` describes the reported window strength, not the peak locator.
     """
+    if (max_candidates is not None and max_candidates <= 0) or not np.isfinite(width_mev) or width_mev < 0:
+        return ()
     energy = EV_NM / np.asarray(result.wavelength_nm, float)
-    order = np.argsort(energy)
-    energy = energy[order]
-    spectra = np.asarray(result.pair_mcd_corrected, float)[:, order]
     fields = np.asarray(result.pair_b, float)
     labels = np.asarray(result.pair_labels, dtype=str)
-    finite_fields = np.isfinite(fields)
-    if energy.size < 2 or spectra.shape != (fields.size, energy.size) or not np.any(finite_fields):
+    values = np.asarray(result.pair_mcd_corrected, float)
+    if energy.ndim != 1 or energy.size < 7 or values.shape != (fields.size, energy.size) or labels.shape != fields.shape:
         return ()
-    max_field = float(np.nanmax(np.abs(fields[finite_fields])))
-    if not np.isfinite(max_field) or max_field <= 0:
+    order = np.argsort(energy)
+    energy, values = energy[order], values[:, order]
+    if not np.all(np.isfinite(energy)) or np.any(np.diff(energy) <= 0):
         return ()
-    high_mask = finite_fields & (np.abs(fields) >= max(0.45 * max_field, 1e-12))
-    if np.count_nonzero(high_mask) < 2:
+    low, high = (float(energy[0]), float(energy[-1])) if energy_range is None else sorted(map(float, energy_range))
+    half = float(width_mev) * .0005
+    low, high = max(low, float(energy[0])) + half, min(high, float(energy[-1])) - half
+    if not np.isfinite(low + high) or high < low:
         return ()
-
-    signed_high = np.sign(fields[high_mask])[:, None] * spectra[high_mask]
-    signal = np.nanmedian(signed_high, axis=0)
-    high_scatter = 1.4826 * np.nanmedian(np.abs(signed_high - signal[None, :]), axis=0)
-
-    zero_mask = finite_fields & (np.abs(fields) <= max(0.12 * max_field, 1e-12))
-    if np.any(zero_mask):
-        zero_noise = 1.4826 * np.nanmedian(
-            np.abs(spectra[zero_mask] - np.nanmedian(spectra[zero_mask], axis=0)[None, :]),
-            axis=0,
-        )
-        zero_noise = np.maximum(zero_noise, np.nanmedian(np.abs(spectra[zero_mask]), axis=0))
-    else:
-        zero_noise = np.zeros_like(signal)
-
-    branch_signals: list[np.ndarray] = []
-    for branch in ("B increasing", "B decreasing"):
-        mask = high_mask & (labels == branch)
-        if np.any(mask):
-            branch_signals.append(
-                np.nanmedian(np.sign(fields[mask])[:, None] * spectra[mask], axis=0)
-            )
-    if len(branch_signals) >= 2:
-        branch_difference = 0.5 * np.abs(branch_signals[0] - branch_signals[1])
-    else:
-        branch_difference = np.zeros_like(signal)
-
-    point_noise = np.sqrt(high_scatter**2 + zero_noise**2 + branch_difference**2)
-    finite_noise = point_noise[np.isfinite(point_noise) & (point_noise > 0)]
-    noise_floor = float(np.nanpercentile(finite_noise, 25)) if finite_noise.size else 1e-12
-    noise_floor = max(noise_floor, 1e-12)
-
-    if energy_range is None:
-        search_low, search_high = float(energy[0]), float(energy[-1])
-    else:
-        search_low, search_high = sorted((float(energy_range[0]), float(energy_range[1])))
-        search_low = max(search_low, float(energy[0]))
-        search_high = min(search_high, float(energy[-1]))
-    half_width = max(float(width_mev), 0.0) * 5e-4
-    centers_mask = (energy >= search_low + half_width) & (energy <= search_high - half_width)
-    center_indices = np.flatnonzero(centers_mask)
-    if center_indices.size == 0:
+    spacing = float(np.median(np.diff(energy)))
+    separation = max(.003, spacing)
+    groups = []
+    detections = []
+    for branch in sorted(set(labels)):
+        for sign in (-1, 1):
+            indices = np.flatnonzero((labels == branch) & np.isfinite(fields) & (np.sign(fields) == sign))
+            # Repeated measurements at one B must not count as distinct fields.
+            rows = []
+            selected_fields = []
+            for index in indices[np.argsort(np.abs(fields[indices]))[::-1]]:
+                field = round(float(fields[index]), 8)
+                if field in selected_fields or np.count_nonzero(np.isfinite(values[index])) < 7:
+                    continue
+                selected_fields.append(field)
+                rows.append(values[index] * sign)
+                if len(rows) == 5:
+                    break
+            if not rows:
+                continue
+            rows = np.asarray(rows)
+            observed = np.isfinite(rows)
+            filled = np.asarray([np.interp(energy, energy[valid], row[valid])
+                                 for row, valid in zip(rows, observed)])
+            smooth = savgol_filter(filled, 7, 2, axis=1)
+            signal = np.median(smooth, axis=0)
+            residual = (rows - smooth)[observed]
+            noise = max(1e-12, float(1.4826 * np.median(np.abs(residual - np.median(residual)))))
+            span = float(np.ptp(signal))
+            if span <= 1e-12:
+                continue
+            group_id = len(groups)
+            groups.append((signal, noise, len(rows)))
+            for polarity in (1, -1):
+                peaks, properties = find_peaks(polarity * signal,
+                    prominence=max(5 * noise, .08 * span), width=(None, None))
+                row_peaks = [find_peaks(polarity * row,
+                    prominence=max(5 * noise, .08 * float(np.ptp(row))))[0] for row in smooth]
+                for index, prominence, left, right in zip(peaks, properties["prominences"], properties["left_ips"], properties["right_ips"]):
+                    center = float(energy[index])
+                    # Interpolation supports smoothing only. A real observed
+                    # neighborhood and repeated extrema must support a peak.
+                    repeated = sum(any(abs(float(energy[p]) - center) <= separation
+                        and np.all(valid[max(0, p - 3):p + 4]) for p in row_found)
+                        for row_found, valid in zip(row_peaks, observed))
+                    if low <= center <= high and repeated >= max(1, int(np.ceil(.6 * len(rows)))):
+                        peak_width = float(np.interp(right, np.arange(energy.size), energy) - np.interp(left, np.arange(energy.size), energy))
+                        detections.append((center, polarity, group_id, float(prominence), peak_width))
+    if not groups:
         return ()
-
-    scores = np.full(energy.size, np.nan, float)
-    snrs = np.full(energy.size, np.nan, float)
-    agreements = np.full(energy.size, np.nan, float)
-    strengths = np.full(energy.size, np.nan, float)
-    magnitude_metric = metric in {"absolute_mean", "field_signed_absolute_mean"}
-    left_edges = np.searchsorted(
-        energy, energy[center_indices] - half_width, side="left"
-    )
-    right_edges = np.searchsorted(
-        energy, energy[center_indices] + half_width, side="right"
-    )
-    right_edges = np.maximum(right_edges, left_edges + 1)
-
-    def rolling_mean(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        finite = np.isfinite(values)
-        sums = np.concatenate(([0.0], np.cumsum(np.where(finite, values, 0.0))))
-        counts = np.concatenate(([0], np.cumsum(finite.astype(np.int64))))
-        window_counts = counts[right_edges] - counts[left_edges]
-        means = np.divide(
-            sums[right_edges] - sums[left_edges],
-            window_counts,
-            out=np.full(center_indices.size, np.nan, float),
-            where=window_counts > 0,
-        )
-        return means, window_counts
-
-    if metric == "integral":
-        strength_values = np.full(center_indices.size, np.nan, float)
-        for output_index, (left, right) in enumerate(zip(left_edges, right_edges)):
-            if right - left >= 2:
-                strength_values[output_index] = abs(float(np.trapezoid(
-                    signal[left:right], x=energy[left:right]
-                ))) / max(2.0 * half_width, 1e-12)
-            else:
-                strength_values[output_index] = abs(float(signal[left]))
-    else:
-        signal_values = np.abs(signal) if magnitude_metric else signal
-        signal_means, _signal_counts = rolling_mean(signal_values)
-        strength_values = signal_means if magnitude_metric else np.abs(signal_means)
-    noise_square_means, noise_counts = rolling_mean(point_noise**2)
-    safe_counts = np.maximum(noise_counts, 1)
-    window_noise = np.sqrt(noise_square_means) / np.sqrt(safe_counts)
-    window_noise = np.maximum(window_noise, noise_floor / np.sqrt(safe_counts))
-    window_noise = np.maximum(window_noise, 1e-12)
-    # A rolling mean is intentionally used here instead of invoking nanmedian
-    # once per possible center. The branch-difference trace is already formed
-    # from robust branch medians, so this retains robustness while removing
-    # thousands of tiny Python/NumPy calls during every automatic search.
-    disagreement_values, _disagreement_counts = rolling_mean(branch_difference)
-    agreement_values = 1.0 / (
-        1.0 + disagreement_values / np.maximum(strength_values, noise_floor)
-    )
-    snr_values = strength_values / window_noise
-    scores[center_indices] = snr_values * agreement_values
-    snrs[center_indices] = snr_values
-    agreements[center_indices] = agreement_values
-    strengths[center_indices] = strength_values
-
-    valid_indices = center_indices[np.isfinite(scores[center_indices])]
-    if valid_indices.size == 0:
+    clusters = []
+    for point in sorted(detections):
+        compatible = [cluster for cluster in clusters
+            if cluster[0][1] == point[1]
+            and point[2] not in {other[2] for other in cluster}
+            and max(point[0], max(other[0] for other in cluster)) - min(point[0], min(other[0] for other in cluster)) <= separation]
+        if compatible:
+            min(compatible, key=lambda cluster: abs(np.median([other[0] for other in cluster]) - point[0])).append(point)
+        else:
+            clusters.append([point])
+    if len(groups) == 1 and groups[0][2] < 3:
         return ()
-    spacing = float(np.nanmedian(np.diff(energy)))
-    minimum_separation = max(2.0 * half_width, spacing)
-    distance_points = max(1, int(np.ceil(minimum_separation / max(spacing, 1e-12))))
-    peak_input = np.where(np.isfinite(scores), scores, -np.inf)
-    peak_indices, _properties = find_peaks(peak_input, distance=distance_points)
-    peak_indices = peak_indices[np.isin(peak_indices, valid_indices)]
-    global_best = int(valid_indices[np.nanargmax(scores[valid_indices])])
-    ranked_pool = np.unique(np.append(peak_indices, global_best))
-    ranked = ranked_pool[np.argsort(scores[ranked_pool])[::-1]]
-    selected: list[int] = []
-    for index in ranked:
-        if any(abs(float(energy[index] - energy[other])) < minimum_separation for other in selected):
+    required_support = max(1, int(np.ceil(.75 * len(groups))))
+    ranked = []
+    for cluster in clusters:
+        if len(cluster) < required_support:
             continue
-        selected.append(int(index))
-        if len(selected) >= max(1, int(max_candidates)):
+        center = float(np.median([point[0] for point in cluster]))
+        mask = np.abs(energy - center) <= half
+        if not np.any(mask):
+            mask[int(np.argmin(np.abs(energy - center)))] = True
+        # Rank only measured extrema. Prominence avoids favoring offsets or
+        # near-flat shoulders with artificially tiny residual noise.
+        prominence = float(np.median([point[3] for point in cluster]))
+        agreement = len(cluster) / len(groups)
+        signals = np.asarray([groups[point[2]][0] for point in cluster])
+        representative = np.median(signals, axis=0)
+        local = representative[mask]
+        strength = float(np.mean(np.abs(local))) if metric in {"absolute_mean", "field_signed_absolute_mean"} else abs(float(np.mean(local)))
+        if metric == "integral" and np.count_nonzero(mask) > 1:
+            strength = abs(float(np.trapezoid(local, x=energy[mask]))) / max(2 * half, 1e-12)
+        noise = float(np.median([groups[point[2]][1] for point in cluster]))
+        snr = prominence / max(noise, 1e-12)
+        ranked.append(McdCenterCandidate(center, prominence * agreement, snr, agreement, strength, 0,
+            cluster[0][1], float(np.median([point[4] for point in cluster]))))
+    ranked.sort(key=lambda candidate: (-candidate.score, candidate.center_ev))
+    selected = []
+    representative = np.median([group[0] for group in groups], axis=0)
+    noise = float(np.median([group[1] for group in groups]))
+    def duplicate(candidate, other):
+        if candidate.polarity != other.polarity:
+            return False
+        distance = abs(candidate.center_ev - other.center_ev)
+        # Integration width does not describe spectral resolution. Nearby
+        # same-polarity extrema may be separate if a resolved saddle exists.
+        if distance > max(separation, .5 * min(candidate.peak_width_ev, other.peak_width_ev)):
+            return False
+        left, right = sorted(np.searchsorted(energy, [candidate.center_ev, other.center_ev]))
+        if right - left < 2:
+            return True
+        segment = candidate.polarity * representative[left:right + 1]
+        depth = min(segment[0], segment[-1]) - float(np.min(segment))
+        prominence = min(candidate.score / candidate.branch_agreement,
+                         other.score / other.branch_agreement)
+        return depth < max(3 * noise, .2 * prominence)
+    for candidate in ranked:
+        if any(duplicate(candidate, other) for other in selected):
+            continue
+        selected.append(McdCenterCandidate(candidate.center_ev, candidate.score,
+            candidate.snr, candidate.branch_agreement, candidate.window_signal, len(selected) + 1,
+            candidate.polarity, candidate.peak_width_ev))
+        if max_candidates is not None and len(selected) >= max_candidates:
             break
-    ranked_candidates = [
-        McdCenterCandidate(
-            center_ev=float(energy[index]),
-            score=float(scores[index]),
-            snr=float(snrs[index]),
-            branch_agreement=float(agreements[index]),
-            window_signal=float(strengths[index]),
-            score_rank=rank,
-        )
-        for rank, index in enumerate(selected, start=1)
-    ]
-    return tuple(sorted(ranked_candidates, key=lambda candidate: candidate.center_ev))
+    return tuple(sorted(selected, key=lambda candidate: candidate.center_ev))
 
 
 def _window_trace_from_cube(
@@ -1909,6 +1911,7 @@ def export_mcd_analysis_bundle(
     fit_near_zero: bool = False,
     fit_window_t: float = 0.2,
     package_outputs: tuple[Path, ...] = (),
+    experiment_root: str | Path | None = None,
 ) -> dict[str, Path]:
     """Export the compact, publication-facing MCD analysis set.
 
@@ -2131,6 +2134,18 @@ def export_mcd_analysis_bundle(
     for key in ("dark_pos_file", "dark_neg_file"):
         if setting_values.get(key):
             setting_values[key] = Path(str(setting_values[key])).name
+    source_path = str(result.source_file)
+    source_relative_path = ""
+    if experiment_root is not None:
+        try:
+            source_relative_path = Path(result.source_file).resolve(strict=False).relative_to(
+                Path(experiment_root).resolve(strict=False)
+            ).as_posix()
+        except (OSError, ValueError, RuntimeError):
+            source_relative_path = ""
+    measurement_source = {"role": "measurement", "filename": Path(result.source_file).name, "source_path": source_path}
+    if source_relative_path:
+        measurement_source["source_relative_path"] = source_relative_path
     payload = {
         "schema_version": 1,
         "app_version": __version__,
@@ -2138,8 +2153,10 @@ def export_mcd_analysis_bundle(
         "source_file": Path(result.source_file).name,
         "dataset_type": "derived_analysis_1d",
         "workflow": "MCD",
+        "source_path": source_path,
+        **({"source_relative_path": source_relative_path} if source_relative_path else {}),
         "package": out.name,
-        "sources": [{"role": "measurement", "filename": Path(result.source_file).name}],
+        "sources": [measurement_source],
         "outputs": [
             figure_path.name,
             csv_path.name,

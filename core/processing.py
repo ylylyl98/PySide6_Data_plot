@@ -28,7 +28,7 @@ COMPARE_CHANNEL_TOKEN_RE = re.compile(
     re.IGNORECASE,
 )
 COMPARE_ANGLE_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9])(?:(?:rot\s*[12]|in|out)\s*[^0-9+\-]*"
+    r"(?<![A-Za-z0-9])(?:(?:rot\s*(?:[12]|in|out)|in|out)\s*[^0-9+\-]*"
     r"[+\-]?\d+(?:[pP\.]\d+)?\s*(?:deg|degree)|"
     r"deg(?:ree)?\s*[+\-]?\d+(?:[pP\.]\d+)?|rot[12]_[+\-]?\d+(?:[pP\.]\d+)?)(?![A-Za-z0-9])",
     re.IGNORECASE,
@@ -102,6 +102,8 @@ class RotationAngles:
 
     rot1: float | None = None
     rot2: float | None = None
+    input_ambiguous: bool = False
+    output_ambiguous: bool = False
 
 
 @dataclass(frozen=True)
@@ -281,42 +283,70 @@ def _parse_angle_token(text: str) -> float:
     return float(str(text).replace("p", ".").replace("P", "."))
 
 
-def parse_compare_rotation_angles(file_name: str) -> RotationAngles:
+def parse_compare_rotation_angles(file_name: str, *, rot1_is_output: bool = False) -> RotationAngles:
     text = str(Path(file_name).stem)
     number = r"([\-+]?\d+(?:[pP\.]\d+)?)"
     unit = r"\s*(?:deg|degree)(?=$|[^A-Za-z0-9])"
     named_prefix = r"(?:^|[_\s-])"
-    in_match = re.search(rf"{named_prefix}in[^0-9\-+]*{number}{unit}", text, flags=re.IGNORECASE)
-    out_match = re.search(rf"{named_prefix}out[^0-9\-+]*{number}{unit}", text, flags=re.IGNORECASE)
-    rot1 = re.search(rf"rot\s*1[^0-9\-+]*{number}{unit}", text, flags=re.IGNORECASE)
-    rot2 = re.search(rf"rot\s*2[^0-9\-+]*{number}{unit}", text, flags=re.IGNORECASE)
-    rot1 = rot1 or re.search(rf"(?<![A-Za-z0-9])rot1_{number}(?![A-Za-z0-9])", text, re.I)
-    rot2 = rot2 or re.search(rf"(?<![A-Za-z0-9])rot2_{number}(?![A-Za-z0-9])", text, re.I)
+
+    def _angles(pattern: str) -> list[float]:
+        return [_parse_angle_token(match.group(1)) for match in re.finditer(
+            pattern, text, flags=re.IGNORECASE
+        )]
+
+    # RotIn/RotOut are semantic arm names and therefore keep their meaning
+    # regardless of the user-selected Rot1/Rot2 mapping.  Keep the older
+    # separated ``in``/``out`` spellings as aliases.
+    named_in = _angles(rf"(?<![A-Za-z0-9])rot\s*in[^0-9\-+]*{number}{unit}")
+    named_out = _angles(rf"(?<![A-Za-z0-9])rot\s*out[^0-9\-+]*{number}{unit}")
+    bare_in = _angles(rf"{named_prefix}in[^0-9\-+]*{number}{unit}")
+    bare_out = _angles(rf"{named_prefix}out[^0-9\-+]*{number}{unit}")
+    rot1 = _angles(rf"(?<![A-Za-z0-9])rot\s*1[^0-9\-+]*{number}{unit}")
+    rot2 = _angles(rf"(?<![A-Za-z0-9])rot\s*2[^0-9\-+]*{number}{unit}")
+    rot1 = rot1 or _angles(rf"(?<![A-Za-z0-9])rot1_{number}(?![A-Za-z0-9])")
+    rot2 = rot2 or _angles(rf"(?<![A-Za-z0-9])rot2_{number}(?![A-Za-z0-9])")
     # Legacy single-analyzer filenames put the unit before the angle.
-    # Explicit output-arm tokens take precedence when both are present.
-    legacy_out = re.search(
-        rf"(?<![A-Za-z0-9])deg(?:ree)?\s*{number}(?![A-Za-z0-9])",
-        text, flags=re.IGNORECASE,
+    legacy_out_angles = [
+        _parse_angle_token(match.group(1))
+        for match in re.finditer(
+            rf"(?<![A-Za-z0-9])deg(?:ree)?\s*{number}(?![A-Za-z0-9])",
+            text, flags=re.IGNORECASE,
+        )
+    ]
+    input_rot, output_rot = (rot2, rot1) if rot1_is_output else (rot1, rot2)
+
+    def _resolve(values: Sequence[float]) -> tuple[float | None, bool]:
+        if not values:
+            return None, False
+        first = float(values[0])
+        if any(circular_angle_distance(value, first) > 1e-9 for value in values[1:]):
+            # Mixed semantic/positional labels for one arm are ambiguous;
+            # leave that arm unclassified instead of silently overriding it.
+            return None, True
+        return first, False
+
+    # Semantic arm names win over positional labels; positional labels win
+    # over the legacy ``deg45`` spelling.  Conflicting labels at the same
+    # precedence remain unclassified instead of being silently overwritten.
+    in_angle, input_ambiguous = _resolve(
+        [*named_in, *bare_in] if (named_in or bare_in) else input_rot
     )
-    return RotationAngles(
-        rot1=(
-            _parse_angle_token(in_match.group(1))
-            if in_match
-            else (_parse_angle_token(rot1.group(1)) if rot1 else None)
-        ),
-        rot2=(
-            _parse_angle_token(out_match.group(1))
-            if out_match
-            else (_parse_angle_token(rot2.group(1)) if rot2
-                  else _parse_angle_token(legacy_out.group(1)) if legacy_out else None)
-        ),
+    out_angle, output_ambiguous = _resolve(
+        [*named_out, *bare_out]
+        if (named_out or bare_out)
+        else (output_rot if output_rot else legacy_out_angles)
+    )
+    return (
+        RotationAngles(out_angle, in_angle, input_ambiguous, output_ambiguous)
+        if rot1_is_output
+        else RotationAngles(in_angle, out_angle, input_ambiguous, output_ambiguous)
     )
 
 
-def parse_compare_in_out_angles(file_name: str) -> tuple[float | None, float | None]:
-    """Backward-compatible tuple view of independently parsed Rot1/Rot2 angles."""
-    angles = parse_compare_rotation_angles(file_name)
-    return angles.rot1, angles.rot2
+def parse_compare_in_out_angles(file_name: str, *, rot1_is_output: bool = False) -> tuple[float | None, float | None]:
+    """Resolve rotation tokens to input/output; named arms keep their meaning."""
+    angles = parse_compare_rotation_angles(file_name, rot1_is_output=rot1_is_output)
+    return (angles.rot2, angles.rot1) if rot1_is_output else (angles.rot1, angles.rot2)
 
 
 def circular_angle_distance(a: float, b: float, *, period: float = 360.0) -> float:
@@ -411,9 +441,10 @@ def infer_compare_angle_references(
     out_k_anchor: float,
     cluster_tolerance: float = 15.0,
     period: float = 360.0,
+    rot1_is_output: bool = False,
 ) -> CompareAngleInference:
     """Suggest K/Kp anchors only when exactly two clusters exist for an arm."""
-    parsed = [parse_compare_rotation_angles(file_name) for file_name in file_names]
+    parsed = [parse_compare_rotation_angles(file_name, rot1_is_output=rot1_is_output) for file_name in file_names]
     rot1_clusters = _cluster_compare_angles(
         [item.rot1 for item in parsed if item.rot1 is not None],
         tolerance=cluster_tolerance,
@@ -434,8 +465,10 @@ def infer_compare_angle_references(
         )
         return clusters[k_index], clusters[1 - k_index]
 
-    in_k, in_kp = assign(rot1_clusters, float(in_k_anchor))
-    out_k, out_kp = assign(rot2_clusters, float(out_k_anchor))
+    in_clusters, out_clusters = ((rot2_clusters, rot1_clusters) if rot1_is_output
+                                else (rot1_clusters, rot2_clusters))
+    in_k, in_kp = assign(in_clusters, float(in_k_anchor))
+    out_k, out_kp = assign(out_clusters, float(out_k_anchor))
     return CompareAngleInference(
         rot1_clusters=rot1_clusters,
         rot2_clusters=rot2_clusters,
@@ -469,8 +502,18 @@ def classify_compare_channel(
     out_kp_angle: float | None = None,
     ambiguity_margin: float = 1.0,
     angle_period: float = 360.0,
+    rot1_is_output: bool = False,
 ) -> str | None:
-    in_angle, out_angle = parse_compare_in_out_angles(file_name)
+    parsed_angles = parse_compare_rotation_angles(
+        file_name, rot1_is_output=rot1_is_output
+    )
+    if parsed_angles.input_ambiguous or parsed_angles.output_ambiguous:
+        return None
+    in_angle, out_angle = (
+        (parsed_angles.rot2, parsed_angles.rot1)
+        if rot1_is_output
+        else (parsed_angles.rot1, parsed_angles.rot2)
+    )
     if in_angle is None and out_angle is None:
         tokens = {
             match.group("channel").casefold()
@@ -574,6 +617,7 @@ def group_compare_sources(
     out_kp_angle: float | None = None,
     tolerance: float = 45.0,
     power_tolerance_fraction: float = 0.05,
+    rot1_is_output: bool = False,
 ) -> list[CompareSourceGroup]:
     """Group raw compare sources by measurement context and nearby power.
 
@@ -601,6 +645,7 @@ def group_compare_sources(
         has_angle = angles.rot1 is not None or angles.rot2 is not None
         channel = classify_compare_channel(
             file_name,
+            rot1_is_output=rot1_is_output,
             in_k_angle=in_k_angle,
             out_k_angle=out_k_angle,
             in_kp_angle=in_kp_angle,
@@ -777,11 +822,13 @@ def coherent_compare_auto_assignment(
     tolerance: float = 45.0,
     ambiguity_margin: float = 1.0,
     angle_period: float = 360.0,
+    rot1_is_output: bool = False,
 ) -> tuple[dict[str, str], dict[str, list[str]], str, list[str]]:
     groups: dict[str, list[tuple[int, str, str]]] = {}
     for idx, file_name in enumerate(file_names):
         key = classify_compare_channel(
             file_name,
+            rot1_is_output=rot1_is_output,
             in_k_angle=in_k_angle,
             out_k_angle=out_k_angle,
             in_kp_angle=in_kp_angle,

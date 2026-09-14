@@ -15,8 +15,8 @@ import pandas as pd
 from core.file_ops import _nat_key, archive_selected, list_root_csvs
 from core.drr_sources import (
     DrrMeasurementAssignment,
+    inspect_csv_spectral_grid,
     resolve_source_path,
-    validate_named_wavelength_centers,
 )
 from core.loader import (
     DataCube,
@@ -38,6 +38,7 @@ from core.processing import (
     power_group_title,
 )
 from core.shg import ShgSweepData, inspect_shg_csv, load_shg_sweep_csv
+from core.source_identity import match_source_identity
 
 
 DEFAULT_ARCHIVE = "Initial data after processing"
@@ -101,6 +102,9 @@ class PowerSeriesSource:
     source_format: str
     file_name: str | None = None
     records: tuple[PowerSeriesFile, ...] = ()
+    # Catalog-only values used for instant pairing feedback.  Spectra remain
+    # loaded by the background validation/load worker.
+    power_values: tuple[float, ...] = ()
 
 
 POWER_SWEEP_KEY_PREFIX = "csv::"
@@ -204,7 +208,8 @@ def classify_pl_source(source: str | Path) -> str:
 
 
 def discover_pl_processing_status(
-    experiment_root: str | Path, sources: Sequence[str]
+    experiment_root: str | Path, sources: Sequence[str], *,
+    ambiguous_sources: set[str] | None = None,
 ) -> dict[str, str]:
     """Map raw PL sources to the newest matching export-metadata timestamp."""
     root = Path(experiment_root)
@@ -216,18 +221,16 @@ def discover_pl_processing_status(
         for source in sources
         if not str(source).replace("\\", "/").casefold().startswith("processed data/pl/")
     ]
-    by_name: dict[str, list[str]] = {}
-    by_relative: dict[str, str] = {}
-    for source in raw_sources:
-        by_name.setdefault(Path(source).name.casefold(), []).append(source)
-        by_relative[source.replace("\\", "/").casefold()] = source
     status: dict[str, str] = {}
+    ambiguous: set[str] = set()
     try:
         metadata_files = metadata_root.rglob("*.metadata.json")
         for metadata_path in metadata_files:
             try:
                 payload = json.loads(metadata_path.read_text(encoding="utf-8"))
             except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
                 continue
             workflow = str(payload.get("workflow", payload.get("operation", ""))).casefold()
             if workflow != "pl":
@@ -240,21 +243,26 @@ def discover_pl_processing_status(
                     ).isoformat()
                 except OSError:
                     created = "processed"
-            for descriptor in payload.get("sources", payload.get("inputs", [])):
+            descriptors = payload.get("sources", payload.get("inputs", []))
+            if not isinstance(descriptors, list):
+                continue
+            for descriptor in descriptors:
                 if not isinstance(descriptor, dict):
                     continue
-                raw = str(descriptor.get("name", descriptor.get("source_path", "")))
-                normalized = raw.replace("\\", "/").casefold()
-                matches: list[str] = []
-                if normalized in by_relative:
-                    matches.append(by_relative[normalized])
-                filename = Path(raw).name.casefold()
-                matches.extend(by_name.get(filename, []))
-                for source in dict.fromkeys(matches):
-                    if created > status.get(source, ""):
-                        status[source] = created
+                matched, uncertain = match_source_identity(
+                    root, raw_sources,
+                    relative_path=str(descriptor.get("source_relative_path", "")),
+                    path=str(descriptor.get("source_path", descriptor.get("path", ""))),
+                    legacy_name=str(descriptor.get("name", descriptor.get("source_file", descriptor.get("filename", "")))),
+                )
+                ambiguous.update(uncertain)
+                if matched is not None and created > status.get(matched, ""):
+                    status[matched] = created
     except OSError:
         return status
+    ambiguous.difference_update(status)
+    if ambiguous_sources is not None:
+        ambiguous_sources.update(ambiguous)
     return status
 
 
@@ -313,6 +321,41 @@ def load_drr_self_cube(
     )
 
 
+def _validate_drr_external_spectral_grids(
+    folder: str,
+    measurement_files: Sequence[str],
+    baseline_files: Sequence[str],
+) -> None:
+    """Reject external DRR interpolation at the public loading boundary.
+
+    The DRR picker uses the same cached header values.  The loader repeats the
+    cheap header-only check so saved/manual recipes cannot bypass eligibility.
+    Filename centers are intentionally not consulted: the original ordered
+    wavelength array is the authoritative acquisition identity.
+    """
+    all_files = [str(item) for item in (*measurement_files, *baseline_files)]
+    if not all_files:
+        raise ValueError("External DRR selection is empty.")
+    try:
+        reference = inspect_csv_spectral_grid(resolve_source_path(folder, all_files[0]))
+        for name in all_files[1:]:
+            current = inspect_csv_spectral_grid(resolve_source_path(folder, name))
+            first = np.asarray(reference, dtype=float)
+            second = np.asarray(current, dtype=float)
+            if (
+                first.shape != second.shape
+                or not np.allclose(first, second, rtol=1e-9, atol=1e-10)
+            ):
+                raise ValueError(
+                    "External DRR files must use one exact spectral grid "
+                    "(same point count, order, and wavelength values)."
+                )
+    except ValueError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise ValueError("External DRR files must have a complete spectral grid.") from exc
+
+
 def load_drr_external_cube(
     folder: str,
     files: Sequence[str],
@@ -322,7 +365,7 @@ def load_drr_external_cube(
     y_axis: str = "auto",
     derivative: int | None = None,
 ) -> DataCube:
-    validate_named_wavelength_centers(files, baseline_files)
+    _validate_drr_external_spectral_grids(folder, files, baseline_files)
     baseline = build_external_baseline(folder, baseline_files, which=baseline_which)
     return load_drr_avg(
         folder,
@@ -355,10 +398,9 @@ def load_drr_resolved_cube(
     for measurement in selected:
         assignment = by_measurement[measurement]
         if assignment.baseline_mode == "External":
-            # Validate filename-declared centers before the loader reaches a
-            # heterogeneous numerical path.  The canonical loader validates
-            # actual grids; this catches named center mismatches as well.
-            validate_named_wavelength_centers([measurement], assignment.baseline_files)
+            _validate_drr_external_spectral_grids(
+                folder, [measurement], assignment.baseline_files
+            )
     return load_drr_resolved_avg(
         folder,
         files,
@@ -438,11 +480,23 @@ def get_power_series_sources(folder: str, files: Sequence[str]) -> Dict[str, Pow
         if inspect_power_sweep_csv(folder, file_name):
             table_files.add(str(file_name))
             key = power_sweep_source_key(file_name)
+            power_values: tuple[float, ...] = ()
+            try:
+                path = Path(folder) / file_name
+                sep = processing_impl._guess_sep_from_first_line(path)
+                stat = path.stat()
+                power_col = _power_header_column(str(path.resolve()), stat.st_mtime_ns, stat.st_size)
+                if power_col is not None:
+                    frame = pd.read_csv(path, sep=sep, usecols=[power_col])
+                    power_values = tuple(float(v) for v in pd.to_numeric(frame[power_col], errors="coerce") if np.isfinite(v))
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
             sources[key] = PowerSeriesSource(
                 key=key,
                 title=power_group_title(key),
                 source_format="table",
                 file_name=str(file_name),
+                power_values=power_values,
             )
     legacy_files = [file_name for file_name in files if str(file_name) not in table_files]
     for key, records in get_power_series_groups(legacy_files).items():

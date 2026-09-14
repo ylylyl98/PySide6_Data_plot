@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
@@ -13,15 +14,19 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QInputDialog,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QTabWidget,
     QTableWidget,
@@ -32,6 +37,7 @@ from PySide6.QtWidgets import (
 
 from core.mcd_extract import (
     BRANCHES,
+    SLOPE_METRICS,
     PALETTES,
     McdBranch,
     McdSeries,
@@ -39,7 +45,6 @@ from core.mcd_extract import (
     assign_plot_colors,
     concise_condition_labels,
     discover_processed_mcd,
-    export_mcd_extract,
     load_branch_traces,
     newest_mcd_versions,
     organize_mcd_series,
@@ -47,6 +52,9 @@ from core.mcd_extract import (
     record_order_value,
 )
 from ui_qt.mcd_async import McdScanWorker
+from ui_qt.common import Worker
+from ui_qt.export_workers import OwnedWorkerPool
+from core.mcd_extract_export import mcd_extract_export_worker
 from ui_qt.fluent_ui.style import set_fluent_property
 from ui_qt.theme import alias as theme_alias
 
@@ -75,8 +83,12 @@ class McdOrganizerWindow(QMainWindow):
         self._omitted_no_slope = 0
         self.series_groups: list[McdSeries] = []
         self._selected_record_ids: dict[str, set[str]] = {}
-        self._default_palette = "viridis"
+        self._default_palette = "tab10"
         self._focused_record_id: str | None = None
+        self._energy_group_overrides = {}
+        self._energy_point_artists = {}
+        self._energy_focus_artists = []
+        self._energy_hover = None
         self._plot_artists: dict[str, list[object]] = {}
         self._slope_lines: dict[str, object] = {}
         self._trace_array_cache: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
@@ -88,6 +100,8 @@ class McdOrganizerWindow(QMainWindow):
         self._scan_generation = 0
         self._scan_workers: list[McdScanWorker] = []
         self._thread_pool = QThreadPool.globalInstance()
+        self._export_pool = OwnedWorkerPool(self)
+        self._export_worker: Worker | None = None
         self._closing = False
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
@@ -185,6 +199,26 @@ class McdOrganizerWindow(QMainWindow):
             self.compare_combo.addItem(label, value)
         compare_row.addWidget(self.compare_combo, 1)
         layout.addLayout(compare_row)
+        self.slope_checks = {}
+        for metric, label in SLOPE_METRICS.items():
+            check = QCheckBox(label)
+            check.setChecked(metric == "near_zero")
+            check.setToolTip("Show or hide this slope in the preview. Exports always include all three metrics and both branches.")
+            check.toggled.connect(self._slope_visibility_changed)
+            self.slope_checks[metric] = check
+            layout.addWidget(check)
+        group_row = QHBoxLayout()
+        group_row.addWidget(QLabel('Energy groups (meV):'))
+        self.energy_group_tolerance = QDoubleSpinBox()
+        self.energy_group_tolerance.setRange(.1, 100)
+        self.energy_group_tolerance.setValue(5.)
+        self.energy_group_tolerance.setToolTip('Initial group span and maximum energy step for connecting unambiguous points. Saved integration centers, not fitted peaks.')
+        group_row.addWidget(self.energy_group_tolerance)
+        self.edit_energy_groups_btn = QPushButton('Edit groups…')
+        self.edit_energy_groups_btn.clicked.connect(self._edit_energy_groups)
+        group_row.addWidget(self.edit_energy_groups_btn)
+        layout.addLayout(group_row)
+        self.energy_group_tolerance.valueChanged.connect(self._energy_groups_changed)
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Find a condition, value, or series…")
         layout.addWidget(self.search_edit)
@@ -277,14 +311,23 @@ class McdOrganizerWindow(QMainWindow):
         self.details_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.details_table)
 
+        self.conditions_panel = QWidget()
+        conditions_layout = QVBoxLayout(self.conditions_panel)
+        conditions_layout.setContentsMargins(4, 0, 0, 0)
+        conditions_layout.addWidget(QLabel("Conditions in selected series"))
+        self.conditions_btn = QPushButton("Conditions")
+        self.conditions_btn.setCheckable(True)
+        self.conditions_btn.setChecked(True)
+        header.addWidget(self.conditions_btn)
+        self.conditions_btn.toggled.connect(self.conditions_panel.setVisible)
         self.condition_list = QListWidget()
-        self.condition_list.setMaximumHeight(150)
+        self.condition_list.setMinimumWidth(280)
+        self.condition_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.condition_list.setWordWrap(True)
         self.condition_list.setSpacing(1)
         condition_row = QHBoxLayout()
-        condition_row.addWidget(QLabel("Conditions in selected series:"))
-        self.condition_exclude_btn = QPushButton("Exclude highlighted")
-        self.condition_restore_selected_btn = QPushButton("Restore highlighted")
+        self.condition_exclude_btn = QPushButton("Exclude")
+        self.condition_restore_selected_btn = QPushButton("Restore")
         self.condition_restore_btn = QPushButton("Restore all")
         self.condition_exclude_btn.setEnabled(False)
         self.condition_restore_selected_btn.setEnabled(False)
@@ -292,11 +335,20 @@ class McdOrganizerWindow(QMainWindow):
         condition_row.addWidget(self.condition_restore_selected_btn)
         condition_row.addWidget(self.condition_restore_btn)
         condition_row.addStretch(1)
-        layout.addLayout(condition_row)
-        layout.addWidget(self.condition_list)
+        conditions_layout.addLayout(condition_row)
+        group_row = QHBoxLayout()
+        self.assign_group_btn = QPushButton("Assign group…")
+        self.reset_group_btn = QPushButton("Reset grouping")
+        group_row.addWidget(self.assign_group_btn)
+        group_row.addWidget(self.reset_group_btn)
+        conditions_layout.addLayout(group_row)
+        self.assign_group_btn.clicked.connect(self._assign_selected_group)
+        self.reset_group_btn.clicked.connect(self._reset_series_groups)
+        self.condition_list.setToolTip("Ctrl / Shift: select multiple windows, then Assign group")
+        conditions_layout.addWidget(self.condition_list, 1)
         self.condition_summary = QLabel("0 of 0 conditions included")
         set_fluent_property(self.condition_summary, "appRole", "hintText")
-        layout.addWidget(self.condition_summary)
+        conditions_layout.addWidget(self.condition_summary)
 
         self.figure = None
         self.canvas = None
@@ -307,6 +359,12 @@ class McdOrganizerWindow(QMainWindow):
         mcd_layout = QVBoxLayout(mcd_tab)
         mcd_layout.setContentsMargins(0, 0, 0, 0)
         mcd_layout.addWidget(QLabel("Preparing preview…"), 1)
+        self.mcd_group_combo = QComboBox()
+        self.mcd_group_combo.addItem('All groups', '')
+        self.mcd_group_combo.setToolTip('Filter MCD vs B only; export includes all groups')
+        self.mcd_group_combo.currentIndexChanged.connect(lambda _i: self._request_preview_update())
+        mcd_layout.addWidget(self.mcd_group_combo)
+
         slope_tab = QWidget()
         slope_layout = QVBoxLayout(slope_tab)
         slope_layout.setContentsMargins(0, 0, 0, 0)
@@ -314,13 +372,20 @@ class McdOrganizerWindow(QMainWindow):
         self._mcd_plot_layout = mcd_layout
         self._slope_plot_layout = slope_layout
         self.preview_tabs.addTab(mcd_tab, "MCD vs B")
-        self.preview_tabs.addTab(slope_tab, "Slope vs E-field")
-        layout.addWidget(self.preview_tabs, 1)
+        self.preview_tabs.addTab(slope_tab, "Window energy / slopes vs E-field")
+        self.preview_splitter = QSplitter(Qt.Horizontal)
+        self.preview_splitter.addWidget(self.preview_tabs)
+        self.preview_splitter.addWidget(self.conditions_panel)
+        self.preview_splitter.setStretchFactor(0, 1)
+        self.preview_splitter.setStretchFactor(1, 0)
+        self.preview_splitter.setChildrenCollapsible(False)
+        self.preview_splitter.setSizes([850, 340])
+        layout.addWidget(self.preview_splitter, 1)
         QTimer.singleShot(0, self._init_plot_widgets)
 
         self.increasing_chk.toggled.connect(lambda _checked: self._request_preview_update())
         self.decreasing_chk.toggled.connect(lambda _checked: self._request_preview_update())
-        self.palette_combo.currentIndexChanged.connect(lambda _index: self._request_preview_update())
+        self.palette_combo.currentIndexChanged.connect(self._energy_palette_changed)
         self.palette_default_btn.clicked.connect(self._set_current_palette_default)
         self.details_btn.toggled.connect(self._toggle_details)
         self.condition_list.currentRowChanged.connect(lambda _row: self._condition_focus_changed())
@@ -340,8 +405,13 @@ class McdOrganizerWindow(QMainWindow):
         self.canvas = ThemeAwareFigureCanvasQTAgg(self.figure)
         self.slope_figure = Figure(figsize=(9, 5), dpi=100, facecolor="white")
         self.slope_canvas = ThemeAwareFigureCanvasQTAgg(self.slope_figure)
+        self.slope_canvas.mpl_connect('motion_notify_event', self._energy_plot_hover)
+        self.slope_canvas.mpl_connect('button_press_event', self._energy_plot_click)
         self._mcd_plot_layout.replaceWidget(self._mcd_plot_layout.itemAt(0).widget(), self.canvas)
-        self._slope_plot_layout.replaceWidget(self._slope_plot_layout.itemAt(0).widget(), self.slope_canvas)
+        self._slope_scroll = QScrollArea()
+        self._slope_scroll.setWidgetResizable(True)
+        self._slope_scroll.setWidget(self.slope_canvas)
+        self._slope_plot_layout.replaceWidget(self._slope_plot_layout.itemAt(0).widget(), self._slope_scroll)
         self._show_empty_preview("Loading processed MCD catalog…")
 
     def _set_default_output(self) -> None:
@@ -601,8 +671,123 @@ class McdOrganizerWindow(QMainWindow):
         self.details_table.setVisible(visible)
         self.details_btn.setText("Hide result details" if visible else "Show result details")
 
+    def _selected_slope_metrics(self) -> tuple[str, ...]:
+        return tuple(key for key, check in self.slope_checks.items() if check.isChecked())
+
+    def _energy_groups(self, records):
+        from core.mcd_energy_groups import initial_energy_groups
+        groups = initial_energy_groups(records,self.energy_group_tolerance.value())
+        groups.update({key:value for key,value in self._energy_group_overrides.items() if key in groups})
+        from core.mcd_energy_groups import compact_group_numbers
+        compact = compact_group_numbers(groups)
+        from core.mcd_energy_groups import visible_group_numbers
+        record_ids = set(groups)
+        for series in self.series_groups:
+            if {r.record_id for r in series.records} == record_ids:
+                included = self._selected_record_ids.get(series.series_id,record_ids)
+                compact = visible_group_numbers(compact,included)
+                break
+        if compact != groups:
+            # Materialize the entire series so old automatic numbers cannot
+            # collide with the renumbered groups on the next refresh or merge.
+            self._energy_group_overrides.update(compact)
+        return compact
+
+    def _energy_groups_changed(self, _value=None):
+        # Save the assignment independently of rendering, which can fail.
+        self._write_condition_selections()
+        try:
+            self._populate_condition_list(self._current_series())
+        except Exception as exc:
+            self.selection_summary.setText(f"Grouping saved; condition refresh failed: {exc}")
+            return
+        self._queue_condition_selection_save()
+        self._request_preview_update()
+
+    def _assign_selected_group(self):
+        series = self._current_series()
+        ids = [str(item.data(Qt.UserRole)) for item in self.condition_list.selectedItems()]
+        if series is None or not ids:
+            return
+        groups = self._energy_groups(series.records)
+        name, accepted = QInputDialog.getItem(self, "Assign group", "Existing or new group:",
+                                             sorted(set(groups.values())), 0, True)
+        if not accepted or not name.strip():
+            return
+        name = name.strip()
+        # Joining an existing group confirms its existing members too.
+        for record_id, group in groups.items():
+            if group == name or record_id in ids:
+                self._energy_group_overrides[record_id] = name
+        self._energy_groups_changed()
+
+    def _reset_series_groups(self):
+        series = self._current_series()
+        if series is not None:
+            for record in series.records:
+                self._energy_group_overrides.pop(record.record_id, None)
+            self._energy_groups_changed()
+
+    def _edit_energy_groups(self):
+        series = self._current_series()
+        if series is None:
+            return
+        records = order_mcd_records(series.records,'E-field')[0]
+        groups = self._energy_groups(series.records)
+        dialog = QDialog(self); dialog.setWindowTitle('Edit energy subgroups'); dialog.resize(850,500)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel('Saved integration window centers, not fitted peaks. Points in the same group connect across uneven E-field spacing.\nBlank subgroup keeps a point unassigned and unconnected. No values are averaged.'))
+        table = QTableWidget(len(records),5,dialog)
+        table.setHorizontalHeaderLabels(['Source','E-field (V)','Window center (eV)','Width (meV)','Subgroup'])
+        for row,record in enumerate(records):
+            for column,value in enumerate((record.source_file,_number(record.condition_value('E-field')),f'{record.center_ev:.12g}',f'{record.width_mev:.12g}',groups[record.record_id])):
+                item = QTableWidgetItem(str(value))
+                if column < 4:
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                table.setItem(row,column,item)
+        table.setColumnWidth(0,280);table.setColumnWidth(4,170)
+        layout.addWidget(table)
+        reset = QPushButton('Reset to automatic groups');layout.addWidget(reset)
+        reset_requested = False
+        def reset_groups():
+            nonlocal reset_requested
+            reset_requested = True
+            from core.mcd_energy_groups import initial_energy_groups
+            automatic = initial_energy_groups(records,self.energy_group_tolerance.value())
+            for row,record in enumerate(records): table.item(row,4).setText(automatic[record.record_id])
+        reset.clicked.connect(reset_groups)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel);layout.addWidget(buttons)
+        buttons.accepted.connect(dialog.accept);buttons.rejected.connect(dialog.reject)
+        if dialog.exec() == QDialog.Accepted:
+            import hashlib
+            from core.mcd_energy_groups import initial_energy_groups
+            automatic = initial_energy_groups(records,self.energy_group_tolerance.value())
+            for row,record in enumerate(records):
+                name = table.item(row,4).text().strip()
+                if reset_requested and name == automatic[record.record_id]:
+                    self._energy_group_overrides.pop(record.record_id,None)
+                else:
+                    self._energy_group_overrides[record.record_id] = name or 'Unassigned ' + hashlib.sha256(record.record_id.encode()).hexdigest()[:6]
+            self._energy_groups_changed()
+
+    def _slope_visibility_changed(self, _checked=False) -> None:
+        series = self._current_series()
+        self._update_details(series)
+        self._populate_condition_list(series)
+        self._request_preview_update()
+
+    def _slope_text(self, record, branch, metric) -> str:
+        value = record.slope(branch, metric)
+        return "N/A" if value is None else _number(value)
+
     def _update_details(self, series: McdSeries | None) -> None:
         self.details_table.setRowCount(0)
+        metrics = self._selected_slope_metrics()
+        headers = list(self.DETAIL_COLUMNS[:5]) + [
+            f"{SLOPE_METRICS[metric]} · {branch}" for metric in metrics for branch in ("Inc", "Dec")
+        ]
+        self.details_table.setColumnCount(len(headers))
+        self.details_table.setHorizontalHeaderLabels(headers)
         if series is None:
             return
         ordered, _ = order_mcd_records(series.records, series.variable)
@@ -614,30 +799,31 @@ class McdOrganizerWindow(QMainWindow):
                 _number(record.center_ev),
                 _number(record.width_mev),
                 _number(record.temperature_measured_k),
-                _number(record.increasing_slope_per_t),
-                _number(record.decreasing_slope_per_t),
-            )
+            ) + tuple(self._slope_text(record, branch, metric) for metric in metrics for branch in BRANCHES)
             for column, value in enumerate(values):
                 self.details_table.setItem(row, column, QTableWidgetItem(value))
         self.details_table.resizeColumnsToContents()
 
     def _populate_condition_list(self, series: McdSeries | None) -> None:
-        self._list_refreshing = True
-        self.condition_list.clear()
         if series is None:
-            self._list_refreshing = False
+            self.condition_list.clear()
             return
         selected = self._selected_record_ids.setdefault(
             series.series_id, {record.record_id for record in series.records}
         )
-        colors = assign_plot_colors(
-            series.records, str(self.palette_combo.currentData() or "viridis"), series.variable
-        )
+        from matplotlib.colors import to_hex
+        groups = self._energy_groups(series.records)
+        colors = {key:to_hex(color) for key,color in self._preview_energy_colors(series).items()}
+        pending_items = []
+        selected_rows = {item.data(Qt.UserRole) for item in self.condition_list.selectedItems()}
+        current_item = self.condition_list.currentItem()
+        current_id = current_item.data(Qt.UserRole) if current_item is not None else None
         for record in order_mcd_records(series.records, series.variable)[0]:
             value = record_order_value(record, series.variable)
             label = (
-                f"{series.variable}={_number(value)} · E={record.center_ev:.5g} eV · "
-                f"Inc={_number(record.increasing_slope_per_t)} · Dec={_number(record.decreasing_slope_per_t)}"
+                f"{groups[record.record_id]} · {series.variable}={_number(value)} · E={record.center_ev:.5g} eV · "
+                + " | ".join(f"{SLOPE_METRICS[metric]}: Inc={self._slope_text(record, 'B increasing', metric)} · Dec={self._slope_text(record, 'B decreasing', metric)}"
+                             for metric in self._selected_slope_metrics())
             )
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, record.record_id)
@@ -650,12 +836,27 @@ class McdOrganizerWindow(QMainWindow):
                 if record.record_id in selected
                 else QColor(theme_alias("surface_secondary"))
             )
-            self.condition_list.addItem(item)
-        self._list_refreshing = False
+            pending_items.append(item)
+        # Build all labels/colors first; a failure must not erase the list.
+        previous_refreshing = self._list_refreshing
+        signals_blocked = self.condition_list.blockSignals(True)
+        self._list_refreshing = True
+        try:
+            self.condition_list.clear()
+            for item in pending_items:
+                self.condition_list.addItem(item)
+                if item.data(Qt.UserRole) == current_id:
+                    self.condition_list.setCurrentItem(item)
+            for item in pending_items:
+                item.setSelected(item.data(Qt.UserRole) in selected_rows)
+        finally:
+            self.condition_list.blockSignals(signals_blocked)
+            self._list_refreshing = previous_refreshing
         self._style_condition_items()
         self._update_condition_summary()
         if self.condition_list.count() and self.condition_list.currentRow() < 0:
             self.condition_list.setCurrentRow(0)
+        self._condition_focus_changed()
 
     def _selected_records_for_series(self, series: McdSeries | None) -> list[ProcessedMcdRecord]:
         if series is None:
@@ -669,11 +870,11 @@ class McdOrganizerWindow(QMainWindow):
         if self._list_refreshing:
             return
         self._update_export_summary()
-        self._style_condition_items()
+        self._populate_condition_list(self._current_series())
         self._update_condition_summary()
         self._queue_condition_selection_save()
         self._update_condition_action_buttons()
-        self._apply_inclusion_visibility()
+        self._request_preview_update()
 
     def _selection_settings_path(self) -> Path:
         root = self.experiment_root
@@ -690,6 +891,14 @@ class McdOrganizerWindow(QMainWindow):
         except (OSError, UnicodeError, json.JSONDecodeError):
             return
         saved_palette = payload.get("default_palette") if isinstance(payload, dict) else None
+        if isinstance(payload, dict):
+            overrides = payload.get('energy_groups',{})
+            self._energy_group_overrides = {str(k):str(v) for k,v in overrides.items() if isinstance(v,str) and v} if isinstance(overrides,dict) else {}
+            tolerance = payload.get('energy_group_tolerance_mev',5.)
+            if isinstance(tolerance,(int,float)) and np.isfinite(tolerance):
+                self.energy_group_tolerance.blockSignals(True)
+                self.energy_group_tolerance.setValue(tolerance)
+                self.energy_group_tolerance.blockSignals(False)
         if isinstance(saved_palette, str) and saved_palette in PALETTES:
             self._default_palette = saved_palette
             index = self.palette_combo.findData(saved_palette)
@@ -715,6 +924,8 @@ class McdOrganizerWindow(QMainWindow):
             path.write_text(json.dumps({
                 "schema_version": 2,
                 "default_palette": self._default_palette,
+                "energy_groups": self._energy_group_overrides,
+                "energy_group_tolerance_mev": self.energy_group_tolerance.value(),
                 "series": {
                     series_id: sorted(record_ids)
                     for series_id, record_ids in self._selected_record_ids.items()
@@ -724,8 +935,8 @@ class McdOrganizerWindow(QMainWindow):
             pass
 
     def _set_current_palette_default(self) -> None:
-        selected = str(self.palette_combo.currentData() or "viridis")
-        self._default_palette = selected if selected in PALETTES else "viridis"
+        selected = str(self.palette_combo.currentData() or "tab10")
+        self._default_palette = selected if selected in PALETTES else "tab10"
         self._write_condition_selections()
         self.palette_default_btn.setText(f"Default: {self._default_palette}")
 
@@ -736,6 +947,7 @@ class McdOrganizerWindow(QMainWindow):
         )
         self._update_condition_action_buttons()
         self._apply_focus_style()
+        self._highlight_energy_record()
 
     def _update_condition_action_buttons(self) -> None:
         series = self._current_series()
@@ -847,7 +1059,7 @@ class McdOrganizerWindow(QMainWindow):
             focused = not focus_visible or record_id == self._focused_record_id
             for artist in artists:
                 artist.set_linewidth(2.4 if focused else 0.9)
-                artist.set_alpha(1.0 if focused else 0.28)
+                artist.set_alpha(1.0)
         self.canvas.draw_idle()
 
     def _apply_inclusion_visibility(self) -> None:
@@ -864,30 +1076,12 @@ class McdOrganizerWindow(QMainWindow):
             self.slope_canvas.draw_idle()
 
     def _update_cached_slope_lines(self, series: McdSeries, included: set[str]) -> None:
-        if series.variable != "E-field" or not self._slope_lines:
-            return
-        ordered, _ = order_mcd_records(series.records, "E-field")
-        active = [record for record in ordered if record.record_id in included]
-        x = np.asarray([record.condition_value("E-field") for record in active], float)
-        for key, attribute in (
-            ("increasing", "increasing_slope_per_t"),
-            ("decreasing", "decreasing_slope_per_t"),
-        ):
-            line = self._slope_lines.get(key)
-            if line is None:
-                continue
-            y = np.asarray([
-                np.nan if getattr(record, attribute) is None else getattr(record, attribute)
-                for record in active
-            ], float)
-            valid = np.isfinite(x) & np.isfinite(y)
-            line.set_data(x[valid], y[valid])
-        axis = self.slope_figure.axes[0] if self.slope_figure.axes else None
-        if axis is not None:
-            axis.relim()
-            axis.autoscale_view()
+        self._update_slope_preview([record for record in series.records if record.record_id in included])
 
     def _show_empty_preview(self, message: str) -> None:
+        self._energy_point_artists = {}
+        self._energy_focus_artists = []
+        self._energy_hover = None
         if self.figure is None or self.slope_figure is None:
             return
         self.figure.clear()
@@ -922,14 +1116,29 @@ class McdOrganizerWindow(QMainWindow):
             self._show_empty_preview("Select at least one field-sweep branch.")
             return
         records, resolved_order = order_mcd_records(records, series.variable)
+        slope_records = list(records)
+        groups = self._energy_groups(series.records)
+        group_names = sorted({groups[r.record_id] for r in records})
+        previous = self.mcd_group_combo.currentData()
+        self.mcd_group_combo.blockSignals(True)
+        self.mcd_group_combo.clear()
+        self.mcd_group_combo.addItem('All groups', '')
+        for name in group_names:
+            self.mcd_group_combo.addItem(name, name)
+        self.mcd_group_combo.setCurrentIndex(max(0,self.mcd_group_combo.findData(previous)))
+        self.mcd_group_combo.blockSignals(False)
+        selected_group = self.mcd_group_combo.currentData()
+        if selected_group:
+            records = [r for r in records if groups[r.record_id] == selected_group]
+
         self.figure.clear()
         self._plot_artists.clear()
         axes = np.atleast_1d(
             self.figure.subplots(1, len(branches), sharey=True)
         ).tolist()
-        colors = assign_plot_colors(
-            records, str(self.palette_combo.currentData() or "viridis"), resolved_order
-        )
+        colors = self._preview_energy_colors(series) if series.variable == 'E-field' else assign_plot_colors(
+            records, str(self.palette_combo.currentData() or "tab10"), resolved_order)
+
         labels, fixed_text = concise_condition_labels(records, resolved_order)
         handles: list[Line2D] = []
         plotted_labels: list[str] = []
@@ -950,7 +1159,7 @@ class McdOrganizerWindow(QMainWindow):
                     linestyle="-" if increasing else "--", marker="o", markersize=3.2,
                     markevery=max(1, len(b_values) // 180),
                     linewidth=2.4 if focused else 0.9,
-                    alpha=1.0 if focused else 0.28,
+                    alpha=1.0,
                     color=color,
                     markerfacecolor=color if increasing else "white",
                     markeredgecolor=color,
@@ -963,7 +1172,7 @@ class McdOrganizerWindow(QMainWindow):
             axis.set_title(branch)
             if index == 0:
                 axis.set_ylabel("Corrected signed-mean MCD")
-        title = f"{series.variable} comparison"
+        title = f"{selected_group or 'All groups'} · {series.variable} comparison"
         if fixed_text:
             title += f" · {fixed_text}"
         self.figure.suptitle(title, fontsize=12, fontweight="bold")
@@ -976,67 +1185,111 @@ class McdOrganizerWindow(QMainWindow):
         elif len(handles) > 12:
             self.figure.text(
                 0.5, 0.01,
-                "Use the condition checklist at the top to identify or remove curves.",
+                "Select a group below; select a condition on the right to highlight a curve.",
                 ha="center", va="bottom", fontsize=8, color="#666",
             )
         self.figure.tight_layout(rect=(0.0, 0.16 if len(handles) <= 12 else 0.0, 1.0, 0.93))
         self.canvas.draw_idle()
-        self._update_slope_preview(records)
+        self._update_slope_preview(slope_records)
 
     def _update_slope_preview(self, records: list[ProcessedMcdRecord]) -> None:
-        from matplotlib.lines import Line2D
-
-        self.slope_figure.clear()
-        self._slope_lines.clear()
-        axis = self.slope_figure.add_subplot(111)
-        series = self._current_series()
-        if series is None or series.variable != "E-field":
-            axis.text(
-                0.5, 0.5,
-                "Slope vs E-field is available when Compare different is E-field.",
-                transform=axis.transAxes, ha="center", va="center", color="#666",
-            )
-            axis.set_axis_off()
-            self.slope_canvas.draw_idle()
+        if self.slope_figure is None:
             return
-        ordered, _ = order_mcd_records(records, "E-field")
-        x = np.asarray([record.condition_value("E-field") for record in ordered], float)
-        inc = np.asarray([
-            record.increasing_slope_per_t if record.increasing_slope_per_t is not None else np.nan
-            for record in ordered
-        ], float)
-        dec = np.asarray([
-            record.decreasing_slope_per_t if record.decreasing_slope_per_t is not None else np.nan
-            for record in ordered
-        ], float)
-        plotted_any = False
-        for values, label, linestyle, filled in (
-            (inc, "B increasing", "-", True),
-            (dec, "B decreasing", "--", False),
-        ):
-            valid = np.isfinite(x) & np.isfinite(values)
-            if not np.any(valid):
-                continue
-            plotted_any = True
-            line, = axis.plot(
-                x[valid], values[valid], linestyle=linestyle, marker="o",
-                linewidth=2.4 if self._focused_record_id is None else 1.5,
-                markersize=5, color="#3568a8",
-                markerfacecolor="#3568a8" if filled else "white",
-                markeredgecolor="#3568a8", label=label,
-            )
-            self._slope_lines["increasing" if filled else "decreasing"] = line
-        axis.axhline(0.0, color="#555", linewidth=0.7)
-        axis.set_xlabel("E-field")
-        axis.set_ylabel("Low-field MCD slope (per T)")
-        axis.set_title("MCD slope vs E-field")
-        axis.grid(alpha=0.25)
-        if plotted_any:
-            axis.legend(loc="best", frameon=True)
-        self.slope_figure.tight_layout()
+        from core.mcd_energy_groups import draw_energy_slope_panels
+        self._energy_focus_artists = []
+        self._energy_hover = None
+        series = self._current_series()
+        self._energy_point_artists = {}
+        self._slope_lines.clear()
+        if series is None or series.variable != 'E-field':
+            self.slope_figure.clear()
+            axis = self.slope_figure.add_subplot(111)
+            axis.text(.5,.5,'Select an E-field comparison series.',ha='center',transform=axis.transAxes)
+            axis.set_axis_off();self.slope_canvas.draw_idle()
+            return
+        self._energy_point_artists = draw_energy_slope_panels(
+            self.slope_figure, records, self._energy_groups(series.records),
+            self._selected_slope_metrics(), self._selected_branches(),
+            self.energy_group_tolerance.value(), str(self.palette_combo.currentData() or 'tab10'),
+            manual_record_ids=tuple(self._energy_group_overrides),
+            record_colors=self._preview_energy_colors(series))
+        self.slope_canvas.setMinimumHeight(220 * (1+bool(self._selected_slope_metrics())))
+        for artist, (members,metric,branch) in self._energy_point_artists.items():
+            if metric != 'window_energy':
+                self._slope_lines[(metric,branch, self._energy_groups(series.records).get(members[0].record_id) if members else '')] = artist
+        self._highlight_energy_record()
         self.slope_canvas.draw_idle()
 
+    def _energy_hits(self, event):
+        hits = []
+        if event.inaxes is None:
+            return hits
+        for artist,(records,metric,branch) in self._energy_point_artists.items():
+            if artist.axes is not event.inaxes:
+                continue
+            contains, info = artist.contains(event)
+            if contains:
+                for index in info.get('ind',[]):
+                    hits.append((records[index],metric,branch))
+        return hits
+
+    def _energy_plot_hover(self, event):
+        hits = self._energy_hits(event)
+        if not hits and self._energy_hover is None:
+            return
+        if self._energy_hover is not None:
+            self._energy_hover.remove();self._energy_hover=None
+        if hits:
+            from core.mcd_energy_groups import point_description
+            series = self._current_series()
+            groups = self._energy_groups(series.records) if series else {}
+            text = '\n\n'.join(point_description(record,metric,branch,groups.get(record.record_id,''))
+                               for record,metric,branch in hits)
+            self._energy_hover = event.inaxes.annotate(text,xy=(.01,.99),xycoords='axes fraction',
+                va='top',fontsize=8,bbox=dict(boxstyle='round',fc='white',ec='#777',alpha=.96),zorder=20)
+        self.slope_canvas.draw_idle()
+
+    def _energy_plot_click(self, event):
+        if event.button != 1:
+            return
+        ids = list(dict.fromkeys(record.record_id for record,_,_ in self._energy_hits(event)))
+        if not ids:
+            return
+        # Repeated clicks cycle coincident windows instead of silently choosing
+        # one or combining their measurements.
+        index = (ids.index(self._focused_record_id)+1)%len(ids) if self._focused_record_id in ids else 0
+        for row in range(self.condition_list.count()):
+            if self.condition_list.item(row).data(Qt.UserRole)==ids[index]:
+                self.condition_list.setCurrentRow(row)
+                self._condition_focus_changed()
+                break
+
+    def _highlight_energy_record(self):
+        for artist in self._energy_focus_artists:
+            artist.remove()
+        self._energy_focus_artists = []
+        seen = set()
+        for artist,(records,metric,branch) in self._energy_point_artists.items():
+            for index,record in enumerate(records):
+                if record.record_id != self._focused_record_id:
+                    continue
+                x,y = artist.get_offsets()[index]
+                if x is None or y is None or not np.isfinite(x) or not np.isfinite(y):
+                    continue
+                key = (id(artist.axes),float(x),float(y))
+                if key in seen:
+                    continue
+                seen.add(key)
+                marker, = artist.axes.plot([x],[y],linestyle='none',marker='o',markersize=11,
+                    markerfacecolor='none',markeredgecolor='#111111',markeredgewidth=1.5,zorder=10)
+                self._energy_focus_artists.append(marker)
+        if self.slope_canvas is not None:
+            self.slope_canvas.draw_idle()
+
     def _export(self) -> None:
+        if self._export_worker is not None:
+            self.selection_summary.setText("Export already running; wait for it to finish.")
+            return
         series = self._checked_series()
         branches = self._selected_branches()
         if not series or not branches:
@@ -1058,21 +1311,86 @@ class McdOrganizerWindow(QMainWindow):
                 if record.record_id not in seen:
                     records.append(record)
                     seen.add(record.record_id)
-        try:
-            paths = export_mcd_extract(
-                records,
-                self.output_label.text(),
-                branches=branches,
-                order_by="Auto",
-                palette=str(self.palette_combo.currentData() or "viridis"),
-                export_csv=self.export_csv_chk.isChecked(),
-                series_groups=selected_groups,
-            )
-        except (OSError, ValueError) as exc:
-            QMessageBox.critical(self, "MCD export failed", str(exc))
+        worker = Worker(
+            mcd_extract_export_worker,
+            tuple(copy.deepcopy(records)),
+            str(self.output_label.text()),
+            branches=tuple(branches),
+            order_by="Auto",
+            palette=str(self.palette_combo.currentData() or "tab10"),
+            export_csv=bool(self.export_csv_chk.isChecked()),
+            series_groups=tuple(copy.deepcopy(selected_groups)),
+            energy_groups=self._export_energy_groups(series),
+            energy_group_palette=self._export_energy_colors(series),
+            manual_record_ids=tuple(self._energy_group_overrides),
+            energy_record_palette=self._export_record_colors(series),
+            group_tolerance_mev=float(self.energy_group_tolerance.value()),
+        )
+        self._export_worker = worker
+        self.export_btn.setEnabled(False)
+        self.selection_summary.setText("Exporting MCD organization…")
+        worker.signals.result.connect(self._on_export_done)
+        worker.signals.error.connect(self._on_export_error)
+        worker.signals.finished.connect(self._on_export_finished)
+        self._export_pool.start_worker(worker)
+
+    def _export_energy_groups(self, series):
+        # Group the full preview series before applying inclusion filters.
+        output = {}
+        for index,group in enumerate(series,start=1):
+            prefix = f'Series {index} / ' if len(series)>1 else ''
+            output.update({key:prefix+name for key,name in self._energy_groups(group.records).items()})
+        return output
+
+    def _energy_palette_changed(self, _index=None):
+        series = self._current_series()
+        if series is not None:
+            from matplotlib.colors import to_hex
+            colors = self._preview_energy_colors(series)
+            for row in range(self.condition_list.count()):
+                item = self.condition_list.item(row)
+                color = colors.get(str(item.data(Qt.UserRole)))
+                if color is not None:
+                    item.setData(Qt.UserRole + 1, to_hex(color))
+            self._style_condition_items()
+        self._request_preview_update()
+
+    def _preview_energy_colors(self, series):
+        from core.mcd_energy_groups import energy_record_colors, energy_group_colors
+        groups = self._energy_groups(series.records)
+        return energy_record_colors(series.records, groups, energy_group_colors(groups, str(self.palette_combo.currentData() or 'tab10')))
+
+    def _export_record_colors(self, series):
+        from core.mcd_energy_groups import energy_record_colors
+        records = [r for group in series for r in group.records]
+        return energy_record_colors(records, self._export_energy_groups(series), self._export_energy_colors(series))
+
+    def _export_energy_colors(self, series):
+        from core.mcd_energy_groups import energy_group_colors
+        colors = {}
+        for index, group in enumerate(series, start=1):
+            prefix = f'Series {index} / ' if len(series)>1 else ''
+            local = energy_group_colors(self._energy_groups(group.records), str(self.palette_combo.currentData() or 'tab10'))
+            colors.update({prefix+name: color for name, color in local.items()})
+        return colors
+
+    def _on_export_done(self, paths: dict) -> None:
+        if self._export_worker is None or self._closing:
             return
+        self.selection_summary.setText("Export complete")
         QMessageBox.information(
-            self,
-            "MCD export complete",
+            self, "MCD export complete",
             "Created:\n" + "\n".join(path.name for path in paths.values()),
         )
+
+    def _on_export_error(self, message: str) -> None:
+        if self._export_worker is None or self._closing:
+            return
+        self.selection_summary.setText(f"MCD export failed: {str(message).splitlines()[0]}")
+
+    def _on_export_finished(self) -> None:
+        if self._export_worker is None:
+            return
+        self._export_worker = None
+        if not self._closing:
+            self.export_btn.setEnabled(bool(self._checked_series()) and bool(self._selected_branches()))

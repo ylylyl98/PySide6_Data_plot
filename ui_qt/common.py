@@ -85,6 +85,7 @@ class LoadedState:
     compare_sources: Dict[str, str] = field(default_factory=dict)
     power_records: tuple[Any, ...] = ()
     power_groups: Dict[str, tuple[Any, ...]] = field(default_factory=dict)
+    power_results: Dict[str, Any] = field(default_factory=dict)
     power_group_key: str = ""
     shg_data: ShgSweepData | None = None
     shg_background: ShgSweepData | None = None
@@ -101,6 +102,7 @@ class LoadedState:
     mcd_result: McdResult | None = None
     mcd_settings: McdSettings | None = None
     mcd_center_candidates: tuple[McdCenterCandidate, ...] = ()
+    mcd_center_history: tuple[dict[str, Any], ...] = ()
     mcd_candidate_search_range: tuple[float, float] | None = None
     mcd_cache_hit: bool = False
     drr_mode_label: str = "DR/R Self"
@@ -132,9 +134,11 @@ class LoadOptions:
     mcd_settings: McdSettings | None = None
     mcd_candidate_width_mev: float = 5.0
     mcd_candidate_metric: str = "mean"
+    mcd_history_roots: tuple[str, ...] = ()
     mcd_candidate_energy_range: tuple[float, float] | None = None
     drr_background_selection: Dict[str, Any] = field(default_factory=dict)
     drr_assignments: tuple[Any, ...] = ()
+    power_role_group_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -145,6 +149,17 @@ class ExportOptions:
     params_log: HeatmapParams | None = None
     params_intensity: HeatmapParams | None = None
     drr_cube: DataCube | None = None
+    # Paired DRR export snapshots.  ``drr_cube`` remains the compatibility
+    # field used by older callers and non-paired analysis exports.
+    drr_raw_cube: DataCube | None = None
+    drr_second_cube: DataCube | None = None
+    drr_raw_params: HeatmapParams | None = None
+    drr_second_params: HeatmapParams | None = None
+    drr_raw_sg_window: int = 0
+    drr_raw_sg_polyorder: int = 0
+    drr_second_sg_window: int = 0
+    drr_second_sg_polyorder: int = 0
+    drr_second_auto_scale: bool = True
     drr_derivative_order: int | None = None
     drr_sg_window: int = 20
     drr_sg_polyorder: int = 2
@@ -240,7 +255,7 @@ class WrappedFilenameDelegate(QStyledItemDelegate):
     def sizeHint(self, option: QStyleOptionViewItem, index) -> QSize:
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
-        text = str(index.data(Qt.DisplayRole) or "")
+        text = self._normalize_text(index.data(Qt.DisplayRole))
         cache_key = (self._text_width(opt), text, opt.font.toString())
         cached = self._size_hint_cache.get(cache_key)
         if cached is not None:
@@ -270,6 +285,20 @@ class WrappedFilenameDelegate(QStyledItemDelegate):
         return result
 
     @staticmethod
+    def _normalize_text(value) -> str:
+        # QTextLayout treats a literal newline as a soft break on Windows,
+        # while Qt's item-style conversion uses U+2028 for a forced row break.
+        # Canonicalize both inputs to U+2028 so status text always stays on
+        # its own row and sizeHint() measures exactly what paint() draws.
+        return (
+            str(value or "")
+            .replace("\r\n", "\u2028")
+            .replace("\r", "\u2028")
+            .replace("\n", "\u2028")
+            .replace("\u2029", "\u2028")
+        )
+
+    @staticmethod
     def _layout_text(text, font, width):
         # Use precisely the same line breaking for measurement and painting.
         # QFontMetrics.boundingRect and QPainter.drawText can disagree at a
@@ -293,7 +322,7 @@ class WrappedFilenameDelegate(QStyledItemDelegate):
     def paint(self, painter, option: QStyleOptionViewItem, index) -> None:
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
-        text = opt.text
+        text = self._normalize_text(opt.text)
         opt.text = ""
         style = opt.widget.style() if opt.widget is not None else QApplication.style()
         style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)

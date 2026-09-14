@@ -5,10 +5,12 @@ from datetime import datetime
 import csv
 import json
 import math
+import os
 from pathlib import Path
 import random
 import re
 import statistics
+import tempfile
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -89,8 +91,149 @@ class DrrSourceCache:
     reused while a file's size and modification timestamp are unchanged.
     """
 
-    def __init__(self) -> None:
+    SCHEMA_VERSION = 1
+
+    @staticmethod
+    def default_path() -> Path:
+        """Return the per-user cache path used by the application."""
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_CACHE_HOME")
+        root = Path(base) if base else Path.home() / ".cache"
+        return root / "PySide6_Data_Plot" / "drr-inspection-cache.json"
+
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        *,
+        load_on_init: bool = True,
+    ) -> None:
+        self.path = Path(path) if path is not None else self.default_path()
         self._entries: dict[str, tuple[int, int, dict[str, object]]] = {}
+        if load_on_init:
+            self.load()
+
+    @staticmethod
+    def _restore_metadata(value: object) -> object:
+        if isinstance(value, list):
+            return tuple(DrrSourceCache._restore_metadata(item) for item in value)
+        if isinstance(value, dict):
+            return {
+                str(key): DrrSourceCache._restore_metadata(item)
+                for key, item in value.items()
+            }
+        return value
+
+    @staticmethod
+    def _valid_metadata(metadata: object) -> bool:
+        required = {
+            "gate_varies", "frame_count", "gate_grid", "spectral_grid",
+            "gate_direction", "gate_ranges", "gate_labels", "grid_complete",
+            "wavelength_center_nm", "wavelength_center_source",
+        }
+        if not isinstance(metadata, dict) or not required.issubset(metadata):
+            return False
+        number = lambda value: isinstance(value, (int, float)) and not isinstance(value, bool)
+        sequence = lambda value: isinstance(value, (list, tuple))
+        if metadata["gate_varies"] is not None and not isinstance(metadata["gate_varies"], bool):
+            return False
+        if metadata["frame_count"] is not None and (
+            not isinstance(metadata["frame_count"], int)
+            or isinstance(metadata["frame_count"], bool)
+        ):
+            return False
+        if not sequence(metadata["gate_grid"]) or any(
+            not sequence(row) or any(not number(value) for value in row)
+            for row in metadata["gate_grid"]
+        ):
+            return False
+        if not sequence(metadata["spectral_grid"]) or any(
+            not number(value) for value in metadata["spectral_grid"]
+        ):
+            return False
+        if not isinstance(metadata["gate_direction"], str):
+            return False
+        if not sequence(metadata["gate_ranges"]) or any(
+            not sequence(row) or len(row) != 2 or any(not number(value) for value in row)
+            for row in metadata["gate_ranges"]
+        ):
+            return False
+        if not sequence(metadata["gate_labels"]) or any(
+            not isinstance(value, str) for value in metadata["gate_labels"]
+        ):
+            return False
+        if not isinstance(metadata["grid_complete"], bool):
+            return False
+        center = metadata["wavelength_center_nm"]
+        if center is not None and not number(center):
+            return False
+        return isinstance(metadata["wavelength_center_source"], str)
+
+    def load(self) -> None:
+        """Load valid persisted entries; malformed data is treated as empty."""
+        memory_entries = dict(self._entries)
+        loaded_entries: dict[str, tuple[int, int, dict[str, object]]] = {}
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or payload.get("schema_version") != self.SCHEMA_VERSION:
+                self._entries = memory_entries
+                return
+            raw_entries = payload.get("entries")
+            if not isinstance(raw_entries, dict):
+                self._entries = memory_entries
+                return
+            for identity, raw in raw_entries.items():
+                if not isinstance(identity, str) or not isinstance(raw, dict):
+                    continue
+                modified_ns = raw.get("modified_ns")
+                size_bytes = raw.get("size_bytes")
+                metadata = raw.get("metadata")
+                if (
+                    not isinstance(modified_ns, int)
+                    or not isinstance(size_bytes, int)
+                    or not isinstance(metadata, dict)
+                ):
+                    continue
+                restored = self._restore_metadata(metadata)
+                if self._valid_metadata(restored):
+                    loaded_entries[identity] = (modified_ns, size_bytes, restored)
+        except (OSError, ValueError, TypeError):
+            loaded_entries = {}
+        # A worker receives an in-memory clone from the last completed scan.
+        # Keep those entries if disk persistence is absent or stale, then let
+        # discovery's mtime/size check decide whether each one is reusable.
+        loaded_entries.update(memory_entries)
+        self._entries = loaded_entries
+
+    def save(self) -> None:
+        """Persist inspection metadata without affecting source data files."""
+        payload = {
+            "schema_version": self.SCHEMA_VERSION,
+            "entries": {
+                identity: {
+                    "modified_ns": modified_ns,
+                    "size_bytes": size_bytes,
+                    "metadata": metadata,
+                }
+                for identity, (modified_ns, size_bytes, metadata) in self._entries.items()
+            },
+        }
+        temporary: Path | None = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.path.parent,
+                prefix=f".{self.path.name}.", suffix=".tmp", delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                json.dump(payload, handle, separators=(",", ":"))
+            temporary.replace(self.path)
+        except (OSError, TypeError, ValueError):
+            return
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
 
     def get(self, identity: str, *, modified_ns: int, size_bytes: int) -> dict[str, object] | None:
         entry = self._entries.get(identity)
@@ -118,7 +261,9 @@ class DrrSourceCache:
 
     def clone(self) -> "DrrSourceCache":
         """Return an independent snapshot suitable for a background scan."""
-        clone = DrrSourceCache()
+        clone = DrrSourceCache.__new__(DrrSourceCache)
+        clone.path = self.path
+        clone._entries = {}
         clone._entries = {
             identity: (modified_ns, size_bytes, dict(metadata))
             for identity, (modified_ns, size_bytes, metadata) in self._entries.items()
@@ -240,6 +385,7 @@ class DrrBackgroundResolution:
     numerical_path: str = "unresolved"
     reason: str = ""
     unresolved_measurements: tuple[str, ...] = ()
+    self_fallback_allowed: bool = False
 
     @property
     def resolved(self) -> bool:
@@ -339,6 +485,34 @@ def inspect_csv_wavelength_center(path: str | Path) -> float | None:
         wavelengths = [1240.0 / value for value in energy_values]
         return 0.5 * (min(wavelengths) + max(wavelengths))
     return None
+
+
+def inspect_csv_spectral_grid(path: str | Path) -> tuple[float, ...]:
+    """Read only a CSV header and return its ordered wavelength columns.
+
+    DRR external-baseline eligibility needs the original wavelength array,
+    including point count and order.  This deliberately stops after the first
+    non-empty line so a picker or loader boundary never scans all frames.
+    """
+    source = Path(path)
+    try:
+        with source.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+            first = next((line for line in handle if line.strip()), "")
+    except OSError as exc:
+        raise ValueError(f"Cannot read DRR spectral header: {source.name}") from exc
+    if not first:
+        raise ValueError(f"Empty DRR file: {source.name}")
+    delimiter = max((",", "\t", ";"), key=first.count)
+    row = next(csv.reader([first], delimiter=delimiter), [])
+    header_is_text = any(_as_float(token) is None for token in row)
+    if header_is_text:
+        indices = [index for index, token in enumerate(row) if _as_float(token) is not None]
+    else:
+        indices = [index for index, token in enumerate(row) if _as_float(token) is not None and float(_as_float(token)) > 50.0]
+    values = tuple(float(_as_float(row[index])) for index in indices)
+    if len(values) < 2 or not all(math.isfinite(value) for value in values):
+        raise ValueError(f"DRR file {source.name} has no complete spectral grid")
+    return values
 
 
 def wavelength_centers_match(first: float, second: float, *, tolerance_nm: float = 1.0) -> bool:
@@ -904,6 +1078,12 @@ def resolve_drr_background_assignments(
         return DrrBackgroundResolution(
             reason="; ".join(dict.fromkeys(reasons)),
             unresolved_measurements=tuple(dict.fromkeys(unresolved)),
+            # Only a selection with no saved history and no accepted external
+            # assignments can use the UI's default Self recipe as a fallback.
+            self_fallback_allowed=not assignments and not any(
+                records_by_measurement.get(str(resolve_source_path(experiment_root, name)).casefold())
+                for name in selected
+            ),
         )
     signatures = {_drr_assignment_signature(item) for item in assignments}
     return DrrBackgroundResolution(
@@ -1309,6 +1489,23 @@ def inspect_csv_gate_profile(
         spectral_grid = tuple(float(_as_float(header[index])) for index in spectral_indices)
         gate_labels = tuple(f"gate {index + 1}" for index in range(len(gate_indices)))
 
+    # Some instrument exports include declared gate channels that are not
+    # wired for a particular sweep (for example Vbias_set/Vbias_meas).  Empty
+    # channels must not make an otherwise complete ordered gate grid appear
+    # malformed.  Keep partially populated channels so missing values still
+    # block automatic compatibility below.
+    populated_gate_indices = [
+        index
+        for index in gate_indices
+        if any(index < len(row) and str(row[index]).strip() for row in data_rows)
+    ]
+    if len(populated_gate_indices) != len(gate_indices):
+        gate_indices = populated_gate_indices
+        if header_is_text:
+            gate_labels = tuple(str(header[index]).strip() for index in gate_indices)
+        else:
+            gate_labels = tuple(f"gate {index + 1}" for index in gate_indices)
+
     if not gate_indices:
         return DrrGateProfile(None, len(data_rows))
     varied = False
@@ -1391,10 +1588,28 @@ def _processed_measurement_paths(root: Path) -> set[str]:
     }
 
 
+def drr_source_paths(root: str | Path, *, include_all: bool = False) -> list[Path]:
+    """Raw DRR inventory, preferring the acquisition REF partition when present."""
+    experiment_root = Path(root).resolve()
+    if not experiment_root.is_dir():
+        return []
+    candidates = [path for path in experiment_root.iterdir() if path.is_file()]
+    initial_root = next((path for path in experiment_root.iterdir()
+                         if path.is_dir() and path.name.casefold() == "initial data"), None)
+    if initial_root is not None:
+        ref_root = next((path for path in initial_root.iterdir()
+                         if path.is_dir() and path.name.casefold() == "ref"), None)
+        search_root = initial_root if include_all else (ref_root or initial_root)
+        candidates.extend(path for path in search_root.rglob("*") if path.is_file())
+    return sorted({path for path in candidates if path.suffix.lower() in SUPPORTED_DRR_SUFFIXES})
+
+
 def discover_drr_sources(
     root: str | Path,
     *,
     cache: DrrSourceCache | None = None,
+    include_history: bool = True,
+    include_all: bool = False,
 ) -> list[DrrSource]:
     """Discover DRR files, reusing unchanged per-file inspections when possible."""
     experiment_root = Path(root).resolve()
@@ -1402,26 +1617,7 @@ def discover_drr_sources(
         if cache is not None:
             cache.clear()
         return []
-    metadata_roles, metadata_records = _read_drr_metadata(experiment_root)
-    processed_paths = {
-        identity for identity, values in metadata_roles.items() if "measurement" in values
-    }
-    metadata_links: dict[str, list[DrrSavedRecipe]] = {}
-    for record in metadata_records:
-        for measurement in record.measurement_files:
-            identity = str(resolve_source_path(experiment_root, measurement)).casefold()
-            metadata_links.setdefault(identity, []).append(record)
-    candidates: list[Path] = []
-    try:
-        candidates.extend(path for path in experiment_root.iterdir() if path.is_file())
-    except OSError:
-        return []
-    initial_root = experiment_root / "Initial Data"
-    if initial_root.is_dir():
-        try:
-            candidates.extend(path for path in initial_root.rglob("*") if path.is_file())
-        except OSError:
-            pass
+    candidates = drr_source_paths(experiment_root, include_all=include_all)
 
     inspected: list[dict] = []
     seen: set[str] = set()
@@ -1495,6 +1691,40 @@ def discover_drr_sources(
     if cache is not None:
         cache.retain(seen)
 
+    return _assemble_drr_sources(experiment_root, inspected, include_history=include_history)
+
+
+def refresh_drr_source_history(root: str | Path, sources: Sequence[DrrSource]) -> list[DrrSource]:
+    """Reapply current saved roles and links without reading measurement contents.
+
+    Recompute classification from raw inspection fields, including when a previous
+    history overlay is supplied, so deleting or correcting metadata cannot stick.
+    """
+    experiment_root = Path(root).resolve()
+    inspected = []
+    for source in sources:
+        path = resolve_source_path(experiment_root, source.source)
+        inspected.append({
+            "path": path, "identity": str(path).casefold(),
+            "modified": source.modified_time, "size_bytes": source.size_bytes,
+            **{name: getattr(source, name) for name in (
+                "gate_varies", "frame_count", "gate_grid", "spectral_grid",
+                "gate_direction", "gate_ranges", "gate_labels", "grid_complete",
+                "wavelength_center_nm", "wavelength_center_source")},
+        })
+    return _assemble_drr_sources(experiment_root, inspected, include_history=True)
+
+
+def _assemble_drr_sources(experiment_root: Path, inspected: list[dict], *, include_history: bool) -> list[DrrSource]:
+    metadata_roles, metadata_records = _read_drr_metadata(experiment_root) if include_history else ({}, [])
+    processed_paths = {
+        identity for identity, values in metadata_roles.items() if "measurement" in values
+    }
+    metadata_links: dict[str, list[DrrSavedRecipe]] = {}
+    for record in metadata_records:
+        for measurement in record.measurement_files:
+            identity = str(resolve_source_path(experiment_root, measurement)).casefold()
+            metadata_links.setdefault(identity, []).append(record)
     csv_sizes = [item["size_bytes"] for item in inspected if item["path"].suffix.lower() == ".csv" and item["size_bytes"] > 0]
     frame_counts = [item["frame_count"] for item in inspected if item["frame_count"] is not None and item["frame_count"] > 0]
     median_size = float(statistics.median(csv_sizes)) if csv_sizes else 0.0
@@ -1593,11 +1823,30 @@ def discover_drr_sources(
 
 
 def group_drr_sources(sources: Sequence[DrrSource]) -> list[DrrSourceGroup]:
-    grouped: dict[tuple[str, str, bool], list[DrrSource]] = {}
+    grouped: dict[tuple[str, str, bool, str, tuple[object, ...]], list[DrrSource]] = {}
     for source in sources:
-        grouped.setdefault((source.session_date, source.group_key, source.is_background), []).append(source)
+        # A reverse sweep has the same filename-derived condition as its
+        # forward counterpart in some instrument exports.  Keep known sweep
+        # directions separate while retaining same-direction repeats in one
+        # group.  Unknown grids remain grouped by their filename condition;
+        # compatibility checks still reject them from automatic additions.
+        direction_key = source.gate_direction.strip().casefold() if source.gate_direction.strip() else "unknown"
+        labels = tuple(label.strip().casefold() for label in source.gate_labels)
+        ranges = tuple(
+            (round(float(low), 9), round(float(high), 9))
+            for low, high in source.gate_ranges
+        )
+        gate_identity: tuple[object, ...] = (
+            ("known", tuple(zip(labels, ranges)))
+            if labels and len(labels) == len(ranges)
+            else ("unknown",)
+        )
+        grouped.setdefault(
+            (source.session_date, source.group_key, source.is_background, direction_key, gate_identity),
+            [],
+        ).append(source)
     result: list[DrrSourceGroup] = []
-    for (session_date, key, is_background), files in grouped.items():
+    for (session_date, key, is_background, direction_key, gate_identity), files in grouped.items():
         ordered = tuple(sorted(files, key=lambda item: (item.filename.casefold(), item.modified_time)))
         latest = max((item.modified_time for item in ordered), default=0.0)
         frame_counts = [item.frame_count for item in ordered if item.frame_count is not None]
@@ -1613,7 +1862,10 @@ def group_drr_sources(sources: Sequence[DrrSource]) -> list[DrrSourceGroup]:
         complete = bool(ordered) and all(item.grid_complete for item in ordered)
         result.append(
             DrrSourceGroup(
-                key=f"{session_date}|{key}|{'background' if is_background else 'measurement'}",
+                key=(
+                    f"{session_date}|{key}|{'background' if is_background else 'measurement'}"
+                    f"|gate-{direction_key}|range-{gate_identity!r}"
+                ),
                 title=key,
                 session_date=session_date,
                 files=ordered,
@@ -1644,7 +1896,7 @@ def group_drr_sources(sources: Sequence[DrrSource]) -> list[DrrSourceGroup]:
                 grid_complete=complete,
             )
         )
-    return sorted(result, key=lambda item: (-item.modified_time, item.title.casefold()))
+    return sorted(result, key=lambda item: (-item.modified_time, item.title.casefold(), item.key.casefold()))
 
 
 def compatible_drr_repeats(

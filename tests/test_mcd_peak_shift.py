@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import os
+import time
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from tempfile import TemporaryDirectory
 
 import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
+from PySide6.QtTest import QTest
 
 from core.mcd_peak_shift import analyze_peak_shift, detect_reflection_peaks, format_mcd_angle, source_spectra, valley_quantities
 
@@ -226,6 +229,46 @@ class MCDPeakShiftUITests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
+    def setUp(self):
+        from pathlib import Path
+        from PySide6.QtCore import QSettings
+        import ui_qt.main_window as main_window
+        self._settings_dir = TemporaryDirectory()
+        self._settings_patch = patch.object(
+            main_window, "QSettings",
+            lambda *args, **kwargs: QSettings(
+                str(Path(self._settings_dir.name) / "settings.ini"), QSettings.IniFormat
+            ),
+        )
+        self._settings_patch.start()
+        self._restore_patch = patch.object(
+            main_window.MainWindow, "_restore_last_folder", lambda _window: None
+        )
+        self._restore_patch.start()
+        self._update_patch = patch.object(
+            main_window.MainWindow, "_schedule_automatic_update_check", lambda _window: None
+        )
+        self._update_patch.start()
+        self.addCleanup(self._update_patch.stop)
+        self.addCleanup(self._restore_patch.stop)
+        self.addCleanup(self._settings_patch.stop)
+        self.addCleanup(self._settings_dir.cleanup)
+
+    def _wait_for_peak_analysis(self, window):
+        deadline = time.monotonic() + 5.0
+        while (
+            getattr(window, "_mcd_peak_analysis_worker", None) is not None
+            and time.monotonic() < deadline
+        ):
+            self.app.processEvents()
+            QTest.qWait(1)
+        self.assertIsNone(
+            getattr(window, "_mcd_peak_analysis_worker", None),
+            "MCD Peak Shift worker did not finish before deadline",
+        )
+        self.assertIn("Raw spectrum", window.mcd_peak_method_results)
+        self.assertIn("Second derivative", window.mcd_peak_method_results)
+
     def test_default_tab_entry_displays_raw_and_derivative_results_without_local_fit(self):
         from ui_qt.main_window import LoadedState, MainWindow
         window = MainWindow()
@@ -238,13 +281,12 @@ class MCDPeakShiftUITests(unittest.TestCase):
             window.loaded = LoadedState(mode="MCD", folder="", mcd_result=source)
             window._update_mcd_peak_shift_source(source)
             index = next(i for i in range(window.tabs.count()) if window.tabs.tabText(i) == "MCD Peak Shift")
-            with patch.object(window.thread_pool, "start") as start:
-                window.tabs.setCurrentIndex(index)
-                self.assertEqual(set(window.mcd_peak_method_results), {"Raw spectrum", "Second derivative"})
-                self.assertTrue(window.mcd_peak_show_derivative_chk.isChecked())
-                methods = {getattr(line, "_mcd_peak_method", None) for line in window.mcd_peak_shift_ax.lines}
-                self.assertTrue({"Raw spectrum", "Second derivative"}.issubset(methods))
-                start.assert_not_called()
+            window.tabs.setCurrentIndex(index)
+            self._wait_for_peak_analysis(window)
+            self.assertEqual(set(window.mcd_peak_method_results), {"Raw spectrum", "Second derivative"})
+            self.assertTrue(window.mcd_peak_show_derivative_chk.isChecked())
+            methods = {getattr(line, "_mcd_peak_method", None) for line in window.mcd_peak_shift_ax.lines}
+            self.assertTrue({"Raw spectrum", "Second derivative"}.issubset(methods))
         finally:
             window.close()
 
@@ -348,6 +390,13 @@ class MCDPeakShiftUITests(unittest.TestCase):
                 path = __import__("pathlib").Path(temp) / "local.csv"
                 with patch("ui_qt.feature_pages.QFileDialog.getSaveFileName", return_value=(str(path), "CSV files (*.csv)")):
                     window._export_mcd_peak_shift()
+                for _ in range(100):
+                    QApplication.processEvents()
+                    if path.is_file() and window._mcd_peak_export_worker is None:
+                        break
+                    QTest.qWait(10)
+                self.assertIsNone(window._mcd_peak_export_worker)
+                self.assertTrue(path.is_file())
                 import csv
                 with path.open(newline="", encoding="utf-8") as handle:
                     rows = list(csv.DictReader(handle))
@@ -462,6 +511,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             window._update_mcd_peak_shift_source(fake)
             window.mcd_peak_tracker_method_combo.setCurrentText("Second derivative")
             window.mcd_peak_analyze_btn.click()
+            self._wait_for_peak_analysis(window)
             first_rows = window.mcd_peak_table.rowCount()
             self.assertGreaterEqual(window.mcd_peak_k_combo.count(), 3)
             window.mcd_peak_analyze_btn.click()
@@ -491,6 +541,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             window._update_mcd_peak_shift_source(fake)
             window.mcd_peak_tracker_method_combo.setCurrentText("Second derivative")
             window.mcd_peak_analyze_btn.click()
+            self._wait_for_peak_analysis(window)
             self.assertEqual(len(window.figure.axes), 3)
             self.assertEqual(len(window.mcd_peak_map_axes), 0)
             self.assertTrue(all(axis.get_visible() for axis in window.figure.axes))
@@ -514,6 +565,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             window._update_mcd_peak_shift_source(fake)
             window.mcd_peak_tracker_method_combo.setCurrentText("Second derivative")
             window.mcd_peak_analyze_btn.click()
+            self._wait_for_peak_analysis(window)
             self.assertEqual(set(window.mcd_peak_method_results), {"Raw spectrum", "Second derivative"})
             d2_before = window.mcd_peak_method_results["Second derivative"]["pos"]
             before = window.mcd_peak_selector_combo.currentData()
@@ -530,6 +582,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             self.assertIn("Raw spectrum · B increasing: unmatched", notes)
             self.assertIn("Raw spectrum · B decreasing: unmatched", notes)
             window.mcd_peak_deriv_window_spin.setValue(37)
+            self._wait_for_peak_analysis(window)
             self.assertIsNot(d2_before, window.mcd_peak_method_results["Second derivative"]["pos"])
         finally:
             window.close()
@@ -546,6 +599,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             window._update_mcd_peak_shift_source(fake)
             window.mcd_peak_tracker_method_combo.setCurrentText("Second derivative")
             window.mcd_peak_analyze_btn.click()
+            self._wait_for_peak_analysis(window)
             window.mcd_peak_show_maps_chk.setChecked(True)
             window.mcd_peak_branch_combo.setCurrentText("B increasing")
             self.assertTrue(all(np.isfinite(np.asarray(line.get_xdata(), float)).sum() == 2 for line in window._mcd_peak_track_lines if line.get_visible()))
@@ -564,6 +618,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             window._update_mcd_peak_shift_source(fake)
             window.mcd_peak_tracker_method_combo.setCurrentText("Second derivative")
             window.mcd_peak_analyze_btn.click()
+            self._wait_for_peak_analysis(window)
             self.assertEqual(len(window.figure.axes), 3)
             self.assertTrue(all(axis.get_visible() for axis in window.figure.axes))
             window.mcd_peak_show_derivative_chk.setChecked(False)
@@ -584,6 +639,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             window._update_mcd_peak_shift_source(fake)
             window.mcd_peak_tracker_method_combo.setCurrentText("Second derivative")
             window.mcd_peak_analyze_btn.click()
+            self._wait_for_peak_analysis(window)
             window.mcd_peak_branch_combo.setCurrentText("B increasing")
             self.assertGreaterEqual(window.mcd_peak_selector_combo.count(), 2)
             second_index = next(
@@ -617,6 +673,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             window._update_mcd_peak_shift_source(fake)
             window.mcd_peak_tracker_method_combo.setCurrentText("Second derivative")
             window.mcd_peak_analyze_btn.click()
+            self._wait_for_peak_analysis(window)
             window.mcd_peak_result_mode_combo.setCurrentText("Single peak shift")
             lines = [line for line in window.mcd_peak_shift_ax.lines if getattr(line, "_mcd_peak_branch", None) == "B decreasing"]
             self.assertGreaterEqual(len(lines), 1)
@@ -648,6 +705,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             window._update_mcd_peak_shift_source(fake)
             window.mcd_peak_tracker_method_combo.setCurrentText("Second derivative")
             window.mcd_peak_analyze_btn.click()
+            self._wait_for_peak_analysis(window)
             window.mcd_peak_result_mode_combo.setCurrentText("Single peak shift")
             window.canvas.draw()
             branch_before = window.mcd_peak_branch_combo.currentText()
@@ -691,6 +749,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             window._update_mcd_peak_shift_source(fake)
             window.mcd_peak_tracker_method_combo.setCurrentText("Second derivative")
             window.mcd_peak_analyze_btn.click()
+            self._wait_for_peak_analysis(window)
             window.canvas.draw()
             selected = window.mcd_peak_selector_combo.currentData()
             self.assertIsNotNone(selected)
@@ -732,6 +791,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             window._update_mcd_peak_shift_source(fake)
             window.mcd_peak_tracker_method_combo.setCurrentText("Second derivative")
             window.mcd_peak_analyze_btn.click()
+            self._wait_for_peak_analysis(window)
             window.mcd_peak_result_mode_combo.setCurrentText("Single peak shift")
             window.canvas.draw()
             result_ax = window.mcd_peak_shift_ax
@@ -761,6 +821,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             window._update_mcd_peak_shift_source(fake)
             window.mcd_peak_tracker_method_combo.setCurrentText("Second derivative")
             window.mcd_peak_analyze_btn.click()
+            self._wait_for_peak_analysis(window)
             window.canvas.draw()
             visible = [button for button in window.mcd_peak_candidate_buttons if not button.isHidden()]
             self.assertGreaterEqual(len(visible), 3)
@@ -801,6 +862,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             window._update_mcd_peak_shift_source(fake)
             window.mcd_peak_tracker_method_combo.setCurrentText("Second derivative")
             window.mcd_peak_analyze_btn.click()
+            self._wait_for_peak_analysis(window)
             window.mcd_peak_branch_combo.setCurrentText("B increasing")
             self.assertGreaterEqual(window.mcd_peak_selector_combo.count(), 2)
             second_index = next(
@@ -852,6 +914,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             window._update_mcd_peak_shift_source(fake)
             window.mcd_peak_tracker_method_combo.setCurrentText("Second derivative")
             window.mcd_peak_analyze_btn.click()
+            self._wait_for_peak_analysis(window)
             window.mcd_peak_branch_combo.setCurrentText("B decreasing")
             window.mcd_peak_result_mode_combo.setCurrentText("Single peak shift")
             selected = window.mcd_peak_selector_combo.currentData()
@@ -891,6 +954,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             window._update_mcd_peak_shift_source(fake)
             window.mcd_peak_tracker_method_combo.setCurrentText("Second derivative")
             window.mcd_peak_analyze_btn.click()
+            self._wait_for_peak_analysis(window)
             window.mcd_peak_branch_combo.setCurrentText("B increasing")
             labels = [window.mcd_peak_selector_combo.itemText(i) for i in range(window.mcd_peak_selector_combo.count())]
             self.assertFalse(any("Boundary unreliable" in label for label in labels))
@@ -914,6 +978,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             window._update_mcd_peak_shift_source(fake)
             window.mcd_peak_tracker_method_combo.setCurrentText("Second derivative")
             window.mcd_peak_analyze_btn.click()
+            self._wait_for_peak_analysis(window)
             self.assertEqual(window.mcd_peak_selector_combo.count(), 0)
             self.assertEqual(window.mcd_peak_table.rowCount(), 0)
             self.assertFalse(window.mcd_peak_export_btn.isEnabled())

@@ -17,6 +17,7 @@ from core.drr_sources import (
     guess_drr_background,
     group_drr_sources,
     inspect_csv_gate,
+    inspect_csv_gate_profile,
     inspect_csv_wavelength_center,
     is_background_name,
     newest_measurement_group,
@@ -351,6 +352,122 @@ class DrrSourceCatalogTests(unittest.TestCase):
 
             self.assertEqual(inspect_csv_gate(sweep), (True, 3))
             self.assertEqual(inspect_csv_gate(constant), (False, 2))
+
+    def test_gate_inspection_ignores_unused_empty_gate_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tgonly.csv"
+            path.write_text(
+                "Vbg_set,Vbg_meas,Vtg_set,Vtg_meas,Vbias_set,Vbias_meas,Ibg,Itg,700,701\n"
+                "0,0,-5,-5,,,0,0,1,2\n"
+                "0,0,-4.9,-4.9,,,0,0,2,3\n"
+                "0,0,-4.8,-4.8,,,0,0,3,4\n",
+                encoding="utf-8",
+            )
+
+            profile = inspect_csv_gate_profile(path, max_rows=None)
+
+            self.assertEqual(
+                profile.gate_labels,
+                ("Vbg_set", "Vbg_meas", "Vtg_set", "Vtg_meas"),
+            )
+            self.assertEqual(len(profile.gate_grid), 3)
+            self.assertTrue(profile.grid_complete)
+            self.assertIn("Vtg_set increasing", profile.gate_direction)
+
+    def test_gate_inspection_keeps_nonempty_invalid_gate_columns_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "invalid_gate.csv"
+            path.write_text(
+                "Vbg_set,Vtg_set,700,701\n"
+                "0,oops,1,2\n"
+                "0,oops,2,3\n",
+                encoding="utf-8",
+            )
+
+            profile = inspect_csv_gate_profile(path, max_rows=None)
+
+            self.assertEqual(profile.gate_labels, ("Vbg_set", "Vtg_set"))
+            self.assertFalse(profile.grid_complete)
+
+    def test_groups_split_known_gate_sweep_directions_but_keep_same_direction_repeats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initial = root / "Initial Data"
+            initial.mkdir()
+            header = "Vbg_set,Vbg_meas,Vtg_set,Vtg_meas,Vbias_set,Vbias_meas,700,701\n"
+            rows = {
+                "forward_rep1_1.csv": ["0,0,-5,-5,,,1,2", "0,0,-4,-4,,,2,3"],
+                "forward_rep1_2.csv": ["0,0,-5,-5,,,3,4", "0,0,-4,-4,,,4,5"],
+                "forward_rep1_3.csv": ["0,0,10,10,,,5,6", "0,0,9,9,,,6,7"],
+            }
+            for name, data in rows.items():
+                (initial / name).write_text(header + "\n".join(data) + "\n", encoding="utf-8")
+
+            groups = [
+                group for group in group_drr_sources(discover_drr_sources(root))
+                if not group.is_background
+            ]
+
+            self.assertEqual(len(groups), 2)
+            self.assertEqual(sorted(len(group.files) for group in groups), [1, 2])
+            self.assertTrue(any(group.gate_direction.endswith("increasing") for group in groups))
+            self.assertTrue(any(group.gate_direction.endswith("decreasing") for group in groups))
+
+    def test_groups_split_known_gate_ranges_and_fixed_multigate_values_stably(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initial = root / "Initial Data"
+            initial.mkdir()
+            header = "Vbg_set,Vtg_set,700,701\n"
+            rows = {
+                "sample_rep1_1.csv": ["0,-5,1,2", "0,10,2,3"],
+                "sample_rep1_2.csv": ["0,-4,3,4", "0,9,4,5"],
+                "sample_rep1_3.csv": ["0,-5,5,6", "0,10,6,7"],
+                "sample_rep1_4.csv": ["1,-5,7,8", "1,10,8,9"],
+            }
+            for name, data in rows.items():
+                path = initial / name
+                path.write_text(header + "\n".join(data) + "\n", encoding="utf-8")
+                os.utime(path, (1_700_000_000, 1_700_000_000))
+
+            catalog = discover_drr_sources(root)
+            groups = [group for group in group_drr_sources(catalog) if not group.is_background]
+            reversed_groups = [
+                group for group in group_drr_sources(list(reversed(catalog)))
+                if not group.is_background
+            ]
+
+            self.assertEqual(len(groups), 3)
+            self.assertEqual(len({group.key for group in groups}), 3)
+            self.assertEqual(
+                [tuple(source.filename for source in group.files) for group in groups],
+                [tuple(source.filename for source in group.files) for group in reversed_groups],
+            )
+            self.assertEqual(
+                sorted(len(group.files) for group in groups),
+                [1, 1, 2],
+            )
+
+    def test_groups_split_ranges_when_grid_incomplete_but_range_metadata_is_known(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            initial = root / "Initial Data"
+            initial.mkdir()
+            (initial / "sample_rep1_1.csv").write_text(
+                "Vbg_set,Vtg_set,700,701\n"
+                "0,-5,1,2\n0,0,2,3\n0,10,,\n",
+                encoding="utf-8",
+            )
+            (initial / "sample_rep1_2.csv").write_text(
+                "Vbg_set,Vtg_set,700,701\n"
+                "0,-4,1,2\n0,0,2,3\n0,9,,\n",
+                encoding="utf-8",
+            )
+
+            groups = [group for group in group_drr_sources(discover_drr_sources(root)) if not group.is_background]
+
+            self.assertEqual(len(groups), 2)
+            self.assertFalse(all(group.grid_complete for group in groups))
 
     def test_constant_gate_backgrounds_recommend_all_frames_only_when_gates_match(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

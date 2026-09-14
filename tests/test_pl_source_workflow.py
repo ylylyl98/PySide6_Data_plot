@@ -131,6 +131,46 @@ class PlSourceWorkflowTests(unittest.TestCase):
                 self.assertEqual(set(seen["saved"]), {"Processed Data/PL/first.dat", "Processed Data/PL/second.dat"})
                 start_load.assert_called_once_with("PL")
             finally:
+                window.settings.setValue(window.SETTINGS_PL_SOURCE_FILTER, "all")
+                window.close()
+
+    def test_pl_state_filters_exclude_ambiguous_sources_from_new(self) -> None:
+        with tempfile.TemporaryDirectory() as folder_text:
+            root = Path(folder_text)
+            for name in ("sample_PL.csv", "sample_REF.csv", "sample_unknown.csv"):
+                (root / name).write_text("a,b\n1,2\n", encoding="utf-8")
+            window = self._window()
+            try:
+                window._set_current_folder(str(root), remember=False)
+                wait_for_file_catalog(window)
+                window.pl_processing_ambiguous = {"sample_PL.csv"}
+                window.pl_processed_status = {"sample_REF.csv": "2026-09-01T00:00:00+00:00"}
+                window.pl_controller._pl_source_type_preference = "All"
+                window.pl_controller._pl_source_filter_preference = "all"
+                seen: dict[str, set[str]] = {}
+
+                def inspect(dialog):
+                    combos = dialog.findChildren(QComboBox)
+                    type_filter = next(combo for combo in combos if combo.findData("All") >= 0)
+                    state_filter = next(combo for combo in combos if combo.findData("unknown") >= 0)
+                    type_filter.setCurrentIndex(type_filter.findData("All"))
+                    for state in ("all", "unprocessed", "processed", "unknown"):
+                        state_filter.setCurrentIndex(state_filter.findData(state))
+                        seen[state] = {
+                            str(dialog.source_list.item(i).data(Qt.UserRole))
+                            for i in range(dialog.source_list.count())
+                        }
+                    dialog.reject()
+                    return SourcePickerDialog.Rejected
+
+                with patch.object(SourcePickerDialog, "exec", inspect):
+                    self.assertIsNone(window.pl_controller._open_pl_source_dialog(""))
+                self.assertEqual(seen["all"], {"sample_PL.csv", "sample_REF.csv", "sample_unknown.csv"})
+                self.assertEqual(seen["unprocessed"], {"sample_unknown.csv"})
+                self.assertEqual(seen["processed"], {"sample_REF.csv"})
+                self.assertEqual(seen["unknown"], {"sample_PL.csv"})
+            finally:
+                window.settings.setValue(window.SETTINGS_PL_SOURCE_FILTER, "all")
                 window.close()
 
     def test_pl_chooser_selection_loads_immediately(self) -> None:
