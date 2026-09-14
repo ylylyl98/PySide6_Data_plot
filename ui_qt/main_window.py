@@ -2117,16 +2117,16 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         content.setVisible(bool(expanded))
         v.addWidget(content)
 
-        def _update(on: bool) -> None:
+        def _update(on: bool, *, persist: bool = True) -> None:
             head.setIcon(
                 self.style().standardIcon(QStyle.SP_ArrowDown if on else QStyle.SP_ArrowRight)
             )
             head.setText(title)
             content.setVisible(bool(on))
-            if hasattr(self, "settings"):
+            if persist and hasattr(self, "settings"):
                 self.settings.setValue(state_key, bool(on))
 
-        _update(bool(expanded))
+        _update(bool(expanded), persist=False)
         head.toggled.connect(_update)
         return box
 
