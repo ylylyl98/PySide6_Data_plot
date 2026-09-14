@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict, List, Sequence, Literal
 import numpy as np
 import pandas as pd
+from .raw_spectrum_cache import RawSpectrumCache
 import matplotlib
 matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
@@ -1405,30 +1406,32 @@ def _parse_spec_axis_from_colname(col) -> Optional[float]:
         "title_name": title_full   # <= full title propagated downstream
     }
 
-def _load_canonical(user_folder: str, origin_name: str, *, y_axis: str = "auto") -> Dict:
-    """
-    Supports BOTH CSV formats:
+# Increment when CSV parsing rules change; axis/background choices are not cached.
+_RAW_PARSE_VERSION = 1
+_RAW_SPECTRUM_CACHE = RawSpectrumCache()
 
-    (A) Legacy matrix (no header row):
-        row0 has wavelength/energy starting after some meta columns,
-        rows 1.. are gate points.
 
-    (B) Header table:
-        columns include gate variables (Vbg/Vtg/...) and many spectrum columns
-        whose *column names* are numeric (e.g. 703.177, 703.238, ...).
+def _numeric_array(values):
+    """Reuse numeric CSV dtypes; coerce only text/mixed columns as before."""
+    if isinstance(values, pd.Series):
+        if not pd.api.types.is_numeric_dtype(values.dtype):
+            values = pd.to_numeric(values, errors="coerce")
+        return values.to_numpy(dtype=float)
+    nonnumeric = [i for i, dtype in enumerate(values.dtypes)
+                  if not pd.api.types.is_numeric_dtype(dtype)]
+    if not nonnumeric:
+        return values.to_numpy(dtype=float)
+    # Assemble once instead of repeatedly replacing blocks in a wide DataFrame.
+    result = np.empty(values.shape, dtype=float)
+    for i in range(values.shape[1]):
+        result[:, i] = _numeric_array(values.iloc[:, i])
+    return result
 
-    Returns dict with:
-      energy, gate_axis, Z (rows=gate, cols=energy), gate_label, parts, stem, title_name
-    """
-    p_user = Path(user_folder)
-    csv_path = _require_csv_in_root(p_user, origin_name)
 
+def _parse_raw_spectrum(csv_path):
+    """Parse both CSV formats into energy, acquisition-order gates and intensity."""
     sep = _guess_sep_from_first_line(csv_path)
     has_header = _csv_has_header_row(csv_path, sep)
-
-    parts = re.findall(r"\$(.*?)\$", origin_name)
-    stem  = Path(origin_name).stem
-    title_full = _title_from_filename(origin_name)
 
     # --------------------------
     # (B) Header-table format
@@ -1443,7 +1446,7 @@ def _load_canonical(user_folder: str, origin_name: str, *, y_axis: str = "auto")
         bg_col = _find_col_by_priority(cols, ["vbg_set", "vbgset", "vbg", "bg", "backgate", "backg"])
         tg_col = _find_col_by_priority(cols, ["vtg_set", "vtgset", "vtg", "tg", "topgate", "topg"])
         bias_col = _find_col_by_priority(cols, ["vbias_set", "vbiasset", "vbias", "bias", "vds", "vd"])
-        vbias = None if bias_col is None else pd.to_numeric(df[bias_col], errors="coerce").to_numpy(dtype=float)
+        vbias = None if bias_col is None else _numeric_array(df[bias_col])
 
         if bg_col is None or tg_col is None:
             raise ValueError(
@@ -1484,7 +1487,7 @@ def _load_canonical(user_folder: str, origin_name: str, *, y_axis: str = "auto")
             else:
                 # choose the column with the most finite points
                 def _finite_count(cc):
-                    arr = pd.to_numeric(df[cc], errors="coerce").to_numpy()
+                    arr = _numeric_array(df[cc])
                     return int(np.isfinite(arr).sum())
                 best = max(col_list, key=_finite_count)
 
@@ -1508,22 +1511,18 @@ def _load_canonical(user_folder: str, origin_name: str, *, y_axis: str = "auto")
         spec_cols_sorted = [spec_cols[i] for i in order]
 
         # Z: rows are gate points
-        Z_gateE = (
-            df[spec_cols_sorted]
-            .apply(pd.to_numeric, errors="coerce")
-            .to_numpy(dtype=float)
-        )
+        Z_gateE = _numeric_array(df[spec_cols_sorted])
 
         # Gate vectors
-        vbg = pd.to_numeric(df[bg_col], errors="coerce").to_numpy(dtype=float)
-        vtg = pd.to_numeric(df[tg_col], errors="coerce").to_numpy(dtype=float)
+        vbg = _numeric_array(df[bg_col])
+        vtg = _numeric_array(df[tg_col])
 
     # --------------------------
     # (A) Legacy matrix format
     # --------------------------
     else:
         df0 = pd.read_csv(csv_path, header=None, sep=sep)
-        A = df0.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+        A = _numeric_array(df0)
 
         if A.shape[0] < 2 or A.shape[1] < 5:
             raise ValueError(f"CSV has unexpected shape {A.shape}; need at least (2 rows, 5 cols).")
@@ -1556,6 +1555,22 @@ def _load_canonical(user_folder: str, origin_name: str, *, y_axis: str = "auto")
             energy = energy[::-1]
             Z_gateE = Z_gateE[:, ::-1]
 
+    return energy, vbg, vtg, vbias, Z_gateE
+
+
+def _load_canonical(user_folder: str, origin_name: str, *, y_axis: str = "auto") -> Dict:
+    """Load raw CSV arrays, then resolve and orient the requested gate axis.
+
+    Only parsing is cached. Returned arrays remain independent and writable.
+    """
+    csv_path = _require_csv_in_root(Path(user_folder), origin_name)
+    energy, vbg, vtg, vbias, Z_gateE = _RAW_SPECTRUM_CACHE.load(
+        csv_path, _RAW_PARSE_VERSION, _parse_raw_spectrum
+    )
+    parts = re.findall(r"\$(.*?)\$", origin_name)
+    stem = Path(origin_name).stem
+    title_full = _title_from_filename(origin_name)
+
     resolved = _resolve_axis_choice(
         y_axis=y_axis,
         vbg=vbg,
@@ -1575,10 +1590,10 @@ def _load_canonical(user_folder: str, origin_name: str, *, y_axis: str = "auto")
         Z_gateE   = Z_gateE[::-1, :]
 
     return {
-        "energy": np.asarray(energy, float),
-        "gate_axis": gate_axis,
+        "energy": np.array(energy, dtype=float, copy=True),
+        "gate_axis": gate_axis.copy(),
         "gate_label": gate_label,
-        "Z": np.asarray(Z_gateE, float),
+        "Z": np.array(Z_gateE, dtype=float, copy=True),
         "stem": stem,
         "parts": parts,
         "title_name": title_full,

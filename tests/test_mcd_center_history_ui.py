@@ -58,6 +58,43 @@ class CenterHistoryUiTests(unittest.TestCase):
         self.assertEqual(w.mcd_window_center_spin.value(), 1.62)
         self.assertEqual(w.mcd_window_width_spin.value(), 10.)
 
+    def test_selecting_h2_keeps_map_window_and_synced_linecut(self):
+        w = MainWindow()
+        self.addCleanup(w.close)
+        history = ({'center_ev': 1.62, 'width_mev': 5., 'last_used': '2026-09-14'},
+                   {'center_ev': 1.65, 'width_mev': 10., 'last_used': '2026-09-10'})
+        w.loaded = LoadedState(mode='MCD', folder='', mcd_result=_result(), mcd_center_history=history)
+        w.mcd_controller._prepare_mcd_center_for_loaded_energy()
+        w._plot_mode('MCD')
+        v = w.mcd_unified_view
+        v.candidate_filter_combo.setCurrentText('History')
+        map_cursors = [line for line in v._artists.get('window_cursor', ()) if line.axes is v.axes['mcd_map']]
+        index = next(i for i in range(v.candidate_combo.count()) if '1.6500' in v.candidate_combo.itemText(i))
+        v.candidate_combo.setCurrentIndex(index)
+        QTest.qWait(150)
+        self.assertEqual(v.selected_candidate['display_id'], 'H2')
+        self.assertEqual(len(map_cursors), 1)
+        self.assertIn(map_cursors[0], v.axes['mcd_map'].lines)
+        self.assertAlmostEqual(map_cursors[0].get_xdata()[0], 1.65)
+        for name in ('mcd_map', 'mcd_spectra'):
+            patch = next(p for p in v._artists['window'] if p.axes is v.axes[name])
+            self.assertTrue(patch.get_visible())
+            self.assertAlmostEqual(patch.get_x(), 1.645)
+            self.assertAlmostEqual(patch.get_width(), .01)
+            self.assertAlmostEqual(patch.get_y(), .985 if name == 'mcd_map' else 0.)
+            self.assertAlmostEqual(patch.get_height(), .015 if name == 'mcd_map' else 1.)
+        v._prepare_blit()
+        v.set_window(1.64, 10.)
+        self.assertTrue(v._blit_backgrounds)
+        for center, width in ((1.62, 5.), (1.65, 10.), (1.62, 5.), (1.65, 10.)):
+            target = next(i for i in range(v.candidate_combo.count()) if f'{center:.4f}' in v.candidate_combo.itemText(i))
+            v.candidate_combo.setCurrentIndex(target)
+            QTest.qWait(120)
+            self.assertIn(map_cursors[0], v.axes['mcd_map'].lines)
+            self.assertTrue(map_cursors[0].get_visible())
+            self.assertAlmostEqual(map_cursors[0].get_xdata()[0], center)
+            self.assertEqual(v.state.window_width_mev, width)
+
     def test_saved_history_refresh_does_not_record_or_move_unsaved_center(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

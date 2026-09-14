@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QLabel, QLineEdit, QMessageBox, QSizePolicy, QVBoxLayout, QDoubleSpinBox, QPushButton, QScrollArea, QWidget,
 )
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from ui_qt.matplotlib_theme import QtFontFigureCanvasQTAgg as FigureCanvasQTAgg
 from matplotlib.figure import Figure
 
 from core.power_combine import combine_power_sweeps, save_combined_power_sweep

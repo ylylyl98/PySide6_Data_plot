@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from ui_qt.matplotlib_theme import ThemeAwareFigureCanvasQTAgg
+from ui_qt.time_format import format_local_timestamp
 
 
 def fit_display_segments(fit: Mapping[str, Any], *, visible_min: float | None = None,
@@ -164,10 +165,19 @@ class McdUnifiedView(QWidget):
         self._feature_energy_axis = None
         self._map_fields = np.array([], dtype=float)
         self._blit_backgrounds: dict[str, Any] = {}
+        self._center_backgrounds: dict[str, Any] = {}
+        self._panel_extents: dict[str, Any] = {}
         self._blit_preparing = False
         self._blit_rebuild_pending = False
         self._rendering = False
         self._overlay_syncing = False
+        self._candidate_overlay_signature = None
+        self._window_trace_cache = None
+        self.window_commit_handler = None
+        self._window_settle_timer = QTimer(self)
+        self._window_settle_timer.setSingleShot(True)
+        self._window_settle_timer.setInterval(180)
+        self._window_settle_timer.timeout.connect(self._settle_window_range)
         self._xlim_cids: list[tuple[Any, int]] = []
         self._displayed_spectrum_rows: dict[tuple[str, str], int] = {}
         self._draw_event_cid = self.canvas.mpl_connect("draw_event", self._on_canvas_draw)
@@ -466,6 +476,7 @@ class McdUnifiedView(QWidget):
     def deactivate(self) -> None:
         """Release the shared Figure when another workflow owns the canvas."""
         self._window_drag_active = False
+        self._window_settle_timer.stop()
         self._blit_rebuild_pending = False
         self._blit_backgrounds = {}
         self._rendering = False
@@ -639,7 +650,7 @@ class McdUnifiedView(QWidget):
             if item.get("history"):
                 history = item["history"]
                 tooltip = (f"Saved center {float(center):.6f} eV · window {float(item['width_mev']):g} meV\n"
-                           f"Last saved: {history.get('last_used', '')}\nSaved records: {history.get('uses', 1)}\n"
+                           f"Last saved: {format_local_timestamp(history.get('last_used', ''))}\nSaved records: {history.get('uses', 1)}\n"
                            + ("Also recommended for the current data\n" if recommended else "")
                            + "\n".join(history.get('records', ())))
             self.candidate_combo.setItemData(self.candidate_combo.count() - 1, tooltip, Qt.ItemDataRole.ToolTipRole)
@@ -875,7 +886,10 @@ class McdUnifiedView(QWidget):
         self._window_drag_active = False
         if self._owns_current_figure():
             # Commit the numerical trace once, after the lightweight gesture.
-            self.set_window(self.state.window_center_ev, self.state.window_width_mev)
+            if callable(self.window_commit_handler):
+                self.window_commit_handler(self.state.window_center_ev, self.state.window_width_mev)
+            else:
+                self.set_window(self.state.window_center_ev, self.state.window_width_mev)
             self.window_center_changed.emit(self.state.window_center_ev)
 
     def set_window(self, center_ev: float, width_mev: float, *, redraw: bool = True) -> None:
@@ -913,17 +927,17 @@ class McdUnifiedView(QWidget):
         # The release handler (and ordinary parameter edits) commits the trace.
         if not self._window_drag_active:
             self._refresh_mcd_window_trace()
+            self._window_settle_timer.start()
         self.draw_only_updates += 1
         if not redraw:
             return
         keys = ("mcd_map", "spectra", "mcd_spectra") if self._window_drag_active else None
-        if not self._blit_update(axes_keys=keys):
+        if not self._blit_update(axes_keys=keys, center_only=True):
             self.canvas.draw_idle()
 
-    def _refresh_mcd_window_trace(self) -> None:
-        """Update the existing MCD-vs-B lines for a center/width edit."""
-        if self._result is None or not self._artists.get("mcd_trace_lines"):
-            return
+    def window_traces(self, result=None):
+        """Share one numerical window reduction between displayed data and fits."""
+        result = self._result if result is None else result
         metric = str(self.state.window_metric).casefold().replace(" ", "_")
         if "integral" in metric:
             metric_key = "integral"
@@ -933,21 +947,40 @@ class McdUnifiedView(QWidget):
             metric_key = "absolute_mean"
         else:
             metric_key = "mean"
-        try:
+        key = (id(result), id(getattr(result, 'pair_mcd_corrected', None)),
+               self.state.window_center_ev, self.state.window_width_mev, metric_key)
+        if self._window_trace_cache is None or self._window_trace_cache[0] != key:
             from core.mcd import pair_window_trace_by_branch
-            traces = pair_window_trace_by_branch(
-                self._result, self.state.window_center_ev, self.state.window_width_mev,
-                metrics=(metric_key,), include_raw=False,
-            )
+            source = result
+            if not hasattr(result, 'wavelength_nm'):
+                import copy
+                source = copy.copy(result)
+                source.wavelength_nm = 1239.841984 / np.asarray(result.energy_ev, float)
+            traces = pair_window_trace_by_branch(source, key[2], key[3], metrics=(metric_key,), include_raw=False)
+            self._window_trace_cache = (key, traces)
+        return metric_key, self._window_trace_cache[1]
+
+    def _refresh_mcd_window_trace(self) -> None:
+        if self._result is None or not self._artists.get('mcd_trace_lines'):
+            return
+        try:
+            metric_key, traces = self.window_traces()
         except (ImportError, AttributeError, TypeError, ValueError, FloatingPointError):
             return
         for branch, line in self._artists.get("mcd_trace_lines", ()):
             points = traces.get(branch, {}).get(f"corrected_{metric_key}")
             if points is not None:
                 line.set_data(points[0], points[1])
-        self._update_mcd_trace_y_limits()
+        self._update_mcd_trace_y_limits(final=False)
 
-    def _update_mcd_trace_y_limits(self) -> None:
+    def _settle_window_range(self) -> None:
+        if self._window_drag_active or not self._owns_current_figure():
+            return
+        self._update_mcd_trace_y_limits(final=True)
+        if not self._blit_update(axes_keys=('mcd_vs_b',)):
+            self.canvas.draw_idle()
+
+    def _update_mcd_trace_y_limits(self, *, final: bool = True) -> None:
         """Size the trace axis from measured data, excluding fit extrapolations."""
         axis = self.axes.get("mcd_vs_b")
         arrays = [np.asarray(line.get_ydata(), dtype=float) for _, line in self._artists.get("mcd_trace_lines", ()) if line.get_visible()]
@@ -957,9 +990,15 @@ class McdUnifiedView(QWidget):
             axis.set_autoscaley_on(False)
             pad = max(float(np.ptp(finite)) * .05, 1e-12)
             limits = (float(finite.min()) - pad, float(finite.max()) + pad)
+            if not final:
+                current = axis.get_ylim()
+                if current[0] <= float(finite.min()) and current[1] >= float(finite.max()):
+                    return
+                room = max(float(np.ptp(finite)) * .2, 1e-12)
+                limits = (min(current[0], limits[0] - room), max(current[1], limits[1] + room))
             if tuple(axis.get_ylim()) != limits:
                 axis.set_ylim(*limits)
-                self._blit_backgrounds = {}
+                self._blit_backgrounds.pop('mcd_vs_b', None)
 
     def update_mcd_slope_readout(self, slopes: Mapping[str, Any] | None) -> None:
         """Refresh compact slope results after a window edit."""
@@ -1126,7 +1165,7 @@ class McdUnifiedView(QWidget):
                 annotation.set_position((0, offset))
                 annotation.set_ha(align)
         if changed and self._blit_backgrounds:
-            self._blit_backgrounds = {}
+            self._blit_backgrounds.pop('mcd_vs_b', None)
 
     def retain_current_window(self, label: str = "MCD", *, settings: Mapping[str, Any] | None = None) -> RetainedMcdWindow:
         return self.state.retain_window(
@@ -1153,6 +1192,8 @@ class McdUnifiedView(QWidget):
                analysis: Mapping[str, Any] | None = None) -> None:
         """Render all four fixed regions from an immutable result snapshot."""
         self._rendering = True
+        self._window_settle_timer.stop()
+        self._candidate_overlay_signature = None
         self._result = result
         self._artists = {}
         self._feature_energy_axis = None
@@ -1363,12 +1404,16 @@ class McdUnifiedView(QWidget):
         center = self.state.window_center_ev
         patch = axis.axvspan(center - self.state.window_width_mev * 0.0005,
                              center + self.state.window_width_mev * 0.0005,
-                             ymin=.985, ymax=1.0, color="#4f9d8f", alpha=0.65)
+                             ymin=.985, ymax=1, color="#4f9d8f", alpha=.65, zorder=6)
+        # The active window belongs to the map, independently of H/R badges.
+        # Candidate switches may rebuild badges but must retain this cursor.
+        self._artists['window_cursor'] = [axis.axvline(
+            center, ymin=.985, ymax=1, color='#0f766e', ls='--', lw=.8, alpha=.65, zorder=8)]
         cursor_value = map_fields[int(np.argmin(np.abs(map_fields - fields[self.state.selected_b_index])))] if map_fields.size and fields.size else 0.0
         cursor = axis.axhline(cursor_value,
                               color="#d97706", ls="--", lw=1.0)
         edges = [axis.axvline(center + direction * self.state.window_width_mev * .0005,
-                    color="#666666", ls=(0, (4, 3)), lw=.85, alpha=.55, zorder=7)
+                    color="#666666", ls=(0, (4, 3)), lw=.6, alpha=.3, zorder=7)
                  for direction in (-1, 1)]
         self._artists["window_edges"] = edges
         self._artists["window"] = [patch]
@@ -1470,11 +1515,7 @@ class McdUnifiedView(QWidget):
         else:
             metric_key = "mean"
         try:
-            from core.mcd import pair_window_trace_by_branch
-            traces = pair_window_trace_by_branch(
-                result, self.state.window_center_ev, self.state.window_width_mev,
-                metrics=(metric_key,), include_raw=False,
-            )
+            metric_key, traces = self.window_traces(result)
         except (ImportError, AttributeError, TypeError, ValueError, FloatingPointError):
             traces = {}
         colors = {"B increasing": "#2563eb", "B decreasing": "#f59e0b"}
@@ -1638,11 +1679,20 @@ class McdUnifiedView(QWidget):
             self._overlay_syncing = False
 
     def _draw_feature_overlay(self) -> None:
+        previous = self._candidate_overlay_signature
         self._sync_candidate_overlay()
-        if not self._rendering and not self._blit_update():
-            self.canvas.draw_idle()
+        keys = ('mcd_map', 'spectra') if previous is not None and previous is self._candidate_overlay_signature else None
+        if not self._rendering and not self._blit_update(axes_keys=keys):
+            self._prepare_blit()
 
     def _sync_candidate_overlay_impl(self) -> None:
+        signature = (tuple((key, tuple(axis.get_xlim()), round(axis.bbox.width, 1))
+                           for key, axis in self.axes.items()),
+                     tuple((str(c.get('id')), self._candidate_center(c), c.get('display_id'),
+                            c.get('kind'), bool(c.get('history'))) for c in self.visible_candidates))
+        if signature == self._candidate_overlay_signature:
+            self._update_candidate_selection_artists()
+            return
         # Candidate badges are static between selections. Bake them into the
         # background once so a long saved history does not slow every drag.
         self._blit_backgrounds = {}
@@ -1699,7 +1749,7 @@ class McdUnifiedView(QWidget):
                               "lw": .7, "alpha": .95},
                         clip_on=True, zorder=10)
                     artists = (label,)
-                elif identifier == selected_id:
+                elif key == 'spectra':
                     outline = axis.axvline(center, color="white", lw=3.2, alpha=.95, zorder=8)
                     line = axis.axvline(center, color="#27313b", lw=1.5, ls="-", alpha=1.0, zorder=9)
                     triangle = axis.plot([center], [.96], transform=axis.get_xaxis_transform(), marker="^", ms=6,
@@ -1711,7 +1761,14 @@ class McdUnifiedView(QWidget):
                                       ha="center", va="top", fontsize=6, color="#27313b",
                                       bbox={"boxstyle": "round,pad=.12", "fc": "white", "ec": "#27313b", "lw": .5, "alpha": .9},
                                       clip_on=True, zorder=10)
-                    artists = (outline, line, triangle, label)
+                    tick = axis.plot([center, center], [.96, 1.0], transform=axis.get_xaxis_transform(),
+                                     color='#64748b', ls=(0, (2, 2)), lw=.8, alpha=.75, clip_on=True, zorder=7)[0]
+                    for locator in (outline, line, triangle, label):
+                        locator._mcd_active_only = True
+                        locator.set_visible(identifier == selected_id)
+                    tick._mcd_inactive_only = True
+                    tick.set_visible(identifier != selected_id)
+                    artists = (outline, line, triangle, label, tick)
                 else:
                     line = axis.plot([center, center], [.96, 1.0], transform=axis.get_xaxis_transform(),
                                      color="#64748b", ls=(0, (2, 2)), lw=.8, alpha=.75,
@@ -1724,13 +1781,11 @@ class McdUnifiedView(QWidget):
             # The analysis window has a distinct color and label so it cannot
             # be mistaken for a candidate center.
             window_center = float(self.state.window_center_ev)
-            if np.isfinite(window_center) and low <= window_center <= high and key != "mcd_spectra":
-                window_line = axis.axvline(window_center, ymin=.985 if key == "mcd_map" else 0,
+            if np.isfinite(window_center) and low <= window_center <= high and key == "spectra":
+                window_line = axis.axvline(window_center, ymin=0,
                     ymax=1, color="#0f766e", ls="--", lw=.9, alpha=.85, zorder=6)
                 window_line._mcd_window_label = "Window"
                 self._artists["feature_selection"].append(window_line)
-                if key == "mcd_map":
-                    continue
                 window_text = axis.text(window_center, .80, f"Window {window_center:.4f} eV", transform=axis.get_xaxis_transform(),
                                         ha="center", va="top", fontsize=6, color="#0f766e", clip_on=True, zorder=9)
                 window_text._mcd_window_label = "Window"
@@ -1747,14 +1802,30 @@ class McdUnifiedView(QWidget):
                 )
         # Selection changes only artists; numerical tracking remains owned by
         # the cancellable analysis worker.
+        self._candidate_overlay_signature = signature
+
+    def _update_candidate_selection_artists(self) -> None:
+        selected = self.selected_candidate or {}
+        selected_id = str(selected.get('id', ''))
+        history_ids = {str(c.get('id')) for c in self.visible_candidates if c.get('history')}
+        for artist in self._artists.get('feature_selection', ()):
+            identifier = str(getattr(artist, '_mcd_candidate_id', ''))
+            active = identifier == selected_id
+            if getattr(artist, '_mcd_active_only', False):
+                artist.set_visible(active)
+            elif getattr(artist, '_mcd_inactive_only', False):
+                artist.set_visible(not active)
+            elif identifier and artist.axes is self.axes.get('mcd_map'):
+                artist.set_color('white' if active else '#7c3aed' if identifier in history_ids else '#333333')
+                artist.get_bbox_patch().set_facecolor('#0f766e' if active else 'white')
+                artist.get_bbox_patch().set_edgecolor('#0f766e' if active else '#777777')
 
     def _dynamic_artists_by_axis(self) -> dict[str, list[Any]]:
         artists = []
         for name in ("b_map_cursor", "window", "window_edges", "window_cursor", "window_status",
                      "b_status", "b_trace_cursor", "slope_readout", "slope_difference_readout"):
             artists.extend(self._artists.get(name, ()))
-        artists.extend(item for item in self._artists.get("feature_selection", ())
-                       if getattr(item, "_mcd_window_label", "") == "Window")
+        artists.extend(self._artists.get('feature_selection', ()))
         artists.extend(item[0] for item in self._artists.get("spectrum_lines", ()))
         artists.extend(item[0] for item in self._artists.get("mcd_spectrum_lines", ()))
         artists.extend(line for _branch, line in self._artists.get("mcd_trace_lines", ()))
@@ -1764,9 +1835,10 @@ class McdUnifiedView(QWidget):
             artists.append(self._artists["spectra_legend"])
         return {key: [item for item in artists if item.axes is axis] for key, axis in self.axes.items()}
 
-    def _prepare_blit(self) -> None:
+    def _prepare_blit(self, *, full_draw: bool = True) -> None:
         """Cache static panel backgrounds for B/window cursor updates."""
         self._blit_backgrounds = {}
+        self._center_backgrounds = {}
         self._blit_preparing = True
         dynamic = self._dynamic_artists_by_axis()
         for artists in dynamic.values():
@@ -1776,36 +1848,113 @@ class McdUnifiedView(QWidget):
                 except AttributeError:
                     pass
         try:
-            self.canvas.draw()
+            if full_draw:
+                self.canvas.draw()
+            else:
+                # A normal full draw already laid out text and painted the
+                # figure. Rebuild clean panel layers in that same renderer.
+                renderer = self.canvas.get_renderer()
+                for axis in self.figure.axes:
+                    axis.draw(renderer)
             for key, axis in self.axes.items():
                 if axis is not None:
                     self._blit_backgrounds[key] = self.canvas.copy_from_bbox(axis.bbox)
+                    self._panel_extents[key] = axis.get_tightbbox(self.canvas.get_renderer()).frozen()
             for key, artists in dynamic.items():
                 axis = self.axes.get(key)
                 if axis is None:
                     continue
+                self._paint_panel_layers(key, artists)
+            # Qt's repaint may service a queued draw_idle immediately. Do
+            # not publish half-painted panels while the overlays are still
+            # animated: that nested draw would erase the panels already
+            # painted above. Restore normal drawing before one final publish.
+            for artists in self._dynamic_artists_by_axis().values():
                 for artist in artists:
-                    axis.draw_artist(artist)
-                self.canvas.blit(axis.bbox)
+                    artist.set_animated(False)
+            self.canvas.blit(self.figure.bbox)
         except (AttributeError, RuntimeError, ValueError):
             self._blit_backgrounds = {}
         finally:
+            # Animation is only needed while capturing a clean background.
+            # Leaving it enabled makes ordinary figure/toolbar redraws omit
+            # the complete overlay unless a draw callback repaints it.
+            for artists in self._dynamic_artists_by_axis().values():
+                for artist in artists:
+                    artist.set_animated(False)
             self._blit_preparing = False
 
-    def _blit_update(self, *, axes_keys: Iterable[str] | None = None) -> bool:
+    def _center_artists(self, key: str) -> list[Any]:
+        axis = self.axes.get(key)
+        items = [item for name in ('window', 'window_edges', 'window_cursor', 'window_status')
+                 for item in self._artists.get(name, ())]
+        items.extend(item for item in self._artists.get('feature_selection', ())
+                     if getattr(item, '_mcd_window_label', '') == 'Window')
+        return [item for item in items if item.axes is axis]
+
+    def _paint_panel_layers(self, key: str, artists: Iterable[Any]) -> None:
+        axis = self.axes[key]
+        markers = self._center_artists(key) if key in ('mcd_map', 'spectra', 'mcd_spectra') else []
+        for artist in artists:
+            if artist not in markers and artist.get_visible():
+                axis.draw_artist(artist)
+        if markers:
+            self._center_backgrounds[key] = self.canvas.copy_from_bbox(axis.bbox)
+            for artist in markers:
+                if artist.get_visible():
+                    axis.draw_artist(artist)
+
+    def _redraw_trace_panel(self) -> None:
+        """Redraw the trace axes and tick labels without touching other panels."""
+        from matplotlib.patches import Rectangle
+        from matplotlib.transforms import Bbox, IdentityTransform
+        key = 'mcd_vs_b'
+        axis = self.axes[key]
+        renderer = self.canvas.get_renderer()
+        extent = axis.get_tightbbox(renderer).frozen()
+        dirty = Bbox.union([extent, self._panel_extents.get(key, extent)]).padded(2)
+        Rectangle((dirty.x0, dirty.y0), dirty.width, dirty.height,
+                  transform=IdentityTransform(), facecolor=self.figure.get_facecolor(),
+                  edgecolor='none').draw(renderer)
+        artists = self._dynamic_artists_by_axis()[key]
+        try:
+            for artist in artists:
+                artist.set_animated(True)
+            axis.draw(renderer)
+            self._blit_backgrounds[key] = self.canvas.copy_from_bbox(axis.bbox)
+            self._paint_panel_layers(key, artists)
+        finally:
+            for artist in artists:
+                artist.set_animated(False)
+        self._panel_extents[key] = extent
+        self.canvas.blit(dirty)
+
+    def _blit_update(self, *, axes_keys: Iterable[str] | None = None, center_only: bool = False) -> bool:
         if not self._blit_backgrounds:
             return False
         try:
+            redrawn = None
+            if ('mcd_vs_b' in self.axes and 'mcd_vs_b' not in self._blit_backgrounds
+                    and (axes_keys is None or 'mcd_vs_b' in axes_keys)):
+                self._redraw_trace_panel()
+                redrawn = 'mcd_vs_b'
             dynamic = self._dynamic_artists_by_axis()
             for key, background in self._blit_backgrounds.items():
+                if key == redrawn:
+                    continue
                 if axes_keys is not None and key not in axes_keys:
                     continue
                 axis = self.axes.get(key)
                 if axis is None:
                     continue
-                self.canvas.restore_region(background)
-                for artist in dynamic.get(key, ()):
-                    axis.draw_artist(artist)
+                if center_only and key in self._center_backgrounds:
+                    self.canvas.restore_region(self._center_backgrounds[key])
+                    for artist in self._center_artists(key):
+                        if artist.get_visible():
+                            axis.draw_artist(artist)
+                else:
+                    self.canvas.restore_region(background)
+                    self._paint_panel_layers(key, dynamic.get(key, ()))
                 self.canvas.blit(axis.bbox)
             return True
         except (AttributeError, RuntimeError, ValueError):
@@ -1873,11 +2022,13 @@ class McdUnifiedView(QWidget):
             if spec is not None:
                 axis.set_position(spec.get_position(self.figure))
         self._blit_backgrounds = {}
+        if not self._rendering and self._owns_current_figure():
+            self._sync_candidate_overlay()
 
     def _rebuild_blit_after_full_draw(self) -> None:
         self._blit_rebuild_pending = False
         if self._owns_current_figure() and self._result is not None:
-            self._prepare_blit()
+            self._prepare_blit(full_draw=False)
 
     def _owns_current_figure(self) -> bool:
         """Return true only while every unified axis is live in Figure."""

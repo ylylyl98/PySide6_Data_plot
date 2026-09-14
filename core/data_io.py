@@ -472,11 +472,19 @@ def _power_header_column(path: str, modified: int, size: int) -> str | None:
         ['power_uw', 'power (uw)', 'poweruw', 'laser_power_uw', 'laserpoweruw', 'power'])
 
 
-def get_power_series_sources(folder: str, files: Sequence[str]) -> Dict[str, PowerSeriesSource]:
+def get_power_series_sources(folder: str, files: Sequence[str], *,
+                             cached_tables: Dict[str, PowerSeriesSource] | None = None) -> Dict[str, PowerSeriesSource]:
     """Discover table-backed power sweeps first, followed by legacy filename groups."""
     sources: Dict[str, PowerSeriesSource] = {}
     table_files: set[str] = set()
     for file_name in files:
+        # The catalog worker supplies only records with a matching source
+        # signature. Keep legacy grouping live; only table inspection is reused.
+        cached = (cached_tables or {}).get(str(file_name))
+        if cached is not None:
+            table_files.add(str(file_name))
+            sources[cached.key] = cached
+            continue
         if inspect_power_sweep_csv(folder, file_name):
             table_files.add(str(file_name))
             key = power_sweep_source_key(file_name)

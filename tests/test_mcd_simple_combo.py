@@ -54,6 +54,23 @@ class SimpleComboTests(unittest.TestCase):
         view.axes['mcd_map'].set_xlim(1.62, 1.67)
         np.testing.assert_allclose(axis.get_xlim(), [1.62, 1.67])
 
+    def test_center_update_preserves_other_panel_caches_and_skips_spectra(self):
+        from unittest.mock import patch
+        view, result = self.make_view()
+        result.wavelength_nm = 1239.841984 / result.energy_ev
+        before = dict(view._blit_backgrounds)
+        old_limits = view.axes['mcd_vs_b'].get_ylim()
+        spectrum = view._artists['spectrum_lines'][0][0]
+        with patch.object(view.canvas, 'draw', wraps=view.canvas.draw) as full, patch.object(spectrum, 'draw', wraps=spectrum.draw) as curve:
+            result.pair_mcd_corrected[:] = np.arange(result.pair_mcd_corrected.shape[0])[:, None] + 3.
+            view.set_window(1.65, 10.)
+            self.app.processEvents()
+            self.assertEqual(full.call_count, 0)
+            self.assertEqual(curve.call_count, 0)
+        self.assertNotEqual(view.axes['mcd_vs_b'].get_ylim(), old_limits)
+        for key in ('mcd_map', 'spectra', 'mcd_spectra'):
+            self.assertIs(view._blit_backgrounds[key], before[key])
+
     def test_background_shading_uses_result_ranges(self):
         view, _ = self.make_view()
         bands = [p for p in view.axes['spectra'].patches if p.get_gid() == 'mcd-background-fit']

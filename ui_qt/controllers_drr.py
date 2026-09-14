@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 import re
+from threading import Event
 from typing import List
 
 import numpy as np
@@ -57,6 +58,7 @@ from core.drr_sources import (
     wavelength_centers_match,
 )
 from core.loader import DataCube
+from core.plotting import downsample_cube_for_display
 from core.processing import apply_sg_derivative_energy, clamp_sg_window, nearest_gate_spectrum
 from ui_qt.common import Worker, WrappedFilenameDelegate
 from ui_qt.theme import alias as theme_alias
@@ -370,16 +372,30 @@ class _DrrFitWorker(QRunnable):
         self.x, self.y = np.asarray(x, float), np.asarray(y, float)
         self.p0, self.lo, self.hi = p0, lo, hi
         self.signals = _DrrFitSignals()
+        self._cancelled = Event()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
 
     def run(self) -> None:
         try:
-            popt, _ = curve_fit(_drr_multi_lorentz_model, self.x, self.y,
+            if self._cancelled.is_set():
+                return
+
+            def model(x, *parameters):
+                if self._cancelled.is_set():
+                    raise InterruptedError("DRR fit superseded")
+                return _drr_multi_lorentz_model(x, *parameters)
+
+            popt, _ = curve_fit(model, self.x, self.y,
                                 p0=np.asarray(self.p0, float),
                                 bounds=(np.asarray(self.lo, float), np.asarray(self.hi, float)),
                                 maxfev=50000)
-            self.signals.result.emit(np.asarray(popt, float))
+            if not self._cancelled.is_set():
+                self.signals.result.emit(np.asarray(popt, float))
         except Exception as exc:
-            self.signals.error.emit(str(exc))
+            if not self._cancelled.is_set():
+                self.signals.error.emit(str(exc))
         finally:
             self.signals.finished.emit()
 
@@ -608,6 +624,25 @@ class DrrController:
     def _drr_cube_for_display(self) -> DataCube:
         cube, _deriv, _used_win, _poly = self._drr_cube_with_metadata()
         return cube
+
+    def _drr_display_preview(self, cube: DataCube) -> DataCube:
+        """Cache bounded display copies for the current immutable load products."""
+        source = self.loaded.cube
+        if getattr(self, "_drr_preview_source", None) is not source:
+            self._drr_preview_source = source
+            self._drr_preview_cache = {}
+        # Bucket dimensions to avoid new copies for every pixel of a resize.
+        width, height = self.figure.bbox.size
+        budget = max(32_000, min(250_000, int(width * height / 2) // 16_000 * 16_000))
+        key = (id(cube), id(cube.Z), id(cube.energy), id(cube.gate), budget)
+        cache = self._drr_preview_cache
+        if key not in cache:
+            if len(cache) >= 2:
+                cache.pop(next(iter(cache)))
+            # Keep the input arrays alive with the key to prevent id reuse.
+            cache[key] = (cube, cube.Z, cube.energy, cube.gate,
+                          downsample_cube_for_display(cube, max_points=budget))
+        return cache[key][-1]
 
     def _drr_baseline_key(self) -> str:
         text = self.drr_baseline_combo.currentText()
@@ -1245,6 +1280,9 @@ class DrrController:
             item.setFont(font)
 
         baseline_recommendations = {}
+        catalog_by_path = {}
+        catalog_peers = {}
+        file_rows_cache = {}
 
         def _baseline_measurements():
             selected_paths = {str(path) for path in self.drr_selected_files}
@@ -1264,6 +1302,14 @@ class DrrController:
 
         def _catalog_groups():
             nonlocal baseline_recommendations
+            # One index per publication/filter rebuild; selecting a group or
+            # adding its members must not rescan the complete catalog.
+            catalog_by_path.clear()
+            catalog_peers.clear()
+            file_rows_cache.clear()
+            for source in self.drr_available_sources:
+                catalog_by_path[source.source] = source
+                catalog_peers.setdefault(source.group_key, []).append(source)
             catalog_sources = (
                 [
                     source
@@ -1356,14 +1402,10 @@ class DrrController:
                     f"Not added: {Path(source).name} does not match every selected measurement spectral grid."
                 )
                 return False
-            catalog_source = next(
-                (entry for entry in self.drr_available_sources if entry.source == source),
-                source,
-            )
+            catalog_source = catalog_by_path.get(source, source)
             peers = tuple(
-                entry for entry in self.drr_available_sources
+                entry for entry in catalog_peers.get(getattr(catalog_source, "group_key", ""), ())
                 if entry.source != source
-                and entry.group_key == getattr(catalog_source, "group_key", "")
             )
             peer_condition_values = tuple(
                 _drr_condition_values(entry) for entry in (catalog_source, *peers)
@@ -1382,7 +1424,7 @@ class DrrController:
             item.setData(Qt.UserRole + 5, True)
             item.setData(Qt.UserRole + 1, bool(incompatible))
             item.setData(Qt.UserRole + 2, bool(allow_existing))
-            full_detail = f"{source}\n{format_drr_source_summary(catalog_source, peers)}"
+            full_detail = f"{source}\n{format_drr_source_summary(catalog_source, peers, peer_condition_values=peer_condition_values)}"
             item.setData(Qt.UserRole + 3, full_detail)
             item.setToolTip(full_detail)
             selected_list.addItem(item)
@@ -1417,6 +1459,15 @@ class DrrController:
                     _sync_drr_rows(file_list, [], preserve_view=preserve_view)
                     group_detail.clear()
                     return
+                cache_key = (group.key, file_list.palette().cacheKey(), file_list.font().toString())
+                cached_rows = file_rows_cache.get(cache_key)
+                if cached_rows is not None:
+                    summary, prototypes = cached_rows
+                    group_detail.setText(summary)
+                    _sync_drr_rows(file_list, [QListWidgetItem(item) for item in prototypes],
+                                   preserve_view=preserve_view)
+                    _show_selected_detail()
+                    return
                 frame_text = (
                     f"{group.frame_count_range[0]}–{group.frame_count_range[1]}"
                     if group.frame_count_range else "unknown"
@@ -1425,7 +1476,7 @@ class DrrController:
                     f" · saved baseline modes: {', '.join(group.saved_baseline_modes)}"
                     if group.saved_baseline_modes else ""
                 )
-                source_by_path = {source.source: source for source in self.drr_available_sources}
+                source_by_path = catalog_by_path
                 def _linked_label(path: str) -> str:
                     linked = source_by_path.get(path)
                     if linked is None:
@@ -1536,6 +1587,17 @@ class DrrController:
                     _style_source_item(item, source)
                     item.setToolTip(full_detail)
                     rows.append(item)
+                # Cache detached prototypes, never items owned by a live list.
+                # Bound retained metadata for large histories and invalidate it
+                # at every catalog publication, font or palette change.
+                if len(rows) <= 2000:
+                    while file_rows_cache and (
+                        len(file_rows_cache) >= 8
+                        or sum(len(value[1]) for value in file_rows_cache.values()) + len(rows) > 2000
+                    ):
+                        file_rows_cache.pop(next(iter(file_rows_cache)))
+                    file_rows_cache[cache_key] = (
+                        group_detail.text(), tuple(QListWidgetItem(item) for item in rows))
                 _sync_drr_rows(file_list, rows, preserve_view=preserve_view)
                 _show_selected_detail()
             finally:
@@ -1933,18 +1995,20 @@ class DrrController:
     def _draw_drr_analysis_overlays(self, cube: DataCube, gate_used: float, x: np.ndarray, y: np.ndarray) -> None:
         if self._drr_spectrum_ax is None or self._drr_heatmap_ax is None:
             return
-        if self._drr_heatmap_peak_artist is not None:
-            try:
-                self._drr_heatmap_peak_artist.remove()
-            except Exception:
-                pass
-            self._drr_heatmap_peak_artist = None
-        if self._drr_heatmap_fit_artist is not None:
-            try:
-                self._drr_heatmap_fit_artist.remove()
-            except Exception:
-                pass
-            self._drr_heatmap_fit_artist = None
+        for name in ("_drr_heatmap_peak_artist", "_drr_heatmap_fit_artist",
+                     "_drr_spectrum_peak_artist", "_drr_spectrum_fit_artist"):
+            artist = getattr(self, name, None)
+            if artist is not None:
+                artist.set_visible(False)
+
+        def scatter(name, axis, xs, ys, **style):
+            artist = getattr(self, name, None)
+            if artist is None or artist.axes is not axis:
+                artist = axis.scatter(xs, ys, **style)
+                setattr(self, name, artist)
+            else:
+                artist.set_offsets(np.column_stack((xs, ys)))
+            artist.set_visible(True)
         if self._drr_peak_gate is not None and abs(float(gate_used) - float(self._drr_peak_gate)) > 1e-9:
             self._drr_peak_gate = None
             self._drr_peak_indices = None
@@ -1963,8 +2027,9 @@ class DrrController:
             and self._drr_peak_indices.size > 0
         ):
             pidx = np.asarray(self._drr_peak_indices, dtype=int)
-            self._drr_spectrum_ax.scatter(x[pidx], y[pidx], s=26, marker="o", facecolor="#ffd84d", edgecolor="#222", zorder=30)
-            self._drr_heatmap_peak_artist = self._drr_heatmap_ax.scatter(
+            scatter("_drr_spectrum_peak_artist", self._drr_spectrum_ax,
+                    x[pidx], y[pidx], s=26, marker="o", facecolor="#ffd84d", edgecolor="#222", zorder=30)
+            scatter("_drr_heatmap_peak_artist", self._drr_heatmap_ax,
                 x[pidx],
                 np.full(pidx.size, float(gate_used)),
                 s=28,
@@ -1981,9 +2046,16 @@ class DrrController:
             and self._drr_fit_y is not None
             and abs(float(gate_used) - float(self._drr_fit_gate)) <= 1e-9
         ):
-            self._drr_spectrum_ax.plot(self._drr_fit_x, self._drr_fit_y, color="#f28e2b", linewidth=1.6, zorder=28)
+            fit = getattr(self, "_drr_spectrum_fit_artist", None)
+            if fit is None or fit.axes is not self._drr_spectrum_ax:
+                fit, = self._drr_spectrum_ax.plot(
+                    self._drr_fit_x, self._drr_fit_y, color="#f28e2b", linewidth=1.6, zorder=28)
+                self._drr_spectrum_fit_artist = fit
+            else:
+                fit.set_data(self._drr_fit_x, self._drr_fit_y)
+            fit.set_visible(True)
             if self._drr_fit_centers is not None and self._drr_fit_centers.size:
-                self._drr_heatmap_fit_artist = self._drr_heatmap_ax.scatter(
+                scatter("_drr_heatmap_fit_artist", self._drr_heatmap_ax,
                     np.asarray(self._drr_fit_centers, float),
                     np.full(int(self._drr_fit_centers.size), float(gate_used)),
                     s=34,
@@ -2064,15 +2136,11 @@ class DrrController:
             p0.extend([y_amp * 0.7, float(c0), g0])
             lo.extend([-5 * y_amp, float(np.nanmin(x_sel)), max(abs(dx) * 0.25, 1e-8)])
             hi.extend([5 * y_amp, float(np.nanmax(x_sel)), x_rng])
-        self._drr_fit_generation = getattr(self, "_drr_fit_generation", 0) + 1
+        self._invalidate_pending_drr_fit()
         generation = self._drr_fit_generation
         cube = self._last_plot_cube
         source_key = tuple(self.drr_selected_files)
         worker = _DrrFitWorker(x_sel, y_sel, p0, lo, hi)
-        workers = getattr(self, "_drr_fit_workers", None)
-        if workers is None:
-            workers = []; self._drr_fit_workers = workers
-        workers.append(worker)
         worker.signals.result.connect(
             lambda popt, g=generation, c=cube, sk=source_key, gate=gate_used,
             requested=self._drr_gate_value(), peaks=n_peaks, xx=x.copy():
@@ -2081,13 +2149,37 @@ class DrrController:
         worker.signals.error.connect(lambda message, g=generation: self._on_drr_fit_error(g, message))
         worker.signals.finished.connect(lambda w=worker: self._finish_drr_fit_worker(w))
         self.drr_fit_status.setText("Fitting Lorentz peaks…")
-        self.thread_pool.start(worker)
+        self._queue_drr_fit_worker(worker)
+
+    def _queue_drr_fit_worker(self, worker) -> None:
+        workers = getattr(self, "_drr_fit_workers", None)
+        if workers is None:
+            workers = []
+            self._drr_fit_workers = workers
+        pending = getattr(self, "_drr_pending_fit_worker", None)
+        if pending is not None:
+            pending.cancel()
+        if workers:
+            for active in workers:
+                active.cancel()
+            self._drr_pending_fit_worker = worker
+        else:
+            self._drr_pending_fit_worker = None
+            workers.append(worker)
+            self.thread_pool.start(worker)
 
     def _finish_drr_fit_worker(self, worker) -> None:
         try:
             self._drr_fit_workers.remove(worker)
         except (AttributeError, ValueError):
             pass
+        pending = getattr(self, "_drr_pending_fit_worker", None)
+        self._drr_pending_fit_worker = None
+        if pending is not None:
+            if getattr(self, "_is_closing", False):
+                pending.cancel()
+            else:
+                self._queue_drr_fit_worker(pending)
 
     def _on_drr_fit_error(self, generation: int, message: str) -> None:
         if generation == getattr(self, "_drr_fit_generation", 0):
@@ -2102,7 +2194,7 @@ class DrrController:
             if str(self.drr_fit_status.text()).startswith("Fitting"):
                 self.drr_fit_status.setText("Fit discarded: DRR source changed.")
             return
-        current_gate, _ = self._current_drr_spectrum(cube)
+        current_gate, _, _ = self._current_drr_spectrum(cube)
         if abs(float(current_gate) - float(gate_used)) > 1e-9 or abs(float(self._drr_gate_value()) - float(requested_gate)) > 1e-9:
             if str(self.drr_fit_status.text()).startswith("Fitting"):
                 self.drr_fit_status.setText("Fit discarded: gate changed.")
@@ -2118,6 +2210,12 @@ class DrrController:
 
     def _invalidate_pending_drr_fit(self, message: str = "") -> None:
         self._drr_fit_generation = getattr(self, "_drr_fit_generation", 0) + 1
+        for worker in getattr(self, "_drr_fit_workers", ()):
+            worker.cancel()
+        pending = getattr(self, "_drr_pending_fit_worker", None)
+        if pending is not None:
+            pending.cancel()
+            self._drr_pending_fit_worker = None
         if message and hasattr(self, "drr_fit_status") and str(self.drr_fit_status.text()).startswith("Fitting"):
             self.drr_fit_status.setText(message)
     def _on_drr_clear_fit(self) -> None:
@@ -2158,7 +2256,9 @@ class DrrController:
             lines.append("Fit: " + "; ".join(fit_pairs))
         else:
             lines.append("Fit: none")
-        self.drr_analysis_text.setPlainText("\n".join(lines))
+        text = "\n".join(lines)
+        if self.drr_analysis_text.toPlainText() != text:
+            self.drr_analysis_text.setPlainText(text)
     def _remove_nearest_drr_peak(self, x_click: float) -> bool:
         if self._last_plot_cube is None or self._drr_peak_indices is None or self._drr_peak_indices.size == 0:
             return False
@@ -2280,17 +2380,34 @@ class DrrController:
             if ax is not None:
                 entries.append((f"gate:{key}", ax, (gate,)))
         helpers = getattr(self, "_drr_region_blitters", {})
+        active_keys = {key for key, _, _ in entries}
+        for key in list(helpers):
+            if key not in active_keys:
+                helpers.pop(key).disconnect()
+        full_draw = False
         for key, axis, artists in entries:
+            overlays = tuple(
+                artist for name in ("_drr_heatmap_peak_artist", "_drr_heatmap_fit_artist",
+                                    "_drr_spectrum_peak_artist", "_drr_spectrum_fit_artist")
+                if (artist := getattr(self, name, None)) is not None and artist.axes is axis
+            )
+            artists = tuple(sorted((*artists, *overlays), key=lambda artist: artist.get_zorder()))
             helper = helpers.get(key)
             bbox = tuple(round(float(v), 3) for v in axis.bbox.bounds)
             if helper is None:
                 helper = AxesRegionBlitter(self.canvas); helpers[key] = helper
                 helper.configure(axis, artists); helper._layout_bbox = bbox
-                helper.restore_interactive_drawing()
+                full_draw = True
             elif (helper._layout_bbox != bbox or helper.axes is not axis
                   or helper.artists != tuple(artists)):
                 helper.configure(axis, artists); helper._layout_bbox = bbox
-                helper.restore_interactive_drawing()
-            elif not helper.draw():
-                helper.restore_interactive_drawing()
+                full_draw = True
+            elif helper._background is None or helper._static_signature != helper._signature():
+                full_draw = True
         self._drr_region_blitters = helpers
+        if full_draw:
+            # Configure all dynamic artists before the shared, coalesced draw.
+            AxesRegionBlitter.restore_many(helpers.values())
+        else:
+            for helper in helpers.values():
+                helper.draw()

@@ -20,7 +20,7 @@ from matplotlib.ticker import PercentFormatter, ScalarFormatter
 from matplotlib.transforms import Bbox
 from matplotlib.widgets import SpanSelector
 from PySide6.QtCore import QFileSystemWatcher, QMimeData, QProcess, QSettings, Qt, QRunnable, QThreadPool, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QColor, QDesktopServices, QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -401,7 +401,8 @@ def _scan_drr_catalog_worker(
     return folder, sources, cache, False, include_all, tuple(missing_selected)
 
 
-def _scan_folder_sources_worker(folder: str, *, power_include_legacy: bool = False, mode: str = "all", progress, log) -> tuple:
+def _scan_folder_sources_worker(folder: str, *, power_include_legacy: bool = False, mode: str = "all",
+                                previous_catalog=None, progress, log) -> tuple:
     """Collect the cross-tab source catalogs without blocking Qt's GUI thread."""
     csv_files = data_io.list_csv_files(folder)
     map_files = data_io.list_map_input_files(folder) if mode in {"all", "Compare"} else []
@@ -446,7 +447,18 @@ def _scan_folder_sources_worker(folder: str, *, power_include_legacy: bool = Fal
             power_signatures.append((str(name), int(stat.st_size), int(stat.st_mtime_ns)))
         except OSError:
             power_signatures.append((str(name), None, None))
-    power_sources = data_io.get_power_series_sources(folder, power_files) if mode in {"all", "Power Dependent"} else {}
+    previous_power = next((item for item in (previous_catalog or ())
+                           if isinstance(item, dict) and item.get("tag") == "power_catalog"
+                           and item.get("version") == 1 and item.get("folder") == folder), {})
+    old_signatures = {name: (size, modified) for name, size, modified
+                      in previous_power.get("signatures", ())}
+    unchanged = {name for name, size, modified in power_signatures
+                 if size is not None and modified is not None
+                 and old_signatures.get(name) == (size, modified)}
+    cached_tables = {source.file_name: source for source in previous_power.get("sources", {}).values()
+                     if isinstance(source, data_io.PowerSeriesSource) and source.source_format == "table"
+                     and source.file_name in unchanged and source.power_values}
+    power_sources = data_io.get_power_series_sources(folder, power_files, cached_tables=cached_tables) if mode in {"all", "Power Dependent"} else {}
     power_combined = {
         str(source.file_name).replace("\\", "/").casefold()
         for source in power_sources.values()
@@ -521,13 +533,17 @@ def _cached_folder_sources_worker(folder: str, *, mode: str, power_include_legac
                                   force: bool, publish_cached, progress, log) -> tuple:
     from core.source_catalog_cache import SourceCatalogCache
     cache = SourceCatalogCache(folder, f"{mode}-{int(power_include_legacy)}")
-    cached = cache.read()
-    cache_usable = cached is not None and _catalog_payload_compatible(cached, folder, mode)
-    if cache_usable:
-        publish_cached(tuple(cached[:-1]) + (dict(cached[-1], preview=True),))
+    previous = None
+    def preview(cached):
+        nonlocal previous
+        previous = cached
+        if publish_cached is not None:
+            publish_cached(tuple(cached[:-1]) + (dict(cached[-1], preview=True),))
     return cache.refresh(lambda: _scan_folder_sources_worker(
-        folder, mode=mode, power_include_legacy=power_include_legacy, progress=progress, log=log),
-        force=force or not cache_usable)
+        folder, mode=mode, power_include_legacy=power_include_legacy,
+        previous_catalog=None if force else previous, progress=progress, log=log),
+        force=force, publish_cached=preview,
+        accept_cached=lambda payload: _catalog_payload_compatible(payload, folder, mode))
 
 
 
@@ -597,6 +613,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._catalog_displayed_modes: set[str] = set()
         self._catalog_active_scan: str | None = None
         self._catalog_pending_requests: dict[str, bool] = {}
+        self._catalog_pending_rebuilds: set[str] = set()
         self._file_refresh_running = False
         self._file_refresh_pending = False
         self._file_refresh_pending_auto = False
@@ -625,6 +642,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._drr_refresh_running = False
         self._drr_refresh_pending = False
         self._drr_refresh_pending_auto = False
+        self._drr_refresh_pending_force = False
         self._drr_refresh_pending_old_sources: set[str] | None = None
         self._drr_refresh_pending_selected_sources: set[str] | None = None
         self._drr_refresh_workers: list[Worker] = []
@@ -976,6 +994,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._drr_include_all_sources = False
             self._catalog_displayed_modes.clear()
             self._catalog_pending_requests.clear()
+            self._catalog_pending_rebuilds.clear()
             self._invalidate_export_move_sources()
             self._reset_workflow_state_for_folder_change()
             if hasattr(self, "drr_pin_baseline_chk"):
@@ -1479,8 +1498,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         apply_accessible_identity(self.open_file_btn, name="Open File", identifier="source.open")
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.setObjectName("refreshButton")
-        self.refresh_btn.setToolTip("Re-scan the current folder for new or changed CSV files")
+        self.refresh_btn.setToolTip("Refresh new or changed files in the background. Right-click to rebuild the catalog.")
         apply_accessible_identity(self.refresh_btn, name="Refresh", identifier="source.refresh")
+        self.rebuild_catalog_action = QAction("Rebuild File Catalog", self.refresh_btn)
+        self.rebuild_catalog_action.triggered.connect(lambda: self._refresh_file_lists(force=True))
+        self.refresh_btn.addAction(self.rebuild_catalog_action)
+        self.refresh_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
         self.data_state_label = QLabel("Shown: no data")
         self.data_state_label.setObjectName("dataStateLabel")
         self.data_state_label.setToolTip("Shows whether the visible plot matches the current source selection")
@@ -1917,7 +1940,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             label = QLabel(label_text) if label_text else None
             if label is not None:
                 label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            dense_layout = DenseFormRowLayout(row, spacing=4, label=label)
+            dense_layout = DenseFormRowLayout(row, spacing=4, label=label, stable_spin_width=True)
             row.setLayout(dense_layout)
             dense_layout.add_group((a, fa), role="range", priority=10, grow_weight=1)
             dense_layout.add_group((b, fb), role="range", priority=10, grow_weight=1)
@@ -2816,6 +2839,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         )
         self.mcd_unified_view.detection_mode_changed.connect(self._on_unified_detection_mode_changed)
         self.mcd_unified_view.window_center_changed.connect(self.mcd_window_center_spin.setValue)
+        import weakref
+        commit_ref = weakref.WeakMethod(self._commit_unified_mcd_window)
+        self.mcd_unified_view.window_commit_handler = lambda center, width: (
+            commit_ref()(center, width) if commit_ref() is not None else None)
         self.mcd_unified_view.manual_candidate_added.connect(
             lambda _item: self._queue_unified_selected_feature_analysis()
         )
@@ -2828,11 +2855,13 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         canvas_layout.setSpacing(0)
         canvas_layout.addWidget(self.canvas, 0, 0)
         self.empty_canvas_overlay = QLabel(
-            "Choose a valid source to display it automatically"
+            "Choose a valid source to display it automatically", self.canvas
         )
         self.empty_canvas_overlay.setObjectName("emptyCanvasOverlay")
         self.empty_canvas_overlay.setAlignment(Qt.AlignCenter)
         self.empty_canvas_overlay.setWordWrap(True)
+        # Guidance is decorative: hiding it after the first draw must not
+        # change the canvas size and trigger a second full render.
         self.empty_canvas_overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.empty_canvas_overlay.setFocusPolicy(Qt.NoFocus)
         set_fluent_property(self.empty_canvas_overlay, "appRole", "emptyCanvas")
@@ -2841,8 +2870,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             name="Plot canvas guidance",
             description="Choose a valid source to load and show a scientific plot.",
         )
-        canvas_layout.addWidget(self.empty_canvas_overlay, 0, 0)
         self.canvas.mpl_connect("draw_event", self._sync_empty_canvas_overlay)
+        self.canvas.mpl_connect("resize_event", self._sync_empty_canvas_overlay)
         self._sync_empty_canvas_overlay()
         self._mcd_unified_canvas_host = canvas_host
         layout.addWidget(canvas_host, 1)
@@ -2853,6 +2882,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         overlay = getattr(self, "empty_canvas_overlay", None)
         figure = getattr(self, "figure", None)
         if overlay is not None and figure is not None:
+            overlay.setGeometry(self.canvas.rect())
             overlay.setVisible(not bool(figure.axes))
 
     def _update_results_dock_page(self) -> None:
@@ -4318,10 +4348,13 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return
         active = self._active_mode()
         mode = active if active in self._catalog_pending_requests else next(iter(self._catalog_pending_requests))
-        force = self._catalog_pending_requests.pop(mode)
-        self._refresh_file_lists(auto=not force, mode=mode)
+        manual = self._catalog_pending_requests.pop(mode)
+        force = mode in self._catalog_pending_rebuilds
+        self._catalog_pending_rebuilds.discard(mode)
+        self._refresh_file_lists(auto=not manual, mode=mode, force=force)
 
-    def _refresh_file_lists(self, *, auto: bool = False, mode: str | None = None) -> None:
+    def _refresh_file_lists(self, *, auto: bool = False, mode: str | None = None,
+                            force: bool = False) -> None:
         """Queue a folder catalog refresh and apply it only if still current."""
         if self._is_closing:
             return
@@ -4363,6 +4396,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._power_result_cache.clear()
             self._drr_refresh_pending = False
             self._drr_refresh_pending_auto = False
+            self._drr_refresh_pending_force = False
             self._drr_refresh_pending_old_sources = None
             self._drr_refresh_pending_selected_sources = None
             self.drr_available_sources = []
@@ -4370,12 +4404,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return
         mode = mode or self._active_mode()
         if mode == "DRR":
-            self._queue_drr_catalog_refresh(auto=auto, old_source_files=old_source_files)
+            self._queue_drr_catalog_refresh(auto=auto, old_source_files=old_source_files, force=force)
             return
         if mode not in {"PL", "Compare", "Power Dependent", "MCD", "SHG Processing"}:
             return
         if self._file_refresh_running:
             self._catalog_pending_requests[mode] = self._catalog_pending_requests.get(mode, False) or not auto
+            if force:
+                self._catalog_pending_rebuilds.add(mode)
             self._file_refresh_pending = True
             self._file_refresh_pending_auto = self._file_refresh_pending_auto or auto
             return
@@ -4390,7 +4426,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         folder = self.current_folder
         worker = Worker(
             _cached_folder_sources_worker,
-            folder, mode=mode, force=not auto, publish_cached=None,
+            folder, mode=mode, force=force, publish_cached=None,
             power_include_legacy=bool(getattr(self, "_power_include_legacy", False)),
         )
         worker.kwargs["publish_cached"] = worker.signals.result.emit
@@ -4661,8 +4697,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             pass
 
     def _queue_drr_catalog_refresh(self, *, auto: bool, old_source_files: set[str],
-                                   selected_sources=()) -> None:
-        """Coalesce DRR scans while keeping unrelated file-list refreshes synchronous."""
+                                   selected_sources=(), force: bool = False) -> None:
+        """Coalesce background DRR scans without losing explicit rebuild requests."""
         if self._is_closing:
             return
         if self._drr_refresh_running:
@@ -4671,6 +4707,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             else:
                 self._drr_refresh_pending_auto = self._drr_refresh_pending_auto and auto
             self._drr_refresh_pending = True
+            self._drr_refresh_pending_force = self._drr_refresh_pending_force or force
             if self._drr_refresh_pending_old_sources is None:
                 self._drr_refresh_pending_old_sources = set(old_source_files)
             pending_selected = self._drr_refresh_pending_selected_sources or set()
@@ -4678,12 +4715,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._drr_refresh_pending_selected_sources = pending_selected
             return
         kwargs = {"auto": auto, "old_source_files": old_source_files}
+        if force:
+            kwargs["force"] = True
         if selected_sources:
             kwargs["selected_sources"] = selected_sources
         self._start_drr_catalog_refresh(**kwargs)
 
     def _start_drr_catalog_refresh(self, *, auto: bool, old_source_files: set[str],
-                                   selected_sources=()) -> None:
+                                   selected_sources=(), force: bool = False) -> None:
         if self._is_closing or not self.current_folder:
             return
         self._drr_refresh_running = True
@@ -4694,7 +4733,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             _scan_drr_catalog_worker,
             folder,
             self._drr_source_cache.clone(),
-            force=not auto, publish_cached=None,
+            force=force, publish_cached=None,
             include_all=bool(getattr(self, "_drr_include_all_sources", False)),
             selected_sources=tuple(selected_sources),
         )
@@ -4881,12 +4920,16 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return
         self._drr_refresh_pending = False
         auto = self._drr_refresh_pending_auto
+        force = self._drr_refresh_pending_force
+        self._drr_refresh_pending_force = False
         old_source_files = self._drr_refresh_pending_old_sources or set()
         self._drr_refresh_pending_auto = False
         self._drr_refresh_pending_old_sources = None
         selected_sources = self._drr_refresh_pending_selected_sources or set()
         self._drr_refresh_pending_selected_sources = None
         kwargs = {"auto": auto, "old_source_files": old_source_files}
+        if force:
+            kwargs["force"] = True
         if selected_sources:
             kwargs["selected_sources"] = selected_sources
         self._start_drr_catalog_refresh(**kwargs)
@@ -6268,9 +6311,13 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             and loaded.mcd_result is not None
             and self.last_plotted_mode == "MCD"
         ):
-            # Give the freshly rendered MCD view a short settling window so
-            # the first center trace refresh is not consumed during plotting.
-            self.mcd_controller._mcd_center_refresh_timer.start(200)
+            # Settle the initial axis separately; start(200) on the interaction
+            # timer would permanently replace its normal 40 ms interval.
+            QTimer.singleShot(200, lambda state=loaded: (
+                self.mcd_unified_view._settle_window_range()
+                if self.loaded is state and not getattr(self, '_is_closing', False)
+                and not self.mcd_controller._mcd_center_refresh_timer.isActive()
+                else None))
 
     def _on_load_finished(self, load_generation: int | None = None,
                           *, request_token: RequestToken | None = None) -> None:
@@ -8898,62 +8945,37 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self._mcd_unified_analysis_pending = False
                 QTimer.singleShot(0, self._queue_mcd_unified_analysis)
 
+    def _commit_unified_mcd_window(self, center: float, width: float) -> None:
+        for spin, value in ((self.mcd_window_center_spin, center), (self.mcd_window_width_spin, width)):
+            blocked = spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(blocked)
+        self._mcd_candidate_active_index = None
+        self.mcd_controller._update_mcd_candidate_bar()
+        summary = getattr(getattr(self.loaded, 'mcd_result', None), 'summary', None)
+        if isinstance(summary, dict):
+            summary['window_center_selection'] = {'method': 'manual'}
+        self.mcd_controller._mcd_center_refresh_timer.stop()
+        self.mcd_controller._apply_pending_mcd_center_refresh()
+
     def _compute_unified_mcd_slopes(self, view: McdUnifiedView) -> Any:
         try:
             from core.mcd_analysis import fit_mcd_slopes
             result = self.loaded.mcd_result
-            energy = np.asarray(result.energy_ev, float)
-            # McdResult.energy_ev is already sorted, whereas paired spectra
-            # retain wavelength-column order. Construct the energy axis in
-            # that same raw order before applying the spectral permutation.
-            wavelength = np.asarray(getattr(result, "wavelength_nm", ()), float)
-            column_energy = 1239.841984 / wavelength if wavelength.shape == energy.shape else energy
-            values = np.asarray(result.pair_mcd_corrected, float)
-            cached_order = getattr(result, "_unified_energy_order", None)
-            order_signature = (column_energy.shape, column_energy.tobytes())
-            if getattr(result, "_unified_energy_order_signature", None) != order_signature:
-                cached_order = None
-            ordered_columns = np.asarray(
-                spectrum_energy_order(result) if cached_order is None else cached_order,
-                dtype=int,
-            )
-            try:
-                result._unified_energy_order = ordered_columns
-                result._unified_energy_order_signature = order_signature
-            except AttributeError:
-                pass
-            half = float(view.state.window_width_mev) * 0.0005
-            ordered_energy = column_energy[ordered_columns] if ordered_columns.size == energy.size else column_energy
-            mask = np.abs(ordered_energy - view.state.window_center_ev) <= half
-            # Match pair_window_trace_by_branch for sub-sample windows.
-            if ordered_energy.size and not np.any(mask):
-                mask[int(np.argmin(np.abs(ordered_energy - view.state.window_center_ev)))] = True
-            metric = str(self.mcd_window_metric_combo.currentText()).casefold().replace(" ", "_")
-            if values.ndim == 2 and ordered_columns.size == values.shape[1] and np.any(mask):
-                # Select the window in energy order before copying columns;
-                # center movement no longer duplicates the whole matrix.
-                selected = values[:, ordered_columns[mask]]
-                selected_energy = ordered_energy[mask]
-            else:
-                selected = None
-                selected_energy = energy[mask]
-            if selected is None:
-                trace = np.full(np.asarray(result.pair_b).shape, np.nan)
-            elif "integral" in metric:
-                trace = np.trapezoid(selected, x=selected_energy, axis=1)
-            elif "field" in metric and "absolute" in metric:
-                trace = np.sign(np.asarray(result.pair_b, dtype=float)) * np.nanmean(np.abs(selected), axis=1)
-            elif "absolute" in metric:
-                trace = np.nanmean(np.abs(selected), axis=1)
-            else:
-                trace = np.nanmean(selected, axis=1)
+            metric, traces = view.window_traces(result)
+            fields, values, labels = [], [], []
+            for branch, metrics in traces.items():
+                bx, by = metrics[f'corrected_{metric}']
+                fields.extend(bx)
+                values.extend(by)
+                labels.extend([branch] * len(bx))
             controls = self.mcd_unified_controls
             ranges = {
                 "low": (controls.slope_low_spin.value(), controls.slope_low_end_spin.value()),
                 "high_positive": (controls.slope_high_positive_spin.value(), controls.slope_high_positive_end_spin.value()),
                 "high_negative": (controls.slope_high_negative_spin.value(), controls.slope_high_negative_end_spin.value()),
             }
-            return fit_mcd_slopes(result.pair_b, trace, result.pair_labels, ranges=ranges)
+            return fit_mcd_slopes(fields, values, labels, ranges=ranges)
         except (AttributeError, ImportError, TypeError, ValueError, FloatingPointError):
             return None
 
@@ -9173,6 +9195,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self._drr_plot_cubes = {key: cube for key, cube, *_rest in products}
                 self._drr_heatmap_axes = {}
                 self._drr_spectrum_axes = {}
+                self._drr_spectrum_lines = {}
                 both = len(products) == 2
                 if both:
                     # Keep one compact filename header for the paired view;
@@ -9229,7 +9252,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                                 "xlabel": "",
                             }
                         )
-                    render = plot_drr(ax1, downsample_cube_for_display(product_cube), product_params)
+                    render = plot_drr(ax1, self.drr_controller._drr_display_preview(product_cube), product_params)
                     self._add_heatmap_colorbar(
                         render, cax,
                         label="" if both else product_params.cbar_label,
@@ -9257,12 +9280,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     )
                     self._drr_heatmap_axes[key] = ax1
                     self._drr_spectrum_axes[key] = ax2
+                    self._drr_spectrum_lines[key] = ax2.lines[0]
                     if shared_heat_ax is None:
                         shared_heat_ax = ax1
                 active_key = "second" if self._drr_plot_view == "second" and "second" in self._drr_plot_cubes else "raw"
                 plot_cube = self._drr_plot_cubes[active_key]
                 self._drr_heatmap_ax = self._drr_heatmap_axes[active_key]
                 self._drr_spectrum_ax = self._drr_spectrum_axes[active_key]
+                self._drr_spectrum_line = self._drr_spectrum_lines[active_key]
                 if self._drr_view_limits is not None:
                     old_xlim, old_ylim = self._drr_view_limits
                     for axis in self._drr_heatmap_axes.values():

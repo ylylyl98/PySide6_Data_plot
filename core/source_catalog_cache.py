@@ -85,21 +85,24 @@ class SourceCatalogCache:
         if not self.folder.is_dir():
             raise OSError(f'Source directory is unavailable: {self.folder}')
         records = []
-        def onerror(error):
-            raise error
-        for directory, dirs, names in os.walk(self.folder, onerror=onerror, followlinks=False):
-            parent = Path(directory)
-            dirs[:] = [name for name in dirs
-                       if not (parent / name).is_symlink()
-                       and (parent / name).resolve() != self.cache_root]
-            for name in names:
-                path = parent / name
-                if path.suffix.lower() not in self._extensions or path.is_symlink():
-                    continue
-                if path == self.path:
-                    continue
-                stat = path.stat()
-                records.append([path.relative_to(self.folder).as_posix(), stat.st_size, stat.st_mtime_ns])
+        pending = [(str(self.folder), '')]
+        while pending:
+            directory, prefix = pending.pop()
+            # Keep DirEntry metadata: on Windows enumeration already supplies
+            # size/mtime, avoiding separate Path.is_symlink/stat calls per file.
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if entry.is_symlink():
+                        continue
+                    relative = prefix + entry.name
+                    if entry.is_dir(follow_symlinks=False):
+                        if Path(entry.path).resolve() != self.cache_root:
+                            pending.append((entry.path, relative + '/'))
+                    elif os.path.splitext(entry.name)[1].lower() in self._extensions:
+                        if Path(entry.path) == self.path:
+                            continue
+                        stat = entry.stat(follow_symlinks=False)
+                        records.append([relative, stat.st_size, stat.st_mtime_ns])
         return sorted(records)
 
     def _read_record(self):
@@ -118,9 +121,12 @@ class SourceCatalogCache:
         return record[1] if record is not None else None
 
     def refresh(self, builder: Callable[[], Any], *, force: bool = False,
-                publish_cached: Callable[[Any], None] | None = None) -> Any:
+                publish_cached: Callable[[Any], None] | None = None,
+                accept_cached: Callable[[Any], bool] | None = None) -> Any:
         # One decoded record supplies both immediate preview and validation.
         record = self._read_record() if publish_cached is not None or not force else None
+        if record is not None and accept_cached is not None and not accept_cached(record[1]):
+            record = None
         if record is not None and publish_cached is not None:
             publish_cached(record[1])
         try:

@@ -15,12 +15,55 @@ class McdRenderFollowupTests(unittest.TestCase):
     def test_full_draw_paints_animated_curves_before_next_event(self):
         view = McdUnifiedView()
         view.render(_result())
-        axis = view.axes['spectra']
-        with patch.object(axis, 'draw_artist', wraps=axis.draw_artist) as draw:
+        line = view._artists['spectrum_lines'][0][0]
+        with patch.object(line, 'draw', wraps=line.draw) as draw:
             view.canvas.draw()
-            lines = [item[0] for item in view._artists['spectrum_lines']]
-            self.assertTrue(all(any(call.args[0] is line for call in draw.call_args_list) for line in lines))
+            draw.assert_called()
         view.close()
+
+    def test_cached_window_is_present_in_full_draw_without_draw_callback(self):
+        view = McdUnifiedView()
+        self.addCleanup(view.close)
+        view.state.window_center_ev = 1.64
+        view.render(_result())
+        view.set_window(1.65, 5.)
+        view._prepare_blit()
+        label = view._artists['window_status'][0]
+        # A full renderer pass must contain the label without needing a
+        # draw-event callback to add animated overlays back afterward.
+        with view.canvas.callbacks.blocked(signal='draw_event'):
+            view.canvas.draw()
+            visible = np.asarray(view.canvas.buffer_rgba()).copy()
+            label.set_visible(False)
+            view.canvas.draw()
+            hidden = np.asarray(view.canvas.buffer_rgba()).copy()
+        self.assertGreater(np.count_nonzero(visible != hidden), 30)
+
+    def test_pending_qt_draw_during_cache_publication_keeps_map_label(self):
+        view = McdUnifiedView()
+        self.addCleanup(view.close)
+        view.state.window_center_ev = 1.64
+        view.render(_result())
+        label = view._artists['window_status'][0]
+        original_blit = view.canvas.blit
+        pending = [True]
+        def publish(*args, **kwargs):
+            # Qt paintEvent can service an already queued draw_idle when a
+            # blit requests repaint (rapid selection / initial Load).
+            if pending[0]:
+                pending[0] = False
+                view.canvas.draw()
+            return original_blit(*args, **kwargs)
+        with patch.object(view.canvas, 'blit', side_effect=publish):
+            view._prepare_blit()
+        actual = np.asarray(view.canvas.buffer_rgba()).copy()
+        bbox = label.get_window_extent(view.canvas.get_renderer())
+        with view.canvas.callbacks.blocked(signal='draw_event'):
+            view.canvas.draw()
+        expected = np.asarray(view.canvas.buffer_rgba()).copy()
+        h = expected.shape[0]
+        crop = (slice(h-int(bbox.y1)-2, h-int(bbox.y0)+2), slice(int(bbox.x0)-2, int(bbox.x1)+2))
+        self.assertLess(np.count_nonzero(actual[crop] != expected[crop]), 5)
 
     def test_window_update_expands_y_limits_without_replacing_map(self):
         result = _result()

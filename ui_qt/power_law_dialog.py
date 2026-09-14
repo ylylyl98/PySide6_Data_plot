@@ -3,7 +3,7 @@ import numpy as np
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox,
     QPushButton, QTableWidget, QHeaderView, QDoubleSpinBox, QDialogButtonBox)
 from matplotlib.figure import Figure
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from ui_qt.matplotlib_theme import QtFontFigureCanvasQTAgg as FigureCanvasQTAgg
 from matplotlib.widgets import SpanSelector
 from core.plotting import plain_log_ticks
 from core.power_law import fit_power_law, suggest_power_range, local_slopes
