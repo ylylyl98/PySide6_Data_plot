@@ -30,7 +30,7 @@ COMPARE_CHANNEL_TOKEN_RE = re.compile(
 COMPARE_ANGLE_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:(?:rot\s*(?:[12]|in|out)|in|out)\s*[^0-9+\-]*"
     r"[+\-]?\d+(?:[pP\.]\d+)?\s*(?:deg|degree)|"
-    r"deg(?:ree)?\s*[+\-]?\d+(?:[pP\.]\d+)?)(?![A-Za-z0-9])",
+    r"deg(?:ree)?\s*[+\-]?\d+(?:[pP\.]\d+)?|rot[12]_[+\-]?\d+(?:[pP\.]\d+)?)(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 
@@ -303,6 +303,8 @@ def parse_compare_rotation_angles(file_name: str, *, rot1_is_output: bool = Fals
     bare_out = _angles(rf"{named_prefix}out[^0-9\-+]*{number}{unit}")
     rot1 = _angles(rf"(?<![A-Za-z0-9])rot\s*1[^0-9\-+]*{number}{unit}")
     rot2 = _angles(rf"(?<![A-Za-z0-9])rot\s*2[^0-9\-+]*{number}{unit}")
+    rot1 = rot1 or _angles(rf"(?<![A-Za-z0-9])rot1_{number}(?![A-Za-z0-9])")
+    rot2 = rot2 or _angles(rf"(?<![A-Za-z0-9])rot2_{number}(?![A-Za-z0-9])")
     # Legacy single-analyzer filenames put the unit before the angle.
     legacy_out_angles = [
         _parse_angle_token(match.group(1))
