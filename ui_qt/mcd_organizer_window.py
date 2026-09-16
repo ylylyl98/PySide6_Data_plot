@@ -373,6 +373,9 @@ class McdOrganizerWindow(QMainWindow):
         self._slope_plot_layout = slope_layout
         self.preview_tabs.addTab(mcd_tab, "MCD vs B")
         self.preview_tabs.addTab(slope_tab, "Window energy / slopes vs E-field")
+        from ui_qt.curie_weiss_panel import CurieWeissPanel
+        self.curie_weiss_panel = CurieWeissPanel()
+        self.preview_tabs.addTab(self.curie_weiss_panel, "Curie–Weiss")
         self.preview_splitter = QSplitter(Qt.Horizontal)
         self.preview_splitter.addWidget(self.preview_tabs)
         self.preview_splitter.addWidget(self.conditions_panel)
@@ -1079,6 +1082,7 @@ class McdOrganizerWindow(QMainWindow):
         self._update_slope_preview([record for record in series.records if record.record_id in included])
 
     def _show_empty_preview(self, message: str) -> None:
+        self.curie_weiss_panel.clear(message)
         self._energy_point_artists = {}
         self._energy_focus_artists = []
         self._energy_hover = None
@@ -1193,6 +1197,12 @@ class McdOrganizerWindow(QMainWindow):
         self._update_slope_preview(slope_records)
 
     def _update_slope_preview(self, records: list[ProcessedMcdRecord]) -> None:
+        series = self._current_series()
+        if series is not None and series.variable == 'Temperature':
+            self.curie_weiss_panel.set_series(
+                series.series_id, records, self._energy_groups(series.records), self._selected_branches())
+        else:
+            self.curie_weiss_panel.clear()
         if self.slope_figure is None:
             return
         from core.mcd_energy_groups import draw_energy_slope_panels

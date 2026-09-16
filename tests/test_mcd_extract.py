@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ from openpyxl import load_workbook
 
 from core.mcd_extract import (
     McdExtractFilters,
+    ProcessedMcdRecord,
     clear_mcd_trace_cache,
     discover_processed_mcd,
     energy_cluster_centers,
@@ -31,6 +33,40 @@ from core.mcd_extract import (
 
 
 class McdExtractTests(unittest.TestCase):
+    def test_temperature_sort_ignores_mean_roundoff_in_equal_doping(self):
+        base = ProcessedMcdRecord('base', Path('x.json'), Path('x.csv'), 'x.csv',
+                                  'test', '', 1.64, 5., 'mean', .2, {}, {}, 1., 1.)
+        records = []
+        for efield, count, doping in [(27., 7, 6.299999999999998),
+                                     (0., 7, 6.299999999999999),
+                                     (23., 10, 6.3), (10., 7, 6.300000000000002)]:
+            for i in range(count):
+                records.append(replace(base, record_id=f'{efield}-{i}', acquisition_conditions={
+                    'T': (1.67+i*.2, 1.67+i*.2), 'Doping': (doping, doping),
+                    'E-field': (efield, efield)}))
+        groups = organize_mcd_series(records, 'Temperature', include_singletons=False)
+        self.assertEqual([s.fixed_conditions['E-field'] for s in groups], [0., 10., 23., 27.])
+
+    def test_temperature_series_sort_by_numeric_doping_then_efield_not_count(self):
+        base = ProcessedMcdRecord('base', Path('x.json'), Path('x.csv'), 'x.csv',
+                                  'test', '', 1.64, 5., 'mean', .2, {}, {}, 1., 1.)
+        records = []
+        # More records and lexical "10" must not outrank smaller numeric doping.
+        conditions = [(10., 0., 4), (2., 10., 3), (2., 2., 2),
+                      (2., -1., 2), (-2., 0., 2), (None, 0., 2)]
+        for group, (doping, field, count) in enumerate(conditions):
+            for t in reversed(range(1, count+1)):
+                values = {'T': (float(t), float(t)), 'E-field': (field, field)}
+                if doping is not None:
+                    values['Doping'] = (doping, doping)
+                records.append(replace(base, record_id=f'{group}-{t}', acquisition_conditions=values))
+        series = organize_mcd_series(records, 'Temperature', include_singletons=False)
+        self.assertEqual([(s.fixed_conditions['Doping'], s.fixed_conditions['E-field']) for s in series],
+                         [(-2., 0.), (2., -1.), (2., 2.), (2., 10.), (10., 0.), (None, 0.)])
+        for group in series:
+            temperatures = [r.condition_value('T') for r in group.records]
+            self.assertEqual(temperatures, sorted(temperatures))
+
     def test_isolated_condition_detection_uses_spacing_not_zero_value(self) -> None:
         self.assertEqual(isolated_condition_values([0, 20, 21, 22, 23]), {0.0})
         self.assertEqual(isolated_condition_values([5, 7, 9]), set())

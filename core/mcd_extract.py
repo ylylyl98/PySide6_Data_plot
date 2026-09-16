@@ -1135,6 +1135,19 @@ def organize_mcd_series(
         series.append(
             McdSeries(f"S{index:02d}_{digest}", best_axis, label, tuple(ordered), fixed)
         )
+    if best_axis == "Temperature":
+        def temperature_series_key(item: McdSeries) -> tuple:
+            # Compare physical numbers, not record counts or formatted labels.
+            doping = item.fixed_conditions.get("Doping")
+            efield = item.fixed_conditions.get("E-field")
+            missing = doping is None or efield is None
+            # Group means can differ by machine roundoff (e.g. 6.3 +/- 2e-15)
+            # depending on record count. Normalize only the sorting keys at
+            # precision far finer than the 0.01 condition-grouping tolerance.
+            return (missing, round(doping, 8) if doping is not None else float("inf"),
+                    round(efield, 8) if efield is not None else float("inf"),
+                    item.label.casefold())
+        return sorted(series, key=temperature_series_key)
     return sorted(series, key=lambda item: (-len(item.records), item.label.casefold()))
 
 

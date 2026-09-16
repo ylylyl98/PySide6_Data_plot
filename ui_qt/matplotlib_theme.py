@@ -79,7 +79,11 @@ def apply_display_theme(figure: Any, theme: MatplotlibDisplayTheme) -> None:
     """Apply presentation attributes to a figure and all current axes."""
     figure.patch.set_facecolor(theme.figure_face)
     figure.patch.set_edgecolor(theme.figure_face)
-    for axis in tuple(getattr(figure, "axes", ())):
+    axes = list(getattr(figure, "axes", ()))
+    for axis in axes:
+        # Axes.inset_axes creates child axes outside figure.axes. Include
+        # these in live theme changes and the light publication context.
+        axes.extend(child for child in axis.child_axes if child not in axes)
         axis.set_facecolor(theme.axes_face)
         for spine in axis.spines.values():
             spine.set_edgecolor(theme.spine)
