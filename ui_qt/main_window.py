@@ -904,8 +904,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._apply_initial_geometry()
         self._set_stage("No data")
         self._update_action_states()
-        from ui_qt.drr_regions import restore_settings
+        from ui_qt.drr_regions import restore_settings, settings_state
         restore_settings(self)
+        self._drr_region_settings_baseline = settings_state(self)
         self._restore_last_folder()
         self.setAcceptDrops(True)
         self._schedule_automatic_update_check()

@@ -11,6 +11,12 @@ from tests.test_drr_three_regions import example
 
 
 class ThreeRegionUiTests(unittest.TestCase):
+    def test_unchanged_window_close_does_not_write_region_defaults(self):
+        self.assertEqual(self.settings.allKeys(), [])
+        self.w.close()
+        self.settings.sync()
+        self.assertEqual(self.settings.allKeys(), [])
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])

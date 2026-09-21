@@ -171,13 +171,21 @@ def refresh(owner, prefix, cubes, *, side=None, center=False):
     return changed
 
 
-def save_settings(owner):
+def settings_state(owner):
     state = {'count': owner.drr_region_count_combo.currentData(),
              'boundary': owner.drr_split_boundary_chk.isChecked()}
     for prefix in ('drr', 'drr_second'):
         state[prefix] = {key: spin.value() for key, spin in getattr(owner, f'{prefix}_split_spins').items()}
         state[prefix+'_fix'] = {key: check.isChecked() for key, check in getattr(owner, f'{prefix}_split_fix_checks').items()}
+    return state
+
+
+def save_settings(owner):
+    state = settings_state(owner)
+    if state == getattr(owner, '_drr_region_settings_baseline', None):
+        return
     owner.settings.setValue(SETTINGS_KEY, json.dumps(state))
+    owner._drr_region_settings_baseline = state
 
 
 def restore_settings(owner):
