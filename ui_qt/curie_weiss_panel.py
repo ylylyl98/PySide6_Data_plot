@@ -11,7 +11,7 @@ from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                                QLabel, QComboBox, QDoubleSpinBox, QPushButton,
                                QPlainTextEdit, QScrollArea, QFileDialog, QMessageBox, QSizePolicy,
-                               QCheckBox, QTabWidget)
+                               QCheckBox, QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView)
 
 
 class CurieWeissPanel(QWidget):
@@ -23,8 +23,11 @@ class CurieWeissPanel(QWidget):
         self.series_id = None
         self.results = {}
         self.points = []
+        self.method_comparison = []
         self.field_fits = []
         self.field_figure = self.field_canvas = None
+        self.range_scan_results = []
+        self.scan_figure = self.scan_canvas = None
         self.figure = self.canvas = None
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
@@ -38,10 +41,11 @@ class CurieWeissPanel(QWidget):
         self.layout = QVBoxLayout(body)
         scroll.setWidget(body)
         outer.addWidget(scroll)
-        hint = QLabel('s(T) = s0 + A / (T − θCW) · near-zero MCD slopes\n'
+        hint = QLabel('s(T) = A / (T − θCW) · near-zero MCD slopes\n'
                       'Select a Temperature series and one energy group. Use conditions on the right to exclude points.')
         hint.setWordWrap(True)
         self.layout.addWidget(hint)
+        self.model_hint = hint
         grid = QGridLayout()
         self.group_combo = QComboBox()
         self.group_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
@@ -59,6 +63,34 @@ class CurieWeissPanel(QWidget):
         self.field_refit_chk = QCheckBox('Refit slopes from MCD–B')
         self.field_refit_chk.setToolTip('Use one B interval for every temperature and branch. Unchecked: use saved slopes.')
         self.b_min, self.b_max = QDoubleSpinBox(), QDoubleSpinBox()
+        self.b_halfwidth = QDoubleSpinBox()
+        self.b_halfwidth.setRange(.0001, 1000)
+        self.b_halfwidth.setDecimals(4)
+        self.b_halfwidth.setSingleStep(.05)
+        self.b_halfwidth.setValue(.2)
+        self.b_halfwidth.setPrefix('± ')
+        self.b_halfwidth.setSuffix(' T')
+        self.b_halfwidth.setKeyboardTracking(False)
+        self.b_halfwidth.setAccessibleName('Symmetric field fit half-width')
+        self.b_halfwidth.setEnabled(False)
+        self.asymmetric_chk = QCheckBox('Custom asymmetric range')
+        self.range_controls = QWidget()
+        range_layout = QHBoxLayout(self.range_controls)
+        range_layout.setContentsMargins(0, 0, 0, 0)
+        range_layout.addWidget(QLabel('B fit half-width'))
+        range_layout.addWidget(self.b_halfwidth)
+        for width in (.1, .15, .2, .3):
+            button = QPushButton(f'±{width:g} T')
+            button.clicked.connect(lambda _checked=False, w=width: self._set_symmetric_range(w))
+            range_layout.addWidget(button)
+        range_layout.addWidget(self.asymmetric_chk)
+        self.asymmetric_host = QWidget()
+        asymmetric_layout = QHBoxLayout(self.asymmetric_host)
+        asymmetric_layout.setContentsMargins(0, 0, 0, 0)
+        for label, spin in [('B min', self.b_min), ('B max', self.b_max)]:
+            asymmetric_layout.addWidget(QLabel(label))
+            asymmetric_layout.addWidget(spin)
+        self.asymmetric_host.hide()
         for spin, value in ((self.b_min, -.2), (self.b_max, .2)):
             spin.setRange(-1000, 1000)
             spin.setDecimals(4)
@@ -69,8 +101,8 @@ class CurieWeissPanel(QWidget):
             spin.setEnabled(False)
         self.background_combo = QComboBox()
         self.method_combo = QComboBox()
-        self.method_combo.addItem('Inverse slope linear · Tang-style', 'inverse')
-        self.method_combo.addItem('Slope nonlinear · previous method', 'slope')
+        self.method_combo.addItem('Inverse slope linear · equal weights', 'inverse')
+        self.method_combo.addItem('Slope nonlinear · equal weights', 'slope')
         self.method_combo.setAccessibleName('CW fitting method')
         self.layout.addWidget(self.method_combo)
         for text, key in [('Zero background', 'zero'), ('Fixed background', 'fixed'),
@@ -85,8 +117,7 @@ class CurieWeissPanel(QWidget):
         for row, (left, control, right, other) in enumerate([
                 ('Energy group', self.group_combo, 'Temperature', self.temperature_combo),
                 ('T min', self.t_min, 'T max', self.t_max),
-                ('Background', self.background_combo, 's0 (MCD/T)', self.background_spin),
-                ('B min', self.b_min, 'B max', self.b_max)]):
+                ('Background', self.background_combo, 's0 (MCD/T)', self.background_spin)]):
             label, label2 = QLabel(left), QLabel(right)
             label.setBuddy(control)
             label2.setBuddy(other)
@@ -98,6 +129,8 @@ class CurieWeissPanel(QWidget):
             other.setAccessibleName(right)
         self.layout.addWidget(self.field_refit_chk)
         self.layout.addLayout(grid)
+        self.layout.addWidget(self.range_controls)
+        self.layout.addWidget(self.asymmetric_host)
         actions = QHBoxLayout()
         self.fit_btn = QPushButton('Refit')
         self.export_btn = QPushButton('Save CW fit…')
@@ -137,8 +170,56 @@ class CurieWeissPanel(QWidget):
         self.field_plot_layout.addWidget(self.field_summary)
         self.plot_tabs.addTab(self.cw_plot_host, 'CW fit')
         self.plot_tabs.addTab(self.field_plot_host, 'MCD–B slopes')
+        self.scan_host = QWidget()
+        self.scan_layout = QVBoxLayout(self.scan_host)
+        self.scan_btn = QPushButton('Scan ±B ranges')
+        self.scan_btn.setToolTip('Scan ±0.1, ±0.15, ±0.2, ±0.3 T and the current half-width for all included temperatures. Does not apply a range.')
+        self.scan_text = QPlainTextEdit()
+        self.scan_text.setReadOnly(True)
+        self.scan_text.setMaximumHeight(160)
+        self.scan_text.setPlainText('Scan symmetric ranges to compare slope stability, SE and point count. No range is selected automatically.')
+        self.scan_layout.addWidget(self.scan_btn)
+        self.scan_layout.addWidget(self.scan_text)
+        self.plot_tabs.addTab(self.scan_host, 'Range scan')
+        self.method_host = QWidget()
+        method_layout = QVBoxLayout(self.method_host)
+        self.method_note = QLabel('Same points and background for all three methods. Sensitivity comparison only; '
+                                 'does not replace the primary fit. R² values in different spaces are not comparable. '
+                                 'Weighted intervals assume independent, accurate slope SE; systematic errors are excluded.')
+        self.method_note.setWordWrap(True)
+        method_layout.addWidget(self.method_note)
+        self.method_table = QTableWidget(0, 7)
+        self.method_table.setHorizontalHeaderLabels(['Branch', 'Method / weights', 'N', 'θCW (K)', '95% interval (K)', 'Status', 'Diagnostics'])
+        self.method_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.method_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.method_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
+        self.method_table.setMinimumHeight(220)
+        method_layout.addWidget(self.method_table)
+        self.method_export_btn = QPushButton('Save method comparison…')
+        self.method_export_btn.setEnabled(False)
+        self.method_export_btn.clicked.connect(self._save_method_comparison)
+        method_layout.addWidget(self.method_export_btn)
+        self.plot_tabs.addTab(self.method_host, 'Method comparison')
+        self.method_plot_host = QWidget()
+        method_plot_layout = QVBoxLayout(self.method_plot_host)
+        method_checks = QHBoxLayout()
+        self.method_plot_checks = {}
+        from ui_qt.cw_comparison_plots import METHODS
+        for key,(label,style) in METHODS.items():
+            check=QCheckBox(label);check.setChecked(True)
+            check.toggled.connect(self._draw_method_curves)
+            self.method_plot_checks[key]=check;method_checks.addWidget(check)
+        method_plot_layout.addLayout(method_checks)
+        from matplotlib.figure import Figure
+        from ui_qt.matplotlib_theme import ThemeAwareFigureCanvasQTAgg
+        self.method_figure=Figure(figsize=(10,7),layout='constrained')
+        self.method_canvas=ThemeAwareFigureCanvasQTAgg(self.method_figure)
+        self.method_canvas.setMinimumHeight(420)
+        method_plot_layout.addWidget(self.method_canvas)
+        self.plot_tabs.addTab(self.method_plot_host, 'Method plots')
+        self.scan_btn.clicked.connect(self._scan_field_ranges)
         self.layout.addWidget(self.plot_tabs, 1)
-        note = QLabel('Default: equal-weight linear fit of 1/(s−s0) vs T, θCW = −intercept/slope. '
+        note = QLabel('Default (zero background): equal-weight linear fit of 1/s vs T, θCW = −intercept/slope. '
                       'Error bars: propagated slope SE; fixed background treated as exact. '
                       'Reference: Tang et al., Nat. Nanotechnol. (2023), doi:10.1038/s41565-022-01309-8. '
                       'Regression weights are an app choice; not specified by the cited figure caption. '
@@ -152,24 +233,126 @@ class CurieWeissPanel(QWidget):
         for spin in (self.t_min, self.t_max, self.background_spin, self.b_min, self.b_max):
             spin.valueChanged.connect(self._changed)
         self.field_refit_chk.toggled.connect(self._changed)
+        self.b_halfwidth.valueChanged.connect(self._halfwidth_changed)
+        self.asymmetric_chk.toggled.connect(self._range_mode_changed)
         self.field_record_combo.currentIndexChanged.connect(self._draw_field)
         self.fit_btn.clicked.connect(self.refit)
         self.export_btn.clicked.connect(self._save)
 
     def _changed(self, *_):
+        self._clear_method_comparison()
+        self._clear_range_scan()
         inverse = self.method_combo.currentData() == 'inverse'
         self.background_combo.model().item(2).setEnabled(not inverse)
         if inverse and self.background_combo.currentData() == 'fit':
             self.background_combo.setCurrentIndex(0)
+        self.model_hint.setText(
+            ('s(T) = A / (T − θCW)' if self.background_combo.currentData() == 'zero'
+             else 's(T) = s0 + A / (T − θCW)') + ' · near-zero MCD slopes\n'
+            'Select a Temperature series and one energy group. Use conditions on the right to exclude points.')
         self.background_spin.setEnabled(self.background_combo.currentData() == 'fixed')
         self.b_min.setEnabled(self.field_refit_chk.isChecked())
         self.b_max.setEnabled(self.field_refit_chk.isChecked())
+        self.b_halfwidth.setEnabled(self.field_refit_chk.isChecked() and not self.asymmetric_chk.isChecked())
         self.results = {}
         self.export_btn.setEnabled(False)
         self.summary.setPlainText('Updating fit…')
         self._timer.start()
 
+    def _clear_range_scan(self):
+        self.range_scan_results = []
+        self.scan_text.setPlainText('Settings changed. Click Scan ±B ranges to compare slopes, errors and point counts.')
+        if self.scan_canvas is not None:
+            self.scan_figure.clear()
+            self.scan_canvas.hide()
+
+    def _halfwidth_changed(self, *_):
+        if not self.asymmetric_chk.isChecked():
+            for spin, value in ((self.b_min, -self.b_halfwidth.value()), (self.b_max, self.b_halfwidth.value())):
+                spin.blockSignals(True)
+                spin.setValue(value)
+                spin.blockSignals(False)
+        self._changed()
+
+    def _range_mode_changed(self, checked):
+        self.asymmetric_host.setVisible(checked)
+        self._halfwidth_changed()
+
+    def _set_symmetric_range(self, width):
+        self.asymmetric_chk.setChecked(False)
+        self.b_halfwidth.setValue(width)
+        self.field_refit_chk.setChecked(True)
+        self._halfwidth_changed()
+
+    def _scan_field_ranges(self):
+        from core.mcd_slope_refit import refit_record_slopes
+        from matplotlib.figure import Figure
+        from ui_qt.matplotlib_theme import ThemeAwareFigureCanvasQTAgg
+        self._clear_range_scan()
+        widths = sorted({.1, .15, .2, .3, self.b_halfwidth.value()})
+        messages = ['Symmetric scan only; applied fit range is unchanged.',
+                    'Compare a stable slope region across temperatures; inspect residuals/jumps before choosing.',
+                    'T (K) | branch | ±B (T) | slope ± SE | N | R² | diagnostics']
+        for record in self.records:
+            t = self._temperature(record)
+            if (self.groups.get(record.record_id) != self.group_combo.currentData()
+                    or t is None or not np.isfinite(t) or t <= 0
+                    or not self.t_min.value() <= t <= self.t_max.value()):
+                continue
+            for width in widths:
+                try:
+                    fits = refit_record_slopes(record, -width, width, self.branches)
+                except (OSError, ValueError, KeyError, np.linalg.LinAlgError) as exc:
+                    messages.append(f'{t:g} K / ±{width:g} T / {record.source_file}: {exc}')
+                    continue
+                for fit in fits:
+                    fit.update(record_id=record.record_id, temperature_k=float(t), halfwidth_t=width,
+                               source=record.source_file)
+                    self.range_scan_results.append(fit)
+                    if fit['status'] == 'ok':
+                        flags = ', '.join(name for name, yes in [('few points', fit['n'] < 5),
+                            ('curvature', fit['curvature_flag']), ('jump', fit['jump_flag'])] if yes) or '—'
+                        messages.append(f"{t:g} | {fit['branch']} | {width:g} | {fit['slope']:.5g} ± {fit['slope_se']:.2g} | {fit['n']} | {fit['r_squared']:.3f} | {flags}")
+                    else:
+                        messages.append(f"{t:g} | {fit['branch']} | {width:g} | unavailable | {fit['n']} | — | {fit['status']}")
+        if not self.range_scan_results:
+            messages.append('No curves available in the selected group and temperature range.')
+        self.scan_text.setPlainText('\n'.join(messages))
+        if self.scan_figure is None:
+            self.scan_figure = Figure(figsize=(8, 5), dpi=100, layout='constrained')
+            self.scan_canvas = ThemeAwareFigureCanvasQTAgg(self.scan_figure)
+            self.scan_canvas.setMinimumHeight(330)
+            self.scan_layout.addWidget(self.scan_canvas, 1)
+        self.scan_figure.clear()
+        slope_ax, count_ax = self.scan_figure.subplots(2, 1, sharex=True)
+        keys = list(dict.fromkeys((r['record_id'], r['branch']) for r in self.range_scan_results))
+        record_order = list(dict.fromkeys(key[0] for key in keys))
+        for index, key in enumerate(keys):
+            rows = [r for r in self.range_scan_results if (r['record_id'], r['branch']) == key]
+            valid = [r for r in rows if r['status'] == 'ok']
+            color = f'C{record_order.index(key[0]) % 10}'
+            style = '-' if key[1] == 'B increasing' else '--'
+            label = f"{rows[0]['temperature_k']:g} K · {'Inc' if key[1] == 'B increasing' else 'Dec'}"
+            if valid:
+                slope_ax.errorbar([r['halfwidth_t'] for r in valid], [r['slope'] for r in valid],
+                    yerr=[r['slope_se'] for r in valid], fmt='o', linestyle=style, color=color, capsize=3, label=label)
+            count_ax.plot([r['halfwidth_t'] for r in rows], [r['n'] for r in rows],
+                          marker='o', linestyle=style, color=color)
+        slope_ax.set_ylabel('Slope (MCD/T)')
+        slope_ax.set_title('Slope stability · error bars are 1σ SE')
+        if slope_ax.lines:
+            slope_ax.legend(fontsize=7, loc='center left', bbox_to_anchor=(1.01, .5))
+        count_ax.set_ylabel('B point count')
+        count_ax.set_xlabel('Symmetric half-width (T)')
+        for ax in (slope_ax, count_ax):
+            ax.grid(alpha=.25)
+        self.scan_canvas.show()
+        self.scan_canvas.draw_idle()
+        self.plot_tabs.setCurrentWidget(self.scan_host)
+
     def clear(self, message='Select a Temperature comparison series.'):
+        self._clear_method_comparison()
+        self._clear_range_scan()
         self._timer.stop()
         self.records = []
         self.results = {}
@@ -218,6 +401,7 @@ class CurieWeissPanel(QWidget):
         return record.condition_value('T')
 
     def refit(self):
+        self._clear_method_comparison()
         self._timer.stop()
         self.results = {}
         self.points = []
@@ -308,7 +492,8 @@ class CurieWeissPanel(QWidget):
         lines = ([f'MCD–B refit: [{self.b_min.value():g}, {self.b_max.value():g}] T; free intercept.']
                  if use_field else ['Using saved near-zero slopes.'])
         inverse_method = self.method_combo.currentData() == 'inverse'
-        lines.append('Equal-weight linear fit: 1/(s−s0) = mT+b; θCW = −b/m.' if inverse_method
+        reciprocal_label = '1/s' if self.background_combo.currentData() == 'zero' else '1/(s−s0)'
+        lines.append(f'Equal-weight linear fit: {reciprocal_label} = mT+b; θCW = −b/m.' if inverse_method
                      else 'Equal-weight nonlinear fit in slope space.')
         for branch in self.branches:
             block = sorted([p for p in self.points if p['branch'] == branch], key=lambda p:p['temperature_k'])
@@ -323,8 +508,10 @@ class CurieWeissPanel(QWidget):
             self.results[branch] = result
             ci = result['theta_ci95_k']
             interval = f'[{ci[0]:.3g}, {ci[1]:.3g}] K' if ci is not None else 'unavailable'
+            background_text = ('' if result['background_mode'] == 'zero'
+                               else f", s0={result['background']:.5g}")
             lines.append(f"{branch}: θCW = {result['theta_k']:.4g} K; 95% CI {interval}\n"
-                         f"  A={result['amplitude']:.5g}, s0={result['background']:.5g}; "
+                         f"  A={result['amplitude']:.5g}{background_text}; "
                          f"R²={result['r_squared']:.3f}; N={result['n']}; "
                          f"T={result['temperature_min_k']:.4g}–{result['temperature_max_k']:.4g} K\n"
                          f"  {result['interpretation']} (model-dependent)")
@@ -338,10 +525,76 @@ class CurieWeissPanel(QWidget):
                                  predicted_inverse=result['predicted_inverse'][i],
                                  inverse_residual=result['inverse_residuals'][i])
         self.warnings = list(dict.fromkeys(warnings))
+        self._update_method_comparison(len(eligible))
         lines += self.warnings
         self.summary.setPlainText('\n'.join(lines) or 'No included points in this energy group.')
         self._draw()
         self.export_btn.setEnabled(bool(self.results))
+
+    def _clear_method_comparison(self):
+        self.method_comparison = []
+        self.method_table.setRowCount(0)
+        self.method_export_btn.setEnabled(False)
+        self.method_figure.clear()
+        self.method_canvas.draw_idle()
+
+    def _update_method_comparison(self, expected):
+        from core.cw_method_comparison import compare_cw_methods
+        for branch in self.branches:
+            block = sorted([p for p in self.points if p['branch'] == branch], key=lambda p:p['temperature_k'])
+            rows = compare_cw_methods([p['temperature_k'] for p in block], [p['slope'] for p in block],
+                                      [p['slope_se'] for p in block],
+                                      background_mode=self.background_combo.currentData(), background=self.background_spin.value())
+            for row in rows:
+                row['branch'] = branch
+                if len(block) != expected:
+                    row.update(theta_k=None,ci95_low_k=None,ci95_high_k=None,status='unavailable',
+                               diagnostics=f'Missing slopes: {len(block)}/{expected} eligible records. No reduced-subset comparison performed.')
+                self.method_comparison.append(row)
+        self.method_table.setRowCount(len(self.method_comparison))
+        for i,r in enumerate(self.method_comparison):
+            lo,hi=r['ci95_low_k'],r['ci95_high_k']
+            interval = ('unavailable' if lo is None and hi is None else
+                        f"{'unbounded' if lo is None else f'{lo:.3g}'} to {'unbounded' if hi is None else f'{hi:.3g}'}")
+            cells=[r['branch'],r['label'],str(r['n']),f"{r['theta_k']:.4g}" if r['theta_k'] is not None else '—',
+                   interval,r['status'],r['diagnostics']]
+            for j,value in enumerate(cells):
+                item=QTableWidgetItem(value);item.setToolTip(value);self.method_table.setItem(i,j,item)
+        self.method_export_btn.setEnabled(bool(self.method_comparison))
+        self._draw_method_curves()
+
+    def _draw_method_curves(self, *_):
+        from ui_qt.cw_comparison_plots import draw_method_curves
+        draw_method_curves(self.method_figure,self.points,self.method_comparison,
+                           {key for key,check in self.method_plot_checks.items() if check.isChecked()},
+                           background=self.background_spin.value() if self.background_combo.currentData()=='fixed' else 0.)
+        self.method_canvas.draw_idle()
+
+    def export_method_comparison(self, path):
+        self.refit()
+        if not self.method_comparison:
+            raise ValueError('No comparison results to save.')
+        path=Path(path)
+        payload=dict(schema_version=1,series_id=self.series_id,energy_group=self.group_combo.currentData(),
+                     primary_method=self.method_combo.currentData(),rows=self.method_comparison,points=self.points,
+                     visible_methods=[key for key,check in self.method_plot_checks.items() if check.isChecked()],
+                     selected_record_ids=[r.record_id for r in self.records if self.groups.get(r.record_id)==self.group_combo.currentData()],
+                     temperature_mode=self.temperature_combo.currentData(),temperature_range_k=[self.t_min.value(),self.t_max.value()],
+                     background_mode=self.background_combo.currentData(),background=self.background_spin.value() if self.background_combo.currentData()=='fixed' else 0.,
+                     field_range_t=[self.b_min.value(),self.b_max.value()] if self.field_refit_chk.isChecked() else None,
+                     warnings=self.warnings,assumptions=self.method_note.text())
+        path.write_text(json.dumps(payload,indent=2,ensure_ascii=False,allow_nan=False),encoding='utf-8')
+        with self.method_canvas.publication_context():
+            self.method_figure.savefig(path.with_name(path.stem+'_plot.png'),dpi=180)
+        return path
+
+    def _save_method_comparison(self):
+        path,_=QFileDialog.getSaveFileName(self,'Save method comparison','cw_method_comparison.json','JSON (*.json)')
+        if path:
+            try:
+                self.export_method_comparison(path)
+            except (OSError,ValueError) as exc:
+                QMessageBox.warning(self,'Method comparison',str(exc))
 
     @staticmethod
     def _saved_slope_se(record, branch, slope):
@@ -420,7 +673,8 @@ class CurieWeissPanel(QWidget):
                         intercepts.append((theta, label, color))
         axis.set_title('Inverse slope · CW fit', fontsize=11)
         axis.set_xlabel('Temperature (K)')
-        axis.set_ylabel('1 / (s − s0) (T/MCD)')
+        axis.set_ylabel('1 / s (T/MCD)' if self.background_combo.currentData() == 'zero'
+                        else '1 / (s − s0) (T/MCD)')
         axis.grid(alpha=.25)
         if axis.lines:
             axis.legend(fontsize=9, loc='upper right')
@@ -434,12 +688,21 @@ class CurieWeissPanel(QWidget):
                 estimate = (f"{fit['theta_k']:.3g} ± {se:.3g} K (approx. 1σ SE)"
                             if se is not None and np.isfinite(se)
                             else f"{fit['theta_k']:.3g} K; SE unavailable")
+                response = '1/s' if fit['background'] == 0 else '1/(s−s0)'
                 labels.append(f"{short} θCW = {estimate}\n" +
-                              (f"95% CI [{ci[0]:.3g}, {ci[1]:.3g}] K" if ci else '95% CI not reliably constrained'))
+                              (f"95% CI [{ci[0]:.3g}, {ci[1]:.3g}] K" if ci else '95% CI not reliably constrained') +
+                              f"\nCW R² ({response} vs T) = {fit['r_squared']:.3f}; N = {fit['n']}")
             annotation = axis.text(.03, .97, '\n'.join(labels), transform=axis.transAxes,
                                    va='top', fontsize=9)
             annotation._use_theme_text = True
             axis.margins(y=.4)
+        else:
+            quality = [f"{'Inc' if branch == 'B increasing' else 'Dec'} CW R² (s vs T) = {fit['r_squared']:.3f}; N = {fit['n']}"
+                       for branch, fit in self.results.items()]
+            if quality:
+                annotation = axis.text(.03, .97, '\n'.join(quality), transform=axis.transAxes,
+                                       va='top', fontsize=9)
+                annotation._use_theme_text = True
         if intercepts:
             axis.set_title('Reciprocal / extrapolated θCW', fontsize=10)
             axis.axhline(0., color='0.5', linewidth=.8)
@@ -541,15 +804,17 @@ class CurieWeissPanel(QWidget):
         self.refit()
         if not self.results:
             raise ValueError('No valid fit to save.')
-        target = Path(folder) / datetime.now().strftime('Curie_Weiss_%Y%m%d_%H%M%S_%f')
+        from core.mcd_extract import dependency_export_folder
+        target = dependency_export_folder(folder, 'Temperature') / datetime.now().strftime('Curie_Weiss_%Y%m%d_%H%M%S_%f')
         target.mkdir(parents=True, exist_ok=False)
         payload = dict(schema_version=3, series_id=self.series_id,
             fit_method=self.method_combo.currentData(),
             reference='https://doi.org/10.1038/s41565-022-01309-8',
             energy_group=self.group_combo.currentData(), temperature_mode=self.temperature_combo.currentData(),
             temperature_range_k=[self.t_min.value(), self.t_max.value()],
-            model='s(T) = s0 + A / (T - theta_CW)', results=self.results,
-            warnings=self.warnings, points=self.points,
+            model=('s(T) = A / (T - theta_CW)' if self.background_combo.currentData() == 'zero'
+                   else 's(T) = s0 + A / (T - theta_CW)'), results=self.results,
+            warnings=self.warnings, points=self.points, method_comparison=self.method_comparison,
             slope_source='refit' if self.field_refit_chk.isChecked() else 'saved',
             field_range_t=[self.b_min.value(), self.b_max.value()] if self.field_refit_chk.isChecked() else None,
             field_fits=self.field_fits, field_preview_record_id=self.field_record_combo.currentData(),

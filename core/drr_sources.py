@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextvars import ContextVar
+from collections import OrderedDict
+from threading import RLock
+from functools import lru_cache
 from datetime import datetime
 import csv
 import json
@@ -434,15 +438,25 @@ class DrrBackgroundGuess:
     candidate_group_count: int = 0
 
 
+_METADATA_PATHS: ContextVar[dict[Path, tuple] | None] = ContextVar('drr_metadata_paths', default=None)
+
+
 def resolve_source_path(root: str | Path, source: str | Path) -> Path:
     path = Path(source)
-    return path.resolve() if path.is_absolute() else (Path(root) / path).resolve()
+    absolute = path if path.is_absolute() else Path(root) / path
+    paths = _METADATA_PATHS.get()
+    if paths is None:
+        return absolute.resolve()
+    if absolute not in paths:
+        stamp = _history_file_signature(absolute)
+        paths[absolute] = (absolute.resolve(), stamp)
+    return paths[absolute][0]
 
 
 def portable_source_name(root: str | Path, source: str | Path) -> str:
-    path = Path(source).resolve()
+    path = resolve_source_path(Path.cwd(), source)
     try:
-        return path.relative_to(Path(root).resolve()).as_posix()
+        return path.relative_to(resolve_source_path(Path.cwd(), root)).as_posix()
     except ValueError:
         return str(path)
 
@@ -614,22 +628,143 @@ def _metadata_assignment_source(
     return _metadata_source_name(root, {"source_path": raw_source})
 
 
+_DRR_HISTORY_CACHE: OrderedDict = OrderedDict()
+_DRR_HISTORY_LOCK = RLock()
+
+
+def _history_file_signature(path: Path) -> tuple | None:
+    try:
+        stat = path.stat()
+        return stat.st_mtime_ns, stat.st_size, stat.st_ino, stat.st_mode
+    except OSError:
+        return None
+
+
 def _read_drr_metadata(
     root: Path, *, require_drr_operation: bool = False
+) -> tuple[dict[str, set[str]], list[DrrSavedRecipe]]:
+    """Reuse parsed history while metadata and source-path dependencies agree.
+
+    Stat checks detect external edits, moves and deletions as well as app saves.
+    Path memoization is scoped to one read (and one thread/context), so it does
+    not retain stale filesystem identities across requests.
+    """
+    root = Path(root).resolve()
+    metadata_root = root / 'Processed Data' / 'DRR'
+    try:
+        files = tuple(sorted(metadata_root.rglob('*.metadata.json')))
+        signature = tuple((path, _history_file_signature(path)) for path in files)
+    except OSError:
+        return {}, []
+    key = (root, require_drr_operation)
+    with _DRR_HISTORY_LOCK:
+        cached = _DRR_HISTORY_CACHE.get(key)
+    if cached is not None:
+        previous, dependencies, roles, records = cached
+        if previous == signature and all(
+            _history_file_signature(path) == stamp for path, stamp in dependencies
+        ):
+            return {name: set(values) for name, values in roles.items()}, list(records)
+    paths: dict[Path, tuple] = {}
+    token = _METADATA_PATHS.set(paths)
+    try:
+        roles, records = _parse_drr_metadata(root, files, require_drr_operation=require_drr_operation)
+    finally:
+        _METADATA_PATHS.reset(token)
+    dependencies = tuple((path, value[1]) for path, value in paths.items())
+    if (all(_history_file_signature(path) == stamp for path, stamp in dependencies)
+            and signature == tuple((path, _history_file_signature(path)) for path in files)):
+        with _DRR_HISTORY_LOCK:
+            _DRR_HISTORY_CACHE[key] = (signature, dependencies, roles, tuple(records))
+            _DRR_HISTORY_CACHE.move_to_end(key)
+            while len(_DRR_HISTORY_CACHE) > 8:
+                _DRR_HISTORY_CACHE.popitem(last=False)
+    return {name: set(values) for name, values in roles.items()}, list(records)
+
+
+_DRR_METADATA_FILES = OrderedDict()
+
+
+class _HistoryPathScope(dict):
+    """Record one file's dependencies while reusing this scan's path lookups."""
+    def __init__(self, shared):
+        super().__init__()
+        self.shared = shared
+
+    def __contains__(self, path):
+        if not super().__contains__(path) and path in self.shared:
+            super().__setitem__(path, self.shared[path])
+        return super().__contains__(path)
+
+    def __setitem__(self, path, value):
+        self.shared.setdefault(path, value)
+        super().__setitem__(path, value)
+
+
+@lru_cache(maxsize=2048)
+def _history_payload(path: Path, signature: tuple):
+    # Read-only payload: strict and legacy views share JSON decoding.
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+def _parse_drr_metadata(root: Path, metadata_files: Sequence[Path], *,
+                        require_drr_operation: bool = False):
+    roles, records = {}, []
+    parent_paths = _METADATA_PATHS.get()
+    shared_paths = parent_paths if parent_paths is not None else {}
+    for path in metadata_files:
+        stamp = _history_file_signature(path)
+        try:
+            payload = _history_payload(path, stamp)
+        except (OSError, ValueError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        operation = payload.get('operation', payload.get('workflow'))
+        if operation not in (None, 'DR/R') or (require_drr_operation and operation != 'DR/R'):
+            continue
+        key = (root, path)
+        with _DRR_HISTORY_LOCK:
+            cached = _DRR_METADATA_FILES.get(key)
+        valid = (cached is not None and cached[0] == stamp and all(
+            _history_file_signature(p) == value[1] for p, value in cached[1].items()))
+        if valid:
+            _, dependencies, file_roles, file_records = cached
+        else:
+            dependencies = _HistoryPathScope(shared_paths)
+            token = _METADATA_PATHS.set(dependencies)
+            try:
+                file_roles, file_records = _parse_drr_metadata_uncached(
+                    root, [path], require_drr_operation=False)
+            finally:
+                _METADATA_PATHS.reset(token)
+            if (_history_file_signature(path) == stamp and all(
+                    _history_file_signature(p) == value[1] for p, value in dependencies.items())):
+                with _DRR_HISTORY_LOCK:
+                    _DRR_METADATA_FILES[key] = (stamp, dict(dependencies), file_roles, tuple(file_records))
+                    _DRR_METADATA_FILES.move_to_end(key)
+                    while len(_DRR_METADATA_FILES) > 2048:
+                        _DRR_METADATA_FILES.popitem(last=False)
+        if parent_paths is not None:
+            # Keep the earliest observation if another record observed the same
+            # source before a concurrent move; the caller must reject the scan.
+            for p, value in dependencies.items():
+                parent_paths.setdefault(p, value)
+        for source, values in file_roles.items():
+            roles.setdefault(source, set()).update(values)
+        records.extend(file_records)
+    return roles, records
+
+
+def _parse_drr_metadata_uncached(
+    root: Path, metadata_files: Sequence[Path], *, require_drr_operation: bool = False
 ) -> tuple[dict[str, set[str]], list[DrrSavedRecipe]]:
     """Read valid DR/R source roles and associations without trusting filenames."""
     roles: dict[str, set[str]] = {}
     records: list[DrrSavedRecipe] = []
-    metadata_root = root / "Processed Data" / "DRR"
-    if not metadata_root.is_dir():
-        return roles, records
-    try:
-        metadata_files = metadata_root.rglob("*.metadata.json")
-    except OSError:
-        return roles, records
     for metadata_path in metadata_files:
         try:
-            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            payload = _history_payload(metadata_path, _history_file_signature(metadata_path))
         except (OSError, ValueError, TypeError):
             continue
         if not isinstance(payload, dict):
@@ -875,6 +1010,8 @@ def resolve_drr_background_assignments(
     explicit_baseline_files: Sequence[str] | None = None,
     explicit_baseline_mode: str | None = None,
     explicit_baseline_which: str = "last",
+    allow_guess: bool = True,
+    saved_recipes: Sequence[DrrSavedRecipe] | None = None,
 ) -> DrrBackgroundResolution:
     """Resolve a concrete baseline for every selected measurement.
 
@@ -882,6 +1019,9 @@ def resolve_drr_background_assignments(
     member association wins; equal-time conflicting records and incomplete
     records remain unresolved.  The fallback deliberately accepts only one
     high-confidence, exact-grid candidate per measurement.
+
+    External recommendation workers can disable guessing and share one
+    saved-recipes snapshot across independent per-measurement resolutions.
     """
     experiment_root = Path(root).resolve()
     selected = tuple(dict.fromkeys(str(item) for item in measurement_files if str(item).strip()))
@@ -933,7 +1073,10 @@ def resolve_drr_background_assignments(
             reason="explicit user baseline selection",
         )
 
-    _roles, records = _read_drr_metadata(experiment_root, require_drr_operation=True)
+    if saved_recipes is None:
+        _roles, records = _read_drr_metadata(experiment_root, require_drr_operation=True)
+    else:
+        records = saved_recipes
     records_by_measurement: dict[str, list[DrrSavedRecipe]] = {}
     for record in records:
         for source in record.measurement_files:
@@ -1010,6 +1153,9 @@ def resolve_drr_background_assignments(
             else:
                 unresolved.append(measurement)
                 reasons.append(f"invalid or incomplete saved assignment for {measurement}")
+        elif not allow_guess:
+            unresolved.append(measurement)
+            reasons.append(f"no saved background for {measurement}")
         else:
             guess = guess_drr_background(experiment_root, catalog, [measurement])
             sufficient_data = False
@@ -1589,7 +1735,7 @@ def _processed_measurement_paths(root: Path) -> set[str]:
 
 
 def drr_source_paths(root: str | Path, *, include_all: bool = False) -> list[Path]:
-    """Raw DRR inventory, preferring the acquisition REF partition when present."""
+    """Raw DRR inventory including legacy flat files alongside the REF partition."""
     experiment_root = Path(root).resolve()
     if not experiment_root.is_dir():
         return []
@@ -1597,6 +1743,9 @@ def drr_source_paths(root: str | Path, *, include_all: bool = False) -> list[Pat
     initial_root = next((path for path in experiment_root.iterdir()
                          if path.is_dir() and path.name.casefold() == "initial data"), None)
     if initial_root is not None:
+        # Older acquisitions live directly in Initial Data. Creating the newer
+        # REF partition must not make those measurement/background files vanish.
+        candidates.extend(path for path in initial_root.iterdir() if path.is_file())
         ref_root = next((path for path in initial_root.iterdir()
                          if path.is_dir() and path.name.casefold() == "ref"), None)
         search_root = initial_root if include_all else (ref_root or initial_root)

@@ -438,6 +438,23 @@ class McdExtractTests(unittest.TestCase):
             }
             self.assertEqual(energies, {1.65, 1.71})
 
+    def test_dependency_exports_use_separate_folders_for_multiple_series(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for t in (2., 4.):
+                for f in (0., 1.):
+                    self._write_result(root, f't{t}f{f}', energy=1.65, doping=2.,
+                                       efield=f, temperature=t)
+            records = discover_processed_mcd(root)
+            for variable, name in [('Temperature', 'Temperature_dependence'),
+                                   ('E-field', 'Efield_dependence')]:
+                series = organize_mcd_series(records, variable)
+                self.assertEqual(len(series), 2)
+                paths = export_mcd_extract(records, root/'exports', series_groups=series,
+                                           branches=('B increasing',), slope_metrics=())
+                self.assertTrue(all(path.parent == root/'exports'/name for path in paths.values()))
+                self.assertTrue(all(path.is_file() for path in paths.values()))
+
 
 if __name__ == "__main__":
     unittest.main()

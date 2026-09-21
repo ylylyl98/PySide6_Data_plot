@@ -1,5 +1,20 @@
 # Curie–Weiss in MCD Organizer
 
+## Quick field-range selection
+
+Enable **Refit slopes from MCD–B** and set the single **B fit half-width**
+control (default ±0.2 T). Presets ±0.1, ±0.15, ±0.2 and ±0.3 T apply a
+symmetric interval and enable field refitting. **Custom asymmetric range**
+reveals independent B min/max; switching it off restores the chosen half-width.
+
+The **Range scan** tab scans those four widths plus the current half-width
+for all included temperatures and branches in the selected energy group.
+It plots slopes with 1σ SE and point counts, with R², insufficient-data status
+and curvature/jump diagnostics in the scrollable table. Scanning does not
+apply a range or select an optimum. Find a stable region and inspect the
+MCD–B residuals before choosing a preset or half-width. Changing selections
+or controls clears the scan so outdated results are not displayed.
+
 1. Reopen the source application's MCD Organizer after updating.
 2. Set **Compare different** to **Temperature (same doping and E-field)**.
 3. Select the required condition series, then the **Curie–Weiss** tab.

@@ -36,7 +36,9 @@ class DrrBackgroundUiTests(unittest.TestCase):
         install_theme(cls.app, mode="light")
 
     def setUp(self) -> None:
-        with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
+        with patch.object(MainWindow, "_restore_last_folder", lambda _self: None), patch.object(
+            MainWindow, "_schedule_automatic_update_check", lambda _self: None
+        ):
             self.window = MainWindow()
 
     def tearDown(self) -> None:
@@ -232,7 +234,9 @@ class DrrBackgroundUiTests(unittest.TestCase):
             self.window.current_folder = str(root)
             self.window.drr_selected_files = [measurement.name]
             self.window.drr_baseline_files_manual = [background.name]
+            self.window.drr_baseline_combo.blockSignals(True)
             self.window.drr_baseline_combo.setCurrentText("External")
+            self.window.drr_baseline_combo.blockSignals(False)
             self.window.drr_baseline_combine_combo.setCurrentText(
                 "Last frame from each file, then average"
             )
@@ -423,7 +427,9 @@ class DrrBackgroundUiTests(unittest.TestCase):
             self.window.current_folder = str(root)
             self.window.drr_selected_files = [measurement.name]
             self.window.drr_baseline_files_manual = [background.name]
+            self.window.drr_baseline_combo.blockSignals(True)
             self.window.drr_baseline_combo.setCurrentText("External")
+            self.window.drr_baseline_combo.blockSignals(False)
             self.window.drr_baseline_combine_combo.setCurrentText(
                 "Last frame from each file, then average"
             )

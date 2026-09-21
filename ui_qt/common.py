@@ -10,11 +10,16 @@ compatibility with existing tests and callers.
 from __future__ import annotations
 
 import traceback
+import hashlib
+import json
+from pathlib import Path
+from uuid import uuid4
+from collections import OrderedDict
 from math import ceil
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List
 
-from PySide6.QtCore import QObject, QPointF, QRect, QRunnable, QSize, Qt, Signal
+from PySide6.QtCore import QObject, QPointF, QRect, QRunnable, QSize, Qt, Signal, qVersion
 from PySide6.QtGui import QTextLayout, QTextOption
 from PySide6.QtWidgets import (
     QApplication,
@@ -152,6 +157,7 @@ class ExportOptions:
     # Paired DRR export snapshots.  ``drr_cube`` remains the compatibility
     # field used by older callers and non-paired analysis exports.
     drr_raw_cube: DataCube | None = None
+    drr_peak_result: dict | None = None
     drr_second_cube: DataCube | None = None
     drr_raw_params: HeatmapParams | None = None
     drr_second_params: HeatmapParams | None = None
@@ -234,12 +240,42 @@ class WrappedFilenameDelegate(QStyledItemDelegate):
     HORIZONTAL_PADDING = 8
     VERTICAL_PADDING = 6
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, *, cache_path=None) -> None:
         super().__init__(parent)
         # Wrapped rows are queried repeatedly while QListView lays out and
         # repaints.  Bounding-rect calculation is surprisingly expensive for
         # long paths, so keep the result for each viewport width/text/font pair.
-        self._size_hint_cache: dict[tuple[int, str, str], QSize] = {}
+        self._size_hint_cache = OrderedDict()
+        self._cache_path = Path(cache_path) if cache_path else None
+        self._saved_sizes = OrderedDict()
+        self._sizes_dirty = False
+        if self._cache_path:
+            try:
+                payload = json.loads(self._cache_path.read_text(encoding='utf-8'))
+                if payload.get('version') == 1 and isinstance(payload.get('sizes'), dict):
+                    for key, size in list(payload['sizes'].items())[-8192:]:
+                        if (isinstance(key, str) and isinstance(size, list) and len(size) == 2
+                                and all(type(value) is int and 0 < value < 100000 for value in size)):
+                            self._saved_sizes[key] = size
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+
+    def save_size_cache(self) -> None:
+        if not self._cache_path or not self._sizes_dirty:
+            return
+        temporary = self._cache_path.with_name(f'.row-heights-{uuid4().hex}.tmp')
+        try:
+            self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(json.dumps({'version': 1, 'sizes': self._saved_sizes}), encoding='utf-8')
+            temporary.replace(self._cache_path)
+            self._sizes_dirty = False
+        except OSError:
+            pass
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _text_width(self, option: QStyleOptionViewItem) -> int:
         view = self.parent()
@@ -256,10 +292,24 @@ class WrappedFilenameDelegate(QStyledItemDelegate):
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
         text = self._normalize_text(index.data(Qt.DisplayRole))
-        cache_key = (self._text_width(opt), text, opt.font.toString())
+        view = self.parent()
+        cache_key = (self._text_width(opt), text, opt.font.toString(),
+                     opt.fontMetrics.height(), opt.fontMetrics.averageCharWidth(),
+                     view.logicalDpiX(), view.logicalDpiY(), view.devicePixelRatioF(),
+                     view.style().metaObject().className(), qVersion(),
+                     self.HORIZONTAL_PADDING, self.VERTICAL_PADDING)
         cached = self._size_hint_cache.get(cache_key)
         if cached is not None:
+            self._size_hint_cache.move_to_end(cache_key)
             return QSize(cached)
+        disk_key = hashlib.sha256(repr(cache_key).encode('utf-8')).hexdigest() if self._cache_path else None
+        saved = self._saved_sizes.get(disk_key)
+        if saved is not None:
+            result = QSize(*saved)
+            if len(self._size_hint_cache) >= 8192:
+                self._size_hint_cache.popitem(last=False)
+            self._size_hint_cache[cache_key] = result
+            return QSize(result)
         text_layout = self._layout_text(text, opt.font, self._text_width(opt))
         metric_height = opt.fontMetrics.boundingRect(
             QRect(0, 0, self._text_width(opt), 10000),
@@ -279,9 +329,14 @@ class WrappedFilenameDelegate(QStyledItemDelegate):
         )
         # Keep this bounded in practice; a list normally has only a handful
         # of viewport widths, but a dialog can be resized many times.
-        if len(self._size_hint_cache) > 512:
-            self._size_hint_cache.clear()
+        if len(self._size_hint_cache) >= 8192:
+            self._size_hint_cache.popitem(last=False)
         self._size_hint_cache[cache_key] = QSize(result)
+        if disk_key is not None:
+            if len(self._saved_sizes) >= 8192:
+                self._saved_sizes.popitem(last=False)
+            self._saved_sizes[disk_key] = [result.width(), result.height()]
+            self._sizes_dirty = True
         return result
 
     @staticmethod

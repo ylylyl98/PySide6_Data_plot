@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import os
 import unittest
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -98,12 +101,22 @@ class ColormapTableTests(unittest.TestCase):
 
 
 class ColormapUiTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.settings = QSettings(str(Path(folder.name) / 'settings.ini'), QSettings.IniFormat)
+        for context in (patch('ui_qt.main_window.QSettings', return_value=self.settings),
+                        patch.object(MainWindow, '_restore_last_folder'),
+                        patch.object(MainWindow, '_schedule_automatic_update_check')):
+            context.start()
+            self.addCleanup(context.stop)
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
     def test_all_selectors_have_required_order_and_legacy_defaults(self) -> None:
-        settings = QSettings(MainWindow.SETTINGS_ORG, MainWindow.SETTINGS_APP)
+        settings = self.settings
         before = {key: settings.value(key) for key in settings.allKeys()}
         window = MainWindow()
         try:

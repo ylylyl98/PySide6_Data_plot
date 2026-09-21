@@ -1608,6 +1608,7 @@ def _export_comparison_png(
     colors: dict[str, str],
     order_variable: str,
     palette: str,
+    groups: dict | None = None,
 ) -> None:
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.cm import ScalarMappable
@@ -1616,6 +1617,29 @@ def _export_comparison_png(
     from matplotlib.figure import Figure
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
+
+    if order_variable == 'Temperature':
+        from core.mcd_energy_groups import temperature_curve_legend, initial_energy_groups
+        figure = Figure(figsize=(9, 5), dpi=300, facecolor='white')
+        FigureCanvasAgg(figure)
+        axes = np.atleast_1d(figure.subplots(1, len(branches), sharey=True))
+        for axis, branch in zip(axes, branches):
+            inc = branch == 'B increasing'
+            for record in records:
+                traces = load_branch_traces(record, (branch,))
+                block = traces[traces['branch'] == branch]
+                axis.plot(block['B_T'], block['corrected_signed_mean'],
+                          color=colors[record.record_id], linestyle='-' if inc else '--',
+                          marker='o' if inc else 's', markersize=3,
+                          markerfacecolor=colors[record.record_id] if inc else 'white',
+                          markevery=max(1, len(block)//24), linewidth=1.3)
+            axis.set(title=branch, xlabel='B field (T)', ylabel='Corrected signed-mean MCD')
+            axis.axhline(0, color='#777', linewidth=.6)
+            axis.grid(alpha=.2)
+        figure.suptitle('Temperature comparison')
+        temperature_curve_legend(figure, records, groups or initial_energy_groups(records), colors)
+        figure.savefig(path, dpi=300, facecolor='white', bbox_inches='tight')
+        return
 
     branch_list = list(branches)
     figure = Figure(figsize=(6.0, 4.5), dpi=300, facecolor="white")
@@ -1741,7 +1765,7 @@ def compact_slope_table(
     for record in records:
         axis_value = (
             record.center_ev if comparison_variable == "Energy"
-            else record.condition_value(comparison_variable)
+            else record.condition_value('T' if comparison_variable == 'Temperature' else comparison_variable)
         )
         row = {
             axis_label: axis_value,
@@ -1853,6 +1877,15 @@ def _export_slope_png(
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
 
+    if comparison_variable == 'Temperature':
+        from core.mcd_energy_groups import initial_energy_groups, draw_temperature_slope_panels
+        figure = Figure(figsize=(7, max(4.5, 2.8*len(slope_metrics))), dpi=300, facecolor='white')
+        FigureCanvasAgg(figure)
+        draw_temperature_slope_panels(figure, records, energy_groups or initial_energy_groups(records),
+                                      slope_metrics, branches, palette, energy_group_palette)
+        figure.savefig(path, dpi=300, facecolor='white', bbox_inches='tight')
+        return
+
     if comparison_variable == 'E-field':
         from core.mcd_energy_groups import initial_energy_groups, draw_energy_slope_panels
         figure = Figure(figsize=(6., 4.5), dpi=300, facecolor='white')
@@ -1926,6 +1959,13 @@ def _export_slope_png(
                    bbox_inches=None)
 
 
+def dependency_export_folder(output_dir: str | Path, variable: str) -> Path:
+    """Route comparison output without nesting an already selected type folder."""
+    folder = Path(output_dir)
+    name = {'Temperature': 'Temperature_dependence', 'E-field': 'Efield_dependence'}.get(variable)
+    return folder / name if name and folder.name.casefold() != name.casefold() else folder
+
+
 def export_mcd_extract(
     records: Sequence[ProcessedMcdRecord],
     output_dir: str | Path,
@@ -1956,7 +1996,7 @@ def export_mcd_extract(
         raise ValueError("Unknown slope metric selected.")
     effective_order = (
         series_groups[0].variable
-        if order_by == "Auto" and series_groups and len(series_groups) == 1
+        if order_by == "Auto" and series_groups and len({s.variable for s in series_groups}) == 1
         else order_by
     )
     ordered_records, resolved_order = order_mcd_records(
@@ -1968,7 +2008,13 @@ def export_mcd_extract(
     comparison_variable = resolved_order
     selected_palette = palette if palette in PALETTES else "tab10"
     colors = assign_plot_colors(ordered_records, selected_palette, comparison_variable)
-    out = Path(output_dir)
+    if comparison_variable == 'Temperature':
+        from core.mcd_energy_groups import energy_group_colors, energy_record_colors
+        bases = energy_group_colors(resolved_groups, selected_palette)
+        bases.update(energy_group_palette or {})
+        colors = energy_record_colors(ordered_records, resolved_groups, bases, variable='Temperature')
+        colors.update(energy_record_palette or {})
+    out = dependency_export_folder(output_dir, comparison_variable)
     out.mkdir(parents=True, exist_ok=True)
     base = _unused_export_base(
         out, descriptive_export_base(ordered_records, resolved_order, descending)
@@ -2008,12 +2054,12 @@ def export_mcd_extract(
     if "B increasing" in branches and comparison_variable != "E-field":
         _export_comparison_png(
             increasing_png, ordered_records, ("B increasing",), colors,
-            comparison_variable, selected_palette,
+            comparison_variable, selected_palette, resolved_groups,
         )
     if "B decreasing" in branches and comparison_variable != "E-field":
         _export_comparison_png(
             decreasing_png, ordered_records, ("B decreasing",), colors,
-            comparison_variable, selected_palette,
+            comparison_variable, selected_palette, resolved_groups,
         )
     group_plot_paths = {}
     if comparison_variable == 'E-field':

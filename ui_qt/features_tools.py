@@ -68,6 +68,19 @@ class ToolsPageMixin:
             "Launch the processed-MCD comparison and export tool in a separate window."
         )
         data_layout.addWidget(self.mcd_extract_btn)
+        drr_hint = QLabel(
+            "Analyze previously processed DRR groups from the current folder, "
+            "compare peak positions, and export analysis results."
+        )
+        drr_hint.setWordWrap(True)
+        set_fluent_property(drr_hint, "appRole", "hintText")
+        data_layout.addWidget(drr_hint)
+        self.drr_analysis_tools_btn = QPushButton("Open DRR Analysis")
+        self.drr_analysis_tools_btn.setAccessibleName("Open standalone DRR Analysis")
+        self.drr_analysis_tools_btn.setToolTip(
+            "Open the DRR Analysis workspace and browse saved groups in the current folder."
+        )
+        data_layout.addWidget(self.drr_analysis_tools_btn)
         layout.addWidget(data_box)
 
         layout.addStretch(1)

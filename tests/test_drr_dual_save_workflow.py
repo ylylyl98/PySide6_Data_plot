@@ -16,6 +16,7 @@ from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
 from core.loader import DataCube
+from core.drr_sources import DrrSource
 from ui_qt.common import LoadedState
 from ui_qt.main_window import MainWindow
 
@@ -28,9 +29,12 @@ class DrrDualSaveWorkflowTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self._old_qsettings_format = QSettings.defaultFormat()
-        QSettings.setDefaultFormat(QSettings.IniFormat)
-        QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, str(self.root / "settings"))
+        # The organization/application overload still uses the Windows registry,
+        # even after setDefaultFormat. Keep every window in its own test file.
+        self.settings = QSettings(str(self.root / 'settings.ini'), QSettings.IniFormat)
+        self.settings_patch = patch('ui_qt.main_window.QSettings', return_value=self.settings)
+        self.settings_patch.start()
+        self.addCleanup(self.settings_patch.stop)
         self.source = self.root / "measurement.csv"
         self.source.write_text("synthetic source\n", encoding="utf-8")
         energy = np.linspace(-2.0, 2.0, 21)
@@ -83,7 +87,6 @@ class DrrDualSaveWorkflowTests(unittest.TestCase):
         self.window.close()
         self.window.deleteLater()
         self.app.processEvents()
-        QSettings.setDefaultFormat(self._old_qsettings_format)
         self.tmp.cleanup()
 
     def _run_save(self, *, view: str = "raw", side_by_side: bool = False) -> dict:
@@ -103,6 +106,104 @@ class DrrDualSaveWorkflowTests(unittest.TestCase):
 
     def _output_dir(self) -> Path:
         return self.root / "Processed Data" / "DRR"
+
+    def _configure_three_regions(self):
+        w = self.window
+        for key, value in dict(xmin=-2, xmax=2, ymin=-1, ymax=1, vmin=-5, vmax=5).items():
+            w._set_spin_value_silent(w.drr_spins[key], value)
+        w.drr_region_count_combo.setCurrentIndex(2)
+        w._set_spin_value_silent(w.drr_split_spins['x0'], -.5)
+        w._set_spin_value_silent(w.drr_split_spins['x1'], .5)
+        for spins in (w.drr_split_spins, w.drr_second_split_spins):
+            for side in ('left', 'middle', 'right'):
+                w._set_spin_value_silent(spins[side + '_vmin'], -5)
+                w._set_spin_value_silent(spins[side + '_vmax'], 5)
+
+    def test_three_region_save_both_writes_both_real_pngs(self):
+        self._configure_three_regions()
+        self._run_save()
+        paths = list(self._output_dir().glob('*.png'))
+        self.assertEqual(len(paths), 2)
+        for path in paths:
+            self.assertEqual(path.read_bytes()[:8], b'\x89PNG\r\n\x1a\n')
+
+    def test_three_region_toolbar_png_saves_snapshot(self):
+        self._configure_three_regions()
+        self.test_toolbar_png_saves_snapshot_in_background()
+
+    def test_toolbar_png_saves_snapshot_in_background(self):
+        import time
+        self.window._plot_mode('DRR')
+        target = self.root / 'toolbar.png'
+        reference = self.root / 'reference.png'
+        def choose(*args):
+            self.window.figure.savefig(reference)
+            return str(target), 'PNG'
+        with patch('ui_qt.main_window.QFileDialog.getSaveFileName', side_effect=choose), patch(
+                'ui_qt.main_window.QMessageBox.critical', side_effect=lambda *args: self.fail(str(args[2]))):
+            self.window.toolbar.save_figure()
+        job = self.window.toolbar._png_save_job
+        self.window.figure.clear()
+        deadline = time.monotonic() + 10
+        while not job.done and time.monotonic() < deadline:
+            self.app.processEvents(); time.sleep(.005)
+        self.assertTrue(job.done)
+        self.assertIsNone(job.error)
+        self.assertEqual(target.read_bytes()[:8], b'\x89PNG\r\n\x1a\n')
+        from matplotlib.image import imread
+        np.testing.assert_array_equal(imread(reference), imread(target))
+
+    def test_save_reuses_display_derivative(self):
+        self.window.drr_controller._drr_cube_with_metadata(2)
+        with patch('ui_qt.main_window.apply_sg_derivative_energy',
+                   side_effect=AssertionError('recomputed displayed derivative')):
+            self._run_save()
+
+    def test_drr_save_refreshes_history_without_directory_scan(self):
+        self.window.current_folder = str(self.root)
+        self.window.drr_available_sources = [DrrSource(
+            source=self.source.name, filename=self.source.name, group_key='measurement',
+            session_date='2026-09-19', modified_time=0, is_background=False)]
+        with patch.object(self.window, '_refresh_file_lists') as scan:
+            self._run_save()
+            self.window.thread_pool.waitForDone(5000)
+            self.app.processEvents()
+            scan.assert_not_called()
+        self.assertTrue(self.window.drr_available_sources[0].processed)
+        self.assertEqual(self.window.drr_available_sources[0].metadata_role, 'measurement')
+
+    def test_changed_sg_parameters_recompute_derivative(self):
+        self.window.drr_controller._drr_cube_with_metadata(2)
+        self.window.drr_sg_window_spin.setValue(9)
+        from core.processing import apply_sg_derivative_energy
+        with patch('ui_qt.main_window.apply_sg_derivative_energy',
+                   wraps=apply_sg_derivative_energy) as compute:
+            self._run_save()
+        compute.assert_called_once()
+        self.assertEqual(compute.call_args.kwargs['window_length'], 9)
+
+    def test_saved_history_does_not_update_another_folder(self):
+        self.window.current_folder = str(self.root / 'other')
+        with patch('ui_qt.main_window.refresh_drr_source_history') as refresh:
+            self.window._refresh_drr_saved_history(str(self.root))
+            refresh.assert_not_called()
+
+    def test_cleaned_source_copies_require_directory_refresh(self):
+        self.window.current_folder = str(self.root)
+        with patch.object(self.window, '_refresh_file_lists') as scan:
+            self.window._on_export_done(dict(mode='DRR', folder=str(self.root), cleaned=1))
+            scan.assert_called_once_with(auto=True, mode='DRR')
+
+    def test_plain_save_reports_queue_and_output_stages(self):
+        ranges = self.window._mode_spins('DRR')
+        for key, value in [('xmin', -2), ('xmax', 2), ('ymin', -1), ('ymax', 1)]:
+            ranges[key].setValue(value)
+        self._run_save()
+        messages = '\n'.join(self.window.log_lines)
+        for stage in ('queued for', 'Computing second derivative', 'Raw: Writing DAT',
+                      'Raw: Rendering PNG', 'd2E: Writing DAT', 'd2E: Rendering PNG',
+                      'worker completed in'):
+            self.assertIn(stage, messages)
 
     def test_real_background_save_from_each_visible_drr_view_writes_pair(self) -> None:
         ranges = self.window._mode_spins("DRR")

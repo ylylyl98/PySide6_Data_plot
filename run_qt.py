@@ -76,6 +76,10 @@ def load_app_icon() -> QIcon:
 
 def main() -> int:
     enable_crash_diagnostics()
+    if "--drr-analysis" in sys.argv:
+        index = sys.argv.index("--drr-analysis")
+        from run_drr_analysis import main as analysis_main
+        return analysis_main(sys.argv[index + 1:])
     if "--mcd-organizer" in sys.argv:
         index = sys.argv.index("--mcd-organizer")
         experiment = sys.argv[index + 1] if index + 1 < len(sys.argv) else str(Path.cwd())

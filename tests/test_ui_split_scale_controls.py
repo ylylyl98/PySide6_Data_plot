@@ -1066,9 +1066,11 @@ class SplitScaleControlTests(unittest.TestCase):
         self.window._set_spin_value_silent(self.window.drr_split_spins["x0"], 0.5)
         spin = self.window.drr_spins["xmin"]
         with (
-            patch.object(self.window, "_schedule_plot_redraw"),
+            patch.object(self.window, "_active_mode", return_value="DRR"),
+            patch.object(self.window, "_plot_mode"),
         ):
             spin.setValue(1.5)
+            self.window._run_scheduled_plot_redraw("DRR")
 
         self.assertAlmostEqual(self.window.drr_split_spins["x0"].value(), 2.5)
 
@@ -1086,14 +1088,20 @@ class SplitScaleControlTests(unittest.TestCase):
         )
         self.window.available_files = ["kk.csv", "kkp.csv"]
         self.window.compare_controller._cmp_set_channel_combo_items()
-        self.window.cmp_channel_combos["KK"].setCurrentText("kk.csv")
-        self.window.cmp_channel_combos["KKp"].setCurrentText("kkp.csv")
+        # This fixture supplies an already loaded cube; assigning its source
+        # labels must not start a new filesystem load.
+        for key, filename in (("KK", "kk.csv"), ("KKp", "kkp.csv")):
+            combo = self.window.cmp_channel_combos[key]
+            blocked = combo.blockSignals(True)
+            combo.setCurrentText(filename)
+            combo.blockSignals(blocked)
         for key, value in (("xmin", 0.0), ("xmax", 3.0), ("ymin", 0.0), ("ymax", 1.0)):
             self.window._set_spin_value_silent(self.window.cmp_spins[key], value)
         self.window.cmp_split_scale_chk.setChecked(True)
         self.window._set_spin_value_silent(self.window.cmp_split_spins["x0"], 0.5)
-        with patch.object(self.window, "_schedule_plot_redraw"):
+        with patch.object(self.window, "_active_mode", return_value="Compare"), patch.object(self.window, "_plot_mode"):
             self.window.cmp_spins["xmin"].setValue(1.5)
+            self.window._run_scheduled_plot_redraw("Compare")
 
         self.assertAlmostEqual(self.window.cmp_split_spins["x0"].value(), 2.5)
 
@@ -1140,8 +1148,15 @@ class SplitScaleControlTests(unittest.TestCase):
         self.window._refresh_automatic_ranges("DRR")
         original_vmax = self.window.drr_spins["vmax"].value()
 
-        with patch.object(self.window, "_plot_mode"):
+        with patch.object(self.window, "_plot_mode"), patch.object(self.window, "_active_mode", return_value="DRR"):
             self.window.drr_derivative_combo.setCurrentText("dE")
+            # Derivative computation and its range refresh are asynchronous.
+            for _ in range(100):
+                self.window._run_scheduled_plot_redraw("DRR")
+                self.window.thread_pool.waitForDone(50)
+                QTest.qWait(10)
+                if self.window.drr_spins["vmax"].value() != original_vmax:
+                    break
 
         self.assertNotAlmostEqual(self.window.drr_spins["vmax"].value(), original_vmax)
 

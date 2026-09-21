@@ -33,6 +33,72 @@ def records(root):
 
 
 class CurieWeissUiTests(unittest.TestCase):
+    def test_three_method_comparison_preserves_default_and_exports_failures(self):
+        with tempfile.TemporaryDirectory() as folder:
+            panel = CurieWeissPanel()
+            try:
+                rr=records(Path(folder))
+                panel.set_series('s',rr,{r.record_id:'G' for r in rr},('B increasing',))
+                panel.refit()
+                self.assertEqual(panel.method_combo.currentData(),'inverse')
+                self.assertEqual(len(panel.method_comparison),3)
+                self.assertEqual(panel.method_comparison[-1]['status'],'unavailable')
+                self.assertEqual(panel.method_table.rowCount(),3)
+                target=panel.export_method_comparison(Path(folder)/'comparison.json')
+                saved=json.loads(target.read_text())
+                self.assertEqual(len(saved['rows']),3)
+                self.assertEqual(len(saved['points']),6)
+                failed=[replace(r,increasing_slope_per_t=None) for r in rr]
+                panel.set_series('failed',failed,{r.record_id:'G' for r in failed},('B increasing',))
+                panel.refit()
+                self.assertTrue(panel.method_export_btn.isEnabled())
+                failure_path=panel.export_method_comparison(Path(folder)/'failed.json')
+                failure=json.loads(failure_path.read_text())
+                self.assertEqual(len(failure['rows']),3)
+                self.assertEqual(failure['points'],[])
+                panel.set_series('empty',[],{},('B increasing',))
+                panel.refit()
+                self.assertEqual(panel.method_table.rowCount(),0)
+                self.assertFalse(panel.method_export_btn.isEnabled())
+            finally:
+                panel.close()
+
+    def test_symmetric_controls_and_scan_preserve_applied_range(self):
+        from tests.test_mcd_slope_refit import write_curved_trace
+        with tempfile.TemporaryDirectory() as folder:
+            r = records(Path(folder))
+            for record in r:
+                write_curved_trace(record)
+            panel = CurieWeissPanel()
+            try:
+                panel.set_series('s', r, {x.record_id:'G' for x in r}, ('B increasing',))
+                panel.field_refit_chk.setChecked(True)
+                panel.b_halfwidth.setValue(.15)
+                self.assertEqual((panel.b_min.value(), panel.b_max.value()), (-.15,.15))
+                panel.asymmetric_chk.setChecked(True)
+                panel.b_min.setValue(-.1)
+                panel.b_max.setValue(.3)
+                panel._scan_field_ranges()
+                self.assertEqual((panel.b_min.value(), panel.b_max.value()), (-.1,.3))
+                rows = [x for x in panel.range_scan_results if x['record_id']==r[0].record_id]
+                narrow = next(x for x in rows if x['halfwidth_t']==.2)
+                wide = next(x for x in rows if x['halfwidth_t']==.3)
+                self.assertAlmostEqual(narrow['slope'], 2.)
+                self.assertAlmostEqual(wide['slope'], 23/7)
+                self.assertEqual(wide['n'], 7)
+                panel.asymmetric_chk.setChecked(False)
+                self.assertEqual((panel.b_min.value(), panel.b_max.value()), (-.15,.15))
+                self.assertFalse(panel.range_scan_results)  # Changed settings invalidate the scan.
+                panel._set_symmetric_range(.05)
+                self.assertEqual((panel.b_min.value(), panel.b_max.value()), (-.05,.05))
+                panel._scan_field_ranges()
+                sparse = [r for r in panel.range_scan_results if r['halfwidth_t']==.05]
+                self.assertTrue(sparse)
+                self.assertTrue(all(r['status'] != 'ok' and r['slope'] is None for r in sparse))
+            finally:
+                panel.close()
+                panel.deleteLater()
+
     def test_inverse_default_exports_errors_and_can_switch_to_slope_fit(self):
         with tempfile.TemporaryDirectory() as folder:
             r = records(Path(folder))

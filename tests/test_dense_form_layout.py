@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import os
 import unittest
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEvent, QRect
+from PySide6.QtCore import QCoreApplication, QEvent, QRect, QSettings
 from PySide6.QtTest import QSignalSpy
 from PySide6.QtWidgets import QApplication, QCheckBox, QDoubleSpinBox, QLabel, QPushButton, QToolButton, QWidget, QSizePolicy, QStyle, QStyleOptionSpinBox, QStyleOptionButton
 
@@ -16,6 +18,17 @@ from tests.profile_phases import profile_phase
 
 
 class DenseFormRowLayoutTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        settings = QSettings(str(Path(folder.name) / 'settings.ini'), QSettings.IniFormat)
+        settings_patch = patch('ui_qt.main_window.QSettings', return_value=settings)
+        settings_patch.start()
+        self.addCleanup(settings_patch.stop)
+        updates = patch.object(MainWindow, '_schedule_automatic_update_check')
+        updates.start()
+        self.addCleanup(updates.stop)
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
@@ -206,12 +219,18 @@ class DenseFormRowLayoutTests(unittest.TestCase):
         with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
             window = MainWindow()
         try:
-            window.resize(1180, 820); window.show(); self.app.processEvents()
-            window.workspace_splitter.setSizes([UI_METRICS["left_width"], 900]); self.app.processEvents()
+            # Leave room for the DRR plot toolbar plus the 380 px test sidebar.
+            # At the minimum window width Qt legitimately shrinks it to 320 px.
+            window.resize(1400, 820); window.show(); self.app.processEvents()
             index = next(i for i in range(window.tabs.count()) if window.tabs.tabText(i) == mode)
             window.tabs.setCurrentIndex(index)
             manual = next(button for button in window.tabs.widget(index).findChildren(QToolButton) if button.text() == "Manual plot ranges")
             manual.setChecked(True)
+            self.app.processEvents()
+            # QSplitter scales requested sizes to the available width; [380, 900]
+            # does not request an actual 380 px sidebar in an 1180 px window.
+            total = sum(window.workspace_splitter.sizes())
+            window.workspace_splitter.setSizes([380, total - 380])
             self.app.processEvents()
             for axis in ("vmin", "xmin", "ymin"):
                 spins = getattr(window, f"{prefix}_spins")
@@ -228,7 +247,7 @@ class DenseFormRowLayoutTests(unittest.TestCase):
                 measured_width = sum(row.layout().safe_min_width(widget) for widget in direct[:5])
                 measured_width += row.layout().spacing() * 4
                 expected_mode = "SINGLE_ROW" if measured_width <= width else "WRAPPED"
-                self.assertEqual(window.workspace_splitter.sizes()[0], 380)
+                self.assertAlmostEqual(window.workspace_splitter.sizes()[0], 380, delta=1)
                 self.assertEqual(row.layout().mode_for_width(width), expected_mode)
                 self.assertLess(row.layout().labelWidget().geometry().bottom(), min(widget.geometry().top() for widget in direct[:5]))
                 first_row_centers = [widget.geometry().center().y() for widget in direct[:4]]
