@@ -29,9 +29,12 @@ class DrrDualSaveWorkflowTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self._old_qsettings_format = QSettings.defaultFormat()
-        QSettings.setDefaultFormat(QSettings.IniFormat)
-        QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, str(self.root / "settings"))
+        # The organization/application overload still uses the Windows registry,
+        # even after setDefaultFormat. Keep every window in its own test file.
+        self.settings = QSettings(str(self.root / 'settings.ini'), QSettings.IniFormat)
+        self.settings_patch = patch('ui_qt.main_window.QSettings', return_value=self.settings)
+        self.settings_patch.start()
+        self.addCleanup(self.settings_patch.stop)
         self.source = self.root / "measurement.csv"
         self.source.write_text("synthetic source\n", encoding="utf-8")
         energy = np.linspace(-2.0, 2.0, 21)
@@ -84,7 +87,6 @@ class DrrDualSaveWorkflowTests(unittest.TestCase):
         self.window.close()
         self.window.deleteLater()
         self.app.processEvents()
-        QSettings.setDefaultFormat(self._old_qsettings_format)
         self.tmp.cleanup()
 
     def _run_save(self, *, view: str = "raw", side_by_side: bool = False) -> dict:
@@ -104,6 +106,30 @@ class DrrDualSaveWorkflowTests(unittest.TestCase):
 
     def _output_dir(self) -> Path:
         return self.root / "Processed Data" / "DRR"
+
+    def _configure_three_regions(self):
+        w = self.window
+        for key, value in dict(xmin=-2, xmax=2, ymin=-1, ymax=1, vmin=-5, vmax=5).items():
+            w._set_spin_value_silent(w.drr_spins[key], value)
+        w.drr_region_count_combo.setCurrentIndex(2)
+        w._set_spin_value_silent(w.drr_split_spins['x0'], -.5)
+        w._set_spin_value_silent(w.drr_split_spins['x1'], .5)
+        for spins in (w.drr_split_spins, w.drr_second_split_spins):
+            for side in ('left', 'middle', 'right'):
+                w._set_spin_value_silent(spins[side + '_vmin'], -5)
+                w._set_spin_value_silent(spins[side + '_vmax'], 5)
+
+    def test_three_region_save_both_writes_both_real_pngs(self):
+        self._configure_three_regions()
+        self._run_save()
+        paths = list(self._output_dir().glob('*.png'))
+        self.assertEqual(len(paths), 2)
+        for path in paths:
+            self.assertEqual(path.read_bytes()[:8], b'\x89PNG\r\n\x1a\n')
+
+    def test_three_region_toolbar_png_saves_snapshot(self):
+        self._configure_three_regions()
+        self.test_toolbar_png_saves_snapshot_in_background()
 
     def test_toolbar_png_saves_snapshot_in_background(self):
         import time

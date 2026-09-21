@@ -1,6 +1,20 @@
 """Compact, vertically stacked legends for three-region heatmaps."""
 from matplotlib.ticker import FuncFormatter, NullLocator, LinearLocator
 from matplotlib.transforms import Bbox
+from functools import partial
+
+
+def _preview_position(parent, index, _axis, renderer):
+    """Module-level callable so toolbar snapshots can serialize the figure."""
+    box = parent.get_position()
+    gap = (20 / 72) / parent.figure.get_figheight()
+    height = min(.24 * box.height, max(.02 * box.height, .36 * box.height - gap))
+    return Bbox.from_bounds(box.x0, box.y1 - height - index * .36 * box.height,
+                            box.width, height)
+
+
+def _compact_tick(value, pos):
+    return f'{value:.3g}'
 
 
 def three_preview_axes(parent):
@@ -9,14 +23,7 @@ def three_preview_axes(parent):
     axes = []
     for index in range(3):
         axis = parent.inset_axes([0, 0, 1, .2])
-        def locate(_axis, renderer, i=index):
-            box = parent.get_position()
-            figure = parent.figure
-            gap = (20 / 72) / figure.get_figheight()
-            height = min(.24 * box.height, max(.02 * box.height, .36 * box.height - gap))
-            return Bbox.from_bounds(box.x0, box.y1 - height - i * .36 * box.height,
-                                    box.width, height)
-        axis.set_axes_locator(locate)
+        axis.set_axes_locator(partial(_preview_position, parent, index))
         axes.append(axis)
     return axes
 
@@ -30,7 +37,7 @@ def add_three_colorbars(figure, render, axes, *, label='', fontsize=8):
         # Endpoints suffice on short bars; compact labels avoid scientific
         # offset text colliding with the next region's heading.
         cb.locator = LinearLocator(2)
-        cb.formatter = FuncFormatter(lambda value, pos: f'{value:.3g}')
+        cb.formatter = FuncFormatter(_compact_tick)
         cb.update_ticks()
         cb.ax.yaxis.set_minor_locator(NullLocator())
         cb.ax.yaxis.get_offset_text().set_visible(False)

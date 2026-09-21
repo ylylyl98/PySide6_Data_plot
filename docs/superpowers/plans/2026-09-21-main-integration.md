@@ -6,7 +6,7 @@
 
 **Validation:** Run imports, the CI representative suite, DRR Save Both/export regressions, and the full suite with visible progress and bounded diagnostics. Report any reproducible remaining failures separately from merge failures.
 
-- [ ] Checkpoint local source and tests; preserve generated files locally.
-- [ ] Integrate latest origin/main and review resulting changes.
-- [ ] Run verification, investigate failures, and obtain code review.
-- [ ] Record the integrated commit and test results; leave remote unchanged unless requested.
+- [x] Checkpoint local source and tests; preserve generated files locally (`7650ec1`).
+- [x] Integrate latest origin/main and review resulting changes (`cf94348`).
+- [x] Run focused verification, investigate failures, and obtain code review; full-suite limitations are recorded in the report.
+- [x] Record the integration and test results in `docs/superpowers/reports/2026-09-21-main-integration.md`; leave remote unchanged.
