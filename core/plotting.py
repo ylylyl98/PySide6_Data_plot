@@ -13,6 +13,10 @@ from core.loader import DataCube
 COMPARE_PANEL_ORDER = ("KK", "KKp", "KpK", "KpKp")
 
 
+def _format_heatmap_cursor_value(value):
+    return "n/a" if not np.isfinite(float(value)) else f"{float(value):.6g}"
+
+
 def plain_log_ticks(axis) -> None:
     """Use numeric log ticks without requiring Matplotlib's optional math fonts.
 
@@ -31,6 +35,19 @@ class SplitColorScale:
     right_vmin: float
     right_vmax: float
     show_boundary: bool = True
+    split_x2: float | None = None
+    middle_vmin: float | None = None
+    middle_vmax: float | None = None
+
+    @property
+    def bounds(self):
+        left = (self.left_vmin, self.left_vmax)
+        right = (self.right_vmin, self.right_vmax)
+        if self.split_x2 is None:
+            return (left, right)
+        if self.middle_vmin is None or self.middle_vmax is None:
+            raise ValueError('Three regions require middle color limits.')
+        return (left, (self.middle_vmin, self.middle_vmax), right)
 
 
 @dataclass
@@ -56,6 +73,16 @@ class HeatmapRender:
     primary: object
     secondary: object | None = None
     split_x: float | None = None
+    tertiary: object | None = None
+    split_x2: float | None = None
+
+    @property
+    def images(self):
+        return tuple(m for m in (self.primary, self.secondary, self.tertiary) if m is not None)
+
+    @property
+    def boundaries(self):
+        return tuple(x for x in (self.split_x, self.split_x2) if x is not None)
 
     @property
     def is_split(self) -> bool:
@@ -171,6 +198,37 @@ def _axis_edges_from_centers(values: np.ndarray, *, log_scale: bool = False) -> 
     return np.concatenate(([first], mids, [last]))
 
 
+def split_region_slices(energy, split, xlim):
+    """Resolve distinct cell boundaries; return non-overlapping column slices."""
+    lo, hi = sorted(xlim)
+    requested = [split.split_x] + ([] if split.split_x2 is None else [split.split_x2])
+    if not all(np.isfinite(x) and lo < x < hi for x in requested):
+        raise ValueError("Split positions must be strictly between xmin and xmax.")
+    if len(requested) == 2 and requested[0] >= requested[1]:
+        raise ValueError("Three regions require x1 < x2.")
+    pairs = [resolve_split_boundary(energy, x) for x in requested]
+    indices, boundaries = zip(*pairs)
+    if (not all(lo < x < hi for x in boundaries)
+            or any(a >= b for a, b in zip(indices, indices[1:]))):
+        raise ValueError("Split boundaries must define distinct, nonempty regions inside the visible x range.")
+    cuts = (0, *indices, len(energy))
+    return tuple(slice(a, b) for a, b in zip(cuts, cuts[1:])), tuple(boundaries)
+
+
+def split_color_layers(cube, params):
+    z = np.asarray(cube.Z, float)
+    slices, boundaries = split_region_slices(cube.energy, params.split_scale, params.xlim)
+    layers = []
+    for region, (vmin, vmax) in zip(slices, params.split_scale.bounds):
+        values = np.minimum(z, vmax) if params.clip_outliers else z
+        mask = np.ones(z.shape, bool)
+        mask[:, region] = False
+        norm = _norm_from_bounds(values, vmin=vmin, vmax=vmax,
+                                log_scale=params.log_scale, center_zero=params.center_zero)
+        layers.append((np.ma.array(values, mask=mask), norm))
+    return layers, boundaries
+
+
 def plot_heatmap(ax: Axes, cube: DataCube, params: HeatmapParams):
     z = np.asarray(cube.Z, float)
     e = np.asarray(cube.energy, float).ravel()
@@ -194,71 +252,18 @@ def plot_heatmap(ax: Axes, cube: DataCube, params: HeatmapParams):
         ]
         applied_split = None
     else:
-        xlo, xhi = sorted((float(params.xlim[0]), float(params.xlim[1])))
-        if not xlo < float(split.split_x) < xhi:
-            raise ValueError("Split position x0 must be strictly between xmin and xmax.")
-        split_index, applied_split = resolve_split_boundary(e, float(split.split_x))
-        if not xlo < applied_split < xhi:
-            raise ValueError(
-                "The nearest data-cell boundary for x0 is outside the visible x range. "
-                "Move x0 farther from xmin or xmax."
-            )
-        left_z = np.asarray(z, float).copy()
-        right_z = np.asarray(z, float).copy()
-        if params.clip_outliers:
-            left_z = np.minimum(left_z, float(split.left_vmax))
-            right_z = np.minimum(right_z, float(split.right_vmax))
-        left_mask = np.zeros(left_z.shape, dtype=bool)
-        right_mask = np.zeros(right_z.shape, dtype=bool)
-        left_mask[:, split_index:] = True
-        right_mask[:, :split_index] = True
-        left_norm = _norm_from_bounds(
-            left_z,
-            vmin=split.left_vmin,
-            vmax=split.left_vmax,
-            log_scale=bool(params.log_scale),
-            center_zero=bool(params.center_zero),
-        )
-        right_norm = _norm_from_bounds(
-            right_z,
-            vmin=split.right_vmin,
-            vmax=split.right_vmax,
-            log_scale=bool(params.log_scale),
-            center_zero=bool(params.center_zero),
-        )
-        images = [
-            ax.pcolormesh(
-                e_edges,
-                g_edges,
-                np.ma.array(left_z, mask=left_mask),
-                shading="flat",
-                cmap=params.cmap,
-                norm=left_norm,
-            ),
-            ax.pcolormesh(
-                e_edges,
-                g_edges,
-                np.ma.array(right_z, mask=right_mask),
-                shading="flat",
-                cmap=params.cmap,
-                norm=right_norm,
-            ),
-        ]
+        layers, boundaries = split_color_layers(cube, params)
+        applied_split = boundaries[0]
+        images = [ax.pcolormesh(e_edges, g_edges, values, shading="flat",
+                               cmap=params.cmap, norm=norm) for values, norm in layers]
         if split.show_boundary:
-            ax.axvline(
-                applied_split,
-                color="#202020",
-                linewidth=0.9,
-                linestyle="--",
-                alpha=0.8,
-                zorder=15,
-            )
+            for boundary in boundaries:
+                ax.axvline(boundary, color="#202020", linewidth=0.9,
+                           linestyle="--", alpha=0.8, zorder=15)
     # Guard matplotlib cursor formatting against inf/nan ranges that can raise in colorizer.
     for image in images:
         try:
-            image._format_cursor_data_override = lambda value: (
-                "n/a" if not np.isfinite(float(value)) else f"{float(value):.6g}"
-            )
+            image._format_cursor_data_override = _format_heatmap_cursor_value
         except Exception:
             pass
     ax.set_title(params.title)
@@ -281,6 +286,8 @@ def plot_heatmap(ax: Axes, cube: DataCube, params: HeatmapParams):
         primary=images[0],
         secondary=(images[1] if len(images) > 1 else None),
         split_x=applied_split,
+        tertiary=(images[2] if len(images) > 2 else None),
+        split_x2=(boundaries[1] if len(images) > 2 else None),
     )
 
 

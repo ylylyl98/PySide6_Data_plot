@@ -16,16 +16,41 @@ from PySide6.QtWidgets import QApplication
 from ui_qt.controllers_drr import DrrController
 from ui_qt.main_window import MainWindow
 from ui_qt.theme import install_theme
+from core.drr_sources import resolve_drr_background_assignments
 
 
 class DrrBgOnlyWorkflowTests(unittest.TestCase):
+    def test_default_self_selection_resolves_history_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'measurement.csv'
+            source.write_text('Vbg,Vtg,700,701\n0,0,10,11\n1,0,12,13\n')
+            w = self.window
+            w.current_folder = str(root)
+            calls = []
+            def resolve(*args, **kwargs):
+                if 'explicit_baseline_mode' not in kwargs:
+                    calls.append(args)
+                return resolve_drr_background_assignments(*args, **kwargs)
+            workers = []
+            with patch.object(DrrController, '_open_drr_source_dialog', return_value=['measurement.csv']), \
+                 patch('ui_qt.controllers_drr.resolve_drr_background_assignments', side_effect=resolve), \
+                 patch('ui_qt.main_window.resolve_drr_background_assignments', side_effect=resolve), \
+                 patch.object(w.thread_pool, 'start', workers.append):
+                w.drr_controller._edit_drr_measurements()
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(workers), 1)
+            self.assertEqual(workers[0].args[0].drr_baseline_text, 'Self (last frame)')
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
         install_theme(cls.app, mode="light")
 
     def setUp(self) -> None:
-        with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
+        with patch.object(MainWindow, "_restore_last_folder", lambda _self: None), patch.object(
+            MainWindow, "_schedule_automatic_update_check", lambda _self: None
+        ):
             self.window = MainWindow()
 
     def tearDown(self) -> None:
@@ -33,7 +58,7 @@ class DrrBgOnlyWorkflowTests(unittest.TestCase):
         self.window.deleteLater()
         self.app.processEvents()
 
-    def test_editing_measurement_clears_stale_external_recipe_and_loads_self(self) -> None:
+    def test_editing_measurement_clears_stale_external_without_silent_self_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "Initial Data" / "BGonly_Rev.csv"
@@ -45,12 +70,15 @@ class DrrBgOnlyWorkflowTests(unittest.TestCase):
             w.drr_baseline_files_manual = ["Initial Data/old_bg.csv"]
             w.drr_baseline_combo.setCurrentText("External")
             captured = []
-            with patch.object(DrrController, "_open_drr_source_dialog", return_value=["Initial Data/BGonly_Rev.csv"]), \
+            with patch.object(DrrController, "_open_drr_source_dialog", side_effect=[["Initial Data/BGonly_Rev.csv"], []]), \
                  patch.object(w.thread_pool, "start", captured.append):
                 w.drr_controller._edit_drr_measurements()
-            self.assertEqual(w.drr_baseline_combo.currentText(), "Self (last frame)")
+                self.assertEqual(len(captured), 1)
+                captured[0].run()
+                self.app.processEvents()
+            self.assertEqual(w.drr_baseline_combo.currentText(), "External")
             self.assertEqual(len(captured), 1, w.statusBar().currentMessage())
-            self.assertEqual(captured[0].args[0].drr_baseline_text, "Self (last frame)")
+            self.assertEqual(w.drr_baseline_files_manual, [])
 
     def test_load_clear_reload_rebuilds_drr_axes_for_full_gate_range(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

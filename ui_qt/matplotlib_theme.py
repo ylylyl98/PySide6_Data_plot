@@ -14,6 +14,8 @@ from typing import Any, Iterator
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.colors import to_rgba
+from matplotlib.text import Text
+from PySide6.QtGui import QFontInfo
 
 from ui_qt.theme import theme_manager
 
@@ -77,7 +79,11 @@ def apply_display_theme(figure: Any, theme: MatplotlibDisplayTheme) -> None:
     """Apply presentation attributes to a figure and all current axes."""
     figure.patch.set_facecolor(theme.figure_face)
     figure.patch.set_edgecolor(theme.figure_face)
-    for axis in tuple(getattr(figure, "axes", ())):
+    axes = list(getattr(figure, "axes", ()))
+    for axis in axes:
+        # Axes.inset_axes creates child axes outside figure.axes. Include
+        # these in live theme changes and the light publication context.
+        axes.extend(child for child in axis.child_axes if child not in axes)
         axis.set_facecolor(theme.axes_face)
         for spine in axis.spines.values():
             spine.set_edgecolor(theme.spine)
@@ -114,7 +120,28 @@ def apply_display_theme(figure: Any, theme: MatplotlibDisplayTheme) -> None:
         legend.get_title().set_color(theme.text)
 
 
-class ThemeAwareFigureCanvasQTAgg(FigureCanvasQTAgg):
+class QtFontFigureCanvasQTAgg(FigureCanvasQTAgg):
+    """Use the inherited Qt font for plot text, retaining mathematical fallback."""
+
+    def apply_ui_font(self) -> None:
+        family = QFontInfo(self.font()).family() or self.font().family()
+        if not family:
+            return
+        families = [family, 'sans-serif']
+        for text in self.figure.findobj(match=Text):
+            if text.get_fontfamily() != families:
+                text.set_fontfamily(families)
+
+    def draw(self, *args: Any, **kwargs: Any) -> Any:
+        self.apply_ui_font()
+        return super().draw(*args, **kwargs)
+
+    def print_figure(self, *args: Any, **kwargs: Any) -> Any:
+        self.apply_ui_font()
+        return super().print_figure(*args, **kwargs)
+
+
+class ThemeAwareFigureCanvasQTAgg(QtFontFigureCanvasQTAgg):
     """QtAgg canvas that reapplies active presentation immediately before draw."""
 
     def __init__(self, figure: Any, *, resolved_theme: Any | None = None,
@@ -179,5 +206,6 @@ def bind_theme_canvas(canvas: Any, manager: Any | None = None) -> Any:
 
 __all__ = [
     "LIGHT_PUBLICATION_THEME", "MatplotlibDisplayTheme", "ThemeAwareFigureCanvasQTAgg",
+    "QtFontFigureCanvasQTAgg",
     "apply_display_theme", "bind_theme_canvas", "display_theme_from_resolved",
 ]

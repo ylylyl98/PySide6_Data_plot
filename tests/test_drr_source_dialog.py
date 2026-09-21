@@ -99,7 +99,7 @@ class DrrSourceSummaryFormatterTests(unittest.TestCase):
         source = self._source("YZ365_p5n2_5T_1.67KREF_720nm_Rot90deg_TG-1BG=0.csv")
         peer = self._source("YZ365_p5n2_5T_1.67KREF_720nm_Rot45deg_TG-2BG=1.csv")
         line = format_drr_source_summary(source, (peer,)).splitlines()[1]
-        self.assertTrue(line.startswith("Rot 90° · TG -1 · BG 0"), line)
+        self.assertTrue(line.startswith("Rot 90° · TG−1BG=0"), line)
         self.assertIn("λ 720 nm", line)
 
     def test_summary_deduplicates_measured_gate_and_uses_two_decimals(self):

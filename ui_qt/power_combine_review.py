@@ -4,7 +4,7 @@ import numpy as np
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QLabel, QComboBox,
     QDoubleSpinBox, QLineEdit, QCheckBox, QTableWidget, QHeaderView, QDialogButtonBox, QPushButton, QSizePolicy)
 from matplotlib.figure import Figure
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from ui_qt.matplotlib_theme import QtFontFigureCanvasQTAgg as FigureCanvasQTAgg
 from core.power_combine import combine_many_power_sweeps
 from core.power_workflow import corrected, estimate_background, estimate_factor, fingerprint, acquisition_info, suspicious_rows, suggested_name, _power_context_and_channel
 from core.plotting import HeatmapParams, plot_heatmap

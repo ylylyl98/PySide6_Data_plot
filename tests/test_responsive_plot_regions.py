@@ -12,6 +12,26 @@ from ui_qt.controllers_pl import PlController
 
 
 class RegionBlitterTests(unittest.TestCase):
+    def test_export_invalidates_display_background_and_restores_clean_pixels(self):
+        from io import BytesIO
+        for format_name in ("png", "pdf", "svg"):
+            with self.subTest(format=format_name):
+                figure = Figure(figsize=(4, 3), dpi=100)
+                canvas = FigureCanvasAgg(figure)
+                axis = figure.add_subplot(111)
+                line, = axis.plot([0, 1], [0, 1], linewidth=4)
+                helper = AxesRegionBlitter(canvas)
+                helper.configure(axis, [line]); helper.restore_interactive_drawing()
+                figure.savefig(BytesIO(), format=format_name, dpi=200)
+                self.assertIsNone(helper._background, "export renderer is not a display background")
+                line.set_ydata([1, 0])
+                self.assertFalse(helper.draw())
+                helper.restore_interactive_drawing()
+                local = np.asarray(canvas.buffer_rgba()).copy()
+                helper.prepare_full_redraw(); canvas.draw()
+                self.assertLessEqual(np.count_nonzero(local != np.asarray(canvas.buffer_rgba())), 64)
+                helper.disconnect()
+
     def test_reuses_artist_and_updates_pixels(self):
         figure = Figure(figsize=(4, 3), dpi=100)
         canvas = FigureCanvasAgg(figure)
@@ -111,7 +131,7 @@ class RegionBlitterTests(unittest.TestCase):
         first = len(calls)
         line.set_ydata([1, 0]); gate.set_ydata([0.7, 0.7])
         controller._draw_pl_regions()
-        self.assertEqual(first, 2)  # first capture per dynamic axes
+        self.assertEqual(first, 1)  # all regions share one clean full render
         self.assertEqual(len(calls), first)
 
     def test_real_pl_canvas_draw_keeps_dynamic_curve_and_rebinds_same_bbox_source(self):

@@ -31,6 +31,8 @@ DPTK Desktop.lnk
 # Test and notebook artifacts
 tests/_tmp/
 preview_output/
+/artifacts/
+/native-*.png
 .coverage
 coverage.xml
 htmlcov/

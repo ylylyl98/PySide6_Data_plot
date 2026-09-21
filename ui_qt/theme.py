@@ -108,7 +108,7 @@ def install_theme(
         qss_template=_QSS_TEMPLATE,
         mode=mode,
         shell_profile="fluent-workbench",
-        prefer_fluent_font=True,
+        prefer_fluent_font=False,
         apply_body_pixel_size=False,
     )
     manager.apply()

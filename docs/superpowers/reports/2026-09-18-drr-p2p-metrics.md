@@ -1,0 +1,9 @@
+# P2P amplitude, positions and separation
+
+Compare now selects amplitude, extrema positions or extrema separation. Existing processed/smoothed results supply the values directly: columns 5 and 4 are E(max)/E(min); separation is their absolute difference multiplied by 1000 for meV. No detection, smoothing or P2P recalculation occurs when changing the selected quantity.
+
+Positions use two shared-X panels. The existing magnetic colors and scatter/line styling apply to all metrics. Hollow markers identify extrema within one sampled energy spacing of the window boundary. Offset remains available only for amplitude. The selected quantity is preserved in the P2P workspace state. Clicks use plotted metric coordinates and map result rows back to source row indices, including duplicate Y values and restricted Y windows.
+
+PNG filenames identify amplitude, positions or separation. CSV always retains all actual metrics, adds B_T, Separation_meV and individual E(min)/E(max) edge flags. Origin XLSX contains Amplitude, Emax, Emin and Separation sheets with independent per-file Y/value pairs, plus Metadata and Quality sheets. No interpolation or padding with invented values; shorter datasets leave blank cells. Dataset IDs and magnetic field are in column names. Strings are stored as literal text.
+
+Validation: 44 related tests passed before the final duplicate-Y regression correction; the final focused run covers the new duplicate-row test and all metric/style/P2P/export checks. A read-only review identified the duplicate-Y selection issue, which was reproduced and fixed. Actual-data validation used eight saved processed datasets, 1000 rows; all 4000 metric values in the XLSX matched the CSV. PNGs were visually inspected for two position panels and one separation panel. Artifacts: artifacts/drr-comparison/p2p-positions.png, p2p-separation.png, p2p-origin-metrics.xlsx and p2p-all-metrics.csv.

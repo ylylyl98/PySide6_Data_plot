@@ -20,7 +20,7 @@ from matplotlib.ticker import PercentFormatter, ScalarFormatter
 from matplotlib.transforms import Bbox
 from matplotlib.widgets import SpanSelector
 from PySide6.QtCore import QFileSystemWatcher, QMimeData, QProcess, QSettings, Qt, QRunnable, QThreadPool, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QColor, QDesktopServices, QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -66,6 +66,7 @@ from core.drr_sources import (
     assess_background_gate_files,
     compatible_drr_repeats,
     discover_drr_sources,
+    refresh_drr_source_history,
     extract_wavelength_center_nm,
     find_saved_drr_recipe,
     guess_drr_background,
@@ -338,17 +339,64 @@ class _PlotToolbar(NavigationToolbar2QT):
             prepare()
         try:
             canvas = self.canvas
+            save = self._save_snapshot if getattr(owner, 'last_plotted_mode', None) == 'DRR' else super().save_figure
             publication = getattr(canvas, "publication_context", None)
             if callable(publication):
                 with publication():
-                    super().save_figure(*args)
+                    save(*args)
             else:
-                super().save_figure(*args)
+                save(*args)
         finally:
             if callable(restore):
                 restore()
             if unified is not None:
                 unified.restore_interactive_drawing()
+
+    def _save_snapshot(self, *args):
+        import matplotlib as mpl
+        from ui_qt.async_figure_save import save_figure_async
+        from shiboken6 import isValid
+        if getattr(self, '_png_save_job', None) is not None and not self._png_save_job.done:
+            return
+        kinds = self.canvas.get_supported_filetypes_grouped()
+        default = self.canvas.get_default_filetype()
+        filters = [f"{name} ({' '.join('*.' + ext for ext in extensions)})"
+                   for name, extensions in sorted(kinds.items())]
+        selected = next((item for item in filters if '*.' + default in item), '')
+        start = str(Path(mpl.rcParams['savefig.directory'] or '.').expanduser()
+                    / self.canvas.get_default_filename())
+        path, chosen_filter = QFileDialog.getSaveFileName(self, 'Choose a filename to save to', start,
+                                             ';;'.join(filters), selected)
+        if not path:
+            return
+        if not Path(path).suffix:
+            extension = next((exts[0] for name, exts in sorted(kinds.items())
+                              if chosen_filter.startswith(name + ' (')), default)
+            path += '.' + extension
+        if mpl.rcParams['savefig.directory']:
+            mpl.rcParams['savefig.directory'] = str(Path(path).parent)
+        try:
+            if Path(path).suffix.lower() != '.png':
+                self.canvas.figure.savefig(path)
+                return
+            owner = self.window()
+            job = save_figure_async(self.canvas.figure, path)
+            self._png_save_job = job
+            if hasattr(owner, '_status'):
+                owner._status('Saving PNG in background…')
+            def complete():
+                if not isValid(owner):
+                    return
+                message = ('PNG save failed: ' + job.error.splitlines()[0] if job.error
+                           else 'PNG saved: ' + path)
+                if hasattr(owner, '_status'):
+                    owner._status(message)
+                if hasattr(owner, '_append_log'):
+                    owner._append_log(f'PNG export: snapshot {job.snapshot_seconds:.3f} s; '
+                                      f'total {job.elapsed:.3f} s; maximum GUI interval {job.max_gui_gap:.3f} s')
+            job.finished.connect(complete)
+        except Exception as exc:
+            QMessageBox.critical(self, 'Error saving file', str(exc))
 
 
 def _scan_drr_catalog_worker(
@@ -359,6 +407,7 @@ def _scan_drr_catalog_worker(
     force: bool = False,
     include_all: bool = False,
     selected_sources=(),
+    prepare_history: bool = True,
     progress,
     log,
 ) -> tuple[str, List[DrrSource], DrrSourceCache, bool, bool]:
@@ -369,14 +418,19 @@ def _scan_drr_catalog_worker(
         publish_cached=(lambda sources: publish_cached((folder, sources, cache, True, include_all)))
         if publish_cached is not None else None,
     )
+    # Prepare the stricter recipe index on this existing background worker,
+    # even when the source catalog itself came from its persistent cache.
+    from core.drr_sources import _read_drr_metadata
+    if prepare_history:
+        _read_drr_metadata(Path(folder), require_drr_operation=True)
     # Selected files may be absolute paths outside the experiment partition.
     # Inspect those exact files in the worker and merge only successful
     # DrrSource records into the catalog result.
     from core.drr_sources import resolve_source_path
-    known = {str(resolve_source_path(folder, source.source).resolve()).casefold()
-             for source in sources}
     missing_selected = []
     if selected_sources:
+        known = {str(resolve_source_path(folder, source.source)).casefold()
+                 for source in sources}
         from core.drr_sources import discover_drr_sources
         for selected in dict.fromkeys(str(value) for value in selected_sources):
             path = resolve_source_path(folder, selected)
@@ -401,7 +455,8 @@ def _scan_drr_catalog_worker(
     return folder, sources, cache, False, include_all, tuple(missing_selected)
 
 
-def _scan_folder_sources_worker(folder: str, *, power_include_legacy: bool = False, mode: str = "all", progress, log) -> tuple:
+def _scan_folder_sources_worker(folder: str, *, power_include_legacy: bool = False, mode: str = "all",
+                                previous_catalog=None, progress, log) -> tuple:
     """Collect the cross-tab source catalogs without blocking Qt's GUI thread."""
     csv_files = data_io.list_csv_files(folder)
     map_files = data_io.list_map_input_files(folder) if mode in {"all", "Compare"} else []
@@ -446,7 +501,18 @@ def _scan_folder_sources_worker(folder: str, *, power_include_legacy: bool = Fal
             power_signatures.append((str(name), int(stat.st_size), int(stat.st_mtime_ns)))
         except OSError:
             power_signatures.append((str(name), None, None))
-    power_sources = data_io.get_power_series_sources(folder, power_files) if mode in {"all", "Power Dependent"} else {}
+    previous_power = next((item for item in (previous_catalog or ())
+                           if isinstance(item, dict) and item.get("tag") == "power_catalog"
+                           and item.get("version") == 1 and item.get("folder") == folder), {})
+    old_signatures = {name: (size, modified) for name, size, modified
+                      in previous_power.get("signatures", ())}
+    unchanged = {name for name, size, modified in power_signatures
+                 if size is not None and modified is not None
+                 and old_signatures.get(name) == (size, modified)}
+    cached_tables = {source.file_name: source for source in previous_power.get("sources", {}).values()
+                     if isinstance(source, data_io.PowerSeriesSource) and source.source_format == "table"
+                     and source.file_name in unchanged and source.power_values}
+    power_sources = data_io.get_power_series_sources(folder, power_files, cached_tables=cached_tables) if mode in {"all", "Power Dependent"} else {}
     power_combined = {
         str(source.file_name).replace("\\", "/").casefold()
         for source in power_sources.values()
@@ -521,13 +587,17 @@ def _cached_folder_sources_worker(folder: str, *, mode: str, power_include_legac
                                   force: bool, publish_cached, progress, log) -> tuple:
     from core.source_catalog_cache import SourceCatalogCache
     cache = SourceCatalogCache(folder, f"{mode}-{int(power_include_legacy)}")
-    cached = cache.read()
-    cache_usable = cached is not None and _catalog_payload_compatible(cached, folder, mode)
-    if cache_usable:
-        publish_cached(tuple(cached[:-1]) + (dict(cached[-1], preview=True),))
+    previous = None
+    def preview(cached):
+        nonlocal previous
+        previous = cached
+        if publish_cached is not None:
+            publish_cached(tuple(cached[:-1]) + (dict(cached[-1], preview=True),))
     return cache.refresh(lambda: _scan_folder_sources_worker(
-        folder, mode=mode, power_include_legacy=power_include_legacy, progress=progress, log=log),
-        force=force or not cache_usable)
+        folder, mode=mode, power_include_legacy=power_include_legacy,
+        previous_catalog=None if force else previous, progress=progress, log=log),
+        force=force, publish_cached=preview,
+        accept_cached=lambda payload: _catalog_payload_compatible(payload, folder, mode))
 
 
 
@@ -597,6 +667,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._catalog_displayed_modes: set[str] = set()
         self._catalog_active_scan: str | None = None
         self._catalog_pending_requests: dict[str, bool] = {}
+        self._catalog_pending_rebuilds: set[str] = set()
         self._file_refresh_running = False
         self._file_refresh_pending = False
         self._file_refresh_pending_auto = False
@@ -625,6 +696,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._drr_refresh_running = False
         self._drr_refresh_pending = False
         self._drr_refresh_pending_auto = False
+        self._drr_refresh_pending_force = False
         self._drr_refresh_pending_old_sources: set[str] | None = None
         self._drr_refresh_pending_selected_sources: set[str] | None = None
         self._drr_refresh_workers: list[Worker] = []
@@ -832,13 +904,23 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._apply_initial_geometry()
         self._set_stage("No data")
         self._update_action_states()
+        from ui_qt.drr_regions import restore_settings
+        restore_settings(self)
         self._restore_last_folder()
         self.setAcceptDrops(True)
         self._schedule_automatic_update_check()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
         """Invalidate background callbacks and let active file reads finish."""
+        from ui_qt.drr_regions import save_settings
+        save_settings(self)
         self._is_closing = True
+        self.drr_controller._cancel_auto_external()
+        batch_peaks = getattr(self, 'drr_peak_analysis', None)
+        if batch_peaks is not None:
+            batch_peaks.generation += 1
+            if batch_peaks.cancel_event is not None:
+                batch_peaks.cancel_event.set()
         if self.power_peak_controller.worker is not None:
             self.power_peak_controller.worker.cancelled.set()
         for timer in self._plot_redraw_timers.values():
@@ -976,6 +1058,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._drr_include_all_sources = False
             self._catalog_displayed_modes.clear()
             self._catalog_pending_requests.clear()
+            self._catalog_pending_rebuilds.clear()
             self._invalidate_export_move_sources()
             self._reset_workflow_state_for_folder_change()
             if hasattr(self, "drr_pin_baseline_chk"):
@@ -999,7 +1082,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._watch_generation += 1
         generation = self._watch_generation
         watched = list(self.folder_watcher.directories())
-        if watched:
+        same_folder = bool(self.current_folder and self._watched_folder and
+                           Path(self.current_folder) == Path(self._watched_folder))
+        if watched and not same_folder:
             self.folder_watcher.removePaths(watched)
         self._watched_folder = ""
         if not self.current_folder:
@@ -1025,10 +1110,24 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if initial_data.is_dir():
             critical_paths.append(initial_data)
         critical_paths.extend(mcd_roots)
+        processed = path / 'Processed Data'
+        for history_path in (processed, processed / 'DRR'):
+            if history_path.is_dir():
+                critical_paths.append(history_path)
         watch_paths = critical_paths + [
             item for item in watch_paths if item not in critical_paths
         ]
-        self.folder_watcher.addPaths([str(item) for item in watch_paths[:256]])
+        existing = set(self.folder_watcher.directories())
+        additions = [str(item) for item in watch_paths if str(item) not in existing]
+        overflow = max(0, len(existing) + len(additions) - 256)
+        if overflow:
+            critical = {str(item) for item in critical_paths}
+            evicted = sorted(existing - critical)[-overflow:]
+            if evicted:
+                self.folder_watcher.removePaths(evicted)
+                existing.difference_update(evicted)
+        if additions:
+            self.folder_watcher.addPaths(additions[:max(0, 256 - len(existing))])
         if str(path) in self.folder_watcher.directories():
             self._watched_folder = str(path)
         # Deep trees are common under Initial Data.  Enumerate their child
@@ -1068,8 +1167,24 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         changed = Path(folder).resolve()
         root = Path(self.current_folder).resolve()
         initial_data = (root / "Initial Data").resolve()
-        if changed == root:
+        def schedule(modes=None):
+            if modes is None or 'DRR' in modes:
+                from ui_qt.drr_picker_cache import freshness
+                freshness(self).invalidate()
+            pending = getattr(self, '_pending_watch_change', None)
+            previous = pending[1] if pending is not None and pending[0] == root else set()
+            dirty = None if modes is None or previous is None else previous | set(modes)
+            self._pending_watch_change = (root, dirty)
             self.folder_refresh_timer.start()
+        if changed == root:
+            schedule()
+            return
+        try:
+            relative = changed.relative_to(root / 'Processed Data')
+        except ValueError:
+            pass
+        else:
+            schedule({'DRR'} if relative.parts and relative.parts[0].casefold() == 'drr' else None)
             return
         mcd_roots: list[Path] = []
         try:
@@ -1085,13 +1200,13 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 changed.relative_to(mcd_root)
             except ValueError:
                 continue
-            self.folder_refresh_timer.start()
+            schedule({'MCD'})
             return
         try:
             changed.relative_to(initial_data)
         except ValueError:
             return
-        self.folder_refresh_timer.start()
+        schedule()
 
     def _refresh_watched_folder(self) -> None:
         if not self.current_folder:
@@ -1104,11 +1219,18 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if self._load_in_progress:
             self.folder_refresh_timer.start()
             return
-        self._catalog_ready_modes.clear()
+        pending = getattr(self, '_pending_watch_change', None)
+        dirty = pending[1] if pending is not None and pending[0] == path.resolve() else None
+        self._pending_watch_change = None
+        if dirty is None:
+            self._catalog_ready_modes.clear()
+        else:
+            self._catalog_ready_modes.difference_update(dirty)
         self.presentation_widget._plots_catalog_dirty = True
         if self.tabs.tabText(self.tabs.currentIndex()) == "Slides":
             self.presentation_widget.set_experiment_folder(self.current_folder)
-        self._refresh_file_lists(auto=True)
+        if dirty is None or self._active_mode() in dirty:
+            self._refresh_file_lists(auto=True)
         self._watch_current_folder()
 
     def _restore_last_folder(self) -> None:
@@ -1351,7 +1473,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             log_content=self.log_text,
             results_pages=(
                 ("PL", "PL peak and fit results", self.pl_analysis_text),
-                ("DRR", "DRR peak and fit results", self.drr_analysis_text),
+                ("DRR", "DRR peak analysis", self.drr_peak_analysis.results_widget),
                 ("MCD", "MCD pair diagnostics", self.mcd_diagnostics_text),
             ),
             results_empty_text="This workflow has no separate text results. Use the plot and export controls.",
@@ -1362,6 +1484,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.results_stack = self.dock_host.results_stack
         self._results_page_indices = self.dock_host.results_page_indices
         self._results_empty_index = self.dock_host.results_empty_index
+        self.drr_peak_analysis.results_widget.layout().addWidget(
+            self._make_expander("Single spectrum / fit results", self.drr_analysis_text, expanded=False))
+        self.canvas.mpl_connect('pick_event', self.drr_peak_analysis.pick)
         self.mcd_diagnostics_expander.hide()
         self._update_results_dock_page()
         self.menu_toolbar_host = MenuToolbarHost(
@@ -1479,8 +1604,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         apply_accessible_identity(self.open_file_btn, name="Open File", identifier="source.open")
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.setObjectName("refreshButton")
-        self.refresh_btn.setToolTip("Re-scan the current folder for new or changed CSV files")
+        self.refresh_btn.setToolTip("Refresh new or changed files in the background. Right-click to rebuild the catalog.")
         apply_accessible_identity(self.refresh_btn, name="Refresh", identifier="source.refresh")
+        self.rebuild_catalog_action = QAction("Rebuild File Catalog", self.refresh_btn)
+        self.rebuild_catalog_action.triggered.connect(lambda: self._refresh_file_lists(force=True))
+        self.refresh_btn.addAction(self.rebuild_catalog_action)
+        self.refresh_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
         self.data_state_label = QLabel("Shown: no data")
         self.data_state_label.setObjectName("dataStateLabel")
         self.data_state_label.setToolTip("Shows whether the visible plot matches the current source selection")
@@ -1510,6 +1639,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         folder_grid.addWidget(self.browse_btn)
         folder_grid.addWidget(self.open_file_btn)
         folder_grid.addWidget(self.refresh_btn)
+        self.drr_analysis_entry_btn = QPushButton("DRR Analysis…")
+        self.drr_analysis_entry_btn.setToolTip("Open the independent multi-dataset DRR analysis workspace")
+        self.drr_analysis_entry_btn.clicked.connect(lambda: self._open_drr_analysis())
+        folder_grid.addWidget(self.drr_analysis_entry_btn)
         folder_grid.addWidget(self.data_state_label)
         QWidget.setTabOrder(self.recent_folder_combo, self.browse_btn)
         QWidget.setTabOrder(self.browse_btn, self.open_file_btn)
@@ -1733,32 +1866,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         auto_right.setToolTip("Automatically set unlocked limits from data between x0 and xmax.")
 
         if prefix in {"drr", "drr_second"}:
-            # DRR uses the compact sidebar form: one control per row keeps
-            # the input and Fix checkbox readable at the minimum width.
-            grid.addWidget(QLabel("x0"), 0, 0)
-            grid.addWidget(split_spins["x0"], 0, 1, 1, 2)
-            grid.addWidget(split_fix_checks["x0"], 0, 3)
-            grid.addWidget(show_boundary, 1, 0, 1, 4)
-            left_title = QLabel("L  xmin → x0")
-            set_fluent_property(left_title, "appRole", "regionTitle")
-            grid.addWidget(left_title, 2, 0, 1, 3)
-            grid.addWidget(auto_left, 2, 3)
-            grid.addWidget(QLabel("min"), 3, 0)
-            grid.addWidget(split_spins["left_vmin"], 3, 1, 1, 2)
-            grid.addWidget(split_fix_checks["left_vmin"], 3, 3)
-            grid.addWidget(QLabel("max"), 4, 0)
-            grid.addWidget(split_spins["left_vmax"], 4, 1, 1, 2)
-            grid.addWidget(split_fix_checks["left_vmax"], 4, 3)
-            right_title = QLabel("R  x0 → xmax")
-            set_fluent_property(right_title, "appRole", "regionTitle")
-            grid.addWidget(right_title, 5, 0, 1, 3)
-            grid.addWidget(auto_right, 5, 3)
-            grid.addWidget(QLabel("min"), 6, 0)
-            grid.addWidget(split_spins["right_vmin"], 6, 1, 1, 2)
-            grid.addWidget(split_fix_checks["right_vmin"], 6, 3)
-            grid.addWidget(QLabel("max"), 7, 0)
-            grid.addWidget(split_spins["right_vmax"], 7, 1, 1, 2)
-            grid.addWidget(split_fix_checks["right_vmax"], 7, 3)
+            from ui_qt.drr_regions import build_panel
+            build_panel(self, prefix, grid, split_spins, split_fix_checks,
+                        show_boundary, auto_left, auto_right, split_spin)
+            if prefix == "drr":
+                toggle.hide()
         else:
             grid.addWidget(QLabel("Split position (x0)"), 0, 0, 1, 2)
             grid.addWidget(split_spins["x0"], 0, 2, 1, 2)
@@ -1917,7 +2029,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             label = QLabel(label_text) if label_text else None
             if label is not None:
                 label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            dense_layout = DenseFormRowLayout(row, spacing=4, label=label)
+            dense_layout = DenseFormRowLayout(row, spacing=4, label=label, stable_spin_width=True)
             row.setLayout(dense_layout)
             dense_layout.add_group((a, fa), role="range", priority=10, grow_weight=1)
             dense_layout.add_group((b, fb), role="range", priority=10, grow_weight=1)
@@ -2345,6 +2457,19 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return
         self._status("Opened the MCD Organizer in a separate window.")
 
+    def _open_drr_analysis(self, *, add_current=False) -> None:
+        start = str(self.current_folder or self._browse_start_folder())
+        args = [start]
+        if add_current:
+            from core.drr_workspace_session import snapshot_loaded
+            try:args.extend(['--snapshot',str(snapshot_loaded(self.loaded))])
+            except Exception as exc:
+                self._status(str(exc));return
+        arguments = ['--drr-analysis',*args] if getattr(sys,'frozen',False) else [str(Path(__file__).resolve().parents[1]/'run_drr_analysis.py'),*args]
+        launched,_ = QProcess.startDetached(sys.executable,arguments,start)
+        if not launched:QMessageBox.warning(self,'DRR Analysis','Could not start DRR Analysis.')
+        else:self._status('DRR Analysis requested; current data sent as a snapshot.' if add_current else 'DRR Analysis requested.')
+
     def _schedule_plot_redraw(self, mode: str, delay_ms: int = 90) -> None:
         """Queue one redraw for *mode*, coalescing control signal bursts."""
         timer = self._plot_redraw_timers.get(mode)
@@ -2376,6 +2501,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._plot_redraw_pending.discard(mode)
         if self._load_in_progress or not self.loaded or self.loaded.mode != mode:
             return
+        if mode == 'DRR' and not self._prepare_drr_display_derivative():
+            return
         if mode == 'Power Dependent' and getattr(self, '_power_pending_range_refresh', False):
             center = bool(getattr(self, '_power_pending_center_split', False))
             self._power_pending_range_refresh = False
@@ -2385,6 +2512,61 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             center = self._pending_range_refresh.pop(mode)
             self._refresh_automatic_ranges(mode, refresh_split=True, center_split=center)
         self._plot_mode(mode)
+
+    def _prepare_drr_display_derivative(self, derivative=None) -> bool:
+        if not self.loaded or self.loaded.mode != 'DRR' or self.loaded.cube is None:
+            return True
+        if derivative is None:
+            derivative = (2 if self._drr_side_by_side or self._drr_plot_view == 'second'
+                          else self.drr_controller._drr_derivative_value())
+        if derivative is None:
+            return True
+        window = self.drr_controller._enforce_drr_sg_constraints(show_status=False)
+        poly = int(self.drr_sg_poly_spin.value())
+        if not hasattr(self, '_drr_display_compute'):
+            from ui_qt.drr_display_compute import DrrDisplayCompute
+            self._drr_display_compute = DrrDisplayCompute(self)
+            self._drr_display_compute.ready.connect(self._on_drr_display_ready)
+            self._drr_display_compute.failed.connect(self._on_drr_display_error)
+        ready = self._drr_display_compute.request(self.loaded.cube, derivative, window, poly)
+        if not ready:
+            self._status('Computing DRR derivative in background…')
+        return ready
+
+    def _on_drr_display_error(self, message):
+        self._drr_pending_ranges = None
+        self._drr_pending_second_split = None
+        self._drr_pending_second_auto = None
+        self._drr_pending_split_sides = {}
+        self._drr_pending_auto_limits_cube = None
+        if not self._is_closing:
+            self._status('DRR derivative failed: ' + str(message).splitlines()[0])
+
+    def _on_drr_display_ready(self):
+        if self._is_closing:
+            return
+        pending = getattr(self, '_drr_pending_ranges', None)
+        self._drr_pending_ranges = None
+        if pending is not None and pending[0] is getattr(self.loaded, 'cube', None):
+            self._refresh_automatic_ranges('DRR', **pending[1])
+        pending_split = getattr(self, '_drr_pending_second_split', None)
+        self._drr_pending_second_split = None
+        if pending_split is not None and pending_split[0] is getattr(self.loaded, 'cube', None):
+            self._refresh_drr_second_split_ranges(center_split=pending_split[1])
+        pending_auto = getattr(self, '_drr_pending_second_auto', None)
+        self._drr_pending_second_auto = None
+        if pending_auto is not None and pending_auto is getattr(self.loaded, 'cube', None):
+            self._auto_drr_second_vrange()
+        pending_sides = getattr(self, '_drr_pending_split_sides', {})
+        self._drr_pending_split_sides = {}
+        for (prefix, side), cube in pending_sides.items():
+            if cube is getattr(self.loaded, 'cube', None):
+                self._auto_split_vrange(prefix, side)
+        pending_limits = getattr(self, '_drr_pending_auto_limits_cube', None)
+        self._drr_pending_auto_limits_cube = None
+        if pending_limits is not None and pending_limits is getattr(self.loaded, 'cube', None):
+            self._apply_auto_limits_for_loaded()
+        self._schedule_plot_redraw('DRR', delay_ms=0)
 
     def _on_drr_plot_view_changed(self, view: str, *, redraw: bool = True) -> None:
         view = str(view)
@@ -2497,6 +2679,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
     def _auto_drr_second_vrange(self) -> None:
         if not self.loaded or self.loaded.mode != "DRR":
+            return
+        self.drr_second_auto_scale = True
+        if not self._prepare_drr_display_derivative(2):
+            self._drr_pending_second_auto = self.loaded.cube
             return
         try:
             cube, _derivative, _window, _poly = self.drr_controller._drr_cube_with_metadata(2)
@@ -2816,6 +3002,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         )
         self.mcd_unified_view.detection_mode_changed.connect(self._on_unified_detection_mode_changed)
         self.mcd_unified_view.window_center_changed.connect(self.mcd_window_center_spin.setValue)
+        import weakref
+        commit_ref = weakref.WeakMethod(self._commit_unified_mcd_window)
+        self.mcd_unified_view.window_commit_handler = lambda center, width: (
+            commit_ref()(center, width) if commit_ref() is not None else None)
         self.mcd_unified_view.manual_candidate_added.connect(
             lambda _item: self._queue_unified_selected_feature_analysis()
         )
@@ -2828,11 +3018,13 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         canvas_layout.setSpacing(0)
         canvas_layout.addWidget(self.canvas, 0, 0)
         self.empty_canvas_overlay = QLabel(
-            "Choose a valid source to display it automatically"
+            "Choose a valid source to display it automatically", self.canvas
         )
         self.empty_canvas_overlay.setObjectName("emptyCanvasOverlay")
         self.empty_canvas_overlay.setAlignment(Qt.AlignCenter)
         self.empty_canvas_overlay.setWordWrap(True)
+        # Guidance is decorative: hiding it after the first draw must not
+        # change the canvas size and trigger a second full render.
         self.empty_canvas_overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.empty_canvas_overlay.setFocusPolicy(Qt.NoFocus)
         set_fluent_property(self.empty_canvas_overlay, "appRole", "emptyCanvas")
@@ -2841,8 +3033,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             name="Plot canvas guidance",
             description="Choose a valid source to load and show a scientific plot.",
         )
-        canvas_layout.addWidget(self.empty_canvas_overlay, 0, 0)
         self.canvas.mpl_connect("draw_event", self._sync_empty_canvas_overlay)
+        self.canvas.mpl_connect("resize_event", self._sync_empty_canvas_overlay)
         self._sync_empty_canvas_overlay()
         self._mcd_unified_canvas_host = canvas_host
         layout.addWidget(canvas_host, 1)
@@ -2853,6 +3045,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         overlay = getattr(self, "empty_canvas_overlay", None)
         figure = getattr(self, "figure", None)
         if overlay is not None and figure is not None:
+            overlay.setGeometry(self.canvas.rect())
             overlay.setVisible(not bool(figure.axes))
 
     def _update_results_dock_page(self) -> None:
@@ -2908,6 +3101,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             getattr(self, f"{prefix}_split_auto_right_btn").clicked.connect(
                 lambda _checked=False, p=prefix: self._auto_split_vrange(p, "right")
             )
+        from ui_qt.drr_regions import select_count
+        self.drr_region_count_combo.currentIndexChanged.connect(lambda: select_count(self))
         self.pl_auto_v_btn.clicked.connect(self.pl_controller._auto_pl_vrange)
         self.pl_auto_x_btn.clicked.connect(self.pl_controller._auto_pl_xrange)
         self.pl_auto_y_btn.clicked.connect(self.pl_controller._auto_pl_yrange)
@@ -3101,6 +3296,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.mcd_select_source_btn.clicked.connect(self.mcd_controller._edit_mcd_source)
         self.mcd_clear_source_btn.clicked.connect(self.mcd_controller._clear_mcd_source)
         self.mcd_extract_btn.clicked.connect(self._open_mcd_extract_dialog)
+        self.drr_analysis_tools_btn.clicked.connect(lambda: self._open_drr_analysis())
         self.mcd_auto_angles_chk.toggled.connect(self.mcd_controller._on_mcd_angle_assignment_changed)
         self.mcd_sigma_plus_combo.currentIndexChanged.connect(self.mcd_controller._on_mcd_params_changed)
         self.mcd_sigma_minus_combo.currentIndexChanged.connect(self.mcd_controller._on_mcd_params_changed)
@@ -4318,10 +4514,13 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return
         active = self._active_mode()
         mode = active if active in self._catalog_pending_requests else next(iter(self._catalog_pending_requests))
-        force = self._catalog_pending_requests.pop(mode)
-        self._refresh_file_lists(auto=not force, mode=mode)
+        manual = self._catalog_pending_requests.pop(mode)
+        force = mode in self._catalog_pending_rebuilds
+        self._catalog_pending_rebuilds.discard(mode)
+        self._refresh_file_lists(auto=not manual, mode=mode, force=force)
 
-    def _refresh_file_lists(self, *, auto: bool = False, mode: str | None = None) -> None:
+    def _refresh_file_lists(self, *, auto: bool = False, mode: str | None = None,
+                            force: bool = False) -> None:
         """Queue a folder catalog refresh and apply it only if still current."""
         if self._is_closing:
             return
@@ -4363,6 +4562,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._power_result_cache.clear()
             self._drr_refresh_pending = False
             self._drr_refresh_pending_auto = False
+            self._drr_refresh_pending_force = False
             self._drr_refresh_pending_old_sources = None
             self._drr_refresh_pending_selected_sources = None
             self.drr_available_sources = []
@@ -4370,12 +4570,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return
         mode = mode or self._active_mode()
         if mode == "DRR":
-            self._queue_drr_catalog_refresh(auto=auto, old_source_files=old_source_files)
+            self._queue_drr_catalog_refresh(auto=auto, old_source_files=old_source_files, force=force)
             return
         if mode not in {"PL", "Compare", "Power Dependent", "MCD", "SHG Processing"}:
             return
         if self._file_refresh_running:
             self._catalog_pending_requests[mode] = self._catalog_pending_requests.get(mode, False) or not auto
+            if force:
+                self._catalog_pending_rebuilds.add(mode)
             self._file_refresh_pending = True
             self._file_refresh_pending_auto = self._file_refresh_pending_auto or auto
             return
@@ -4390,7 +4592,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         folder = self.current_folder
         worker = Worker(
             _cached_folder_sources_worker,
-            folder, mode=mode, force=not auto, publish_cached=None,
+            folder, mode=mode, force=force, publish_cached=None,
             power_include_legacy=bool(getattr(self, "_power_include_legacy", False)),
         )
         worker.kwargs["publish_cached"] = worker.signals.result.emit
@@ -4661,16 +4863,19 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             pass
 
     def _queue_drr_catalog_refresh(self, *, auto: bool, old_source_files: set[str],
-                                   selected_sources=()) -> None:
-        """Coalesce DRR scans while keeping unrelated file-list refreshes synchronous."""
+                                   selected_sources=(), force: bool = False, catalog_only: bool = False) -> None:
+        """Coalesce background DRR scans without losing explicit rebuild requests."""
         if self._is_closing:
             return
         if self._drr_refresh_running:
             if not self._drr_refresh_pending:
                 self._drr_refresh_pending_auto = auto
+                self._drr_refresh_pending_catalog_only = catalog_only
             else:
                 self._drr_refresh_pending_auto = self._drr_refresh_pending_auto and auto
+                self._drr_refresh_pending_catalog_only = getattr(self, '_drr_refresh_pending_catalog_only', False) and catalog_only
             self._drr_refresh_pending = True
+            self._drr_refresh_pending_force = self._drr_refresh_pending_force or force
             if self._drr_refresh_pending_old_sources is None:
                 self._drr_refresh_pending_old_sources = set(old_source_files)
             pending_selected = self._drr_refresh_pending_selected_sources or set()
@@ -4678,32 +4883,40 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._drr_refresh_pending_selected_sources = pending_selected
             return
         kwargs = {"auto": auto, "old_source_files": old_source_files}
+        if catalog_only:
+            kwargs['catalog_only'] = True
+        if force:
+            kwargs["force"] = True
         if selected_sources:
             kwargs["selected_sources"] = selected_sources
         self._start_drr_catalog_refresh(**kwargs)
 
     def _start_drr_catalog_refresh(self, *, auto: bool, old_source_files: set[str],
-                                   selected_sources=()) -> None:
+                                   selected_sources=(), force: bool = False, catalog_only: bool = False) -> None:
         if self._is_closing or not self.current_folder:
             return
         self._drr_refresh_running = True
         self._drr_refresh_generation += 1
         generation = self._drr_refresh_generation
         folder = self.current_folder
+        from ui_qt.drr_picker_cache import freshness
+        validation_token = freshness(self).begin(folder, getattr(self, '_drr_include_all_sources', False))
         worker = Worker(
             _scan_drr_catalog_worker,
             folder,
             self._drr_source_cache.clone(),
-            force=not auto, publish_cached=None,
+            force=force, publish_cached=None,
             include_all=bool(getattr(self, "_drr_include_all_sources", False)),
             selected_sources=tuple(selected_sources),
+            prepare_history=not catalog_only,
         )
         worker.kwargs["publish_cached"] = worker.signals.result.emit
         self._drr_refresh_workers.append(worker)
         worker.signals.result.connect(
             lambda result, generation=generation, auto=auto, old_source_files=set(old_source_files),
-            selected_sources=tuple(selected_sources):
-            self._on_drr_catalog_refresh_result(result, generation, auto, old_source_files, selected_sources)
+            selected_sources=tuple(selected_sources), catalog_only=catalog_only, validation_token=validation_token:
+            self._on_drr_catalog_refresh_result(result, generation, auto, old_source_files, selected_sources,
+                                                catalog_only=catalog_only, validation_token=validation_token)
         )
         worker.signals.error.connect(
             lambda message, generation=generation, folder=folder: self._on_drr_catalog_refresh_error(
@@ -4732,6 +4945,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         auto: bool,
         old_source_files: set[str],
         selected_sources: tuple[str, ...] = (),
+        *, catalog_only: bool = False, validation_token=None,
     ) -> None:
         if generation != self._drr_refresh_generation:
             return
@@ -4746,7 +4960,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             if str(folder).casefold() == str(self.current_folder).casefold() and "DRR" not in self._catalog_displayed_modes:
                 self.drr_available_sources = sources
                 self._catalog_displayed_modes.add("DRR")
-                self.drr_controller._update_drr_selection_labels()
+                if not catalog_only:
+                    self.drr_controller._update_drr_selection_labels()
                 self._status("Showing cached DRR files; checking for changes…")
                 self.drr_catalog_preview_ready.emit(str(folder))
             return
@@ -4757,7 +4972,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             missing_selected, current_selection, request_selection,
             bool(self._drr_refresh_pending),
         )
-        if terminal_missing and str(folder).casefold() == str(self.current_folder).casefold():
+        if not catalog_only and terminal_missing and str(folder).casefold() == str(self.current_folder).casefold():
             self._invalidate_drr_for_background_selection(
                 "Selected DRR source is unavailable: " + ", ".join(missing_selected)
             )
@@ -4767,6 +4982,18 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return
         self._drr_refresh_running = False
         if str(folder).casefold() != str(self.current_folder).casefold():
+            self._finish_drr_catalog_refresh()
+            return
+
+        if validation_token is not None:
+            from ui_qt.drr_picker_cache import freshness
+            freshness(self).complete(validation_token)
+        if catalog_only:
+            self.drr_available_sources = sources
+            self._drr_source_cache = cache
+            self._catalog_ready_modes.add('DRR')
+            self._catalog_displayed_modes.add('DRR')
+            self.drr_catalog_refresh_finished.emit(str(folder), True)
             self._finish_drr_catalog_refresh()
             return
 
@@ -4813,7 +5040,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             f for f in self.drr_baseline_files_found if f in drr_candidates
         ]
         self.drr_controller._update_drr_selection_labels()
-        if self._drr_assignments_automatic and self.drr_selected_files:
+        external_refresh_handled = self.drr_controller._refresh_auto_external(
+            selected_before != set(self.drr_selected_files))
+        if not external_refresh_handled and self._drr_assignments_automatic and self.drr_selected_files:
             resolved = resolve_drr_background_assignments(
                 self.current_folder, self.drr_available_sources, self.drr_selected_files,
             )
@@ -4878,15 +5107,27 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if self._drr_refresh_running:
             return
         if not self._drr_refresh_pending:
+            history_folder = getattr(self, '_drr_saved_history_pending', '')
+            if history_folder:
+                self._drr_saved_history_pending = ''
+                self._refresh_drr_saved_history(history_folder)
             return
         self._drr_refresh_pending = False
         auto = self._drr_refresh_pending_auto
+        catalog_only = getattr(self, '_drr_refresh_pending_catalog_only', False)
+        self._drr_refresh_pending_catalog_only = False
+        force = self._drr_refresh_pending_force
+        self._drr_refresh_pending_force = False
         old_source_files = self._drr_refresh_pending_old_sources or set()
         self._drr_refresh_pending_auto = False
         self._drr_refresh_pending_old_sources = None
         selected_sources = self._drr_refresh_pending_selected_sources or set()
         self._drr_refresh_pending_selected_sources = None
         kwargs = {"auto": auto, "old_source_files": old_source_files}
+        if catalog_only:
+            kwargs['catalog_only'] = True
+        if force:
+            kwargs["force"] = True
         if selected_sources:
             kwargs["selected_sources"] = selected_sources
         self._start_drr_catalog_refresh(**kwargs)
@@ -4934,6 +5175,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._power_pending_measurement_selection = None
         self._power_pending_measurement_validation = {}
         self._power_pending_measurement_generation = None
+        self.drr_controller._cancel_auto_external()
         self.drr_selected_files = []
         self.drr_baseline_files_manual = []
         self.drr_baseline_files_found = []
@@ -4976,6 +5218,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._drr_spectrum_axes = {}
         self._drr_plot_cubes = {}
         self._drr_gate_lines = {}
+        self._drr_reuse_state = None
+        self._drr_heatmap_renders = {}
         self._update_action_states()
 
     def _clear_loaded_drr_view(self) -> None:
@@ -4994,6 +5238,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._drr_spectrum_axes = {}
         self._drr_plot_cubes = {}
         self._drr_gate_lines = {}
+        self._drr_reuse_state = None
+        self._drr_heatmap_renders = {}
         self._last_plot_cube = None
         self._last_plot_params_key = None
 
@@ -5252,6 +5498,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             getattr(self, f"{prefix}_split_auto_right_btn").setEnabled(
                 enabled and split_enabled and not right_fully_fixed
             )
+        for prefix in ("drr", "drr_second"):
+            fixes = getattr(self, f"{prefix}_split_fix_checks")
+            getattr(self, f"{prefix}_split_auto_middle_btn").setEnabled(
+                drr_loaded and self.drr_region_count_combo.currentData() == 3
+                and not all(fixes[k].isChecked() for k in ("middle_vmin", "middle_vmax")))
         cmp_split_available = not self.compare_controller._cmp_is_vp_view()
         power_split_available = self.power_controller._power_view() != "VP"
         self.cmp_split_scale_chk.setEnabled(cmp_split_available)
@@ -5312,7 +5563,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return
         self._launch_load_options(options)
 
-    def _start_load(self, mode: str) -> None:
+    def _start_load(self, mode: str, *, drr_resolution=None) -> None:
         if self._is_closing:
             return
         if self._load_in_progress and not getattr(self, "_capture_pending_load", False):
@@ -5327,7 +5578,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             # second worker or rereading them after completion.
             self._capture_pending_load = True
             try:
-                self._start_load(mode)
+                self._start_load(mode, drr_resolution=drr_resolution)
             finally:
                 self._capture_pending_load = False
             self._status("State: Load in progress; latest update queued.")
@@ -5468,16 +5719,29 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                         explicit_baseline_which=drr_baseline_which,
                     )
                 elif baselines:
-                    resolved = resolve_drr_background_assignments(
-                        self.current_folder, self.drr_available_sources, selected,
-                        explicit_baseline_files=baselines,
-                        explicit_baseline_mode="External",
-                        explicit_baseline_which=drr_baseline_which,
-                    )
+                    resolved = drr_resolution
+                    if not (
+                        resolved is not None and resolved.resolved
+                        and tuple(a.measurement_file for a in resolved.assignments) == tuple(selected)
+                        and all(a.baseline_mode == 'External'
+                                and tuple(a.baseline_files) == tuple(baselines)
+                                and a.baseline_which == drr_baseline_which
+                                for a in resolved.assignments)
+                    ):
+                        resolved = resolve_drr_background_assignments(
+                            self.current_folder, self.drr_available_sources, selected,
+                            explicit_baseline_files=baselines,
+                            explicit_baseline_mode="External",
+                            explicit_baseline_which=drr_baseline_which,
+                        )
                 else:
-                    resolved = resolve_drr_background_assignments(
-                        self.current_folder, self.drr_available_sources, selected,
-                    )
+                    # Selection already inspected history, including the
+                    # unresolved/default-Self case. Reuse that exact result.
+                    resolved = drr_resolution
+                    if resolved is None:
+                        resolved = resolve_drr_background_assignments(
+                            self.current_folder, self.drr_available_sources, selected,
+                        )
                     if resolved.self_fallback_allowed and drr_baseline in {"Self (first frame)", "Self (last frame)"}:
                         # Keep saved/validated recipes when available. Otherwise
                         # the visible default Self is a usable recipe, even if
@@ -6092,6 +6356,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if loaded.mode == self._active_load_mode:
             self._active_load_succeeded = True
         self.loaded = loaded
+        if hasattr(self, 'drr_peak_analysis'):
+            self.drr_peak_analysis.loaded_changed()
         if loaded.mode == "DRR":
             self._drr_assignments = tuple(getattr(loaded, "drr_assignments", ()))
             self._drr_assignments_automatic = (
@@ -6268,9 +6534,13 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             and loaded.mcd_result is not None
             and self.last_plotted_mode == "MCD"
         ):
-            # Give the freshly rendered MCD view a short settling window so
-            # the first center trace refresh is not consumed during plotting.
-            self.mcd_controller._mcd_center_refresh_timer.start(200)
+            # Settle the initial axis separately; start(200) on the interaction
+            # timer would permanently replace its normal 40 ms interval.
+            QTimer.singleShot(200, lambda state=loaded: (
+                self.mcd_unified_view._settle_window_range()
+                if self.loaded is state and not getattr(self, '_is_closing', False)
+                and not self.mcd_controller._mcd_center_refresh_timer.isActive()
+                else None))
 
     def _on_load_finished(self, load_generation: int | None = None,
                           *, request_token: RequestToken | None = None) -> None:
@@ -6357,6 +6627,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         }[prefix]
 
     def _on_split_scale_toggled(self, prefix: str, checked: bool) -> None:
+        if prefix == "drr":
+            from ui_qt.drr_regions import sync_legacy_toggle
+            sync_legacy_toggle(self, checked)
         panel: QWidget = getattr(self, f"{prefix}_split_scale_panel")
         panel.setVisible(bool(checked))
         spins = self._mode_spins(self._split_prefix_mode(prefix))
@@ -6434,9 +6707,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if not toggle.isChecked():
             return
         if prefix == "drr_second":
-            self._set_spin_value_silent(
-                self.drr_split_spins["x0"], float(self.drr_second_split_spins["x0"].value())
-            )
+            from ui_qt.drr_regions import is_triple
+            if not is_triple(self):
+                self._set_spin_value_silent(
+                    self.drr_split_spins["x0"], float(self.drr_second_split_spins["x0"].value())
+                )
             self._refresh_drr_second_split_ranges()
         else:
             self._refresh_automatic_ranges(
@@ -6472,6 +6747,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         )
         if not enabled:
             return None
+        from ui_qt.drr_regions import is_triple, scale
+        if is_triple(self, prefix):
+            return scale(self, prefix)
         spins = self._mode_spins(mode)
         split_spins: Dict[str, QDoubleSpinBox] = getattr(self, f"{prefix}_split_spins")
         xmin, xmax = sorted((float(spins["xmin"].value()), float(spins["xmax"].value())))
@@ -6509,6 +6787,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         )
         if not enabled:
             return (False,)
+        from ui_qt.drr_regions import is_triple
+        if is_triple(self, prefix):
+            controls = getattr(self, f"{prefix}_split_spins")
+            return (True, 3, self.drr_split_spins["x0"].value(), self.drr_split_spins["x1"].value(),
+                    *(controls[k].value() for k in ("left_vmin", "left_vmax", "middle_vmin", "middle_vmax", "right_vmin", "right_vmax")),
+                    self.drr_split_boundary_chk.isChecked())
         spins: Dict[str, QDoubleSpinBox] = getattr(self, f"{prefix}_split_spins")
         shared_boundary = prefix == "drr_second" and hasattr(self, "drr_split_spins")
         shared_spins = self.drr_split_spins if shared_boundary else spins
@@ -6535,7 +6819,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if mode == "DRR" and self.loaded.cube is not None:
             try:
                 if prefix == "drr_second":
+                    if not self._prepare_drr_display_derivative(2):
+                        return []
                     return [self.drr_controller._drr_cube_with_metadata(2)[0]]
+                derivative = self.drr_controller._drr_derivative_value()
+                if derivative is not None and not self._prepare_drr_display_derivative(derivative):
+                    return []
                 return [self.drr_controller._drr_cube_for_display()]
             except (TypeError, ValueError):
                 return []
@@ -6612,10 +6901,17 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return False
         if not self.loaded or self.loaded.mode != "DRR" or self.loaded.cube is None:
             return False
+        if not self._prepare_drr_display_derivative(2):
+            previous = getattr(self, '_drr_pending_second_split', None)
+            self._drr_pending_second_split = (self.loaded.cube, center_split or bool(previous and previous[0] is self.loaded.cube and previous[1]))
+            return False
         try:
             second_cube = self.drr_controller._drr_cube_with_metadata(2)[0]
         except (TypeError, ValueError):
             return False
+        from ui_qt.drr_regions import is_triple, refresh
+        if is_triple(self):
+            return refresh(self, "drr_second", [second_cube])
         spins = self.drr_spins
         split_spins: Dict[str, QDoubleSpinBox] = self.drr_second_split_spins
         split_fixes: Dict[str, QCheckBox] = self.drr_second_split_fix_checks
@@ -6742,6 +7038,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         )
         if self._automatic_range_update:
             return False
+        derivative = self.drr_controller._drr_derivative_value() if mode == 'DRR' else None
+        if derivative is not None and not self._prepare_drr_display_derivative(derivative):
+            previous = getattr(self, '_drr_pending_ranges', None)
+            options = dict(refresh_axes=refresh_axes, refresh_split=refresh_split, center_split=center_split)
+            if previous is not None and previous[0] is self.loaded.cube:
+                options = {key: value or previous[1][key] for key, value in options.items()}
+            self._drr_pending_ranges = (self.loaded.cube, options)
+            return False
         cubes = self._automatic_cubes_for_mode(mode)
         if not cubes:
             return False
@@ -6778,6 +7082,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 if mode == "DRR":
                     return changed or self._refresh_drr_second_split_ranges(center_split=center_split)
                 return changed
+            from ui_qt.drr_regions import is_triple, refresh
+            if is_triple(self, prefix):
+                triple_changed = refresh(self, prefix, cubes, center=center_split)
+                second_changed = self._refresh_drr_second_split_ranges()
+                return changed or triple_changed or second_changed
             split_spins: Dict[str, QDoubleSpinBox] = getattr(self, f"{prefix}_split_spins")
             split_fixes: Dict[str, QCheckBox] = getattr(self, f"{prefix}_split_fix_checks")
             xmin, xmax = sorted((float(spins["xmin"].value()), float(spins["xmax"].value())))
@@ -6813,9 +7122,23 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
     def _auto_split_vrange(self, prefix: str, side: str) -> None:
         mode = self._split_prefix_mode(prefix)
+        if mode == 'DRR' and self.loaded and self.loaded.mode == 'DRR':
+            derivative = 2 if prefix == 'drr_second' else self.drr_controller._drr_derivative_value()
+            if derivative is not None and not self._prepare_drr_display_derivative(derivative):
+                pending = getattr(self, '_drr_pending_split_sides', {})
+                pending[(prefix, side)] = self.loaded.cube
+                self._drr_pending_split_sides = pending
+                return
         cubes = self._split_auto_cubes(mode, prefix)
         if not cubes:
             self._status("Split auto scale is available after loading an intensity heatmap.")
+            return
+        from ui_qt.drr_regions import is_triple, refresh
+        if is_triple(self, prefix):
+            refresh(self, prefix, cubes, side=side)
+            # Do not refresh all regions here: a region-specific Auto must
+            # preserve the other region's manually entered values.
+            self.drr_controller._on_drr_plot_param_changed()
             return
         spins = self._mode_spins(mode)
         split_spins: Dict[str, QDoubleSpinBox] = getattr(self, f"{prefix}_split_spins")
@@ -7033,6 +7356,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if mode == "PL" and self.loaded.cube is not None:
             cube = self.loaded.cube
         elif mode == "DRR" and self.loaded.cube is not None:
+            derivative = self.drr_controller._drr_derivative_value()
+            if derivative is not None and not self._prepare_drr_display_derivative(derivative):
+                self._drr_pending_auto_limits_cube = self.loaded.cube
+                return
             cube = self.drr_controller._drr_cube_for_display()
         elif mode == "Compare" and self.loaded.compare_cubes:
             background = self.compare_controller._cmp_background_value(self.loaded.compare_cubes)
@@ -7628,6 +7955,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             if ticks_on_top and orientation == "horizontal":
                 colorbar.ax.xaxis.set_ticks_position("top")
                 colorbar.ax.xaxis.set_label_position("top")
+            return
+        if render.tertiary is not None:
+            from core.region_colorbars import add_three_colorbars, three_preview_axes
+            axes = three_preview_axes(cax)
+            add_three_colorbars(self.figure, render, axes, label=label, fontsize=7)
             return
         cax.set_axis_off()
         if orientation == "horizontal":
@@ -8898,62 +9230,37 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self._mcd_unified_analysis_pending = False
                 QTimer.singleShot(0, self._queue_mcd_unified_analysis)
 
+    def _commit_unified_mcd_window(self, center: float, width: float) -> None:
+        for spin, value in ((self.mcd_window_center_spin, center), (self.mcd_window_width_spin, width)):
+            blocked = spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(blocked)
+        self._mcd_candidate_active_index = None
+        self.mcd_controller._update_mcd_candidate_bar()
+        summary = getattr(getattr(self.loaded, 'mcd_result', None), 'summary', None)
+        if isinstance(summary, dict):
+            summary['window_center_selection'] = {'method': 'manual'}
+        self.mcd_controller._mcd_center_refresh_timer.stop()
+        self.mcd_controller._apply_pending_mcd_center_refresh()
+
     def _compute_unified_mcd_slopes(self, view: McdUnifiedView) -> Any:
         try:
             from core.mcd_analysis import fit_mcd_slopes
             result = self.loaded.mcd_result
-            energy = np.asarray(result.energy_ev, float)
-            # McdResult.energy_ev is already sorted, whereas paired spectra
-            # retain wavelength-column order. Construct the energy axis in
-            # that same raw order before applying the spectral permutation.
-            wavelength = np.asarray(getattr(result, "wavelength_nm", ()), float)
-            column_energy = 1239.841984 / wavelength if wavelength.shape == energy.shape else energy
-            values = np.asarray(result.pair_mcd_corrected, float)
-            cached_order = getattr(result, "_unified_energy_order", None)
-            order_signature = (column_energy.shape, column_energy.tobytes())
-            if getattr(result, "_unified_energy_order_signature", None) != order_signature:
-                cached_order = None
-            ordered_columns = np.asarray(
-                spectrum_energy_order(result) if cached_order is None else cached_order,
-                dtype=int,
-            )
-            try:
-                result._unified_energy_order = ordered_columns
-                result._unified_energy_order_signature = order_signature
-            except AttributeError:
-                pass
-            half = float(view.state.window_width_mev) * 0.0005
-            ordered_energy = column_energy[ordered_columns] if ordered_columns.size == energy.size else column_energy
-            mask = np.abs(ordered_energy - view.state.window_center_ev) <= half
-            # Match pair_window_trace_by_branch for sub-sample windows.
-            if ordered_energy.size and not np.any(mask):
-                mask[int(np.argmin(np.abs(ordered_energy - view.state.window_center_ev)))] = True
-            metric = str(self.mcd_window_metric_combo.currentText()).casefold().replace(" ", "_")
-            if values.ndim == 2 and ordered_columns.size == values.shape[1] and np.any(mask):
-                # Select the window in energy order before copying columns;
-                # center movement no longer duplicates the whole matrix.
-                selected = values[:, ordered_columns[mask]]
-                selected_energy = ordered_energy[mask]
-            else:
-                selected = None
-                selected_energy = energy[mask]
-            if selected is None:
-                trace = np.full(np.asarray(result.pair_b).shape, np.nan)
-            elif "integral" in metric:
-                trace = np.trapezoid(selected, x=selected_energy, axis=1)
-            elif "field" in metric and "absolute" in metric:
-                trace = np.sign(np.asarray(result.pair_b, dtype=float)) * np.nanmean(np.abs(selected), axis=1)
-            elif "absolute" in metric:
-                trace = np.nanmean(np.abs(selected), axis=1)
-            else:
-                trace = np.nanmean(selected, axis=1)
+            metric, traces = view.window_traces(result)
+            fields, values, labels = [], [], []
+            for branch, metrics in traces.items():
+                bx, by = metrics[f'corrected_{metric}']
+                fields.extend(bx)
+                values.extend(by)
+                labels.extend([branch] * len(bx))
             controls = self.mcd_unified_controls
             ranges = {
                 "low": (controls.slope_low_spin.value(), controls.slope_low_end_spin.value()),
                 "high_positive": (controls.slope_high_positive_spin.value(), controls.slope_high_positive_end_spin.value()),
                 "high_negative": (controls.slope_high_negative_spin.value(), controls.slope_high_negative_end_spin.value()),
             }
-            return fit_mcd_slopes(result.pair_b, trace, result.pair_labels, ranges=ranges)
+            return fit_mcd_slopes(fields, values, labels, ranges=ranges)
         except (AttributeError, ImportError, TypeError, ValueError, FloatingPointError):
             return None
 
@@ -9055,6 +9362,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             pending_changed = bool(getattr(self, "_pending_load_options", None))
             if self._load_in_progress and (not auto or request_changed or lifecycle_changed or pending_changed or not busy_before):
                 return
+            if mode == 'DRR' and not self._prepare_drr_display_derivative():
+                return
             plot_key = self._current_plot_params_key(mode)
             gate_only_update = mode == "DRR" and self.drr_controller._is_drr_gate_only_change(plot_key)
             if gate_only_update and self._last_plot_cube is not None:
@@ -9076,7 +9385,17 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             if mode == "DRR" and not self._drr_limits_from_controls:
                 self._capture_drr_view_limits()
             self._drr_limits_from_controls = False
+            if mode == 'DRR':
+                from ui_qt.drr_plot_reuse import try_update
+                if try_update(self):
+                    self._last_plot_params_key = self._current_plot_params_key(mode)
+                    self._set_stage('Plotted')
+                    self._update_action_states()
+                    self._status('Plotted DRR (data and color-scale update).')
+                    return
             self.compare_controller._disable_cmp_blitting()
+            self._drr_reuse_state = None
+            self._drr_heatmap_renders = {}
             self.figure.clear()
             self._drr_heatmap_ax = None
             self._drr_spectrum_ax = None
@@ -9138,41 +9457,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self._pl_spectrum_ax = None
                 self._pl_last_plot_cube = None
                 self._pl_gate_line = None
-                raw_cube, _, raw_win, raw_poly = self.drr_controller._drr_cube_with_metadata(None)
-                second_cube = None
-                second_win = second_poly = 0
-                view = "both" if self._drr_side_by_side else self._drr_plot_view
-                products: list[tuple[str, DataCube, HeatmapParams, int | None, int, int]] = []
-                raw_params = self._make_drr_params(raw_cube, None)
-                advanced_derivative = self.drr_controller._drr_derivative_value()
-                if view in {"raw", "both"}:
-                    display_raw_cube = raw_cube
-                    display_raw_derivative = None
-                    if view == "raw" and advanced_derivative == 1:
-                        display_raw_cube, _, raw_win, raw_poly = self.drr_controller._drr_cube_with_metadata(1)
-                        raw_params = self._make_drr_params(display_raw_cube, 1)
-                        raw_params = HeatmapParams(**{
-                            **raw_params.__dict__,
-                            "title": f"{raw_cube.title} (Advanced first derivative, dE)",
-                            "cbar_label": "d(DR/R)/dE",
-                        })
-                        display_raw_derivative = 1
-                    products.append(("raw", display_raw_cube, raw_params, display_raw_derivative, raw_win, raw_poly))
-                if view in {"second", "both"}:
-                    second_cube, _, second_win, second_poly = self.drr_controller._drr_cube_with_metadata(2)
-                    self._sync_drr_second_auto_scale(second_cube)
-                    second_params = self._make_drr_params(second_cube, 2)
-                    products.append(("second", second_cube, second_params, 2, second_win, second_poly))
-                if not products:
-                    products.append(("raw", raw_cube, raw_params, None, raw_win, raw_poly))
-                self.loaded.drr_derivative_label = (
-                    "Advanced first derivative (dE)"
-                    if advanced_derivative == 1 and self._drr_plot_view == "raw"
-                    else {"raw": "None", "second": "d2E"}.get(self._drr_plot_view, "None")
-                )
+                from ui_qt.drr_plot_reuse import products_for_display
+                products = products_for_display(self)
+                raw_cube = self.loaded.cube
                 self._drr_plot_cubes = {key: cube for key, cube, *_rest in products}
                 self._drr_heatmap_axes = {}
                 self._drr_spectrum_axes = {}
+                self._drr_spectrum_lines = {}
+                self._drr_heatmap_renders = {}
                 both = len(products) == 2
                 if both:
                     # Keep one compact filename header for the paired view;
@@ -9187,7 +9479,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                         1.0, float(self.figure.get_figwidth() * self.figure.dpi)
                     )
                     left_margin_px = float(np.clip(80.0, 70.0, 85.0))
-                    right_margin_px = 55.0
+                    right_margin_px = 125.0 if self.drr_region_count_combo.currentData() == 3 else 55.0
                     gs = self.figure.add_gridspec(
                         nrows=1, ncols=2,
                         left=left_margin_px / figure_width_px,
@@ -9229,7 +9521,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                                 "xlabel": "",
                             }
                         )
-                    render = plot_drr(ax1, downsample_cube_for_display(product_cube), product_params)
+                    render = plot_drr(ax1, self.drr_controller._drr_display_preview(product_cube), product_params)
+                    self._drr_heatmap_renders[key] = render
                     self._add_heatmap_colorbar(
                         render, cax,
                         label="" if both else product_params.cbar_label,
@@ -9257,12 +9550,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     )
                     self._drr_heatmap_axes[key] = ax1
                     self._drr_spectrum_axes[key] = ax2
+                    self._drr_spectrum_lines[key] = ax2.lines[0]
                     if shared_heat_ax is None:
                         shared_heat_ax = ax1
                 active_key = "second" if self._drr_plot_view == "second" and "second" in self._drr_plot_cubes else "raw"
                 plot_cube = self._drr_plot_cubes[active_key]
                 self._drr_heatmap_ax = self._drr_heatmap_axes[active_key]
                 self._drr_spectrum_ax = self._drr_spectrum_axes[active_key]
+                self._drr_spectrum_line = self._drr_spectrum_lines[active_key]
                 if self._drr_view_limits is not None:
                     old_xlim, old_ylim = self._drr_view_limits
                     for axis in self._drr_heatmap_axes.values():
@@ -9273,6 +9568,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 gate_used, _, _ = self.drr_controller._current_drr_spectrum(plot_cube)
                 self.drr_controller._set_drr_gate_spin_value(gate_used)
                 self.drr_controller._update_drr_spectrum_and_gate_line(plot_cube)
+                from ui_qt.drr_plot_reuse import remember
+                remember(self, products)
             elif mode == "MCD" and self.loaded.mcd_result is not None:
                 result = self.loaded.mcd_result
                 plot_cube = result.cube(self.mcd_map_combo.currentText())
@@ -10162,6 +10459,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.status_bar_view.set_cursor_readback(f"Hover {label}: {y:.3f} {unit}")
 
     def _on_canvas_click(self, event: Any) -> None:
+        if getattr(event, '_drr_seed_consumed', False):
+            return
         if event.button != 1:
             return
         if self.last_plotted_mode == "Power Dependent" and self.power_peak_controller.click(event):
@@ -10309,6 +10608,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.pl_controller._update_pl_spectrum_and_gate_line(self._pl_last_plot_cube)
 
     def _start_export(self, mode: str) -> None:
+        prepare_started = perf_counter()
         if self._is_closing:
             return
         if self._export_in_progress:
@@ -10379,11 +10679,15 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 drr_raw_params = self._drr_params_with_view_limits(
                     self._make_drr_params(drr_raw_cube, None)
                 )
-                # The second derivative is deliberately computed by the
-                # owned export worker from this frozen SG snapshot.  Build its
-                # presentation snapshot here without touching scientific Z.
+                # Reuse an identical display result; cache misses are computed
+                # by the export worker from this frozen SG snapshot.
                 drr_second_win = int(self.drr_sg_window_spin.value())
                 drr_second_poly = int(self.drr_sg_poly_spin.value())
+                cached_second = self._drr_derivative_cache.get(
+                    (id(self.loaded.cube), 2, drr_second_win, drr_second_poly)
+                )
+                if cached_second is not None:
+                    drr_second_cube, drr_second_win = cached_second
                 drr_second_params = HeatmapParams(
                     **{
                         **drr_raw_params.__dict__,
@@ -10515,6 +10819,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 params=params,
                 drr_cube=export_cube,
                 drr_raw_cube=drr_raw_cube,
+                drr_peak_result=self.drr_peak_analysis.snapshot(),
                 drr_second_cube=drr_second_cube,
                 drr_raw_params=drr_raw_params,
                 drr_second_params=drr_second_params,
@@ -10627,18 +10932,48 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._status("This unchanged result is already saved; no duplicate created.")
             return
 
-        worker = Worker(self._export_task, self.loaded, options)
-        worker.signals.log.connect(self._append_log)
+        worker = Worker(self._export_task, self.loaded, options, queued_at=perf_counter())
+        worker.signals.log.connect(self._on_export_log)
         worker.signals.result.connect(self._on_export_done)
         worker.signals.error.connect(self._on_export_error)
         self._export_in_progress = True
+        if mode == 'DRR':
+            self._append_log(f'DRR export: GUI preparation {perf_counter() - prepare_started:.3f} s')
+            self._export_gui_last_tick = perf_counter()
+            self._export_gui_max_gap = 0.0
+            if not hasattr(self, '_export_gui_timer'):
+                self._export_gui_timer = QTimer(self)
+                self._export_gui_timer.setInterval(20)
+                self._export_gui_timer.timeout.connect(self._sample_export_gui_interval)
+            self._export_gui_timer.start()
         self._active_export_request_key = request_key
         self._update_action_states()
         self._set_stage("Exporting...")
         self.thread_pool.start(worker)
 
-    def _export_task(self, loaded: LoadedState, options: ExportOptions, *, progress: Signal, log: Signal) -> dict:
+    def _sample_export_gui_interval(self):
+        now = perf_counter()
+        self._export_gui_max_gap = max(self._export_gui_max_gap, now - self._export_gui_last_tick)
+        self._export_gui_last_tick = now
+
+    def _finish_export_gui_probe(self):
+        timer = getattr(self, '_export_gui_timer', None)
+        if timer is not None and timer.isActive():
+            self._sample_export_gui_interval()
+            timer.stop()
+            self._append_log(f'DRR export: maximum GUI interval {self._export_gui_max_gap:.3f} s')
+
+    def _on_export_log(self, message: str) -> None:
+        self._append_log(message)
+        if self._export_in_progress and message.startswith('DRR export:'):
+            self._status(message)
+
+    def _export_task(self, loaded: LoadedState, options: ExportOptions, *, progress: Signal, log: Signal, queued_at=None) -> dict:
+        export_started = perf_counter()
         mode = options.mode
+        if mode == 'DRR':
+            queued = max(0., export_started - queued_at) if queued_at is not None else 0.
+            log.emit(f'DRR export: worker started; queued for {queued:.3f} s')
         folder = loaded.folder
         out_folder: str | None = None
         save_status = "created"
@@ -10741,6 +11076,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 second_window = int(options.drr_second_sg_window or options.drr_sg_window)
                 second_poly = int(options.drr_second_sg_polyorder or options.drr_sg_polyorder)
                 if second_product is None:
+                    derivative_started = perf_counter()
+                    log.emit('DRR export: Computing second derivative')
                     # Export receives immutable SG settings and performs the
                     # expensive transform off the GUI thread.
                     second_product, second_window = apply_sg_derivative_energy(
@@ -10749,6 +11086,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     )
                     second_product.gate_unit = getattr(loaded.cube, "gate_unit", "")
                     second_product.y_axis_semantic = getattr(loaded.cube, "y_axis_semantic", "")
+                    log.emit(f'DRR export: Computing second derivative completed in {perf_counter() - derivative_started:.3f} s')
                 second_params = options.drr_second_params
                 if second_params is None:
                     second_params = HeatmapParams(
@@ -10800,6 +11138,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     metadata_processing_raw=raw_processing,
                     metadata_processing_second=second_processing,
                     metadata_extra=metadata_extra,
+                    export_progress=lambda message: log.emit('DRR export: ' + message),
                 )
                 save_status = getattr(pair_paths, "save_status", "created")
                 log.emit(
@@ -10808,6 +11147,13 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 )
                 out_folder = str(pair_paths["raw_png"].parent)
                 paths = pair_paths
+                if options.drr_peak_result is not None:
+                    from core.drr_peak_export import export_drr_peak_analysis
+                    analysis_paths = export_drr_peak_analysis(
+                        out_folder, raw_base, options.drr_peak_result, raw_product)
+                    for name, path in analysis_paths.items():
+                        paths[f'peak_{name}'] = path
+                    log.emit('DRR peak analysis: ' + ', '.join(path.name for path in analysis_paths.values()))
             elif options.drr_cube is not None and options.params is not None:
                 # Compatibility for direct callers that still request one
                 # DRR product. Normal GUI saves always use the pair fields.
@@ -11153,6 +11499,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             if cleaned:
                 log.emit(f"Cleaned {cleaned} verified temporary source copy(s).")
         moved = 0
+        if mode == 'DRR':
+            log.emit(f'DRR export: worker completed in {perf_counter() - export_started:.3f} s')
         return {
             "out_folder": out_folder or str(Path(folder)),
             "moved": moved,
@@ -11165,6 +11513,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         }
 
     def _on_export_error(self, message: str) -> None:
+        self._finish_export_gui_probe()
         self._export_in_progress = False
         self._active_export_request_key = ""
         self._pl_export_source_was_processed = False
@@ -11173,7 +11522,39 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._set_stage("Export failed")
         self._show_error(message)
 
+    def _refresh_drr_saved_history(self, folder: str) -> None:
+        """Update saved roles/links using the existing raw catalog, off the UI thread."""
+        if self._is_closing or str(folder).casefold() != str(self.current_folder).casefold():
+            return
+        if self._drr_refresh_running or self._drr_refresh_pending:
+            self._drr_saved_history_pending = folder
+            return
+        sources = self.drr_available_sources
+        generation = self._drr_refresh_generation
+        if not sources:
+            return
+        worker = Worker(lambda *, progress, log: refresh_drr_source_history(folder, sources))
+        self._drr_refresh_workers.append(worker)
+
+        def publish(updated):
+            if self._is_closing or str(folder).casefold() != str(self.current_folder).casefold():
+                return
+            if (generation != self._drr_refresh_generation
+                    or sources is not self.drr_available_sources):
+                self._refresh_drr_saved_history(folder)
+                return
+            self.drr_available_sources = updated
+            self.drr_controller._update_drr_selection_labels()
+            self.drr_catalog_refresh_finished.emit(folder, True)
+
+        worker.signals.result.connect(publish)
+        worker.signals.error.connect(lambda message: self._append_log(
+            'DRR saved-state refresh failed: ' + str(message).splitlines()[0]))
+        worker.signals.finished.connect(lambda: self._on_drr_catalog_refresh_finished(worker))
+        self.thread_pool.start(worker)
+
     def _on_export_done(self, result: object) -> None:
+        self._finish_export_gui_probe()
         self._export_in_progress = False
         self._last_export_request_key = self._active_export_request_key
         self._active_export_request_key = ""
@@ -11203,7 +11584,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         else:
             self._invalidate_export_move_sources()
         self._set_stage("Already saved" if save_status == "reused" else "Exported")
-        if exported_mode in {"PL", "DRR"} and self.current_folder:
+        if exported_mode == "DRR" and self.current_folder:
+            if cleaned and str(folder).casefold() == str(self.current_folder).casefold():
+                self._refresh_file_lists(auto=True, mode='DRR')
+            else:
+                self._refresh_drr_saved_history(folder)
+        elif exported_mode == "PL" and self.current_folder:
             self._refresh_file_lists(auto=True, mode=exported_mode)
         elif exported_mode == "SHG Processing" and self.current_folder:
             # SHG history lives in export metadata; rescan it after a

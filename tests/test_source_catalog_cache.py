@@ -36,6 +36,48 @@ class SourceCatalogCacheTests(unittest.TestCase):
         self.assertEqual(events, [['saved'], 'validate'])
         self.assertEqual(read.call_count, 1)
 
+    def test_drr_snapshot_reuses_decoding_and_isolates_returned_list(self):
+        source = DrrSource('a', 'a.csv', 'g', '', 1., False, spectral_grid=(1., 2., 3.))
+        self.cache().refresh(lambda: [source])
+        self.cache().read()
+        with patch('core.source_catalog_cache.json.loads', side_effect=AssertionError('decoded twice')):
+            first = self.cache().read()
+            first.clear()
+            self.assertEqual(self.cache().read(), [source])
+
+    def test_shared_grid_json_preserves_exact_values_and_survives_memory_clear(self):
+        from dataclasses import replace
+        grid = tuple(float(i) / 7 for i in range(100))
+        source = DrrSource('a', 'a.csv', 'g', '', 1., False, spectral_grid=grid)
+        items = [replace(source, source=str(i)) for i in range(30)]
+        self.cache().refresh(lambda: items)
+        record = json.loads(self.cache().path.read_text())
+        self.assertEqual(len(record['grids']), 1)
+        self.assertLess(self.cache().path.stat().st_size, 40000)
+        from core.source_catalog_cache import _DRR_SNAPSHOTS
+        _DRR_SNAPSHOTS.clear()
+        restored = self.cache().read()
+        self.assertEqual(restored, items)
+        self.assertIs(restored[0].spectral_grid, restored[-1].spectral_grid)
+
+    def test_drr_memory_snapshot_does_not_hide_external_cache_replacement(self):
+        source = DrrSource('a', 'a.csv', 'g', '', 1., False)
+        self.cache().refresh(lambda: [source])
+        self.cache().read()
+        self.cache().path.write_text('{broken')
+        self.assertIsNone(self.cache().read())
+
+    def test_legacy_snapshot_migrates_without_losing_grid_values(self):
+        from core.source_catalog_cache import _encode
+        source = DrrSource('a', 'a.csv', 'g', '', 1., False, spectral_grid=(1., 2.))
+        cache = self.cache()
+        cache.cache_root.mkdir()
+        cache.path.write_text(json.dumps(dict(schema=1, folder=cache._identity,
+                                              namespace=cache.namespace, inventory=[], payload=_encode([source]))))
+        self.assertEqual(cache.read(), [source])
+        self.assertEqual(json.loads(cache.path.read_text())['schema'], 2)
+        self.assertEqual(cache.read(), [source])
+
     def test_custom_inventory_ignores_unrelated_outputs(self):
         cache = SourceCatalogCache(str(self.folder), 'custom', self.cache_root, inventory_provider=lambda: [['raw.csv', 1, 2]])
         cache.refresh(lambda: ['raw'])

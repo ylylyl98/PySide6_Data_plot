@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -81,11 +82,25 @@ class DrrDualViewRegressionTests(unittest.TestCase):
             spin.blockSignals(blocked)
 
     def _assert_visible_limits(self, xlim, ylim):
+        self._wait_derivative()
         for axis in self.window._drr_heatmap_axes.values():
             np.testing.assert_allclose(axis.get_xlim(), xlim)
             np.testing.assert_allclose(axis.get_ylim(), ylim)
         for axis in self.window._drr_spectrum_axes.values():
             np.testing.assert_allclose(axis.get_xlim(), xlim)
+
+    def _wait_derivative(self):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            self.window.thread_pool.waitForDone(100)
+            self.app.processEvents()
+            self.window._run_scheduled_plot_redraw('DRR')
+            compute = getattr(self.window, '_drr_display_compute', None)
+            if compute is None or compute.worker is None:
+                self.app.processEvents()
+                return
+            time.sleep(.005)
+        self.fail('Derivative did not finish')
 
     def test_layout_and_product_switches_retain_shared_zoom(self):
         w = self.window
@@ -148,13 +163,17 @@ class DrrDualViewRegressionTests(unittest.TestCase):
     def test_raw_split_scale_does_not_override_second_color_limits(self):
         w = self.window
         w.drr_split_scale_chk.setChecked(True)
+        self._wait_derivative()
         second, *_ = w.drr_controller._drr_cube_with_metadata(2)
         w.drr_second_vmin_spin.setValue(-3)
         w.drr_second_vmax_spin.setValue(3)
         raw_params = w._make_drr_params(self.cube, None)
         second_params = w._make_drr_params(second, 2)
         self.assertIsNotNone(raw_params.split_scale)
-        self.assertIsNone(second_params.split_scale)
+        # Current UI shares the split boundary; each product retains its own limits.
+        self.assertIsNotNone(second_params.split_scale)
+        self.assertEqual(second_params.split_scale.split_x, raw_params.split_scale.split_x)
+        self.assertNotEqual(second_params.split_scale.left_vmax, raw_params.split_scale.left_vmax)
         self.assertEqual((second_params.vmin, second_params.vmax), (-3, 3))
         self.errors.assert_not_called()
 
@@ -167,6 +186,7 @@ class DrrDualViewRegressionTests(unittest.TestCase):
         w.drr_auto_v_btn.click()
         w._run_scheduled_plot_redraw("DRR")
         self.assertTrue(w.drr_second_auto_scale)
+        self._wait_derivative()
         limits = compute_auto_limits(w._drr_plot_cubes["second"], log_scale=False)
         np.testing.assert_allclose(
             (w.drr_second_vmin_spin.value(), w.drr_second_vmax_spin.value()),
@@ -178,6 +198,7 @@ class DrrDualViewRegressionTests(unittest.TestCase):
         w = self.window
         w.drr_derivative_combo.setCurrentText("dE")
         w._run_scheduled_plot_redraw("DRR")
+        self._wait_derivative()
         expected, _ = apply_sg_derivative_energy(
             self.cube, derivative=1, window_length=9, polyorder=2,
         )
@@ -197,6 +218,16 @@ class DrrDualViewRegressionTests(unittest.TestCase):
         w._on_drr_plot_view_changed("second")
         self.assertIsNone(w._drr_fit_y)
         self.assertTrue(w._drr_peak_indices is None or w._drr_peak_indices.size == 0)
+        self.errors.assert_not_called()
+
+    def test_pending_auto_does_not_apply_to_replacement_source(self):
+        from dataclasses import replace
+        w = self.window
+        w._drr_pending_second_auto = self.cube
+        w.loaded.cube = replace(self.cube)
+        with patch.object(w, '_auto_drr_second_vrange') as auto:
+            w._on_drr_display_ready()
+            auto.assert_not_called()
         self.errors.assert_not_called()
 
 

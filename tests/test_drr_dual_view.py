@@ -138,6 +138,12 @@ class DrrDualViewWidgetTests(unittest.TestCase):
         self.assertFalse(self.window.drr_view_second_btn.isChecked())
 
         self.window._on_drr_plot_view_changed("second")
+        # Keep the last valid raw image until the queued derivative completes.
+        self.assertEqual(set(self.window._drr_plot_cubes), {"raw"})
+        self.assertTrue(self.window.thread_pool.waitForDone(5000))
+        with patch.object(self.window, '_active_mode', return_value='DRR'):
+            self.app.processEvents()
+            self.app.processEvents()
         self.assertEqual(set(self.window._drr_plot_cubes), {"second"})
         self.assertTrue(self.window.drr_view_second_btn.isChecked())
         self.window.drr_view_side_btn.setChecked(True)

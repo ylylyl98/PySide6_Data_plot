@@ -69,20 +69,26 @@ def safe_energy_edges(records, tolerance_mev=5.0, manual_record_ids=()):
 
 def energy_group_colors(groups, palette='tab10'):
     from matplotlib import colormaps
+    import hashlib
+    import re
     labels = sorted(set(groups.values()))
     cmap = colormaps[palette]
-    if palette == "tab10":
-        return {name: cmap(i % 10) for i,name in enumerate(labels)}
-    return {name: cmap(.15 + .7*i/max(1,len(labels)-1)) for i,name in enumerate(labels)}
+    result = {}
+    for name in labels:
+        match = re.search(r'(?:^| / )Group ([1-9][0-9]*)$', name)
+        index = int(match[1])-1 if match else int.from_bytes(hashlib.sha256(name.encode()).digest()[:4], 'big')
+        result[name] = cmap(index % 10) if palette == 'tab10' else cmap(.15 + .7*((index * .61803398875) % 1))
+    return result
 
 
-def energy_record_colors(records, groups, group_colors):
-    """Light-to-dark shades by field, shared by branches and slope metrics."""
+def energy_record_colors(records, groups, group_colors, variable='E-field'):
+    """Light-to-dark shades computed from the full comparison membership."""
     from matplotlib.colors import to_rgba
     result = {}
     for group in set(groups.values()):
         members = [r for r in records if groups.get(r.record_id) == group]
-        fields = [r.condition_value('E-field') for r in members]
+        fields = [r.condition_value('T' if variable == 'Temperature' else variable) for r in members]
+        fields = [round(f, 8) if f is not None and np.isfinite(f) else None for f in fields]
         finite = [f for f in fields if f is not None and np.isfinite(f)]
         levels = sorted(set(finite))
         ranks = {value:index/max(1,len(levels)-1) for index,value in enumerate(levels)}
@@ -166,6 +172,89 @@ def draw_energy_slope_panels(figure, records, groups, metrics, branches,
     return point_artists
 
 
+def temperature_curve_legend(figure, records, groups, colors):
+    """Exact temperature swatches per group, shared by preview and export."""
+    from matplotlib.lines import Line2D
+    handles = []
+    for group in sorted({groups[r.record_id] for r in records}):
+        members = sorted([r for r in records if groups[r.record_id] == group],
+                         key=lambda r: r.condition_value('T') if r.condition_value('T') is not None else np.inf)
+        seen = set()
+        for record in members:
+            t = record.condition_value('T')
+            label = f'{group} · {t:g} K' if t is not None else f'{group} · T unknown'
+            if label in seen:
+                continue
+            seen.add(label)
+            handles.append(Line2D([], [], color=colors[record.record_id], linewidth=2, label=label))
+    # Measure the legend rather than assuming it fits a fixed right margin.
+    legend = figure.legend(handles=handles, loc='center left', bbox_to_anchor=(1, .5),
+                           fontsize=7, title='Group / Temperature', title_fontsize=8,
+                           ncol=max(1, (len(handles)+19)//20))
+    figure.canvas.draw()
+    renderer = figure.canvas.get_renderer()
+    box = legend.get_window_extent(renderer)
+    width = box.width / figure.bbox.width + .025
+    if width <= .38 and box.height <= figure.bbox.height * .85:
+        legend.set_bbox_to_anchor((1-width, .5))
+        figure.tight_layout(rect=(0, .04, 1-width, .92))
+    else:
+        legend.remove()
+        columns = max(1, int(figure.get_figwidth() / 2.4))
+        legend = figure.legend(handles=handles, loc='lower center', bbox_to_anchor=(.5, .01),
+                               fontsize=7, title='Group / Temperature', title_fontsize=8, ncol=columns)
+        figure.canvas.draw()
+        box = legend.get_window_extent(figure.canvas.get_renderer())
+        # Large selections stay inside the canvas; group filtering remains available.
+        if box.height > figure.bbox.height * .45 or box.width > figure.bbox.width * .96:
+            scale = min(.45*figure.bbox.height/box.height, .96*figure.bbox.width/box.width)
+            for text in legend.get_texts():
+                text.set_fontsize(max(3, 7*scale))
+            figure.canvas.draw()
+            box = legend.get_window_extent(figure.canvas.get_renderer())
+        figure.tight_layout(rect=(0, box.height/figure.bbox.height+.035, 1, .92))
+
+
+def draw_temperature_slope_panels(figure, records, groups, metrics, branches,
+                                  palette='tab10', group_colors=None):
+    """Separate metric panels; fixed group hue and branch style, never cross groups."""
+    from core.mcd_extract import SLOPE_METRICS
+    from matplotlib.lines import Line2D
+    figure.clear()
+    axes = np.atleast_1d(figure.subplots(max(1, len(metrics)), 1, sharex=True))
+    colors = energy_group_colors(groups, palette)
+    colors.update(group_colors or {})
+    artists = {}
+    visible = sorted({groups[r.record_id] for r in records})
+    for axis, metric in zip(axes, metrics):
+        for group in visible:
+            members = sorted([r for r in records if groups[r.record_id] == group],
+                             key=lambda r: r.condition_value('T') if r.condition_value('T') is not None else np.inf)
+            x = np.asarray([r.condition_value('T') for r in members], float)
+            for branch in branches:
+                inc = branch == 'B increasing'
+                y = np.asarray([r.slope(branch, metric) for r in members], float)
+                # Duplicate temperatures are ambiguous; show points without connecting.
+                unique = len(set(np.round(x, 8))) == len(x)
+                axis.plot(x, y, color=colors[group], linestyle=('-' if inc else '--') if unique else 'none', linewidth=1)
+                artist = axis.scatter(x, y, color=colors[group], marker='o' if inc else 's',
+                                      facecolors=colors[group] if inc else 'none', picker=7)
+                artists[artist] = (tuple(members), metric, branch)
+        axis.set_ylabel('Slope (MCD/T)')
+        axis.set_title(SLOPE_METRICS[metric], fontsize=10, loc='left')
+        axis.axhline(0, color='#777', linewidth=.6)
+        axis.grid(alpha=.2)
+    handles = [Line2D([], [], color=colors[g], linewidth=2, label=g) for g in visible]
+    handles += [Line2D([], [], color='#555', marker='o' if b == 'B increasing' else 's',
+                       linestyle='-' if b == 'B increasing' else '--', label=b) for b in branches]
+    axes[0].legend(handles=handles, fontsize=7)
+    if not metrics:
+        axes[0].text(.5, .5, 'Select a slope metric.', ha='center', transform=axes[0].transAxes)
+    axes[-1].set_xlabel('Temperature (K)')
+    figure.tight_layout()
+    return artists
+
+
 def point_description(record, metric, branch, group):
     from core.mcd_extract import SLOPE_METRICS
     label = 'Window center' if metric=='window_energy' else SLOPE_METRICS[metric]
@@ -177,5 +266,5 @@ def point_description(record, metric, branch, group):
             slope = record.slope(branch,key)
             extra += f'\n{name}: ' + ('N/A' if slope is None else f'{slope:.12g} MCD/T')
     return (f'{group} | {branch}\nWindow center: {record.center_ev:.12g} eV\n'
-            f'E-field: {record.condition_value("E-field"):.12g} V | Width: {record.width_mev:.12g} meV\n'
+            f'E-field: {record.condition_value("E-field")} V | T: {record.condition_value("T")} K | Width: {record.width_mev:.12g} meV\n'
             f'{label}: {number} {"eV" if metric=="window_energy" else "MCD/T"}{extra}')

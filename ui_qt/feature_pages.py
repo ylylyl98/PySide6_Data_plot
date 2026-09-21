@@ -659,7 +659,7 @@ class FeatureTabsMixin:
         second_scale_h.addWidget(self.drr_second_vmax_spin, 1)
         second_scale_h.addWidget(self.drr_second_auto_v_btn)
         basic_form.addRow("d2E color", second_scale)
-        basic_form.addRow("Color scale", self.drr_split_scale_chk)
+        basic_form.addRow("Color scale", self.drr_region_count_combo)
         basic_form.addRow(self.drr_split_scale_panel)
         self.drr_second_split_expander = self._make_expander(
             "d2E split color scale", self.drr_second_split_scale_panel, expanded=False
@@ -771,7 +771,20 @@ class FeatureTabsMixin:
         set_fluent_property(self.drr_fit_status, "appRole", "fitStatus")
         params_layout.addWidget(self._make_expander("Manual plot ranges", basic, expanded=False))
         layout.addWidget(self._make_expander("Parameters", params, expanded=True))
-        layout.addWidget(self._make_expander("Spectrum Analysis", analysis_box, expanded=False))
+        from ui_qt.drr_peak_analysis import DrrPeakAnalysisController
+        self.drr_peak_analysis = DrrPeakAnalysisController(self)
+        peak_controls = self.drr_peak_analysis.build_controls()
+        # Keep legacy controller bindings available, while moving batch work into
+        # its independent dataset workspace instead of duplicating visible panels.
+        peak_controls.setParent(tab)
+        peak_controls.hide()
+        analysis_entry = QPushButton("Add current DRR to Analysis…")
+        analysis_entry.clicked.connect(lambda: self._open_drr_analysis(add_current=True))
+        layout.addWidget(analysis_entry)
+        open_analysis = QPushButton("Open DRR Analysis workspace…")
+        open_analysis.clicked.connect(lambda: self._open_drr_analysis())
+        layout.addWidget(open_analysis)
+        layout.addWidget(self._make_expander("Single spectrum / fit", analysis_box, expanded=False))
         layout.addStretch(1)
         return tab
 

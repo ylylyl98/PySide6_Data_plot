@@ -6,6 +6,15 @@ from unittest.mock import patch
 from core.drr_sources import discover_drr_sources, refresh_drr_source_history, drr_source_paths
 
 class DrrCatalogLayerTests(unittest.TestCase):
+    def test_ref_partition_keeps_legacy_initial_data_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);initial=root/'Initial Data';ref=initial/'REF'
+            ref.mkdir(parents=True)
+            old=initial/'old_REF.csv';new=ref/'new_REF.csv'
+            for path in (old,new):path.write_text('Vbg,700,701\n0,1,2\n1,2,3\n')
+            self.assertEqual(set(drr_source_paths(root)),{old,new})
+            self.assertEqual(len(discover_drr_sources(root,include_history=False)),2)
+
     def test_ref_partition_and_legacy_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

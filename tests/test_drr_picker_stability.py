@@ -44,10 +44,74 @@ class DrrPickerStabilityTests(unittest.TestCase):
         ]
 
     def open_picker(self, execute, *, baseline_mode=False):
-        with patch.object(QDialog, "exec", execute):
+        with patch.object(QDialog, "exec", execute), patch.object(self.window, '_queue_drr_catalog_refresh'):
             self.window.drr_controller._open_drr_source_dialog(
                 title="Choose", selected=[], baseline_mode=baseline_mode,
             )
+
+    def test_filter_reuses_group_tooltips(self):
+        from PySide6.QtWidgets import QCheckBox
+        from ui_qt import controllers_drr
+        def execute(dialog):
+            toggle = next(w for w in dialog.findChildren(QCheckBox) if w.text() == 'Show all history')
+            with patch.object(controllers_drr.data_io, 'is_xlsx_map_file',
+                              wraps=controllers_drr.data_io.is_xlsx_map_file) as classify:
+                toggle.setChecked(False)
+                toggle.setChecked(True)
+                classify.assert_not_called()
+            return QDialog.Rejected
+        self.open_picker(execute)
+
+    def test_identical_catalog_publication_does_not_rebuild_groups(self):
+        from ui_qt import controllers_drr
+        def execute(dialog):
+            with patch.object(controllers_drr, 'group_drr_sources',
+                              wraps=controllers_drr.group_drr_sources) as groups:
+                self.window.drr_catalog_preview_ready.emit(self.window.current_folder)
+                self.window.drr_catalog_refresh_finished.emit(self.window.current_folder, True)
+                groups.assert_not_called()
+            return QDialog.Rejected
+        self.open_picker(execute)
+
+    def test_reopening_unchanged_picker_reuses_groups_and_row_metadata(self):
+        from ui_qt import controllers_drr
+        self.open_picker(lambda dialog: QDialog.Rejected)
+        with patch.object(controllers_drr, 'group_drr_sources', wraps=controllers_drr.group_drr_sources) as groups, patch.object(
+                controllers_drr, 'format_drr_source_summary', wraps=controllers_drr.format_drr_source_summary) as summaries:
+            self.open_picker(lambda dialog: QDialog.Rejected)
+        groups.assert_not_called()
+        summaries.assert_not_called()
+
+    def test_closed_picker_releases_widgets_but_keeps_detached_rows(self):
+        from PySide6.QtCore import QCoreApplication, QEvent
+        destroyed = []
+        def execute(dialog):
+            dialog.destroyed.connect(lambda: destroyed.append(True))
+            return QDialog.Rejected
+        self.open_picker(execute)
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        self.assertEqual(destroyed, [True])
+        self.test_reopening_unchanged_picker_reuses_groups_and_row_metadata()
+
+    def test_batch_add_formats_peer_conditions_once(self):
+        from PySide6.QtWidgets import QPushButton, QMessageBox
+        from ui_qt import controllers_drr
+        self.window.drr_available_sources = [replace(
+            self.window.drr_available_sources[0], source=f'YZ365_{i}_1.67KREF_760nmc.csv', filename=f'YZ365_{i}_1.67KREF_760nmc.csv')
+            for i in range(40)]
+        def execute(dialog):
+            add = next(w for w in dialog.findChildren(QPushButton) if w.text() == 'Add Entire Group')
+            with patch.object(QMessageBox, 'question', return_value=QMessageBox.Yes), patch.object(
+                    controllers_drr, '_drr_condition_values', wraps=controllers_drr._drr_condition_values) as values:
+                add.click()
+                self.assertLessEqual(values.call_count, 80)
+            chosen = dialog.findChild(QListWidget, 'drr_source_chosen_list')
+            self.assertEqual(chosen.count(), 40)
+            add.click()
+            self.assertEqual(chosen.count(), 40)
+            return QDialog.Rejected
+        with patch('ui_qt.controllers_drr.QMessageBox.question', return_value=16384):
+            self.open_picker(execute)
 
     def test_first_painted_rows_fit_wrapped_filenames(self):
         self.window.drr_available_sources = [
@@ -84,6 +148,42 @@ class DrrPickerStabilityTests(unittest.TestCase):
             self.open_picker(execute)
         self.assertTrue(extents)
         self.assertTrue(all(actual >= needed for actual, needed in extents), extents)
+
+    def test_default_history_includes_older_groups_after_search_and_refresh(self):
+        from PySide6.QtTest import QTest
+        from PySide6.QtWidgets import QLineEdit
+
+        self.window.drr_available_sources = [
+            replace(self.window.drr_available_sources[0], group_key=f"session-{i:02}",
+                    source=f"sample_REF_{i:02}.csv", filename=f"sample_REF_{i:02}.csv",
+                    modified_time=1000-i)
+            for i in range(40)
+        ]
+
+        def execute(dialog):
+            groups = dialog.findChild(QListWidget, "drr_source_group_list")
+            files = dialog.findChild(QListWidget, "drr_source_file_list")
+            self.assertEqual(groups.count(), 40)
+            groups.setCurrentRow(39)
+            self.assertEqual(files.item(0).data(Qt.UserRole), "sample_REF_39.csv")
+            search = dialog.findChild(QLineEdit)
+            search.setText("sample_REF_39")
+            QTest.qWait(250)
+            self.assertEqual(groups.count(), 1)
+            search.clear()
+            QTest.qWait(250)
+            self.assertEqual(groups.count(), 40)
+            self.window.drr_available_sources.append(replace(
+                self.window.drr_available_sources[-1], group_key="older-session",
+                source="older_REF.csv", filename="older_REF.csv", modified_time=1,
+            ))
+            self.window.drr_catalog_refresh_finished.emit(self.window.current_folder, True)
+            self.assertEqual(groups.count(), 41)
+            groups.setCurrentRow(40)
+            self.assertEqual(files.item(0).data(Qt.UserRole), "older_REF.csv")
+            return QDialog.Rejected
+
+        self.open_picker(execute)
 
     def test_unchanged_completion_keeps_file_selection_and_rows(self):
         def execute(dialog):

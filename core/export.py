@@ -12,6 +12,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable
 from uuid import uuid4
+from time import perf_counter
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import matplotlib
@@ -23,6 +25,7 @@ from matplotlib.font_manager import FontProperties
 from matplotlib.ticker import FixedFormatter, FixedLocator, FuncFormatter, NullFormatter, NullLocator
 
 from core.loader import DataCube
+from core.drr_export_title import display_title
 from core.plotting import COMPARE_PANEL_ORDER, HeatmapParams, plot_heatmap, resolve_split_boundary, plain_log_ticks
 from core.processing import background_correct_cube, parse_compare_gate_condition, power_group_title, valley_polarization_cube
 from core.processing_run import save_as_dat
@@ -471,6 +474,7 @@ def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *,
     g = np.asarray(cube.gate, float).ravel()
     z = np.asarray(cube.Z, float)
 
+    triple = params.split_scale is not None and params.split_scale.split_x2 is not None
     fig = plt.figure(figsize=EXPORT_FIGSIZE, dpi=EXPORT_DPI, facecolor="white")
     ax = fig.add_axes(EXPORT_AXES_RECT)
     axpos = ax.get_position()
@@ -530,18 +534,23 @@ def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *,
     title_left = axpos.x0
     # Reserve a small fixed gap so long titles cannot run into the colorbar's
     # left tick label while keeping the same canvas and axes rectangle.
-    title_right = cbar_x - 0.06
-
-    title_wrapped = _wrap_title_to_fig_span(
-        fig,
-        params.title,
-        title_left,
-        title_right,
-        fontsize=16,
-        weight="bold",
-        max_lines=3,
-    )
-    fig.text(title_left, 0.95, title_wrapped, ha="left", va="top", fontsize=16, fontweight="bold", linespacing=1.0)
+    if triple:
+        from core.compact_region_export import complete_title
+        cbar_w = .34 * axpos.width
+        cbar_x = axpos.x1 - cbar_w
+        if not drr:
+            complete_title(fig, _prettify_title(params.title), title_left, cbar_x - .03)
+    elif drr:
+        from core.compact_region_export import complete_title
+        # DRR title fitting follows colorbar creation to measure occupied space.
+    else:
+        title_right = cbar_x - 0.06
+        title_wrapped = _wrap_title_to_fig_span(
+            fig, params.title, title_left, title_right,
+            fontsize=16, weight="bold", max_lines=3,
+        )
+        fig.text(title_left, 0.95, title_wrapped, ha="left", va="top", fontsize=16,
+                 fontweight="bold", linespacing=1.0)
 
     is_derivative = bool(drr and ("d(" in str(params.cbar_label) or "d2(" in str(params.cbar_label)))
 
@@ -571,7 +580,25 @@ def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *,
         cb.ax.tick_params(top=True, labeltop=True, bottom=False, labelbottom=False, pad=1, labelsize=11 if split_render is not None else 14)
         cb.ax.set_title(title, fontsize=9 if split_render is not None else 16, fontweight="bold", loc="center", pad=1)
 
-    if split_render is None:
+    if drr:
+        from core.compact_region_export import compact_colorbars
+        from core.plotting import HeatmapRender
+        compact_colorbars(fig, split_render or HeatmapRender(im), left=cbar_x, right=axpos.x1,
+                          bottom=cbar_y, label=params.cbar_label, drr_header=True)
+        renderer = fig.canvas.get_renderer()
+        obstacles = [a.get_tightbbox(renderer) for a in fig.axes[1:]]
+        obstacles += [t.get_window_extent(renderer) for t in fig.texts
+                      if t.get_gid() == 'drr-colorbar-quantity']
+        complete_title(fig, display_title(params.title), title_left, axpos.x1,
+                       obstacles=obstacles)
+        # Keep the title first for existing export consumers.
+        fig.texts.insert(0, fig.texts.pop())
+
+    elif triple:
+        from core.compact_region_export import compact_colorbars
+        compact_colorbars(fig, split_render, left=cbar_x, right=axpos.x1,
+                          bottom=cbar_y, label=params.cbar_label)
+    elif split_render is None:
         cax = fig.add_axes([cbar_x, cbar_y, cbar_w, cbar_h])
         cb = fig.colorbar(im, cax=cax, orientation="horizontal")
         _style_colorbar(cb, vmin, vmax, title=params.cbar_label)
@@ -750,32 +777,121 @@ def _drr_analysis_fingerprint(
     )
 
 
+@lru_cache(maxsize=4096)
+def _cached_drr_export_record(path: str, size: int, modified_ns: int, changed_ns: int):
+    """Reuse unchanged history records; stat identity detects external edits."""
+    payload = json.loads(Path(path).read_text(encoding='utf-8'))
+    if not isinstance(payload, dict):
+        return {}, None
+    fingerprint = payload.get('analysis_fingerprint')
+    if not fingerprint:
+        sources = payload.get('sources', payload.get('inputs', []))
+        processing = payload.get('processing', {})
+        if (isinstance(sources, list) and all(isinstance(item, dict) for item in sources)
+                and isinstance(processing, dict)):
+            fingerprint = _drr_analysis_fingerprint(
+                sources, processing, operation=payload.get('operation', 'DR/R'))
+    return payload, fingerprint
+
+
+def _drr_export_index(out_dir: Path, *, snapshot: dict | None = None) -> dict:
+    """Persist compact fingerprints; only changed metadata needs parsing."""
+    index_path = out_dir / '.drr-export-index.json'
+    try:
+        if snapshot is not None and out_dir in snapshot:
+            entries = snapshot[out_dir]
+        else:
+            with index_path.open(encoding='utf-8') as stream:
+                saved = json.load(stream)
+            entries = saved.get('entries', {}) if saved.get('version') == 1 else {}
+        if not isinstance(entries, dict):
+            entries = {}
+    except (OSError, ValueError, TypeError, AttributeError):
+        entries = {}
+    current = {}
+    changed = []
+    for path in sorted(out_dir.glob('*.metadata.json')):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        signature = [stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
+        prior = entries.get(path.name)
+        if (isinstance(prior, dict) and prior.get('signature') == signature
+                and isinstance(prior.get('operation'), str)
+                and isinstance(prior.get('fingerprint'), str)):
+            current[path.name] = prior
+        else:
+            changed.append((path, signature))
+
+    def inspect(item):
+        path, signature = item
+        try:
+            payload, fingerprint = _cached_drr_export_record(str(path.absolute()), *signature)
+            return path.name, dict(signature=signature,
+                                   operation=payload.get('operation') or '',
+                                   fingerprint=fingerprint or '')
+        except (OSError, ValueError, TypeError):
+            return path.name, None
+
+    if len(changed) >= 64:
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix='drr-history') as pool:
+            updates = list(pool.map(inspect, changed))
+    else:
+        updates = map(inspect, changed)
+    current.update((name, entry) for name, entry in updates if entry is not None)
+    if current != entries:
+        temporary = index_path.with_name(f'.drr-index-{uuid4().hex}.tmp')
+        try:
+            temporary.write_text(json.dumps(dict(version=1, entries=current)), encoding='utf-8')
+            temporary.replace(index_path)
+        except OSError:
+            pass  # An optional cache must never prevent exporting.
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+    if snapshot is not None:
+        snapshot[out_dir] = current
+    return current
+
+
 def _existing_drr_result(
     out_dir: Path,
     *,
     analysis_fingerprint: str,
     operation: str = "DR/R",
+    preferred_stem: str | None = None,
+    history_index: dict | None = None,
 ) -> tuple[str, dict] | None:
     """Find a prior DRR result, including metadata written before fingerprints existed."""
-    for metadata_path in sorted(out_dir.glob("*.metadata.json")):
+    def read_record(metadata_path):
         try:
-            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            stat = metadata_path.stat()
+            payload, existing_fingerprint = _cached_drr_export_record(
+                str(metadata_path.absolute()), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
         except (OSError, ValueError, TypeError):
-            continue
+            return None
         if payload.get("operation") != operation:
-            continue
-        existing_fingerprint = payload.get("analysis_fingerprint")
-        if not existing_fingerprint:
-            sources = payload.get("sources", payload.get("inputs", []))
-            processing = payload.get("processing", {})
-            if isinstance(sources, list) and isinstance(processing, dict):
-                existing_fingerprint = _drr_analysis_fingerprint(
-                    sources, processing, operation=operation
-                )
+            return None
         if existing_fingerprint != analysis_fingerprint:
-            continue
+            return None
         suffix = ".metadata.json"
         return metadata_path.name[: -len(suffix)], payload
+
+    if preferred_stem is not None:
+        preferred = read_record(out_dir / f'{safe_stem(preferred_stem)}.metadata.json')
+        if preferred is not None:
+            return preferred
+    entries = _drr_export_index(out_dir, snapshot=history_index)
+    for name in sorted(entries):
+        entry = entries[name]
+        if entry['operation'] != operation or entry['fingerprint'] != analysis_fingerprint:
+            continue
+        result = read_record(out_dir / name)
+        if result is not None:
+            return result
     return None
 
 
@@ -836,6 +952,8 @@ def export_drr_png_and_dat(
     metadata_processing: dict | None = None,
     metadata_extra: dict | None = None,
     reuse_existing_analysis: bool = False,
+    export_progress=None,
+    _history_index: dict | None = None,
 ) -> Dict[str, Path]:
     """Export one heatmap and its DAT table.
 
@@ -844,6 +962,14 @@ def export_drr_png_and_dat(
     ``False`` while still sharing the same data-export path.
     """
     out_dir = ensure_processed_dir(folder, processed_name)
+    def run_step(label, function, *args, **kwargs):
+        if export_progress is not None:
+            export_progress(label)
+        started = perf_counter()
+        result = function(*args, **kwargs)
+        if export_progress is not None:
+            export_progress(f'{label} completed in {perf_counter() - started:.3f} s')
+        return result
     input_files = tuple(metadata_input_files)
     processing = {
         **(metadata_processing or {}),
@@ -851,26 +977,28 @@ def export_drr_png_and_dat(
         "y_axis_unit": getattr(cube, "gate_unit", ""),
         "y_axis_semantic": getattr(cube, "y_axis_semantic", ""),
     }
-    sources = [
+    sources = run_step('Checking source files', lambda: [
         _source_descriptor(folder, name, role=role)
         for role, name in input_files
         if name
-    ]
+    ])
     operation = "DR/R" if drr_style else "MCD"
     analysis_fingerprint = _drr_analysis_fingerprint(
         sources, processing, operation=operation
     )
     plot_fingerprint = _fingerprint_json(
         {
-            "render_version": HEATMAP_PNG_RENDER_VERSION,
+            "render_version": 7 if drr_style else HEATMAP_PNG_RENDER_VERSION,
             "params": params,
         }
     )
     prior = (
-        _existing_drr_result(
+        run_step('Finding saved result', _existing_drr_result,
             out_dir,
             analysis_fingerprint=analysis_fingerprint,
             operation=operation,
+            preferred_stem=export_base,
+            history_index=_history_index,
         )
         if drr_style or reuse_existing_analysis
         else None
@@ -894,20 +1022,20 @@ def export_drr_png_and_dat(
     needs_dat = not dat_path.is_file()
     needs_png = not png_path.is_file() or not plot_matches
     if needs_dat:
-        _save_drr_dat_atomic(
+        run_step('Writing DAT', _save_drr_dat_atomic,
             dat_path,
             cube,
             folder=folder,
             processed_name=processed_name,
         )
     if needs_png:
-        _save_heatmap_png_atomic(png_path, cube, params, drr=drr_style)
+        run_step('Rendering PNG', _save_heatmap_png_atomic, png_path, cube, params, drr=drr_style)
     if prior and (needs_dat or needs_png):
         save_status = "updated"
     paths = ExportPathResult({"png": png_path, "dat": dat_path}, save_status=save_status)
     if save_status == "reused":
         return paths
-    write_export_metadata(
+    run_step('Writing metadata', write_export_metadata,
         folder,
         [dat_path],
         operation=operation,
@@ -918,6 +1046,7 @@ def export_drr_png_and_dat(
         outputs=paths.values(),
         extra={
             **(metadata_extra or {}),
+            **({"display_title": display_title(params.title), "title_policy_version": 1} if drr_style else {}),
             "analysis_fingerprint": analysis_fingerprint,
             "plot_fingerprint": plot_fingerprint,
         },
@@ -962,6 +1091,7 @@ def export_drr_pair_pngs_and_dat(
     metadata_processing_second: dict | None = None,
     metadata_extra: dict | None = None,
     processed_name: str = "Processed Data/DRR",
+    export_progress=None,
 ) -> ExportPathResult:
     """Export the raw DRR map and its energy second derivative as one pair.
 
@@ -981,6 +1111,7 @@ def export_drr_pair_pngs_and_dat(
         **(metadata_processing_second or {}),
         "derivative_order": 2,
     }
+    history_index = {}
     raw_paths = export_drr_png_and_dat(
         folder,
         cube=raw_cube,
@@ -990,6 +1121,8 @@ def export_drr_pair_pngs_and_dat(
         metadata_input_files=input_files,
         metadata_processing=raw_processing,
         metadata_extra=metadata_extra,
+        export_progress=(lambda message: export_progress('Raw: ' + message)) if export_progress else None,
+        _history_index=history_index,
     )
     second_paths = export_drr_png_and_dat(
         folder,
@@ -1000,6 +1133,8 @@ def export_drr_pair_pngs_and_dat(
         metadata_input_files=input_files,
         metadata_processing=second_processing,
         metadata_extra=metadata_extra,
+        _history_index=history_index,
+        export_progress=(lambda message: export_progress('d2E: ' + message)) if export_progress else None,
     )
     statuses = (
         getattr(raw_paths, "save_status", "created"),
@@ -1088,6 +1223,9 @@ def _split_scale_header_lines(params: HeatmapParams) -> list[str]:
     return [
         "split_color_scale=True",
         f"split_x_requested={split.split_x}",
+        *([f"split_x2_requested={split.split_x2}",
+           f"split_middle_vmin={split.middle_vmin}",
+           f"split_middle_vmax={split.middle_vmax}"] if split.split_x2 is not None else []),
         f"split_left_vmin={split.left_vmin}",
         f"split_left_vmax={split.left_vmax}",
         f"split_right_vmin={split.right_vmin}",
