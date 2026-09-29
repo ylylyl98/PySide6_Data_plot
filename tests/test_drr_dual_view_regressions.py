@@ -62,6 +62,8 @@ class DrrDualViewRegressionTests(unittest.TestCase):
             ("gate", 0), ("vmin", -5), ("vmax", 20),
         ):
             self._set_silently(self.window.drr_spins[key], value)
+        # These numerical regressions intentionally use a fixed manual W=9.
+        self.window.drr_sg_auto_chk.setChecked(False)
         self._set_silently(self.window.drr_sg_window_spin, 9)
         self._set_silently(self.window.drr_sg_poly_spin, 2)
         self.window._drr_view_limits = None

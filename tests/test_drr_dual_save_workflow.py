@@ -107,6 +107,37 @@ class DrrDualSaveWorkflowTests(unittest.TestCase):
     def _output_dir(self) -> Path:
         return self.root / "Processed Data" / "DRR"
 
+    def test_second_export_auto_uses_xy_roi_and_manual_limits_survive(self):
+        from core.processing import apply_sg_derivative_energy
+        w = self.window
+        # Hold SG fixed while testing automatic color limits in the ROI.
+        w.drr_sg_auto_chk.setChecked(False)
+        self.cube.Z = np.array([(i + 1) * self.cube.energy ** 4 for i in range(3)])
+        for key, value in dict(xmin=.4, xmax=1.2, ymin=-.1, ymax=.1).items():
+            w._set_spin_value_silent(w.drr_spins[key], value)
+        second, _ = apply_sg_derivative_energy(self.cube, derivative=2,
+            window_length=w.drr_sg_window_spin.value(), polyorder=w.drr_sg_poly_spin.value())
+        roi = second.Z[np.ix_((second.gate >= -.1) & (second.gate <= .1),
+                              (second.energy >= .4) & (second.energy <= 1.2))]
+        w.drr_second_auto_scale = True
+        # Toolbar zoom crops the export without changing the preview color scale.
+        axis = w.figure.add_subplot(111)
+        axis.set_xlim(.7, .9)
+        axis.set_ylim(-.05, .05)
+        w._drr_heatmap_ax = axis
+        w._drr_limits_from_controls = False
+        self._run_save()
+        def saved_limits():
+            records = [json.loads(p.read_text(encoding='utf-8')) for p in self._output_dir().glob('*.metadata.json')]
+            plot = next(r['plot'] for r in records if r['processing']['derivative_order'] == 2)
+            return [plot['vmin'], plot['vmax']]
+        np.testing.assert_allclose(saved_limits(), np.percentile(roi[np.isfinite(roi)], [.01, 99.99]))
+        w.drr_second_auto_scale = False
+        w._set_spin_value_silent(w.drr_second_vmin_spin, -123)
+        w._set_spin_value_silent(w.drr_second_vmax_spin, 234)
+        self._run_save()
+        np.testing.assert_allclose(saved_limits(), [-123, 234])
+
     def _configure_three_regions(self):
         w = self.window
         for key, value in dict(xmin=-2, xmax=2, ymin=-1, ymax=1, vmin=-5, vmax=5).items():

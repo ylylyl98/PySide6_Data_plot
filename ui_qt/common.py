@@ -152,6 +152,7 @@ class ExportOptions:
     params: HeatmapParams | None
     params_linear: HeatmapParams | None = None
     params_log: HeatmapParams | None = None
+    pl_include_pair: bool = False
     params_intensity: HeatmapParams | None = None
     drr_cube: DataCube | None = None
     # Paired DRR export snapshots.  ``drr_cube`` remains the compatibility
@@ -166,6 +167,8 @@ class ExportOptions:
     drr_second_sg_window: int = 0
     drr_second_sg_polyorder: int = 0
     drr_second_auto_scale: bool = True
+    drr_second_scale_xlim: tuple[float, float] | None = None
+    drr_second_scale_ylim: tuple[float, float] | None = None
     drr_derivative_order: int | None = None
     drr_sg_window: int = 20
     drr_sg_polyorder: int = 2
