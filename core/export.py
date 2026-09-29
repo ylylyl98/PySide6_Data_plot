@@ -635,6 +635,7 @@ def export_pl_pngs_and_dat(
     cube_log: DataCube,
     params_linear: HeatmapParams,
     params_log: HeatmapParams,
+    include_pair: bool = False,
     processed_name: str = DEFAULT_PROCESSED,
     metadata_input_files: Iterable[tuple[str, str]] = (),
     metadata_extra: dict | None = None,
@@ -643,7 +644,7 @@ def export_pl_pngs_and_dat(
     safe = _unique_result_stem(
         out_dir,
         f"{Path(file_name).stem}_PL",
-        ("_linear.dat", "_linear.metadata.json", "_linear.png", "_log.png"),
+        ("_linear.dat", "_linear.metadata.json", "_linear.png", "_log.png", "_side_by_side.png"),
     )
 
     png_linear = out_dir / f"{safe}_linear.png"
@@ -665,6 +666,15 @@ def export_pl_pngs_and_dat(
         )
     )
     paths = {"png_linear": png_linear, "png_log": png_log, "dat": dat_path}
+    if include_pair:
+        # Reuse the exact standalone panels, including their export typography.
+        from PIL import Image
+        with Image.open(png_linear) as left, Image.open(png_log) as right:
+            pair = Image.new('RGB', (left.width + right.width, max(left.height, right.height)), 'white')
+            pair.paste(left.convert('RGB'), (0, 0))
+            pair.paste(right.convert('RGB'), (left.width, 0))
+            paths['png_pair'] = out_dir / f'{safe}_side_by_side.png'
+            pair.save(paths['png_pair'], dpi=(EXPORT_DPI, EXPORT_DPI))
     write_export_metadata(
         folder,
         [dat_path],
@@ -683,6 +693,7 @@ def export_pl_pngs_and_dat(
             ("data", dat_path),
             ("figure_linear", png_linear),
             ("figure_log", png_log),
+            *((('figure_side_by_side', paths['png_pair']),) if include_pair else ()),
         ),
     )
     return paths

@@ -587,6 +587,8 @@ class PlController:
         self._apply_dat_y_axis_selection()
         if self.loaded and self.loaded.mode == "PL":
             sender = source if source is not None else self.sender()
+            if sender in tuple(self.pl_spins[k] for k in ('xmin', 'xmax', 'ymin', 'ymax')):
+                self._pl_limits_from_controls = True
             if sender in (
                 self.pl_spins["xmin"], self.pl_spins["xmax"],
                 self.pl_spins["ymin"], self.pl_spins["ymax"], self.pl_log_chk,
@@ -642,6 +644,7 @@ class PlController:
     def _auto_pl_xrange(self) -> None:
         if not self.loaded or self.loaded.mode != "PL" or self.loaded.cube is None:
             return
+        self._pl_limits_from_controls = True
         self.pl_spins["xmin"].setValue(float(np.nanmin(self.loaded.cube.energy)))
         self.pl_spins["xmax"].setValue(float(np.nanmax(self.loaded.cube.energy)))
         self._status("State: Auto xmin/xmax set from energy axis.")
@@ -649,6 +652,7 @@ class PlController:
     def _auto_pl_yrange(self) -> None:
         if not self.loaded or self.loaded.mode != "PL" or self.loaded.cube is None:
             return
+        self._pl_limits_from_controls = True
         self.pl_spins["ymin"].setValue(float(np.nanmin(self.loaded.cube.gate)))
         self.pl_spins["ymax"].setValue(float(np.nanmax(self.loaded.cube.gate)))
         self._status("State: Auto ymin/ymax set from gate axis.")
@@ -744,6 +748,8 @@ class PlController:
         self._pl_spectrum_ax.set_ylabel(cube.cbar_label)
         self._pl_spectrum_ax.grid(alpha=0.25)
         xlim = (float(self.pl_spins["xmin"].value()), float(self.pl_spins["xmax"].value()))
+        if not getattr(self, '_pl_limits_from_controls', True):
+            xlim = self._pl_heatmap_ax.get_xlim()
         self._pl_spectrum_ax.set_xlim(xlim)
         self._auto_scale_spectrum_y(self._pl_spectrum_ax, x, y, xlim)
         self._draw_pl_analysis_overlays(gate_used, x, np.asarray(y, float))
@@ -754,6 +760,13 @@ class PlController:
             return
         gate = np.asarray(cube.gate, float).ravel()
         gate_clamped = float(np.clip(gate_value, float(np.nanmin(gate)), float(np.nanmax(gate))))
+        extra_axes = [ax for ax in getattr(self, '_pl_heatmap_axes', {}).values() if ax is not self._pl_heatmap_ax]
+        extra_lines = getattr(self, '_pl_extra_gate_lines', [])
+        if len(extra_lines) != len(extra_axes) or any(line.axes is not ax for line, ax in zip(extra_lines, extra_axes)):
+            self._pl_extra_gate_lines = [ax.axhline(gate_clamped, lw=1.2, alpha=.9, color='#222', linestyle='--', zorder=20) for ax in extra_axes]
+        else:
+            for line in extra_lines:
+                line.set_ydata([gate_clamped, gate_clamped])
         if self._pl_gate_line is None or getattr(self._pl_gate_line, "axes", None) is not self._pl_heatmap_ax:
             self._pl_gate_line = self._pl_heatmap_ax.axhline(
                 y=gate_clamped,
@@ -786,6 +799,8 @@ class PlController:
             x,
             (float(self.pl_spins["xmin"].value()), float(self.pl_spins["xmax"].value())),
         )
+        if not getattr(self, '_pl_limits_from_controls', True):
+            xlim = self._pl_heatmap_ax.get_xlim()
         self._pl_spectrum_ax.set_xlim(xlim)
         self._auto_scale_spectrum_y(self._pl_spectrum_ax, x, y, xlim)
         self._set_pl_gate_spin_value(gate_used)
@@ -796,6 +811,9 @@ class PlController:
 
     def _draw_pl_regions(self) -> None:
         """Draw PL dynamic artists locally when the static layout is valid."""
+        if len(getattr(self, '_pl_heatmap_axes', {})) > 1:
+            self.canvas.draw_idle()
+            return
         line = getattr(self, "_pl_spectrum_line", None)
         gate = getattr(self, "_pl_gate_line", None)
         if line is None or gate is None:

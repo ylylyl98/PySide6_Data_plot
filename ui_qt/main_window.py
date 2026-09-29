@@ -2687,7 +2687,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return
         try:
             cube, _derivative, _window, _poly = self.drr_controller._drr_cube_with_metadata(2)
-            limits = compute_auto_limits(cube, log_scale=False)
+            limits = compute_auto_limits(cube, log_scale=False,
+                xlim=tuple(self.drr_spins[k].value() for k in ('xmin', 'xmax')),
+                ylim=tuple(self.drr_spins[k].value() for k in ('ymin', 'ymax')))
         except (TypeError, ValueError) as exc:
             self._status(f"State: Auto d2E vmin/vmax skipped ({exc}).")
             return
@@ -2708,7 +2710,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if not getattr(self, "drr_second_auto_scale", True):
             return
         try:
-            limits = compute_auto_limits(cube, log_scale=False)
+            limits = compute_auto_limits(cube, log_scale=False,
+                xlim=tuple(self.drr_spins[k].value() for k in ('xmin', 'xmax')),
+                ylim=tuple(self.drr_spins[k].value() for k in ('ymin', 'ymax')))
         except (TypeError, ValueError):
             return
         for spin, value in (
@@ -2720,6 +2724,31 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 spin.setValue(float(value))
             finally:
                 spin.blockSignals(blocked)
+
+    def _open_drr_raw_preview(self) -> None:
+        from core.drr_raw_preview import snapshot_from_loaded
+        from ui_qt.drr_raw_dialog import DrrRawDialog
+        try:
+            snapshot = snapshot_from_loaded(self.loaded)
+        except ValueError as exc:
+            self._show_error(str(exc))
+            return
+        previous = getattr(self, '_drr_raw_dialog', None)
+        if previous is not None:
+            if previous.snapshot == snapshot:
+                previous.raise_()
+                previous.activateWindow()
+                return
+            previous.close()
+        dialog = DrrRawDialog(snapshot, pool=self.thread_pool,
+            initial_gate=self.drr_spins['gate'].value(), parent=self)
+        self._drr_raw_dialog = dialog
+        def release_dialog():
+            if getattr(self, '_drr_raw_dialog', None) is dialog:
+                self._drr_raw_dialog = None
+            dialog.deleteLater()
+        dialog.finished.connect(release_dialog)
+        dialog.show()
 
     def _capture_drr_view_limits(self) -> None:
         """Snapshot the shared map viewport before a DRR layout rebuild."""
@@ -2736,6 +2765,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         )
 
     def _update_plot_view_bar_visibility(self) -> None:
+        if hasattr(self, 'pl_plot_view_bar'):
+            self.pl_plot_view_bar.setVisible(self._active_mode() == 'PL')
         if hasattr(self, "drr_plot_view_bar"):
             drr_active = self._active_mode() == "DRR"
             self.drr_plot_view_bar.setVisible(drr_active)
@@ -2862,7 +2893,15 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         drr_view_layout.addWidget(self.drr_gate_prev_btn)
         drr_view_layout.addWidget(self.drr_gate_next_btn)
         drr_view_layout.addStretch(1)
+        self.drr_raw_preview_btn = QToolButton()
+        self.drr_raw_preview_btn.setText('Raw data…')
+        self.drr_raw_preview_btn.setToolTip('Inspect individual or averaged measurement/background intensities in a separate window')
+        self.drr_raw_preview_btn.setEnabled(False)
+        self.drr_raw_preview_btn.clicked.connect(self._open_drr_raw_preview)
+        drr_view_layout.addWidget(self.drr_raw_preview_btn)
         layout.addWidget(self.drr_plot_view_bar)
+        from ui_qt.pl_views import build_bar
+        layout.addWidget(build_bar(self))
         self.cmp_plot_view_bar = QFrame()
         self.cmp_plot_view_bar.setFrameShape(QFrame.NoFrame)
         self.cmp_plot_view_bar.setVisible(False)
@@ -3121,9 +3160,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             )
         self.pl_spins["gate"].valueChanged.connect(self.pl_controller._on_pl_gate_changed)
         self.pl_cmap.currentTextChanged.connect(self.pl_controller._on_pl_plot_param_changed)
-        self.pl_log_chk.toggled.connect(
-            lambda _checked: self.pl_controller._on_pl_plot_param_changed(self.pl_log_chk)
-        )
+        from ui_qt.pl_views import select_scale
+        self.pl_log_chk.toggled.connect(lambda checked: select_scale(self, checked))
         self.pl_clip_chk.toggled.connect(self.pl_controller._on_pl_plot_param_changed)
         self.cmp_in_k_angle_spin.valueChanged.connect(self.compare_controller._on_cmp_angle_reference_changed)
         self.cmp_rotation_mapping_combo.currentIndexChanged.connect(self.compare_controller._on_cmp_rotation_mapping_changed)
@@ -3250,7 +3288,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.drr_gate_prev_btn.clicked.connect(lambda: self._step_drr_gate(-1))
         self.drr_gate_next_btn.clicked.connect(lambda: self._step_drr_gate(1))
         self.drr_derivative_combo.currentTextChanged.connect(self.drr_controller._on_drr_derivative_changed)
-        self.drr_sg_window_spin.valueChanged.connect(self.drr_controller._on_drr_derivative_changed)
+        self.drr_sg_window_spin.valueChanged.connect(self.drr_controller._on_drr_sg_window_changed)
+        self.drr_sg_auto_chk.toggled.connect(self.drr_controller._on_drr_derivative_changed)
         self.drr_sg_poly_spin.valueChanged.connect(self.drr_controller._on_drr_derivative_changed)
         self.drr_edit_measurements_btn.clicked.connect(self.drr_controller._edit_drr_measurements)
         self.drr_clear_measurements_btn.clicked.connect(self.drr_controller._clear_drr_measurements)
@@ -5443,6 +5482,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._update_move_exported_sources_state()
         pl_loaded = loaded_mode == "PL"
         drr_loaded = loaded_mode == "DRR"
+        self.drr_raw_preview_btn.setEnabled(drr_loaded and not self._load_in_progress)
         self._sync_drr_gate_toolbar_state(drr_loaded)
         cmp_loaded = loaded_mode == "Compare"
         power_loaded = loaded_mode == "Power Dependent"
@@ -9397,6 +9437,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self.compare_controller._disable_cmp_blitting()
             self._drr_reuse_state = None
             self._drr_heatmap_renders = {}
+            if mode == 'PL':
+                from ui_qt.pl_views import capture_view
+                capture_view(self)
             self.figure.clear()
             self._drr_heatmap_ax = None
             self._drr_spectrum_ax = None
@@ -9426,33 +9469,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             plot_cube = None
             if mode == "PL" and self.loaded.cube is not None:
                 plot_cube = self.loaded.cube
-                params = self._make_params(mode, plot_cube)
-                gs = self.figure.add_gridspec(
-                    nrows=2,
-                    ncols=2,
-                    width_ratios=[1.0, 0.035],
-                    height_ratios=[1.0, 1.0],
-                    wspace=0.12,
-                    hspace=0.28,
-                )
-                ax1 = self.figure.add_subplot(gs[0, 0])
-                cax = self.figure.add_subplot(gs[0, 1])
-                ax2 = self.figure.add_subplot(gs[1, 0], sharex=ax1)
-                render = plot_pl(ax1, downsample_cube_for_display(plot_cube), params)
-                self._add_heatmap_colorbar(render, cax, label=params.cbar_label)
-                self._pl_heatmap_ax = ax1
-                self._pl_spectrum_ax = ax2
-                self._pl_last_plot_cube = plot_cube
-                self._pl_gate_line = None
-                for helper in (getattr(self.pl_controller, "_pl_region_blitters", None) or ()):
-                    try:
-                        helper.disconnect()
-                    except (AttributeError, RuntimeError):
-                        pass
-                self.pl_controller._pl_region_blitters = None
-                self._pl_heatmap_peak_artist = None
-                self._pl_heatmap_fit_artist = None
-                self.pl_controller._update_pl_spectrum_and_gate_line(plot_cube)
+                from ui_qt.pl_views import draw
+                draw(self, plot_cube)
             elif mode == "DRR" and self.loaded.cube is not None:
                 self._pl_heatmap_ax = None
                 self._pl_spectrum_ax = None
@@ -10426,7 +10444,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             heatmap_ax = self._drr_heatmap_ax
             cube = self._last_plot_cube
         elif self.last_plotted_mode == "PL":
-            heatmap_ax = self._pl_heatmap_ax
+            heatmap_ax = event.inaxes if event.inaxes in getattr(self, '_pl_heatmap_axes', {}).values() else self._pl_heatmap_ax
             cube = self._pl_last_plot_cube
         elif self.last_plotted_mode == "Compare":
             heatmap_ax = event.inaxes if event.inaxes in set(self._cmp_heatmap_axes.values()) else None
@@ -10520,7 +10538,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             event.xdata is not None
             and event.ydata is not None
             and self.last_plotted_mode == "PL"
-            and event.inaxes is self._pl_heatmap_ax
+            and event.inaxes in getattr(self, '_pl_heatmap_axes', {}).values()
         ):
             if self.pl_controller._remove_peak_from_pl_heatmap_click(float(event.xdata), float(event.ydata)):
                 return
@@ -10600,7 +10618,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
         if self.last_plotted_mode != "PL" or self._pl_heatmap_ax is None or self._pl_last_plot_cube is None:
             return
-        if event.inaxes is not self._pl_heatmap_ax or event.ydata is None:
+        if event.inaxes not in getattr(self, '_pl_heatmap_axes', {}).values() or event.ydata is None:
             return
         ygrid = np.asarray(self._pl_last_plot_cube.gate, float).ravel()
         idx = int(np.argmin(np.abs(ygrid - float(event.ydata))))
@@ -10800,18 +10818,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 return
 
         if mode == "PL":
-            log_split = params.split_scale
-            if log_split is not None and (
-                log_split.left_vmin <= 0.0 or log_split.right_vmin <= 0.0
-            ):
-                log_split = None
+            from ui_qt.pl_views import export_parameters
+            pl_params = export_parameters(self, self.loaded.cube)
             options = ExportOptions(
                 mode=mode,
                 params=params,
-                params_linear=HeatmapParams(**{**params.__dict__, "log_scale": False}),
-                params_log=HeatmapParams(
-                    **{**params.__dict__, "log_scale": True, "split_scale": log_split}
-                ),
+                params_linear=pl_params['linear'],
+                params_log=pl_params['log'],
+                pl_include_pair=self.pl_export_pair_chk.isChecked(),
                 cleanup_verified_sources=bool(self.clean_verified_sources_chk.isChecked()),
             )
         elif mode == "DRR":
@@ -10829,6 +10843,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 drr_second_sg_window=drr_second_win,
                 drr_second_sg_polyorder=drr_second_poly,
                 drr_second_auto_scale=bool(getattr(self, "drr_second_auto_scale", True)),
+                drr_second_scale_xlim=tuple(self.drr_spins[k].value() for k in ('xmin', 'xmax')),
+                drr_second_scale_ylim=tuple(self.drr_spins[k].value() for k in ('ymin', 'ymax')),
                 drr_derivative_order=drr_deriv,
                 drr_sg_window=drr_used_win,
                 drr_sg_polyorder=drr_poly,
@@ -10997,6 +11013,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 cube_log=log_cube,
                 params_linear=options.params_linear,
                 params_log=options.params_log,
+                include_pair=options.pl_include_pair,
                 processed_name=str(Path("Processed Data") / "PL"),
                 metadata_input_files=(("measurement", loaded.primary_file),),
                 metadata_extra=metadata_extra,
@@ -11100,7 +11117,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     )
                 if options.drr_second_auto_scale and second_params.split_scale is None:
                     try:
-                        second_limits = compute_auto_limits(second_product, log_scale=False)
+                        second_limits = compute_auto_limits(second_product, log_scale=False,
+                            xlim=options.drr_second_scale_xlim or second_params.xlim,
+                            ylim=options.drr_second_scale_ylim or second_params.ylim)
                         second_params = HeatmapParams(
                             **{
                                 **second_params.__dict__,

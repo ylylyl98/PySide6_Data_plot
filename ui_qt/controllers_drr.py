@@ -655,13 +655,26 @@ class DrrController:
             if self.loaded and self.loaded.mode == "DRR" and self.loaded.cube is not None
             else 401
         )
+        auto_window = getattr(self, "drr_sg_auto_chk", None)
+        auto_enabled = auto_window is not None and auto_window.isChecked()
+        clamped_request = getattr(self, "_drr_sg_clamped_request", None)
+        if not auto_enabled and clamped_request is not None and req_win == clamped_request[1]:
+            req_win = clamped_request[0]
+        if (auto_enabled
+                and self.loaded and self.loaded.mode == "DRR" and self.loaded.cube is not None):
+            req_win = 11 if n_energy <= 512 else 21
         used_win = clamp_sg_window(req_win, n_energy=n_energy, polyorder=poly)
-        if used_win != req_win:
+        # A short source can reduce the effective window temporarily. Keep
+        # the manual request so a longer source restores it automatically.
+        self._drr_sg_clamped_request = (
+            (req_win, used_win) if not auto_enabled and req_win != used_win else None
+        )
+        if used_win != int(self.drr_sg_window_spin.value()):
             blocked = self.drr_sg_window_spin.blockSignals(True)
             self.drr_sg_window_spin.setValue(used_win)
             self.drr_sg_window_spin.blockSignals(blocked)
             if show_status:
-                self._status(f"State: SG window clamped to {used_win} (odd, valid for order={poly}).")
+                self._status(f"State: SG window = {used_win} ({n_energy} energy points, order={poly}).")
         return used_win
 
     def _drr_cube_with_metadata(
@@ -798,15 +811,21 @@ class DrrController:
         self._drr_gate_lines = lines
         self._gate_line = lines.get("raw") or lines.get("active") or next(iter(lines.values()), None)
 
+    def _on_drr_sg_window_changed(self) -> None:
+        # Programmatic auto/clamp updates block the spin signal; only an
+        # explicit window edit disables automatic selection.
+        self._drr_sg_clamped_request = None
+        blocked = self.drr_sg_auto_chk.blockSignals(True)
+        self.drr_sg_auto_chk.setChecked(False)
+        self.drr_sg_auto_chk.blockSignals(blocked)
+        self._on_drr_derivative_changed()
+
     def _on_drr_derivative_changed(self) -> None:
         update_label = getattr(self, "_update_drr_advanced_derivative_label", None)
         if update_label is not None:
             update_label()
         self._invalidate_pending_drr_fit("Fit discarded: derivative changed.")
         self._invalidate_export_move_sources()
-        derivative_active = self._drr_derivative_value() is not None
-        self.drr_sg_window_spin.setVisible(derivative_active)
-        self.drr_sg_poly_spin.setVisible(derivative_active)
         self._enforce_drr_sg_constraints(show_status=True)
         if self.loaded and self.loaded.mode == "DRR" and not self._suspend_drr_autoplot:
             self._refresh_automatic_ranges("DRR", refresh_split=True)

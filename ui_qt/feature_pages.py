@@ -547,20 +547,26 @@ class FeatureTabsMixin:
         self.drr_derivative_combo.setFixedWidth(UI_METRICS["deriv_combo_w"])
         self.drr_derivative_combo.setMinimumHeight(UI_METRICS["input_h"])
         self.drr_sg_window_spin = QSpinBox()
-        self.drr_sg_window_spin.setRange(5, 401)
+        self.drr_sg_window_spin.setRange(3, 401)
         self.drr_sg_window_spin.setSingleStep(2)
-        self.drr_sg_window_spin.setValue(20)
-        self.drr_sg_window_spin.setToolTip("Savitzky-Golay window length (odd).")
+        self.drr_sg_window_spin.setValue(21)
+        self.drr_sg_window_spin.setToolTip("Savitzky-Golay window points (odd). Editing turns Auto window off.")
+        self.drr_sg_window_spin.setAccessibleName("Second derivative window points")
         self.drr_sg_window_spin.setFixedWidth(UI_METRICS["spin_w"])
         self.drr_sg_window_spin.setMinimumHeight(UI_METRICS["input_h"])
         self.drr_sg_poly_spin = QSpinBox()
-        self.drr_sg_poly_spin.setRange(1, 6)
+        self.drr_sg_poly_spin.setRange(2, 6)
         self.drr_sg_poly_spin.setValue(2)
         self.drr_sg_poly_spin.setToolTip("Savitzky-Golay polynomial order.")
+        self.drr_sg_poly_spin.setAccessibleName("Second derivative polynomial order")
         self.drr_sg_poly_spin.setFixedWidth(UI_METRICS["spin_w"])
         self.drr_sg_poly_spin.setMinimumHeight(UI_METRICS["input_h"])
-        self.drr_sg_window_spin.setVisible(False)
-        self.drr_sg_poly_spin.setVisible(False)
+        self.drr_sg_auto_chk = QCheckBox("Auto window")
+        self.drr_sg_auto_chk.setChecked(True)
+        self.drr_sg_auto_chk.setToolTip(
+            "Use 11 points for up to 512 energy samples, otherwise 21 (including 1024 / 1340). "
+            "The window is limited to the available samples. Uncheck to keep a manual value."
+        )
 
         # Raw and second-derivative panels have separate color ranges while
         # sharing the DRR axis and cursor controls.  Keep these lightweight
@@ -577,17 +583,17 @@ class FeatureTabsMixin:
             spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             spin.setMinimumHeight(UI_METRICS["input_h"])
 
-        deriv_row = QWidget()
-        deriv_grid = QGridLayout(deriv_row)
-        deriv_grid.setContentsMargins(0, 0, 0, 0)
-        deriv_grid.setHorizontalSpacing(4)
-        deriv_grid.setVerticalSpacing(3)
-        deriv_grid.addWidget(self.drr_derivative_combo, 0, 0, 1, 2)
-        self.drr_sg_window_spin.setPrefix("W ")
-        deriv_grid.addWidget(self.drr_sg_window_spin, 1, 0)
-        self.drr_sg_poly_spin.setPrefix("O ")
-        deriv_grid.addWidget(self.drr_sg_poly_spin, 1, 1)
-        deriv_grid.setColumnStretch(1, 1)
+        self.drr_second_controls = QGroupBox("Second derivative (d2E)")
+        second_form = QFormLayout(self.drr_second_controls)
+        second_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        second_form.setVerticalSpacing(UI_METRICS["row_spacing"])
+        second_note = QLabel("Side by side: left ΔR/R, right d2E.")
+        second_note.setWordWrap(True)
+        second_form.addRow(second_note)
+        second_form.addRow(self.drr_sg_auto_chk)
+        second_form.addRow("Window points", self.drr_sg_window_spin)
+        second_form.addRow("Polynomial order", self.drr_sg_poly_spin)
+        second_form.addRow("Cmap", self.drr_second_cmap)
 
         # DRR range actions are real push buttons so their readable content
         # width participates in the dense row's metric-based packing.
@@ -625,11 +631,8 @@ class FeatureTabsMixin:
         _drr_yc_h.setSpacing(6)
         _drr_yc_h.addWidget(self.drr_yaxis_combo, 1)
         cfg.addRow("DRR Baseline", baseline_cmap_row)
-        cfg.addRow("d2E Cmap", self.drr_second_cmap)
         cfg.addRow("Y-axis", _drr_yc_row)
         cfg.addRow("", self.drr_yaxis_advanced_box)
-        cfg.addRow("Derivative / SG", deriv_row)
-        cfg.addRow("Advanced view", self.drr_advanced_derivative_label)
         self._set_form_label_width(cfg, UI_METRICS["label_col_width"])
         params_layout.addLayout(cfg)
 
@@ -658,13 +661,13 @@ class FeatureTabsMixin:
         second_scale_h.addWidget(QLabel("vmax"))
         second_scale_h.addWidget(self.drr_second_vmax_spin, 1)
         second_scale_h.addWidget(self.drr_second_auto_v_btn)
-        basic_form.addRow("d2E color", second_scale)
+        second_form.addRow("Color limits", second_scale)
         basic_form.addRow("Color scale", self.drr_region_count_combo)
         basic_form.addRow(self.drr_split_scale_panel)
         self.drr_second_split_expander = self._make_expander(
             "d2E split color scale", self.drr_second_split_scale_panel, expanded=False
         )
-        basic_form.addRow("d2E split", self.drr_second_split_expander)
+        second_form.addRow(self.drr_second_split_expander)
         basic_form.addRow(
             self._make_axis_range_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.drr_auto_x_btn, "Auto X", dense=True, label_text="xmin / xmax"),
         )
@@ -769,6 +772,16 @@ class FeatureTabsMixin:
         self.drr_analysis_text.setPlaceholderText("Peak/fit results will appear here after detection.")
         analysis_form.addRow("", self.drr_analysis_text)
         set_fluent_property(self.drr_fit_status, "appRole", "fitStatus")
+        params_layout.addWidget(self.drr_second_controls)
+        advanced = QWidget()
+        advanced_form = QFormLayout(advanced)
+        advanced_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        advanced_form.addRow("Derivative", self.drr_derivative_combo)
+        advanced_form.addRow(self.drr_advanced_derivative_label)
+        advanced_note = QLabel("dE uses the same SG settings. Side by side always shows ΔR/R and d2E.")
+        advanced_note.setWordWrap(True)
+        advanced_form.addRow(advanced_note)
+        params_layout.addWidget(self._make_expander("Advanced derivative", advanced, expanded=False))
         params_layout.addWidget(self._make_expander("Manual plot ranges", basic, expanded=False))
         layout.addWidget(self._make_expander("Parameters", params, expanded=True))
         from ui_qt.drr_peak_analysis import DrrPeakAnalysisController

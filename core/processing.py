@@ -243,10 +243,17 @@ def group_measurement_files(files: Sequence[str]) -> Dict[str, List[str]]:
     return out
 
 
-def compute_auto_limits(cube: DataCube, *, log_scale: bool = False, low: float = 0.01, high: float = 99.99) -> Limits:
+def compute_auto_limits(cube: DataCube, *, log_scale: bool = False, low: float = 0.01, high: float = 99.99,
+                        xlim: tuple[float, float] | None = None,
+                        ylim: tuple[float, float] | None = None) -> Limits:
+    """Compute color limits in an optional ROI; returned axis extents stay global."""
     z = np.asarray(cube.Z, float)
     e = np.asarray(cube.energy, float).ravel()
     g = np.asarray(cube.gate, float).ravel()
+    if xlim is not None or ylim is not None:
+        xmask = np.ones(e.size, dtype=bool) if xlim is None else (e >= min(xlim)) & (e <= max(xlim))
+        ymask = np.ones(g.size, dtype=bool) if ylim is None else (g >= min(ylim)) & (g <= max(ylim))
+        z = z[np.ix_(ymask, xmask)]
     finite = z[np.isfinite(z)]
     if finite.size == 0:
         raise ValueError("Data contains no finite values.")
