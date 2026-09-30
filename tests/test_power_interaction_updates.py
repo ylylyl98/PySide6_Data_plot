@@ -17,6 +17,7 @@ class PowerInteractionUpdateTests(unittest.TestCase):
             _update_power_compare_spectrum_and_lines=Mock(), _refresh_automatic_ranges=Mock(),
             _schedule_plot_redraw=Mock(), _plot_mode=Mock(), _is_closing=False,
             _plot_redraw_pending={'Power Dependent'}, _load_in_progress=False,
+            _active_mode=lambda: 'Power Dependent',
         )
 
     def test_gate_updates_spectrum_without_rescan_or_heatmap_rebuild(self):

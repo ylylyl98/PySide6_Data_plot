@@ -55,17 +55,35 @@ def recommend_window(axis, traces, poly=2, *, maximum=21):
 
 
 def _first_derivative(values, axis, window, poly):
+    """Fit within the fixed window, retaining gaps and unsupported derivatives.
+
+    Missing samples are excluded from the local polynomial fit, never filled.
+    A missing target or fewer than poly + 1 independent finite samples leaves
+    NaN, including in the intermediate derivative used by the second axis.
+    """
     x = validate_axis(axis)
     z = np.asarray(values, float)
-    result = np.empty_like(z)
+    rows = z.reshape(-1, len(x))
+    result = np.full_like(rows, np.nan)
     for i in range(len(x)):
         start = min(max(0, i-window//2), len(x)-window)
         offsets = x[start:start+window] - x[i]
         scale = np.max(np.abs(offsets))
         design = np.polynomial.polynomial.polyvander(offsets/scale, poly)
         weights = np.linalg.pinv(design)[1]/scale
-        result[..., i] = z[..., start:start+window] @ weights
-    return result
+        samples = rows[:, start:start+window]
+        finite = np.isfinite(samples)
+        complete = np.all(finite, axis=1)
+        result[complete, i] = samples[complete] @ weights
+        supported = (~complete & np.isfinite(rows[:, i])
+                     & (finite.sum(axis=1) >= poly + 1))
+        for row in np.flatnonzero(supported):
+            mask = finite[row]
+            coefficients, _, rank, _ = np.linalg.lstsq(
+                design[mask], samples[row, mask], rcond=None)
+            if rank == poly + 1:
+                result[row, i] = coefficients[1]/scale
+    return result.reshape(z.shape)
 
 
 def mixed_derivative(cube, window_x, window_y, poly=2):

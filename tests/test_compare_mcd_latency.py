@@ -150,6 +150,11 @@ class McdRedrawLatencyTests(unittest.TestCase):
     def test_range_color_burst_coalesces_through_shared_scheduler(self) -> None:
         with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
             window = MainWindow()
+        # Only the visible workflow may redraw the shared canvas. Loading MCD
+        # data alone does not activate its page (the initial page is PL).
+        window.tabs.setCurrentIndex(next(
+            i for i in range(window.tabs.count()) if window.tabs.tabText(i) == "MCD"))
+        self.assertEqual(window._active_mode(), "MCD")
         window.loaded = LoadedState(mode="MCD", folder="")
         try:
             with patch.object(window, "_plot_mode") as plot_mode, patch.object(

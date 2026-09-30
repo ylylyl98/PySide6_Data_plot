@@ -18,6 +18,7 @@ class BatchPeakIntegrationTests(unittest.TestCase):
     setUp = fixture.DrrDualViewRegressionTests.setUp
     tearDown = fixture.DrrDualViewRegressionTests.tearDown
     _set_silently = staticmethod(fixture.DrrDualViewRegressionTests._set_silently)
+    _wait_derivative = fixture.DrrDualViewRegressionTests._wait_derivative
 
     def prepare(self):
         w = self.window
@@ -29,6 +30,7 @@ class BatchPeakIntegrationTests(unittest.TestCase):
         w._drr_view_limits = ((1.60, 1.76), (-1., 1.))
         w.drr_view_side_btn.setChecked(True)
         w._plot_mode('DRR')
+        self._wait_derivative()
         c = w.drr_peak_analysis
         result = analyze_drr_peaks(w.loaded.cube, c.settings())
         c.finished(result, c.key(), c.generation)

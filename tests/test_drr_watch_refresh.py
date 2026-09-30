@@ -22,7 +22,7 @@ class WatchRefreshTests(unittest.TestCase):
         (self.root / 'MCD').mkdir()
         settings = QSettings(str(self.root / 'settings.ini'), QSettings.IniFormat)
         with patch('ui_qt.main_window.QSettings', return_value=settings), patch.object(
-                MainWindow, '_restore_last_folder'), patch.object(MainWindow, '_schedule_automatic_update_check'):
+                MainWindow, '_restore_last_folder', autospec=True), patch.object(MainWindow, '_schedule_automatic_update_check', autospec=True):
             self.w = MainWindow()
         self.addCleanup(self.w.close)
         self.w.current_folder = str(self.root)

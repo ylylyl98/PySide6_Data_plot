@@ -31,6 +31,113 @@ def _repository() -> ProjectTokenRepository:
     )
 
 
+class ThemeInstallationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_reapply_skips_identical_qss_but_restores_external_changes(self) -> None:
+        from unittest.mock import patch
+        from ui_qt.theme import install_theme
+
+        manager = install_theme(self.app, mode="light")
+        changes = []
+        manager.themeChanged.connect(changes.append)
+        self.addCleanup(manager.themeChanged.disconnect, changes.append)
+        self.addCleanup(manager.set_mode, "light")
+        expected = self.app.styleSheet()
+        with patch.object(self.app, "setStyleSheet", wraps=self.app.setStyleSheet) as write:
+            manager.apply()
+            write.assert_not_called()
+            self.assertEqual([theme.name for theme in changes], ["light"])
+            self.app.setStyleSheet("QWidget { color: red; }")
+            write.reset_mock()
+            manager.apply()
+            write.assert_called_once_with(expected)
+            self.assertEqual(self.app.styleSheet(), expected)
+            self.assertEqual([theme.name for theme in changes], ["light", "light"])
+            write.reset_mock()
+            manager.set_mode("dark")
+            write.assert_called_once()
+            self.assertNotEqual(self.app.styleSheet(), expected)
+            self.assertEqual(changes[-1].name, "dark")
+
+    def test_reinstallation_reuses_manager_and_changes_mode(self) -> None:
+        from ui_qt.theme import install_theme
+        from ui_qt.fluent_ui.theme import FluentThemeManager
+
+        first = install_theme(self.app, mode="light")
+        self.addCleanup(first.set_mode, "light")
+        count = len(self.app.findChildren(FluentThemeManager))
+        second = install_theme(self.app, mode="dark")
+        self.assertIs(second, first)
+        self.assertEqual(len(self.app.findChildren(FluentThemeManager)), count)
+        self.assertEqual(second.current_theme.name, "dark")
+        self.assertIs(install_theme(self.app, mode="light"), first)
+        self.assertEqual(first.current_theme.name, "light")
+
+    def test_destroyed_window_disconnects_application_theme_callbacks(self) -> None:
+        import sys
+        from unittest.mock import patch
+        from ui_qt.main_window import MainWindow
+        from ui_qt.theme import install_theme
+        from tests.ui_test_helpers import dispose_owned_window
+
+        manager = install_theme(self.app, mode="light")
+        self.addCleanup(manager.set_mode, "light")
+        with patch.object(MainWindow, "_restore_last_folder", autospec=True), \
+             patch.object(MainWindow, "_schedule_automatic_update_check", autospec=True):
+            window = MainWindow()
+        self.addCleanup(dispose_owned_window, window)
+        light_icon = window.load_action.icon().cacheKey()
+        manager.set_mode("dark")
+        self.assertNotEqual(window.load_action.icon().cacheKey(), light_icon)
+        dispose_owned_window(window)
+        errors = []
+        with patch.object(sys, "excepthook", side_effect=lambda *args: errors.append(args)):
+            install_theme(self.app, mode="light")
+            self.app.processEvents()
+        self.assertEqual(errors, [], [str(error[1]) for error in errors])
+
+    def test_installation_after_application_recreation(self) -> None:
+        import subprocess
+        import sys
+        import textwrap
+
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent("""
+                from PySide6.QtWidgets import QApplication
+                from shiboken6 import delete, isValid
+                from ui_qt.theme import install_theme
+                app = QApplication([])
+                first = install_theme(app, mode="light")
+                delete(app)
+                assert not isValid(first)
+                app = QApplication([])
+                second = install_theme(app, mode="dark")
+                assert second is not first and second.parent() is app
+                assert second.current_theme.name == "dark"
+            """)],
+            cwd=Path(__file__).resolve().parent.parent,
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_reinstallation_replaces_explicitly_destroyed_manager(self) -> None:
+        from PySide6.QtCore import QCoreApplication, QEvent
+        from ui_qt.theme import install_theme
+        from shiboken6 import isValid
+
+        first = install_theme(self.app, mode="light")
+        first.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        self.assertFalse(isValid(first))
+        second = install_theme(self.app, mode="light")
+        self.assertIsNot(second, first)
+        self.assertTrue(isValid(second))
+        self.assertIs(second.parent(), self.app)
+
+
 class ThemeLayerTests(unittest.TestCase):
     def test_repository_resolves_both_themes_with_project_aliases(self) -> None:
         repository = _repository()

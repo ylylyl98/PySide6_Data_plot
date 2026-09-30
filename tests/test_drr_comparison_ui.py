@@ -68,7 +68,7 @@ class ComparisonUiTests(unittest.TestCase):
                     self.assertEqual(load.call_count,1)
                     w.persist_comparison(w.comparison_store(),'one',w.comparison_snapshot())
                     w.comparison_key=None
-                    with patch.object(page.__class__,'compute_records',side_effect=AssertionError('Cached P2P recomputed')):
+                    with patch.object(page.__class__,'compute_records',autospec=True,side_effect=AssertionError('Cached P2P recomputed')):
                         w.open_comparison('one')
                     self.assertEqual(load.call_count,1)
                     dat.write_text('changed source')

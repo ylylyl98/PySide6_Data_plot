@@ -318,7 +318,7 @@ def _expand_safe_sections(window, workflow: str) -> None:
         "Power": {"Power Sweep Files", "Parameters", "Plot Setup", "Manual plot ranges"},
         "MCD": {"Source", "Correction", "Advanced", "Diagnostics", "Plot"},
         "SHG": {"Data", "Peak Integration", "Cosmic Rays", "Angle", "Angular Fit"},
-        "MCD Peak Shift": set(),
+        "MCD Peak Shift": {"Advanced detection"},
         "Slides": set(),
         "Tools": set(),
     }.get(workflow, set())

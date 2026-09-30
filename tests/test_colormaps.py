@@ -106,8 +106,8 @@ class ColormapUiTests(unittest.TestCase):
         self.addCleanup(folder.cleanup)
         self.settings = QSettings(str(Path(folder.name) / 'settings.ini'), QSettings.IniFormat)
         for context in (patch('ui_qt.main_window.QSettings', return_value=self.settings),
-                        patch.object(MainWindow, '_restore_last_folder'),
-                        patch.object(MainWindow, '_schedule_automatic_update_check')):
+                        patch.object(MainWindow, '_restore_last_folder', autospec=True),
+                        patch.object(MainWindow, '_schedule_automatic_update_check', autospec=True)):
             context.start()
             self.addCleanup(context.stop)
 

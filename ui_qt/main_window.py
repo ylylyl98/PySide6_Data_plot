@@ -898,6 +898,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._build_ui()
         self._folder_placeholder_text = self.folder_edit.placeholderText()
         self.apply_ui_metrics()
+        # Keep the complete source bar reachable after optional actions are added.
+        # QToolBar otherwise moves the whole QWidgetAction into its overflow menu.
+        self.menu_toolbar_host.main_toolbar.ensurePolished()
+        self.setMinimumWidth(max(self.minimumWidth(), self.menu_toolbar_host.main_toolbar.sizeHint().width()))
         self._wire_actions()
         self.compare_controller._cmp_update_background_mode()
         self._apply_initial_geometry()
@@ -909,6 +913,13 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._restore_last_folder()
         self.setAcceptDrops(True)
         self._schedule_automatic_update_check()
+
+    @Slot(object)
+    def _on_application_theme_changed(self, theme) -> None:
+        # Use the QObject receiver so Qt disconnects this application-owned
+        # signal when the window is destroyed; closing still permits re-show.
+        self.menu_toolbar_host.apply_theme(theme, navigation_toolbar=self.toolbar)
+        self.mcd_controller._on_theme_changed(theme)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
         """Invalidate background callbacks and let active file reads finish."""
@@ -1499,12 +1510,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._theme_manager = theme_manager()
         if self._theme_manager is not None:
             self._theme_manager.themeChanged.connect(
-                lambda theme: self.menu_toolbar_host.apply_theme(
-                    theme, navigation_toolbar=self.toolbar
-                )
-            )
-            self._theme_manager.themeChanged.connect(
-                self.mcd_controller._on_theme_changed
+                self._on_application_theme_changed
             )
         # Compatibility aliases remain owned by MainWindow for existing callers.
         self.show_log_action = self.menu_toolbar_host.show_log_action

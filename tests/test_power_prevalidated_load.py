@@ -2,14 +2,17 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from PySide6.QtCore import QCoreApplication, QObject
+from PySide6.QtCore import QObject
+from PySide6.QtWidgets import QApplication
 from ui_qt.main_window import MainWindow
 
 
 class PowerPrevalidatedLoadTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.app = QCoreApplication.instance() or QCoreApplication([])
+        # Other modules create widgets in this process; Qt cannot upgrade a
+        # previously created QCoreApplication into a QApplication.
+        cls.app = QApplication.instance() or QApplication([])
 
     def owner(self):
         owner = QObject()

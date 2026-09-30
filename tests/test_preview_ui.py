@@ -802,7 +802,17 @@ _validate_capture_font(app)
                 workflow="PL", theme="light", scale="1", width=1200, height=800, sidebar_width=380, demo_data=True
             )
         try:
-            self.assertEqual(window.workspace_splitter.sizes()[0], 380)
+            window.show()
+            app.processEvents()
+            splitter = window.workspace_splitter
+            plot = splitter.widget(1)
+            plot_minimum = max(plot.minimumWidth(), plot.minimumSizeHint().width())
+            chrome = window.width() - sum(splitter.sizes())
+            window.resize(max(window.width(), 380 + plot_minimum + chrome), window.height())
+            app.processEvents()
+            splitter.setSizes([380, splitter.width() - splitter.handleWidth() - 380])
+            app.processEvents()
+            self.assertEqual(splitter.sizes()[0], 380)
             self.assertIsNotNone(window.findChild(QLabel, "previewDemoBanner"))
         finally:
             with _profile_phase("preview_teardown:PL_demo"):
@@ -865,7 +875,7 @@ _validate_capture_font(app)
 
     def test_each_workflow_profile_uses_only_active_targets(self) -> None:
         sys.path.insert(0, str(ROOT))
-        from scripts.preview_ui import WORKFLOWS, build_preview_window, workflow_index, _apply_demo_profile
+        from scripts.preview_ui import WORKFLOWS, build_preview_window, workflow_index, _apply_demo_profile, _expand_safe_sections
         from PySide6.QtWidgets import QApplication
         from PySide6.QtWidgets import QDoubleSpinBox
 
@@ -894,6 +904,7 @@ _validate_capture_font(app)
                     window.workflow_tabs.setCurrentIndex(index)
                 with _profile_phase(f"demo_population:{workflow}"):
                     _apply_demo_profile(window, workflow)
+                    _expand_safe_sections(window, workflow)
                 with _profile_phase(f"signal_processing:{workflow}"):
                     app.processEvents()
                 self.assertTrue(window._preview_profile_targets, workflow)

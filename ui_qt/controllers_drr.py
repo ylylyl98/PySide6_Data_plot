@@ -10,7 +10,7 @@ from threading import Event
 from typing import List
 
 import numpy as np
-from PySide6.QtCore import QObject, QRunnable, QSize, Qt, Signal, QItemSelectionModel, QStandardPaths, QTimer, QPoint
+from PySide6.QtCore import QByteArray, QDataStream, QIODevice, QObject, QRunnable, QSize, Qt, Signal, QItemSelectionModel, QStandardPaths, QTimer, QPoint
 from PySide6.QtGui import QColor, QFont, QPainter, QPalette
 from scipy.optimize import curve_fit
 from PySide6.QtWidgets import (
@@ -1421,6 +1421,15 @@ class DrrController:
                               selected_sources=tuple(selected_paths))
             return ()
 
+        def _palette_content_key(widget):
+            # cacheKey identifies Qt storage, not palette content. Styled
+            # dialogs recreate equivalent palettes; serialize all brush roles
+            # for a value-based, hashable key in both row caches.
+            data = QByteArray()
+            stream = QDataStream(data, QIODevice.WriteOnly)
+            stream << widget.palette()
+            return bytes(data)
+
         catalog_signature = None
         presentations = getattr(self._owner, '_drr_picker_presentations', [])
         self._owner._drr_picker_presentations = presentations
@@ -1429,7 +1438,10 @@ class DrrController:
             return (str(self.current_folder).casefold(), baseline_mode,
                     tuple(self.drr_available_sources), type_combo.currentData(),
                     tuple(self.drr_selected_files) if baseline_mode else (),
-                    dlg.palette().cacheKey(), dlg.font().toString())
+                    # Equal styled palettes may have distinct Qt cache keys.
+                    # Keep a value snapshot: reuse unchanged rows, but invalidate
+                    # them when actual theme colors change.
+                    dlg.palette(), dlg.font().toString())
 
         def _catalog_groups():
             nonlocal baseline_recommendations, catalog_signature
@@ -1588,7 +1600,7 @@ class DrrController:
                     _sync_drr_rows(file_list, [], preserve_view=preserve_view)
                     group_detail.clear()
                     return
-                cache_key = (group.key, file_list.palette().cacheKey(), file_list.font().toString())
+                cache_key = (group.key, _palette_content_key(file_list), file_list.font().toString())
                 cached_rows = file_rows_cache.get(cache_key)
                 if cached_rows is not None:
                     summary, prototypes = cached_rows
@@ -1607,6 +1619,8 @@ class DrrController:
                 )
                 source_by_path = catalog_by_path
                 def _linked_label(path: str) -> str:
+                    if self._drr_missing_sources([path]):
+                        return f"{path} (missing)"
                     linked = source_by_path.get(path)
                     if linked is None:
                         return f"{path} (gate details unavailable)"
@@ -1775,7 +1789,7 @@ class DrrController:
             try:
                 rows = []
                 for group in visible:
-                    cache_key = (group.key, group_list.palette().cacheKey(), group_list.font().toString())
+                    cache_key = (group.key, _palette_content_key(group_list), group_list.font().toString())
                     cached = group_rows_cache.get(cache_key)
                     if cached is not None:
                         rows.append(QListWidgetItem(cached))

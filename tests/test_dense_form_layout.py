@@ -25,7 +25,7 @@ class DenseFormRowLayoutTests(unittest.TestCase):
         settings_patch = patch('ui_qt.main_window.QSettings', return_value=settings)
         settings_patch.start()
         self.addCleanup(settings_patch.stop)
-        updates = patch.object(MainWindow, '_schedule_automatic_update_check')
+        updates = patch.object(MainWindow, '_schedule_automatic_update_check', autospec=True)
         updates.start()
         self.addCleanup(updates.stop)
 
@@ -219,18 +219,25 @@ class DenseFormRowLayoutTests(unittest.TestCase):
         with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
             window = MainWindow()
         try:
-            # Leave room for the DRR plot toolbar plus the 380 px test sidebar.
-            # At the minimum window width Qt legitimately shrinks it to 320 px.
+            # Establish the active page before measuring its toolbar minimum.
             window.resize(1400, 820); window.show(); self.app.processEvents()
             index = next(i for i in range(window.tabs.count()) if window.tabs.tabText(i) == mode)
             window.tabs.setCurrentIndex(index)
             manual = next(button for button in window.tabs.widget(index).findChildren(QToolButton) if button.text() == "Manual plot ranges")
             manual.setChecked(True)
             self.app.processEvents()
-            # QSplitter scales requested sizes to the available width; [380, 900]
-            # does not request an actual 380 px sidebar in an 1180 px window.
+            # Toolbar minimums vary with platform fonts and available actions.
+            # Reserve their actual minimum plus the 380 px sidebar under test;
+            # a fixed 1400 px window can legitimately compress the sidebar.
+            target_width = 380
+            plot_panel = window.workspace_splitter.widget(1)
+            plot_minimum = max(plot_panel.minimumWidth(), plot_panel.minimumSizeHint().width())
+            chrome_width = window.width() - sum(window.workspace_splitter.sizes())
+            window.resize(max(window.width(), target_width + plot_minimum + chrome_width), window.height())
+            self.app.processEvents()
+            # Requested sizes must sum to the available width to avoid scaling.
             total = sum(window.workspace_splitter.sizes())
-            window.workspace_splitter.setSizes([380, total - 380])
+            window.workspace_splitter.setSizes([target_width, total - target_width])
             self.app.processEvents()
             for axis in ("vmin", "xmin", "ymin"):
                 spins = getattr(window, f"{prefix}_spins")
@@ -240,7 +247,6 @@ class DenseFormRowLayoutTests(unittest.TestCase):
                 self.assertIsInstance(row.layout(), DenseFormRowLayout)
                 self.assertTrue(row.layout().labelWidget().isVisible())
                 direct = [row.layout().itemAt(i).widget() for i in range(row.layout().count()) if row.layout().itemAt(i).widget() is not row.layout().labelWidget()]
-                target_width = 380
                 row.resize(target_width, row.layout().heightForWidth(target_width))
                 row.layout().setGeometry(row.contentsRect())
                 width = row.contentsRect().width()

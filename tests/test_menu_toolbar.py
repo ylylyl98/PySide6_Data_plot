@@ -75,14 +75,14 @@ class MenuToolbarHostTests(unittest.TestCase):
             self.assertFalse(host.main_toolbar.isMovable())
             self.assertEqual(
                 [action.text() for action in host.main_toolbar.actions()],
-                ["Load", "Plot / Update", "Save PNG + DAT", "", ""],
+                ["Reload", "Update now", "Save PNG + DAT", "", ""],
             )
             self.assertEqual(host.main_toolbar.actions()[3], host.source_separator_action)
             self.assertEqual(host.main_toolbar.actions()[4], host.source_widget_action)
             self.assertIs(host.source_widget_action.defaultWidget(), source)
             self.assertIs(host.main_toolbar.widgetForAction(host.source_widget_action), source)
-            self.assertEqual(host.load_action.toolTip(), "Load data for the active tab")
-            self.assertEqual(host.plot_action.toolTip(), "Plot/update current state")
+            self.assertEqual(host.load_action.toolTip(), "Reload data for the active tab")
+            self.assertEqual(host.plot_action.toolTip(), "Update the current plot")
             self.assertEqual(host.save_action.toolTip(), "Export for the active tab")
             self.assertIsInstance(host.clean_verified_sources_chk, QCheckBox)
             self.assertIsInstance(host.move_now_btn, QPushButton)

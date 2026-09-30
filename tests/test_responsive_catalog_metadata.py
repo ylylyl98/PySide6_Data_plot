@@ -11,6 +11,17 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 class CatalogMetadataTests(unittest.TestCase):
+    def _window_view(self, owner, center, width):
+        # Exercise the real numerical adapter used by the unified view.
+        from ui_qt.mcd_unified_page import McdUnifiedView
+        view = SimpleNamespace(
+            state=SimpleNamespace(window_center_ev=center, window_width_mev=width,
+                                  window_metric=owner.mcd_window_metric_combo.currentText()),
+            _window_trace_cache=None,
+        )
+        view.window_traces = lambda result: McdUnifiedView.window_traces(view, result)
+        return view
+
     def test_worker_publishes_tagged_mtimes_for_requested_scope(self):
         from ui_qt.main_window import _scan_folder_sources_worker
         with tempfile.TemporaryDirectory() as folder:
@@ -147,7 +158,7 @@ class CatalogMetadataTests(unittest.TestCase):
         result = SimpleNamespace(
             energy_ev=[2.2, 2.0, 1.8],
             pair_mcd_corrected=[[1.0, 2.0, 3.0]], pair_b=[0.5],
-            pair_labels=("p",),
+            pair_labels=("B increasing",),
         )
         owner = MainWindow.__new__(MainWindow)
         object.__setattr__(owner, "loaded", SimpleNamespace(mcd_result=result))
@@ -158,7 +169,7 @@ class CatalogMetadataTests(unittest.TestCase):
             slope_high_positive_spin=spin(0), slope_high_positive_end_spin=spin(1),
             slope_high_negative_spin=spin(-1), slope_high_negative_end_spin=spin(0),
         )
-        view = SimpleNamespace(state=SimpleNamespace(window_center_ev=2.0, window_width_mev=400.0))
+        view = self._window_view(owner, 2.0, 500.0)
         captured = {}
         with patch("core.mcd_analysis.fit_mcd_slopes", side_effect=lambda b, trace, labels, ranges: captured.setdefault("trace", trace)):
             MainWindow._compute_unified_mcd_slopes(owner, view)
@@ -170,7 +181,7 @@ class CatalogMetadataTests(unittest.TestCase):
         result = SimpleNamespace(
             energy_ev=[2.2, 2.0, 2.0, 1.8],
             pair_mcd_corrected=[[1.0, np.nan, 3.0, 5.0]], pair_b=[-2.0],
-            pair_labels=("p",),
+            pair_labels=("B increasing",),
         )
         owner = MainWindow.__new__(MainWindow)
         object.__setattr__(owner, "loaded", SimpleNamespace(mcd_result=result))
@@ -180,15 +191,16 @@ class CatalogMetadataTests(unittest.TestCase):
             slope_high_positive_spin=spin(0), slope_high_positive_end_spin=spin(1),
             slope_high_negative_spin=spin(-1), slope_high_negative_end_spin=spin(0),
         )
-        view = SimpleNamespace(state=SimpleNamespace(window_center_ev=2.0, window_width_mev=200.0))
+
         for metric, expected in (("Mean", 3.0), ("Absolute mean", 3.0),
                                  ("Field absolute", -3.0), ("Integral", 0.0)):
             owner.mcd_window_metric_combo = SimpleNamespace(currentText=lambda m=metric: m)
+            view = self._window_view(owner, 2.0, 200.0)
             captured = {}
             with patch("core.mcd_analysis.fit_mcd_slopes", side_effect=lambda b, trace, labels, ranges: captured.setdefault("trace", trace)):
                 MainWindow._compute_unified_mcd_slopes(owner, view)
             if metric == "Integral":
-                self.assertEqual(metric, "Integral")
+                self.assertTrue(np.isnan(captured["trace"]).all())
             else:
                 self.assertTrue(np.isfinite(captured["trace"]).all())
                 self.assertAlmostEqual(float(captured["trace"][0]), expected, places=6)
@@ -208,17 +220,16 @@ class CatalogMetadataTests(unittest.TestCase):
             slope_high_positive_spin=spin(0), slope_high_positive_end_spin=spin(1),
             slope_high_negative_spin=spin(-1), slope_high_negative_end_spin=spin(0),
         )
-        view = SimpleNamespace(state=SimpleNamespace(window_center_ev=2.0, window_width_mev=500.0))
+        view = self._window_view(owner, 2.2, 100.0)
         traces = []
         with patch("core.mcd_analysis.fit_mcd_slopes", side_effect=lambda b, trace, labels, ranges: traces.append(np.asarray(trace).copy())):
             MainWindow._compute_unified_mcd_slopes(owner, view)
             result.energy_ev[:] = [1.8, 2.2]
-            result.pair_mcd_corrected[:] = [[4.0, 2.0]]
+            result.pair_mcd_corrected[:] = [[4.0, 7.0]]
             MainWindow._compute_unified_mcd_slopes(owner, view)
         self.assertEqual(len(traces), 2)
-        np.testing.assert_allclose(traces[0], [3.0])
-        np.testing.assert_allclose(traces[1], [3.0])
-        self.assertNotEqual(getattr(result, "_unified_energy_order_signature", None), None)
+        np.testing.assert_allclose(traces[0], [2.0])
+        np.testing.assert_allclose(traces[1], [7.0])
 
     def test_mcd_four_metric_branch_matrix_matches_reference_including_empty_window(self):
         from ui_qt.main_window import MainWindow
@@ -235,17 +246,19 @@ class CatalogMetadataTests(unittest.TestCase):
         for label, expected in (("Mean", [2., 5.]), ("Absolute mean", [2., 5.]),
                                 ("Field absolute", [-2., 5.]), ("Integral", [.8, 2.])):
             owner.mcd_window_metric_combo = SimpleNamespace(currentText=lambda value=label: value)
-            view = SimpleNamespace(state=SimpleNamespace(window_center_ev=2., window_width_mev=500.))
+            view = self._window_view(owner, 2.0, 500.0)
             captured = {}
             with patch("core.mcd_analysis.fit_mcd_slopes", side_effect=lambda b, trace, labels, ranges: captured.setdefault("trace", trace)):
                 MainWindow._compute_unified_mcd_slopes(owner, view)
             np.testing.assert_allclose(captured["trace"], expected, equal_nan=True)
         owner.mcd_window_metric_combo = SimpleNamespace(currentText=lambda: "Integral")
-        empty = SimpleNamespace(state=SimpleNamespace(window_center_ev=9., window_width_mev=1.))
+        empty = self._window_view(owner, 9.0, 1.0)
         captured = {}
         with patch("core.mcd_analysis.fit_mcd_slopes", side_effect=lambda b, trace, labels, ranges: captured.setdefault("trace", trace)):
             MainWindow._compute_unified_mcd_slopes(owner, empty)
-        self.assertTrue(np.isnan(captured["trace"]).all())
+        # The shared core reduction uses the nearest measured sample when
+        # the requested window contains no samples; a one-point integral is zero.
+        np.testing.assert_allclose(captured["trace"], [0., 0.])
 
     def test_shg_angle_spin_signal_is_view_only_for_single_and_compare(self):
         from ui_qt.common import LoadedState

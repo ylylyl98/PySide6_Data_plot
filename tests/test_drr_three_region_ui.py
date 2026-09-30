@@ -26,7 +26,7 @@ class ThreeRegionUiTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.settings = QSettings(str(Path(self.tmp.name) / 'settings.ini'), QSettings.IniFormat)
         with patch('ui_qt.main_window.QSettings', return_value=self.settings), patch.object(
-                MainWindow, '_restore_last_folder'), patch.object(MainWindow, '_schedule_automatic_update_check'):
+                MainWindow, '_restore_last_folder', autospec=True), patch.object(MainWindow, '_schedule_automatic_update_check', autospec=True):
             self.w = MainWindow()
         self.addCleanup(self.w.close)
         cube, _ = example()

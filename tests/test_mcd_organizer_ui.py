@@ -14,6 +14,7 @@ import pandas as pd
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QCoreApplication, QEvent, Qt, QThreadPool
 from PySide6.QtWidgets import QApplication, QMainWindow
+from PySide6.QtTest import QTest
 
 from ui_qt.main_window import MainWindow
 from ui_qt.mcd_organizer_window import McdOrganizerWindow
@@ -129,7 +130,11 @@ class McdOrganizerWindowTests(unittest.TestCase):
                 self.assertIn("1 series / 2 results selected", window.selection_summary.text())
                 self.assertIn("Export 1 selected series", window.export_btn.text())
                 self.assertEqual(len(window.figure.axes), 2)
-                self.assertEqual(len(window.slope_figure.axes), 1)
+                # Energy centers and the enabled near-zero slopes have separate panels.
+                energy_axis, slope_axis = window.slope_figure.axes
+                self.assertIn("saved integration center", energy_axis.get_title(loc="left"))
+                self.assertEqual(slope_axis.get_title(loc="left"), "MCD slopes vs E-field")
+                self.assertTrue(energy_axis.get_shared_x_axes().joined(energy_axis, slope_axis))
                 self.assertEqual(window.condition_list.count(), 2)
                 window.condition_exclude_btn.click()
                 self.assertIn("1 series / 1 results selected", window.selection_summary.text())
@@ -209,7 +214,7 @@ class McdOrganizerWindowTests(unittest.TestCase):
             finally:
                 window.close()
 
-    def test_focus_and_exclusion_reuse_existing_plot_artists(self) -> None:
+    def test_focus_and_exclusion_update_coalesced_preview(self) -> None:
         with tempfile.TemporaryDirectory() as folder_text:
             root = Path(folder_text)
             self._write_result(root, "low", doping=6.3, efield=0.0, energy=1.57)
@@ -220,13 +225,27 @@ class McdOrganizerWindowTests(unittest.TestCase):
                 self._wait_for_scan(window)
                 window.condition_list.setCurrentRow(0)
                 record_id = str(window.condition_list.currentItem().data(Qt.UserRole))
-                artists = list(window._plot_artists[record_id])
-                with patch.object(window, "_update_preview") as rebuild:
-                    window._exclude_focused_condition()
-                    rebuild.assert_not_called()
-                self.assertTrue(all(not artist.get_visible() for artist in artists))
+                original_ids = set(window._plot_artists)
+                window._exclude_focused_condition()
+                for _ in range(100):
+                    QTest.qWait(10)
+                    if not window._preview_timer.isActive():
+                        break
+                self.assertFalse(window._preview_timer.isActive())
+                self.assertEqual(set(window._plot_artists), original_ids - {record_id})
+                slope_ids = {record.record_id
+                             for records, _, _ in window._energy_point_artists.values()
+                             for record in records}
+                self.assertEqual(slope_ids, original_ids - {record_id})
                 window._restore_focused_condition()
-                self.assertTrue(all(artist.get_visible() for artist in artists))
+                for _ in range(100):
+                    QTest.qWait(10)
+                    if not window._preview_timer.isActive():
+                        break
+                self.assertFalse(window._preview_timer.isActive())
+                self.assertEqual(set(window._plot_artists), original_ids)
+                self.assertTrue(all(artist.get_visible()
+                                    for artist in window._plot_artists[record_id]))
             finally:
                 window.close()
 
