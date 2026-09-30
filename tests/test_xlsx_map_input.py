@@ -260,7 +260,7 @@ class XlsxMapDrrUiTests(unittest.TestCase):
         combo = self.window.drr_yaxis_combo
         self.assertEqual(
             self._combo_items(),
-            ["Auto / Default", "TG", "BG", "Bias", "Advanced..."],
+            ["Auto / Default", "TG+BG", "TG-BG", "TG", "BG", "Bias", "Advanced..."],
         )
 
         self.window.drr_selected_files = ["dR_R.xlsx"]
@@ -282,7 +282,7 @@ class XlsxMapDrrUiTests(unittest.TestCase):
         self.window.drr_controller._update_drr_selection_labels()
         self.assertEqual(
             self._combo_items(),
-            ["Auto / Default", "TG", "BG", "Bias", "Advanced..."],
+            ["Auto / Default", "TG+BG", "TG-BG", "TG", "BG", "Bias", "Advanced..."],
         )
 
     def test_reject_mixed_xlsx_selection(self) -> None:

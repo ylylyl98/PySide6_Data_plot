@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QApplication
 from ui_qt.controllers_drr import DrrController
 from ui_qt.main_window import MainWindow
 from ui_qt.theme import install_theme
+from tests.ui_test_helpers import dispose_owned_window
 from core.drr_sources import resolve_drr_background_assignments
 
 
@@ -54,9 +55,7 @@ class DrrBgOnlyWorkflowTests(unittest.TestCase):
             self.window = MainWindow()
 
     def tearDown(self) -> None:
-        self.window.close()
-        self.window.deleteLater()
-        self.app.processEvents()
+        dispose_owned_window(self.window)
 
     def test_editing_measurement_clears_stale_external_without_silent_self_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -163,6 +162,8 @@ class DrrBgOnlyWorkflowTests(unittest.TestCase):
             )
             w._on_loaded(loaded, request_token=w._active_load_token)
             w._on_load_finished(request_token=w._active_load_token)
+            from tests.test_drr_dual_view_regressions import DrrDualViewRegressionTests
+            DrrDualViewRegressionTests._wait_derivative(self)
             w.figure.canvas.draw()
             raw_map = w._drr_heatmap_axes["raw"]
             second_map = w._drr_heatmap_axes["second"]

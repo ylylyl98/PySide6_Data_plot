@@ -12,6 +12,15 @@ from ui_qt.main_window import MainWindow, _scan_folder_sources_worker, _cached_f
 
 
 class LazyCatalogTests(unittest.TestCase):
+    def setUp(self):
+        # Exercise real cache persistence without depending on (or modifying)
+        # the user's AppData directory, which may be read-only in test runners.
+        cache_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_directory.cleanup)
+        environment = patch.dict(os.environ, LOCALAPPDATA=cache_directory.name)
+        environment.start()
+        self.addCleanup(environment.stop)
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])

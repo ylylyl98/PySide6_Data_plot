@@ -63,7 +63,7 @@ class WorkspaceWindowTests(unittest.TestCase):
             self.assertTrue(w.save_workspace(quiet=True))
             restored=DrrAnalysisWindow()
             try:
-                with patch('ui_qt.drr_p2p_batch.BatchRangeAmplitudePage.compute_records',side_effect=AssertionError('recalculated')):
+                with patch('ui_qt.drr_p2p_batch.BatchRangeAmplitudePage.compute_records',autospec=True,side_effect=AssertionError('recalculated')):
                     restored.restore_session(path)
                 p=restored.amplitude_page
                 self.assertIsNotNone(p)

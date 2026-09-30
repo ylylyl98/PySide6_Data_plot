@@ -54,7 +54,7 @@ from ui_qt.fluent_ui.style import set_fluent_property
 from ui_qt.status_badge import StatusBadge
 from ui_qt.mcd_source_summary import McdSourceSummary
 from ui_qt.dense_form_layout import DenseFormRowLayout
-from ui_qt.mcd_unified_page import McdUnifiedControls
+from ui_qt.mcd_unified_page import McdUnifiedControls, McdControlFlowLayout
 
 
 def _mcd_local_fit_worker(
@@ -1421,16 +1421,13 @@ class FeatureTabsMixin:
         self.mcd_show_absolute_mean_chk = QCheckBox("B*|MCD|"); self.mcd_show_absolute_mean_chk.setChecked(False)
         self.mcd_show_unsigned_absolute_mean_chk = QCheckBox("|MCD|"); self.mcd_show_unsigned_absolute_mean_chk.setChecked(False)
         self.mcd_show_integral_chk = QCheckBox("Integral"); self.mcd_show_integral_chk.setChecked(False)
-        trace_visibility = QWidget(); trace_visibility_layout = QGridLayout(trace_visibility)
+        trace_visibility = QWidget(); trace_visibility_layout = McdControlFlowLayout(trace_visibility)
         trace_visibility_layout.setContentsMargins(0, 0, 0, 0)
-        trace_visibility_layout.setHorizontalSpacing(6); trace_visibility_layout.setVerticalSpacing(2)
-        trace_visibility_layout.addWidget(self.mcd_show_raw_chk, 0, 0)
-        trace_visibility_layout.addWidget(self.mcd_show_signed_mean_chk, 0, 1)
-        trace_visibility_layout.addWidget(self.mcd_show_absolute_mean_chk, 1, 0)
-        trace_visibility_layout.addWidget(self.mcd_show_unsigned_absolute_mean_chk, 1, 1)
-        trace_visibility_layout.addWidget(self.mcd_show_integral_chk, 2, 0)
-        trace_visibility_layout.setColumnStretch(0, 1)
-        trace_visibility_layout.setColumnStretch(1, 1)
+        trace_visibility_layout.setSpacing(4)
+        for checkbox in (self.mcd_show_raw_chk, self.mcd_show_signed_mean_chk,
+                         self.mcd_show_absolute_mean_chk, self.mcd_show_unsigned_absolute_mean_chk,
+                         self.mcd_show_integral_chk):
+            trace_visibility_layout.addWidget(checkbox)
         self.mcd_window_metric_combo.setToolTip("Selects the primary MCD(B) metric recorded in export settings. The Origin-ready MCD(B) CSV contains corrected signed mean, field-signed absolute mean, and signed integral for both B-sweep directions.")
         self.mcd_show_raw_chk.setToolTip("Add dashed raw-MCD curves for comparison with the corrected curves.")
         self.mcd_show_signed_mean_chk.setToolTip("Average signed MCD inside the selected energy window.")

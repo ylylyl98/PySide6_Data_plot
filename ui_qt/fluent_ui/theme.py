@@ -473,7 +473,11 @@ class FluentThemeManager(QObject):
             )
             self.app.setFont(self._build_font(theme))
             self.app.setPalette(palette)
-            self.app.setStyleSheet(qss)  # fluent-audit: allow generated application QSS
+            # Reinstalling identical application QSS repolishes every widget.
+            # Compare the actual value so external stylesheet changes are still
+            # restored, while all other apply steps and notifications continue.
+            if self.app.styleSheet() != qss:
+                self.app.setStyleSheet(qss)  # fluent-audit: allow generated application QSS
             self._current_theme = theme
             self.themeChanged.emit(theme)
             return theme

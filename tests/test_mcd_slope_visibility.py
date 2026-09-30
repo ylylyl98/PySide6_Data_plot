@@ -87,7 +87,14 @@ class SlopeVisibilityTests(unittest.TestCase):
                 self.assertEqual(w.condition_list.count(), count_before)
                 self.assertFalse(w._list_refreshing)
                 saved = json.loads(w._selection_settings_path().read_text(encoding='utf-8'))
-                self.assertTrue(all(saved['energy_groups'][r.record_id]=='Joined' for r in records))
+                self.assertEqual(saved['schema_version'], 3)
+                scope_key = w._scope_series_bindings[w._current_series().series_id]
+                self.assertEqual(saved['group_scopes'][scope_key]['manual'],
+                                 {r.record_id: 'Joined' for r in records})
+                # Legacy assignments are retained separately for migration only.
+                w._energy_group_overrides.clear()
+                w._load_saved_condition_selections()
+                self.assertEqual(set(w._energy_groups(records).values()), {'Joined'})
                 self.assertIn('test color failure',w.selection_summary.text())
                 w._energy_groups_changed()
                 self.assertEqual(w.condition_list.count(),count_before)

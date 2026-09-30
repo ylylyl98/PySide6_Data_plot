@@ -255,6 +255,12 @@ class MCDPeakShiftUITests(unittest.TestCase):
         self.addCleanup(self._settings_dir.cleanup)
 
     def _wait_for_peak_analysis(self, window):
+        # Plot interaction tests must give this workflow ownership of the shared
+        # canvas; hidden pages deliberately defer drawing to the active page.
+        index = next(i for i in range(window.tabs.count())
+                     if window.tabs.tabText(i) == "MCD Peak Shift")
+        window.tabs.setCurrentIndex(index)
+        self.assertTrue(window._mcd_peak_page_active())
         deadline = time.monotonic() + 5.0
         while (
             getattr(window, "_mcd_peak_analysis_worker", None) is not None

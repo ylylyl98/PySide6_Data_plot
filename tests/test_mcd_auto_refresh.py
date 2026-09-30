@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -10,12 +11,14 @@ import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QCoreApplication, QEvent
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from core.mcd import McdSettings, _pair_angles
 from core.mcd_peak_shift import analyze_peak_shift
 from tests.test_mcd_peak_shift import _result
 from ui_qt.main_window import LoadedState, MainWindow
+from ui_qt.feature_pages import _mcd_local_fit_worker
 
 
 class AngleMatchingTests(unittest.TestCase):
@@ -116,12 +119,30 @@ class MCDAutoRefreshTests(unittest.TestCase):
         w._update_mcd_peak_shift_source(source)
         return next(i for i in range(w.tabs.count()) if w.tabs.tabText(i) == "MCD Peak Shift")
 
+    def wait_for_analysis(self):
+        deadline = time.monotonic() + 5.0
+        while self.window._mcd_peak_analysis_worker is not None and time.monotonic() < deadline:
+            self.app.processEvents()
+            QTest.qWait(1)
+        self.assertIsNone(self.window._mcd_peak_analysis_worker)
+        self.assertIsNotNone(self.window.mcd_peak_result)
+
+    def capture_local_fit(self, submitted):
+        def start(worker):
+            # The same pool also runs history lookups and raw/derivative analysis.
+            # Run their real functions inline; count only the local fits under test.
+            if worker.fn is _mcd_local_fit_worker:
+                submitted.append(worker)
+            else:
+                worker.run()
+        return patch.object(self.window.thread_pool, "start", side_effect=start)
+
     def test_tab_entry_analyzes_once_and_reuses_results(self):
         index = self.prepare_peak()
         w = self.window
         with patch("ui_qt.feature_pages.analyze_peak_shift", wraps=analyze_peak_shift) as analyze:
             w.tabs.setCurrentIndex(index)
-            self.assertIsNotNone(w.mcd_peak_result)
+            self.wait_for_analysis()
             result = w.mcd_peak_result
             count = analyze.call_count
             w.tabs.setCurrentIndex(0)
@@ -131,13 +152,14 @@ class MCDAutoRefreshTests(unittest.TestCase):
             w.tabs.setCurrentIndex(0)
             w.mcd_peak_prom_spin.setValue(w.mcd_peak_prom_spin.value() + .01)
             w.tabs.setCurrentIndex(index)
+            self.wait_for_analysis()
             self.assertGreater(analyze.call_count, count)
 
     def test_tab_entry_during_local_fit_does_not_restart_worker(self):
         index = self.prepare_peak("Local mixed fit")
         w = self.window
         submitted = []
-        with patch.object(w.thread_pool, "start", side_effect=submitted.append):
+        with self.capture_local_fit(submitted):
             w.tabs.setCurrentIndex(index)
             self.assertEqual(len(submitted), 1)
             token = w._mcd_peak_fit_cancel_event
@@ -155,13 +177,13 @@ class MCDAutoRefreshTests(unittest.TestCase):
         w.tabs.setCurrentIndex(index)
         self.assertIsNone(w.mcd_peak_result)
         w._on_load_finished()
-        self.assertIsNotNone(w.mcd_peak_result)
+        self.wait_for_analysis()
 
     def test_identical_explicit_local_fit_request_is_not_restarted(self):
         self.prepare_peak("Local mixed fit")
         w = self.window
         submitted = []
-        with patch.object(w.thread_pool, "start", side_effect=submitted.append):
+        with self.capture_local_fit(submitted):
             w._request_mcd_local_fit(seed_energy_ev=1.68, feature_kind="peak")
             token = w._mcd_peak_fit_cancel_event
             w._request_mcd_local_fit(seed_energy_ev=1.68, feature_kind="peak")
@@ -172,7 +194,7 @@ class MCDAutoRefreshTests(unittest.TestCase):
         self.prepare_peak("Local mixed fit")
         w = self.window
         submitted = []
-        with patch.object(w.thread_pool, "start", side_effect=submitted.append):
+        with self.capture_local_fit(submitted):
             w._request_mcd_local_fit(seed_energy_ev=1.68, feature_kind="peak")
             token = w._mcd_peak_fit_cancel_event
             w.mcd_peak_tracker_method_combo.setCurrentText("Raw spectrum")

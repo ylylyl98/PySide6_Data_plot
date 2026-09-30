@@ -949,7 +949,19 @@ class McdUnifiedView(QWidget):
             metric_key = "mean"
         key = (id(result), id(getattr(result, 'pair_mcd_corrected', None)),
                self.state.window_center_ev, self.state.window_width_mev, metric_key)
-        if self._window_trace_cache is None or self._window_trace_cache[0] != key:
+        # Results may be revised in place; identity alone cannot validate a
+        # cached trace (nor slopes derived from that trace).
+        inputs = tuple(np.asarray(getattr(result, name)) for name in
+                       ('wavelength_nm', 'pair_mcd_corrected', 'pair_b', 'pair_labels')
+                       if hasattr(result, name))
+        if not hasattr(result, 'wavelength_nm'):
+            inputs += (np.asarray(result.energy_ev),)
+        cached = self._window_trace_cache
+        unchanged = (cached is not None and cached[0] == key and len(cached) == 3
+                     and len(cached[2]) == len(inputs)
+                     and all(np.array_equal(old, new, equal_nan=old.dtype.kind in 'fc')
+                             for old, new in zip(cached[2], inputs)))
+        if not unchanged:
             from core.mcd import pair_window_trace_by_branch
             source = result
             if not hasattr(result, 'wavelength_nm'):
@@ -957,7 +969,7 @@ class McdUnifiedView(QWidget):
                 source = copy.copy(result)
                 source.wavelength_nm = 1239.841984 / np.asarray(result.energy_ev, float)
             traces = pair_window_trace_by_branch(source, key[2], key[3], metrics=(metric_key,), include_raw=False)
-            self._window_trace_cache = (key, traces)
+            self._window_trace_cache = (key, traces, tuple(array.copy() for array in inputs))
         return metric_key, self._window_trace_cache[1]
 
     def _refresh_mcd_window_trace(self) -> None:
@@ -2056,6 +2068,7 @@ class McdUnifiedControls(QWidget):
     def __init__(self, parent: QWidget | None = None, *, expander_factory=None) -> None:
         super().__init__(parent)
         from PySide6.QtWidgets import QFormLayout, QGroupBox, QLineEdit
+        from ui_qt.dense_form_layout import DenseFormRowLayout
 
         self.setObjectName("mcdUnifiedControls")
         layout = QVBoxLayout(self)
@@ -2063,6 +2076,7 @@ class McdUnifiedControls(QWidget):
         layout.setSpacing(4)
         feature = QGroupBox("Feature analysis", self)
         form = QFormLayout(feature)
+        form.setRowWrapPolicy(QFormLayout.WrapAllRows)
         self.feature_method_combo = QComboBox(feature)
         self.feature_method_combo.addItems(["Raw spectrum", "Second derivative", "Local fit (advanced)"])
         self.feature_source_combo = QComboBox(feature)
@@ -2078,6 +2092,7 @@ class McdUnifiedControls(QWidget):
         form.addRow("Search high (eV)", self.feature_search_high_spin)
         advanced = QGroupBox("Advanced reference / detection", feature)
         advanced_form = QFormLayout(advanced)
+        advanced_form.setRowWrapPolicy(QFormLayout.WrapAllRows)
         self.reference_mode_combo = QComboBox(advanced)
         self.reference_mode_combo.addItems(["E(0) per channel / branch", "Manual reference"])
         self.manual_reference_spin = QDoubleSpinBox(advanced)
@@ -2124,6 +2139,7 @@ class McdUnifiedControls(QWidget):
 
         slopes = QGroupBox("MCD slope ranges", self)
         slope_form = QFormLayout(slopes)
+        slope_form.setRowWrapPolicy(QFormLayout.WrapAllRows)
         self.slope_low_spin = QDoubleSpinBox(slopes)
         self.slope_low_end_spin = QDoubleSpinBox(slopes)
         self.slope_high_positive_spin = QDoubleSpinBox(slopes)
@@ -2136,27 +2152,30 @@ class McdUnifiedControls(QWidget):
         for spin, value in ((self.slope_low_spin, -0.2), (self.slope_low_end_spin, 0.2), (self.slope_high_positive_spin, 1.5), (self.slope_high_positive_end_spin, 2.0), (self.slope_high_negative_spin, -2.0), (self.slope_high_negative_end_spin, -1.5)):
             spin.setRange(-1e6, 1e6)
             spin.setDecimals(5)
+            spin.setMaximumWidth(130)
+            spin.setMinimumWidth(0)
+            spin.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
             spin.setValue(value)
             spin.setSuffix(" T")
         low_row = QWidget(slopes)
-        low_layout = QHBoxLayout(low_row)
+        low_layout = DenseFormRowLayout(low_row, stable_spin_width=True)
         low_layout.setContentsMargins(0, 0, 0, 0)
         low_layout.addWidget(self.slope_low_spin)
         low_layout.addWidget(QLabel("to"))
-        low_layout.addWidget(self.slope_low_end_spin)
+        low_layout.add_group((self.slope_low_end_spin,), role="action")
         slope_form.addRow("Low-field range", low_row)
         pos_row = QWidget(slopes)
-        pos_layout = QHBoxLayout(pos_row)
+        pos_layout = DenseFormRowLayout(pos_row, stable_spin_width=True)
         pos_layout.setContentsMargins(0, 0, 0, 0)
         pos_layout.addWidget(self.slope_high_positive_spin)
         pos_layout.addWidget(QLabel("to"))
-        pos_layout.addWidget(self.slope_high_positive_end_spin)
+        pos_layout.add_group((self.slope_high_positive_end_spin,), role="action")
         neg_row = QWidget(slopes)
-        neg_layout = QHBoxLayout(neg_row)
+        neg_layout = DenseFormRowLayout(neg_row, stable_spin_width=True)
         neg_layout.setContentsMargins(0, 0, 0, 0)
         neg_layout.addWidget(self.slope_high_negative_spin)
         neg_layout.addWidget(QLabel("to"))
-        neg_layout.addWidget(self.slope_high_negative_end_spin)
+        neg_layout.add_group((self.slope_high_negative_end_spin,), role="action")
         self.slope_high_positive_spin.setSuffix("")
         self.slope_high_negative_spin.setSuffix("")
         slope_form.addRow("High + range", pos_row)
@@ -2171,13 +2190,13 @@ class McdUnifiedControls(QWidget):
         retained_layout = QVBoxLayout(retained)
         self.retained_window_list = QListWidget(retained)
         self.retained_window_list.setMinimumHeight(48)
-        self.retain_window_btn = QPushButton("Retain current window", retained)
+        self.retain_window_btn = QPushButton("Retain current\nwindow", retained)
         self.update_retained_btn = QPushButton("Update selected", retained)
-        self.save_results_btn = QPushButton("Export retained results", retained)
+        self.save_results_btn = QPushButton("Export retained\nresults", retained)
         self.mcd_export_retained_btn = self.save_results_btn
         self.save_results_btn.setToolTip("Export only checked retained snapshots. Use the top Save button for the current center.")
         retained_layout.addWidget(self.retained_window_list)
-        row = QHBoxLayout()
+        row = QVBoxLayout()
         row.addWidget(self.retain_window_btn)
         row.addWidget(self.update_retained_btn)
         retained_layout.addLayout(row)
@@ -2188,17 +2207,19 @@ class McdUnifiedControls(QWidget):
         self.change_save_folder_btn = QPushButton("Change…", retained)
         retained_layout.addWidget(self.save_folder_label)
         retained_layout.addWidget(self.change_save_folder_btn)
-        retained_layout.addWidget(QLabel("Retained feature tracks"))
+        feature_label = QLabel("Retained feature tracks")
+        feature_label.setWordWrap(True)
+        retained_layout.addWidget(feature_label)
         self.retained_feature_list = QListWidget(retained)
         self.retained_feature_list.setMinimumHeight(36)
-        self.include_feature_chk = QPushButton("Include selected feature", retained)
+        self.include_feature_chk = QPushButton("Include selected\nfeature", retained)
         self.include_feature_chk.setCheckable(True)
         self.include_feature_chk.setChecked(True)
         self.include_feature_chk.setToolTip("Include the completed selected feature when saving the current center with the top Save button.")
-        self.retain_feature_btn = QPushButton("Retain selected feature", retained)
-        self.update_feature_btn = QPushButton("Update selected feature", retained)
+        self.retain_feature_btn = QPushButton("Retain selected\nfeature", retained)
+        self.update_feature_btn = QPushButton("Update selected\nfeature", retained)
         retained_layout.addWidget(self.retained_feature_list)
-        feature_row = QHBoxLayout()
+        feature_row = QVBoxLayout()
         feature_row.addWidget(self.include_feature_chk)
         feature_row.addWidget(self.retain_feature_btn)
         feature_row.addWidget(self.update_feature_btn)

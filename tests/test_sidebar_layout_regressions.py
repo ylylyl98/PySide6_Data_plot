@@ -239,8 +239,11 @@ class SidebarLayoutRegressionTests(unittest.TestCase):
             self.app.processEvents()
             pin = window.drr_pin_baseline_chk
             self.assertLessEqual(pin.fontMetrics().horizontalAdvance(pin.text()), pin.width())
-            self.assertEqual(window.drr_sg_window_spin.prefix(), "W ")
-            self.assertEqual(window.drr_sg_poly_spin.prefix(), "O ")
+            self._expand(window, "Advanced derivative")
+            for spin, label in ((window.drr_sg_window_spin, "X window points"),
+                                (window.drr_sg_poly_spin, "Polynomial order")):
+                form = spin.parentWidget().layout()
+                self.assertEqual(form.labelForField(spin).text(), label)
             for sidebar_width in (320, 380):
                 window.workspace_splitter.setSizes(
                     [sidebar_width, max(1, window.workspace_splitter.width() - sidebar_width)]

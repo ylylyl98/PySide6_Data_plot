@@ -45,6 +45,19 @@ class SplitScaleControlTests(unittest.TestCase):
             self.window.show()
             self.window.pl_split_scale_chk.setChecked(True)
             self.app.processEvents()
+            self._set_sidebar_width(UI_METRICS["left_width"])
+
+    def _set_sidebar_width(self, width):
+        """Reserve the actual plot minimum before testing a sidebar width."""
+        splitter = self.window.workspace_splitter
+        plot = splitter.widget(1)
+        minimum = max(plot.minimumWidth(), plot.minimumSizeHint().width())
+        chrome = self.window.width() - sum(splitter.sizes())
+        self.window.resize(max(self.window.width(), width + minimum + chrome), self.window.height())
+        self.app.processEvents()
+        total = sum(splitter.sizes())
+        splitter.setSizes([width, total - width])
+        self.app.processEvents()
 
     def tearDown(self) -> None:
         with profile_phase("mainwindow_teardown"):
@@ -55,6 +68,8 @@ class SplitScaleControlTests(unittest.TestCase):
     def _wait_for_drr_catalog(self) -> None:
         with profile_phase("drr_event_wait"):
             self._wait_for_file_catalog()
+            # Catalogs are lazy: request the DRR workflow, even while PL is active.
+            self.window._refresh_file_lists(mode="DRR", auto=True)
             # File discovery is intentionally asynchronous and GitHub's Windows
             # runners can be busy while the full Qt suite is running.
             for _ in range(500):
@@ -113,7 +128,7 @@ class SplitScaleControlTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             return
 
-        self.window.workspace_splitter.setSizes([UI_METRICS["left_width"], 900])
+        self._set_sidebar_width(UI_METRICS["left_width"])
         self.assertEqual(self.window.left_panel.width(), UI_METRICS["left_width"])
 
         for mode, prefix in (("PL", "pl"), ("DRR", "drr"), ("Compare", "cmp"), ("Power", "power")):
@@ -227,7 +242,7 @@ class SplitScaleControlTests(unittest.TestCase):
 
     def test_axis_range_rows_fit_ordinary_formatted_values_at_minimum_sidebar(self) -> None:
         """Negative ordinary bounds remain fully visible beside steppers and actions."""
-        self.window.workspace_splitter.setSizes([UI_METRICS["left_width"], 900])
+        self._set_sidebar_width(UI_METRICS["left_width"])
         self.assertEqual(self.window.left_panel.width(), UI_METRICS["left_width"])
         for mode, prefix in (("PL", "pl"), ("DRR", "drr"), ("Compare", "cmp"), ("Power", "power")):
             tab_index = next(i for i in range(self.window.tabs.count()) if self.window.tabs.tabText(i) == mode)
@@ -258,8 +273,9 @@ class SplitScaleControlTests(unittest.TestCase):
         self.assertTrue(overlay.isVisible())
         self.assertTrue(overlay.testAttribute(Qt.WA_TransparentForMouseEvents))
         self.assertTrue(overlay.accessibleName())
-        self.assertIn("Load", overlay.text())
-        self.assertIn("Plot", overlay.text())
+        # Source selection now triggers plotting automatically.
+        self.assertIn("Choose a valid source", overlay.text())
+        self.assertIn("automatically", overlay.text())
 
         self.window.figure.add_subplot(111)
         self.window.canvas.draw()
@@ -280,7 +296,7 @@ class SplitScaleControlTests(unittest.TestCase):
 
     def test_sidebar_can_resize_within_bounds_and_canvas_remains_dominant(self) -> None:
         splitter = self.window.workspace_splitter
-        splitter.setSizes([UI_METRICS["left_width"] + 80, 900])
+        self._set_sidebar_width(UI_METRICS["left_width"] + 80)
         self.app.processEvents()
         self.assertEqual(splitter.sizes()[0], UI_METRICS["left_width"] + 80)
         self.assertGreater(splitter.sizes()[1], splitter.sizes()[0])
@@ -417,6 +433,7 @@ class SplitScaleControlTests(unittest.TestCase):
                 group_list = dialog.findChild(QListWidget, "drr_source_group_list")
                 self.assertEqual(group_list.count(), 1)
                 observed["text"] = group_list.item(0).text()
+                observed["tooltip"] = group_list.item(0).toolTip()
                 return QDialog.Rejected
 
             with patch.object(QDialog, "exec", fake_exec):
@@ -425,7 +442,7 @@ class SplitScaleControlTests(unittest.TestCase):
                 )
 
             self.assertIn("PARTIAL 5/7", observed["text"])
-            self.assertIn("Modified ", observed["text"])
+            self.assertIn("Modified ", observed["tooltip"])
             self.assertIn("partial_760nmc_3.6KREF", observed["text"])
             self.assertNotIn("complete_760nmc_3.6KREF", observed["text"])
 
@@ -542,9 +559,13 @@ class SplitScaleControlTests(unittest.TestCase):
                     for i in range(file_list.count())
                 ]
                 observed["chosen"] = [
-                    (chosen.item(i).text(), chosen.item(i).foreground().color())
+                    (chosen.item(i).data(Qt.UserRole), chosen.item(i).foreground().color())
                     for i in range(chosen.count())
                 ]
+                observed["chosen_text"] = {
+                    chosen.item(i).data(Qt.UserRole): chosen.item(i).text()
+                    for i in range(chosen.count())
+                }
                 return QDialog.Rejected
 
             with patch.object(QDialog, "exec", fake_exec):
@@ -557,7 +578,9 @@ class SplitScaleControlTests(unittest.TestCase):
             self.assertEqual(members["processed_REF.csv"], QColor(theme_alias("source_processed_foreground")))
             chosen = dict(observed["chosen"])
             self.assertEqual(chosen["new_REF.csv"], QColor(theme_alias("source_new_foreground")))
-            self.assertEqual(chosen["Missing · missing_REF.csv"], QColor(theme_alias("danger_foreground")))
+            self.assertEqual(chosen["missing_REF.csv"], QColor(theme_alias("danger_foreground")))
+            self.assertEqual(observed["chosen_text"]["new_REF.csv"], "UNPROCESSED\nnew_REF.csv")
+            self.assertEqual(observed["chosen_text"]["missing_REF.csv"], "Missing\nmissing_REF.csv")
 
     def test_drr_unknown_single_file_adds_without_confirmation(self) -> None:
         self.window.drr_available_sources = [self._manual_drr_source("manual_REF_760nmc_single.csv")]
@@ -604,7 +627,8 @@ class SplitScaleControlTests(unittest.TestCase):
                     title="Choose DRR files", selected=[], baseline_mode=False
                 )
 
-            self.assertIn("(gate details unavailable)", observed["detail"])
+            self.assertIn(f"{existing} (gate details unavailable)", observed["detail"])
+            self.assertNotIn(f"{existing} (missing)", observed["detail"])
             self.assertIn("(missing)", observed["detail"])
             self.assertIn("first file gate ranges", observed["detail"])
             self.assertIn("per-file acquisition grids known", observed["detail"])
@@ -700,7 +724,7 @@ class SplitScaleControlTests(unittest.TestCase):
             ):
                 next(button for button in dialog.findChildren(QPushButton) if button.text() == "Add Entire Group").click()
             self.assertEqual(chosen_list.count(), 3)
-            observed["rows"] = [group_list.item(0).text(), *(file_list.item(i).text() for i in range(file_list.count()))]
+            observed["rows"] = [file_list.item(i).toolTip() for i in range(file_list.count())]
             return QDialog.Rejected
 
         with patch.object(QDialog, "exec", fake_exec):
@@ -712,9 +736,13 @@ class SplitScaleControlTests(unittest.TestCase):
         self.assertTrue(any("Unknown" in row for row in observed["rows"]))
 
     def test_drr_baseline_picker_keeps_chosen_when_type_filter_changes(self) -> None:
+        # Recommendations require a selected measurement and compatible cached
+        # spectral grids; an empty selection intentionally offers no baselines.
+        self.window.drr_selected_files = ["measurement_REF.csv"]
         self.window.drr_available_sources = [
-            DrrSource("ref_back_760nmc.csv", "ref_back_760nmc.csv", "back", "2026-08-26", 2.0, True),
-            DrrSource("odd_back_760nmc.csv", "odd_back_760nmc.csv", "back", "2026-08-26", 1.0, True),
+            self._manual_drr_source("measurement_REF.csv", rows=2),
+            self._manual_drr_source("ref_back_760nmc.csv", background=True, rows=2),
+            self._manual_drr_source("odd_back_760nmc.csv", background=True, rows=2),
         ]
         observed = {}
 
@@ -723,8 +751,16 @@ class SplitScaleControlTests(unittest.TestCase):
             chosen = dialog.findChild(QListWidget, "drr_source_chosen_list")
             self.assertEqual(combo.currentText(), "REF")
             self.assertEqual(chosen.count(), 1)
-            self.assertIn("PL", chosen.item(0).text())
+            self.assertEqual(chosen.item(0).data(Qt.UserRole), "pl_back_760nmc.csv")
+            self.assertIn("pl_back_760nmc.csv", chosen.item(0).text())
             combo.setCurrentText("All data")
+            self.app.processEvents()
+            # The selected measurement may itself be offered as a historical
+            # baseline; inspect the background group whose filter changed.
+            groups = dialog.findChild(QListWidget, "drr_source_group_list")
+            background_row = next(i for i in range(groups.count())
+                                  if "|background|" in str(groups.item(i).data(Qt.UserRole)))
+            groups.setCurrentRow(background_row)
             self.app.processEvents()
             observed["files"] = dialog.findChild(QListWidget, "drr_source_file_list").count()
             observed["chosen"] = chosen.count()
@@ -744,6 +780,7 @@ class SplitScaleControlTests(unittest.TestCase):
             root = Path(tmp)
             entered = threading.Event()
             release = threading.Event()
+            discovery_threads = []
             source = DrrSource(
                 source="Initial Data/async_760nmc.csv",
                 filename="async_760nmc.csv",
@@ -753,19 +790,21 @@ class SplitScaleControlTests(unittest.TestCase):
                 is_background=False,
             )
 
-            def delayed_discovery(_folder, *, cache=None):
+            def delayed_discovery(_folder, cache, **_kwargs):
+                discovery_threads.append(threading.get_ident())
                 entered.set()
                 release.wait(2.0)
                 return [source]
 
             self.window.current_folder = str(root)
             with patch(
-                "ui_qt.main_window.discover_drr_sources",
+                "core.drr_catalog.load_drr_catalog",
                 side_effect=delayed_discovery,
             ):
-                self.window._refresh_file_lists()
+                self.window._refresh_file_lists(mode="DRR")
                 self._wait_for_file_catalog()
                 self.assertTrue(entered.wait(1.0))
+                self.assertNotEqual(discovery_threads[0], threading.get_ident())
                 # The worker is intentionally blocked; reaching this point
                 # proves the refresh call itself did not perform discovery.
                 self.assertFalse(release.is_set())
@@ -1106,6 +1145,10 @@ class SplitScaleControlTests(unittest.TestCase):
         self.assertAlmostEqual(self.window.cmp_split_spins["x0"].value(), 2.5)
 
     def test_compare_auto_background_toggle_refreshes_color_range(self) -> None:
+        from PySide6.QtCore import QSignalBlocker
+        self.window.tabs.setCurrentIndex(next(
+            i for i in range(self.window.tabs.count())
+            if self.window.tabs.tabText(i) == 'Compare'))
         cube = DataCube(
             energy=np.array([0.0, 1.0, 2.0, 3.0]),
             gate=np.array([0.0, 1.0]),
@@ -1119,8 +1162,12 @@ class SplitScaleControlTests(unittest.TestCase):
         )
         self.window.available_files = ["kk.csv", "kkp.csv"]
         self.window.compare_controller._cmp_set_channel_combo_items()
-        self.window.cmp_channel_combos["KK"].setCurrentText("kk.csv")
-        self.window.cmp_channel_combos["KKp"].setCurrentText("kkp.csv")
+        # This fixture already supplies loaded cubes. Channel assignment is
+        # setup, not a request to load nonexistent files from an empty folder.
+        for channel, name in (("KK", "kk.csv"), ("KKp", "kkp.csv")):
+            with QSignalBlocker(self.window.cmp_channel_combos[channel]):
+                self.window.cmp_channel_combos[channel].setCurrentText(name)
+        self.window.loaded.compare_sources = self.window.compare_controller._cmp_selection_from_ui().as_pairs()
         for key, value in (("xmin", 0.0), ("xmax", 3.0), ("ymin", 0.0), ("ymax", 1.0)):
             self.window._set_spin_value_silent(self.window.cmp_spins[key], value)
         self.window.cmp_vp_auto_background_chk.setChecked(False)
@@ -1128,6 +1175,7 @@ class SplitScaleControlTests(unittest.TestCase):
         self.window._set_spin_value_silent(self.window.cmp_spins["vmax"], 999.0)
 
         self.window.cmp_vp_auto_background_chk.setChecked(True)
+        self.window._run_scheduled_plot_redraw('Compare')
 
         self.assertGreater(self.window.cmp_spins["vmin"].value(), -999.0)
         self.assertLess(self.window.cmp_spins["vmax"].value(), 999.0)
@@ -1261,7 +1309,11 @@ class SplitScaleControlTests(unittest.TestCase):
                 self.window.drr_baseline_combine_combo.currentText(),
                 "Average all frames in each file, then average files",
             )
-            start_load.assert_called_once_with("DRR")
+            start_load.assert_called_once()
+            self.assertEqual(start_load.call_args.args, ("DRR",))
+            resolution = start_load.call_args.kwargs["drr_resolution"]
+            self.assertEqual(resolution.assignments[0].baseline_files, ("Initial Data/sample_760nmc_back.csv",))
+            self.assertEqual(resolution.assignments[0].baseline_which, "all")
 
     def test_constant_gate_background_selection_defaults_to_all_frames(self) -> None:
         with profile_phase("drr_filesystem_setup"), tempfile.TemporaryDirectory() as tmp:
@@ -1308,7 +1360,7 @@ class SplitScaleControlTests(unittest.TestCase):
         self.assertEqual(
             self.window.drr_baseline_files_manual, ["old_760nmc_back.csv"]
         )
-        start_load.assert_called_once_with("DRR")
+        start_load.assert_called_once_with("DRR", drr_resolution=None)
 
 
 class WindowLifecycleTests(unittest.TestCase):

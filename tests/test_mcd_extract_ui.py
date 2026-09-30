@@ -89,7 +89,7 @@ class McdExtractDialogTests(unittest.TestCase):
                 self.assertEqual(dialog.table.item(0, headers.index("Increasing slope")).text(), "2")
                 self.assertEqual(dialog.table.item(0, headers.index("Decreasing slope")).text(), "3")
                 self.assertEqual(dialog.order_combo.currentData(), "Auto")
-                self.assertEqual(dialog.palette_combo.currentData(), "viridis")
+                self.assertEqual(dialog.palette_combo.currentData(), "tab10")
                 self.assertFalse(dialog.export_csv_chk.isChecked())
                 self.assertIn("XLSX + PNG", dialog.export_btn.text())
                 self.assertEqual(

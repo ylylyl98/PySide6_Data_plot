@@ -97,6 +97,19 @@ def install_theme(
     global _manager
     from ui_qt.wheel_policy import install_wheel_value_guard
     install_wheel_value_guard(app)
+    # The manager is an application-owned event filter. Replacing only the
+    # module reference leaves old managers alive and observing every Qt event.
+    from shiboken6 import isValid
+
+    manager = getattr(app, "_dptk_theme_manager", None)
+    if manager is not None and isValid(manager):
+        requested_mode = mode if isinstance(mode, ThemeMode) else ThemeMode(mode)
+        if manager.mode != requested_mode:
+            manager.set_mode(requested_mode)
+        else:
+            manager.apply()
+        _manager = manager
+        return manager
     repository = ProjectTokenRepository(
         _RESOURCE_ROOT / "fluent2-official-web-theme-tokens.json",
         _RESOURCE_ROOT / "qt-token-map.json",
@@ -112,6 +125,7 @@ def install_theme(
         apply_body_pixel_size=False,
     )
     manager.apply()
+    app._dptk_theme_manager = manager
     _manager = manager
     return manager
 

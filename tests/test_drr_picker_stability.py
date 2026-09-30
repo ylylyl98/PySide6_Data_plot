@@ -82,6 +82,51 @@ class DrrPickerStabilityTests(unittest.TestCase):
         groups.assert_not_called()
         summaries.assert_not_called()
 
+    def _check_themed_picker_in_subprocess(self, *, change_theme):
+        import subprocess
+        import sys
+        import textwrap
+        from pathlib import Path
+
+        # Theme installation is application-global. Use a fresh application so
+        # this regression cannot change the palette/QSS of other test fixtures.
+        script = textwrap.dedent("""
+            import sys
+            from unittest.mock import patch
+            from PySide6.QtWidgets import QDialog
+            from tests.test_drr_picker_stability import DrrPickerStabilityTests
+            from tests.ui_test_helpers import dispose_owned_window
+            from ui_qt import controllers_drr
+            from ui_qt.theme import install_theme
+            case = DrrPickerStabilityTests('test_reopening_unchanged_picker_reuses_groups_and_row_metadata')
+            case.setUpClass()
+            manager = install_theme(case.app, mode="light")
+            case.setUp()
+            try:
+                if sys.argv[1] == "change":
+                    case.open_picker(lambda dialog: QDialog.Rejected)
+                    manager.set_mode("dark")
+                    with patch.object(controllers_drr, 'group_drr_sources', wraps=controllers_drr.group_drr_sources) as groups:
+                        case.open_picker(lambda dialog: QDialog.Rejected)
+                        groups.assert_called_once()
+                case.test_reopening_unchanged_picker_reuses_groups_and_row_metadata()
+            finally:
+                case.doCleanups()
+                dispose_owned_window(case.window)
+        """)
+        result = subprocess.run(
+            [sys.executable, "-c", script, "change" if change_theme else "same"],
+            cwd=Path(__file__).resolve().parent.parent,
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_themed_picker_reuses_equal_palette_presentation(self):
+        self._check_themed_picker_in_subprocess(change_theme=False)
+
+    def test_theme_palette_change_invalidates_picker_presentation(self):
+        self._check_themed_picker_in_subprocess(change_theme=True)
+
     def test_closed_picker_releases_widgets_but_keeps_detached_rows(self):
         from PySide6.QtCore import QCoreApplication, QEvent
         destroyed = []

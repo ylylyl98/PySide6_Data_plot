@@ -109,8 +109,8 @@ class PeakShiftDispatchTests(unittest.TestCase):
         self._settings_patches = [
             patch.object(main_window, "QSettings", settings_factory),
             patch.object(presentation_widget, "QSettings", settings_factory),
-            patch.object(main_window.MainWindow, "_restore_last_folder"),
-            patch.object(main_window.MainWindow, "_schedule_automatic_update_check"),
+            patch.object(main_window.MainWindow, "_restore_last_folder", autospec=True),
+            patch.object(main_window.MainWindow, "_schedule_automatic_update_check", autospec=True),
         ]
         for item in self._settings_patches:
             item.start()

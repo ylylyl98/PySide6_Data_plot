@@ -14,6 +14,8 @@ import pandas as pd
 from matplotlib.figure import Figure
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QCoreApplication, QEvent, Qt
+from PySide6.QtTest import QTest, QSignalSpy
+from shiboken6 import isValid
 from PySide6.QtWidgets import QApplication, QMainWindow, QWidget
 
 from core.mcd import McdCenterCandidate, McdSettings, background_fit_regions, detect_angles, discover_mcd_processing_status, ensure_mcd_package_dir, export_mcd_analysis_bundle, export_mcd_tables, extract_mcd_acquisition_conditions, format_mcd_acquisition_conditions, format_mcd_energy, load_b_sweep_csv, low_field_mcd_branch_fits, pair_window_trace_by_branch, process_mcd, suggest_mcd_background_ranges, suggest_mcd_window_centers, window_trace, window_trace_comparison
@@ -34,6 +36,10 @@ class McdProcessingTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
+        for method in ("_restore_last_folder", "_schedule_automatic_update_check"):
+            stub = patch.object(MainWindow, method, autospec=True)
+            stub.start()
+            self.addCleanup(stub.stop)
         self._owned_windows: list[QMainWindow] = []
         self.addCleanup(self._dispose_test_windows)
 
@@ -52,6 +58,7 @@ class McdProcessingTests(unittest.TestCase):
 
     def _own_window(self, window: QMainWindow) -> QMainWindow:
         self._owned_windows.append(window)
+        window.tabs.setCurrentIndex(next(i for i in range(window.tabs.count()) if window.tabs.tabText(i) == "MCD"))
         return window
 
     def _write_sweep(self, folder: Path) -> Path:
@@ -68,11 +75,10 @@ class McdProcessingTests(unittest.TestCase):
 
     def test_test_owned_main_windows_are_destroyed_by_cleanup(self) -> None:
         window = self._own_window(MainWindow())
-        reference = weakref.ref(window)
+        destroyed = QSignalSpy(window.destroyed)
         self._dispose_test_windows()
-        del window
-        gc.collect()
-        self.assertIsNone(reference())
+        self.assertEqual(destroyed.count(), 1)
+        self.assertFalse(isValid(window))
 
     def test_mcd_processing_defaults_use_quadratic_spectral_baseline(self) -> None:
         settings = McdSettings()
@@ -282,22 +288,20 @@ class McdProcessingTests(unittest.TestCase):
 
                 window._on_loaded(window._load_task(options, progress=Sink(), log=Sink()))
                 window.canvas.draw()
-                self.assertTrue(window.mcd_controller._mcd_blit_enabled)
-                old_backgrounds = dict(window.mcd_controller._mcd_blit_backgrounds)
-                self.assertIn("heat", old_backgrounds)
-
-                window.mcd_controller._on_theme_changed()
-                self.assertEqual(window.mcd_controller._mcd_blit_backgrounds, {})
-                self.assertEqual(window.mcd_controller._mcd_blit_bboxes, {})
-
+                view = window.mcd_unified_view
+                QTest.qWait(10)
+                old_backgrounds = dict(view._blit_backgrounds)
+                self.assertIn("mcd_map", old_backgrounds)
+                window.canvas._on_theme_changed(window.canvas._resolved_theme)
                 window.canvas.draw()
-                rebuilt = window.mcd_controller._mcd_blit_backgrounds
-                self.assertTrue(window.mcd_controller._mcd_blit_enabled)
-                self.assertIn("heat", rebuilt)
-                self.assertNotEqual(id(old_backgrounds["heat"]), id(rebuilt["heat"]))
+                QTest.qWait(10)
+                rebuilt = view._blit_backgrounds
+                self.assertIn("mcd_map", rebuilt)
+                self.assertIsNot(old_backgrounds["mcd_map"], rebuilt["mcd_map"])
                 with patch.object(window.canvas, "blit", wraps=window.canvas.blit) as blit:
-                    self.assertTrue(window.mcd_controller._refresh_mcd_center_trace())
+                    view._on_map_click(type("Click", (), {"inaxes": view.axes["mcd_map"], "button": 1, "xdata": view.state.window_center_ev + 1e-6, "key": ""})())
                     self.assertGreater(blit.call_count, 0)
+                    view._on_map_release(None)
             finally:
                 window.close()
 
@@ -1038,6 +1042,11 @@ class McdProcessingTests(unittest.TestCase):
             window.tabs.setCurrentIndex(mcd_tab)
             window.tabs.setCurrentIndex(peak_tab)
             self.assertEqual(window.last_plotted_mode, "MCD Peak Shift")
+            for _ in range(500):
+                if window._mcd_peak_analysis_worker is None:
+                    break
+                QTest.qWait(10)
+            self.assertIsNone(window._mcd_peak_analysis_worker)
             peak_result = window.mcd_peak_result
             self.assertIsNotNone(peak_result, window.mcd_peak_status.text())
             with patch.object(window, "_start_load") as load, \
@@ -1076,70 +1085,33 @@ class McdProcessingTests(unittest.TestCase):
                 self.assertEqual(window.last_plotted_mode, "MCD")
                 self.assertGreaterEqual(len(window.figure.axes), 4)
                 window.canvas.draw()
-                heat_bounds = window._mcd_heatmap_ax.get_position()
-                spectrum_bounds = window._mcd_spectrum_ax.get_position()
-                trace_bounds = window._mcd_trace_ax.get_position()
-                colorbar_bounds = window._mcd_colorbar_ax.get_position()
-                self.assertGreater(heat_bounds.y0, spectrum_bounds.y1)
-                self.assertLess(heat_bounds.x1, trace_bounds.x0)
-                self.assertGreater(colorbar_bounds.x0, heat_bounds.x0)
-                self.assertLess(colorbar_bounds.x1, heat_bounds.x1)
-                self.assertGreater(colorbar_bounds.y0, heat_bounds.y1)
-                self.assertLess(colorbar_bounds.y0 - heat_bounds.y1, 0.05)
-                self.assertIn("E =", window._mcd_trace_ax.get_title())
-                metric_legend = window._mcd_trace_ax.get_legend()
-                self.assertIsNotNone(metric_legend)
-                # A one-item metric legend adds no information; only the
-                # increasing/decreasing branch key remains.
-                self.assertEqual(
-                    [text.get_text() for text in metric_legend.get_texts()],
-                    ["B increasing", "B decreasing"],
-                )
+                view = window.mcd_unified_view
+                self.assertEqual(set(view.axes), {"mcd_map", "spectra", "mcd_spectra", "mcd_vs_b"})
+                for axis in view.axes.values():
+                    self.assertIn(axis, window.figure.axes)
+                map_bounds = view.axes["mcd_map"].get_position()
+                colorbar_bounds = view._map_colorbar.ax.get_position()
+                self.assertGreaterEqual(colorbar_bounds.x0, map_bounds.x1)
+                self.assertEqual(view.axes["mcd_vs_b"].get_ylabel(), "MCD")
+                renderer = window.canvas.get_renderer()
                 figure_bounds = window.figure.bbox
-                for axis in (window._mcd_trace_ax, window._mcd_integral_ax):
-                    for text in [axis.yaxis.label, *axis.get_yticklabels()]:
-                        bounds = text.get_window_extent(window.canvas.get_renderer())
-                        self.assertGreaterEqual(bounds.x0, figure_bounds.x0)
-                        self.assertLessEqual(bounds.x1, figure_bounds.x1)
-                original_trace_artists = {
-                    key: id(line) for key, line in window._mcd_trace_lines.items()
-                }
+                for axis in view.axes.values():
+                    for label in (axis.yaxis.label, *axis.get_yticklabels()):
+                        if label.get_visible() and label.get_text():
+                            bounds = label.get_window_extent(renderer)
+                            self.assertGreaterEqual(bounds.x0, figure_bounds.x0)
+                            self.assertLessEqual(bounds.x1, figure_bounds.x1)
+                QTest.qWait(10)
+                original = [id(line) for _, line in view._artists["mcd_trace_lines"]]
                 with patch.object(window.canvas, "blit", wraps=window.canvas.blit) as blit:
-                    self.assertTrue(window.mcd_controller._refresh_mcd_center_trace())
+                    view._on_map_click(type("Click", (), {"inaxes": view.axes["mcd_map"], "button": 1, "xdata": view.state.window_center_ev + 1e-6, "key": ""})())
                     self.assertGreater(blit.call_count, 0)
-                self.assertEqual(
-                    original_trace_artists,
-                    {key: id(line) for key, line in window._mcd_trace_lines.items()},
-                )
-                with (
-                    patch.object(
-                        type(window.mcd_controller),
-                        "_refresh_mcd_center_trace",
-                        return_value=True,
-                    ) as refresh,
-                    patch.object(window, "_plot_mode") as full_replot,
-                ):
-                    window.mcd_window_center_spin.setValue(
-                        window.mcd_window_center_spin.value() + 1e-6
-                    )
-                    self.assertTrue(window.mcd_controller._mcd_center_refresh_timer.isActive())
-                    window.mcd_controller._mcd_center_refresh_timer.stop()
-                    window.mcd_controller._apply_pending_mcd_center_refresh()
-                    refresh.assert_called_once_with()
+                    view._on_map_release(None)
+                self.assertEqual(original, [id(line) for _, line in view._artists["mcd_trace_lines"]])
+                with patch.object(window, "_plot_mode") as full_replot:
+                    view.set_selected_b(0)
                     full_replot.assert_not_called()
-                if window.mcd_pair_b_combo.count() > 1:
-                    with (
-                        patch.object(
-                            type(window.mcd_controller),
-                            "_refresh_mcd_pair_panels",
-                            return_value=True,
-                        ) as pair_refresh,
-                        patch.object(window, "_plot_mode") as full_replot,
-                    ):
-                        target_index = 0 if window.mcd_pair_b_combo.currentIndex() != 0 else 1
-                        window.mcd_pair_b_combo.setCurrentIndex(target_index)
-                        pair_refresh.assert_called_once_with()
-                        full_replot.assert_not_called()
+                self.assertEqual(view.state.selected_b_index, 0)
             finally:
                 window.close()
 
@@ -1164,8 +1136,8 @@ class McdProcessingTests(unittest.TestCase):
                 self.assertEqual(window.mcd_files.count(), 1)
                 self.assertEqual(window.mcd_files.item(0).text(), "mcd/sweep.csv")
                 self.assertEqual(window._selected(window.mcd_files), ["mcd/sweep.csv"])
-                self.assertIn("Selected:", window.mcd_selection_summary.text())
-                self.assertIn("● NEW", window.mcd_selection_summary.text())
+                self.assertEqual(window.mcd_selection_summary.filename_label.text(), "sweep.csv")
+                self.assertEqual(window.mcd_selection_summary.status_label.text(), "New")
                 self.assertTrue(
                     any(
                         os.path.samefile(watched, mcd_folder)
@@ -1230,10 +1202,11 @@ class McdProcessingTests(unittest.TestCase):
                 window._set_current_folder(str(root))
                 wait_for_file_catalog(window)
                 summary = window.mcd_selection_summary.text()
-                self.assertIn("✓ PROCESSED", summary)
-                self.assertIn("Last saved: 2026-08-24 21:30", summary)
-                self.assertEqual(window.mcd_selection_summary.property("appRole"), "sourceBadge")
-                self.assertEqual(window.mcd_selection_summary.property("badgeState"), "processed")
+                from ui_qt.time_format import format_local_timestamp
+                self.assertIn("Processed", summary)
+                self.assertIn(format_local_timestamp("2026-08-24T21:30:00+00:00"), summary)
+                self.assertEqual(window.mcd_selection_summary.status_label.property("appRole"), "sourceBadge")
+                self.assertEqual(window.mcd_selection_summary.status_label.property("badgeState"), "processed")
             finally:
                 window.close()
 
@@ -1326,10 +1299,20 @@ class McdProcessingTests(unittest.TestCase):
             window.show()
             self.app.processEvents()
             scroll = window.mcd_tab_scroll
-            self.assertLessEqual(
-                scroll.widget().minimumSizeHint().width(),
-                scroll.viewport().width(),
-            )
+            for sidebar_width in (320, 380, 560):
+                with self.subTest(sidebar_width=sidebar_width):
+                    window.workspace_splitter.setSizes([sidebar_width, 1100])
+                    self.app.processEvents()
+                    self.assertLessEqual(scroll.widget().minimumSizeHint().width(), scroll.viewport().width())
+                    controls = window.mcd_unified_controls
+                    for spin in (controls.slope_low_spin, controls.slope_low_end_spin,
+                                 controls.slope_high_positive_spin, controls.slope_high_positive_end_spin,
+                                 controls.slope_high_negative_spin, controls.slope_high_negative_end_spin):
+                        self.assertTrue(spin.parentWidget().contentsRect().contains(spin.geometry()))
+                    for button in (controls.retain_window_btn, controls.update_retained_btn,
+                                   controls.include_feature_chk, controls.retain_feature_btn,
+                                   controls.update_feature_btn):
+                        self.assertGreaterEqual(button.width(), max(button.fontMetrics().horizontalAdvance(line) for line in button.text().splitlines()))
             for key in ("xmin", "xmax", "ymin", "ymax"):
                 self.assertGreater(window.mcd_spins[key].width(), 0)
             self.assertNotIn("gate", window.mcd_spins)
@@ -1516,12 +1499,12 @@ class McdProcessingTests(unittest.TestCase):
                     "ydata": 0.7,
                     "key": "control",
                 })()
-                window._on_canvas_click(event)
+                window.mcd_unified_view._on_map_click(event)
                 expected_index = int(np.argmin(np.abs(result.pair_b - 0.7)))
-                self.assertEqual(int(window.mcd_pair_b_combo.currentData()), expected_index)
-                self.assertIn(f"B = {result.pair_b[expected_index]:.5g} T", window._mcd_spectrum_ax.get_title())
-                window.mcd_pair_b_combo.setCurrentIndex(0)
-                self.assertIn(f"B = {result.pair_b[0]:.5g} T", window._mcd_spectrum_ax.get_title())
+                self.assertEqual(window.mcd_unified_view.state.selected_b_index, expected_index)
+                self.assertAlmostEqual(window.mcd_unified_view.spectra_b_spin.value(), result.pair_b[expected_index])
+                window.mcd_unified_view.set_selected_b(0)
+                self.assertAlmostEqual(window.mcd_unified_view.spectra_b_spin.value(), result.pair_b[0])
             finally:
                 window.close()
 
@@ -1553,17 +1536,17 @@ class McdProcessingTests(unittest.TestCase):
                     "xdata": target, "ydata": 0.4,
                 })()
                 release = type("McdRelease", (), {"button": 1})()
-                window._on_canvas_click(press)
-                self.assertTrue(window._mcd_window_dragging)
-                window._on_canvas_motion(move)
-                window.mcd_controller._on_canvas_release(release)
+                window.mcd_unified_view._on_map_click(press)
+                self.assertTrue(window.mcd_unified_view._window_drag_active)
+                window.mcd_unified_view._on_map_motion(move)
+                window.mcd_unified_view._on_map_release(release)
 
                 expected = window.mcd_controller._clamp_mcd_window_center(
                     target, window.loaded.mcd_result.energy_ev, original_width
                 )
                 self.assertAlmostEqual(window.mcd_window_center_spin.value(), expected, places=6)
                 self.assertEqual(window.mcd_window_width_spin.value(), original_width)
-                self.assertFalse(window._mcd_window_dragging)
+                self.assertFalse(window.mcd_unified_view._window_drag_active)
             finally:
                 window.close()
 

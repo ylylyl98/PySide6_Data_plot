@@ -190,8 +190,8 @@ class AstraPeakShiftEventTests(unittest.TestCase):
         folder = stack.enter_context(TemporaryDirectory())
         stack.enter_context(patch.object(mw, "QSettings", lambda *a, **k:
             QSettings(str(Path(folder) / "settings.ini"), QSettings.IniFormat)))
-        stack.enter_context(patch.object(mw.MainWindow, "_restore_last_folder"))
-        stack.enter_context(patch.object(mw.MainWindow, "_schedule_automatic_update_check"))
+        stack.enter_context(patch.object(mw.MainWindow, "_restore_last_folder", autospec=True))
+        stack.enter_context(patch.object(mw.MainWindow, "_schedule_automatic_update_check", autospec=True))
         app = QApplication.instance() or QApplication([])
         window = mw.MainWindow()
         source = _result([-1., 0., 1.])

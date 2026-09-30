@@ -71,7 +71,7 @@ class RightAxisUiTests(unittest.TestCase):
         from ui_qt.main_window import MainWindow
         from ui_qt.common import LoadedState
         with tempfile.TemporaryDirectory() as tmp:
-            with patch('ui_qt.main_window.QSettings', return_value=QSettings(str(Path(tmp)/'settings.ini'), QSettings.IniFormat)), patch.object(MainWindow, '_restore_last_folder'), patch.object(MainWindow, '_schedule_automatic_update_check'):
+            with patch('ui_qt.main_window.QSettings', return_value=QSettings(str(Path(tmp)/'settings.ini'), QSettings.IniFormat)), patch.object(MainWindow, '_restore_last_folder', autospec=True), patch.object(MainWindow, '_schedule_automatic_update_check', autospec=True):
                 w = MainWindow()
             try:
                 from ui_qt.common import LoadOptions, WorkerSignals

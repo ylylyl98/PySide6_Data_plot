@@ -84,6 +84,13 @@ class PeakWorkflowTests(unittest.TestCase):
 
     def setUp(self):
         workflow_helpers.PowerWorkflowTests.setUp(self)
+        self.window.tabs.setCurrentIndex(next(
+            i for i in range(self.window.tabs.count())
+            if self.window.tabs.tabText(i) == 'Power'))
+        self.assertEqual(self.window._active_mode(), 'Power Dependent')
+        errors = patch.object(self.window, '_show_error', side_effect=self.fail)
+        errors.start()
+        self.addCleanup(errors.stop)
 
     def tearDown(self):
         workflow_helpers.PowerWorkflowTests.tearDown(self)
@@ -99,6 +106,9 @@ class PeakWorkflowTests(unittest.TestCase):
         w.loaded = LoadedState(mode="Power Dependent", folder="", primary_file="combined.csv",
             selected_files=["combined.csv"], cube=cube, power_records=records,
             power_groups={}, power_group_key="csv::combined.csv", y_axis_spec="auto")
+        from core.data_io import PowerSeriesResult
+        w._power_result_cache['csv::combined.csv'] = PowerSeriesResult(
+            cube, 'csv::combined.csv', records, {})
         w.power_background_auto_chk.setChecked(False)
         w.power_background_spin.setValue(0)
         w._apply_auto_limits_for_loaded()
@@ -117,6 +127,43 @@ class PeakWorkflowTests(unittest.TestCase):
                 return
             time.sleep(.01)
         self.fail("Peak fitting did not finish")
+
+    def combination_picker(self, folder):
+        """Select two real sources through the current combination entry point."""
+        from PySide6.QtWidgets import QPushButton
+        from PySide6.QtCore import Qt
+        from ui_qt.source_picker_dialog import SourcePickerDialog
+        for name in ('segment_a.csv', 'segment_b.csv'):
+            (Path(folder) / name).write_text('Power_uW,1.5,1.6\n1,2,3\n2,4,5\n')
+        self.window._refresh_file_lists(auto=False, mode='Power Dependent')
+        self.wait_catalog()
+        # Review consumes already loaded sources; prepare that worker output
+        # with real CSV parsing rather than relying on GUI-thread loading.
+        from core.data_io import load_power_sweep_csv, PowerSeriesResult
+        for name in ('segment_a.csv', 'segment_b.csv'):
+            cube, records = load_power_sweep_csv(folder, name)
+            key = 'csv::' + name
+            self.window._power_result_cache[key] = PowerSeriesResult(cube, key, records, {})
+
+        def choose(dialog):
+            for i in range(dialog.source_list.count()):
+                item = dialog.source_list.item(i)
+                item.setSelected(item.data(Qt.UserRole) in
+                                 ('csv::segment_a.csv', 'csv::segment_b.csv'))
+            self.assertEqual(len(dialog.source_list.selectedItems()), 2)
+            dialog.findChild(QPushButton, 'power_add_selected').click()
+            self.assertTrue(dialog.ok_button.isEnabled())
+            return 1
+        return patch.object(SourcePickerDialog, 'exec', choose)
+
+    def wait_catalog(self):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(.01)  # Release the GIL for the Python catalog worker.
+            if not self.window._file_refresh_running:
+                return
+        self.fail('Power catalog did not finish')
 
     def test_linked_scales_cache_metric_and_click(self):
         w = self.window
@@ -222,8 +269,9 @@ class PeakWorkflowTests(unittest.TestCase):
                 dialog.saved_path = path
                 dialog.open_requested = True
                 return 1
-            with patch.object(PowerCombineDialog, "exec", accept), patch.object(w, "_start_load") as load:
+            with self.combination_picker(folder), patch.object(PowerCombineDialog, "exec", accept), patch.object(w, "_start_load") as load:
                 w.power_controller._on_power_combine()
+                self.wait_catalog()
             load.assert_called_once_with("Power Dependent")
             self.assertEqual(w.power_group_combo.currentData(), "csv::combined.csv")
 
@@ -240,8 +288,9 @@ class PeakWorkflowTests(unittest.TestCase):
                 dialog.saved_path = path
                 dialog.open_requested = False
                 return 0
-            with patch.object(PowerCombineDialog, "exec", close), patch.object(w, "_start_load") as load:
+            with self.combination_picker(folder), patch.object(PowerCombineDialog, "exec", close), patch.object(w, "_start_load") as load:
                 w.power_controller._on_power_combine()
+                self.wait_catalog()
             load.assert_not_called()
             # The selected source must remain discoverable, as it is in the real workflow.
             self.assertNotEqual(w.power_group_combo.currentData(), "csv::saved.csv")
@@ -282,7 +331,7 @@ class PeakWorkflowTests(unittest.TestCase):
                 dialog.saved_path = path
                 dialog.open_requested = True
                 return 1
-            with patch.object(PowerCombineDialog, "exec", accept), patch.object(w, "_show_error") as error:
+            with self.combination_picker(folder), patch.object(PowerCombineDialog, "exec", accept), patch.object(w, "_show_error") as error:
                 w.power_controller._on_power_combine()
                 deadline = time.monotonic() + 10
                 while time.monotonic() < deadline and (w._load_in_progress or w.loaded is None):
@@ -331,6 +380,7 @@ class PeakWorkflowTests(unittest.TestCase):
         first, second = "csv::combined.csv", "csv::other.csv"
         sources = {first: PowerSeriesResult(a, first, records, {}),
                    second: PowerSeriesResult(b, second, records_b, {})}
+        w._power_result_cache.update(sources)
         for combo, key in [(w.power_kk_group_combo, first), (w.power_kkp_group_combo, second)]:
             combo.blockSignals(True)
             combo.addItem(key, key)
@@ -340,7 +390,11 @@ class PeakWorkflowTests(unittest.TestCase):
             key: PowerSeriesSource(key, key, "table") for key in sources
         }), patch.object(type(c), "_power_load_group_result", side_effect=sources.__getitem__), \
                 patch.object(w, "_show_error") as error:
-            w.power_compare_chk.setChecked(True)
+            # Both channel results are already supplied by this plotting
+            # fixture; selecting Compare must not launch a second disk load.
+            from PySide6.QtCore import QSignalBlocker
+            with QSignalBlocker(w.power_compare_chk):
+                w.power_compare_chk.setChecked(True)
             w._plot_mode("Power Dependent")
             self.wait_fits()
             fits = w.power_peak_controller.current_results

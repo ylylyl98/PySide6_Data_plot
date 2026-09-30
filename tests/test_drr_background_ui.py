@@ -116,6 +116,8 @@ class DrrBackgroundUiTests(unittest.TestCase):
         with (
             patch("ui_qt.main_window.resolve_drr_background_assignments", return_value=resolved) as resolve,
             patch("ui_qt.main_window.data_io.load_drr_resolved_cube", return_value=replacement) as load,
+            # This fixture supplies a synthetic cube, not an on-disk CSV.
+            patch("core.drr_axis_coordinates.load_coordinates", return_value={}),
             patch("ui_qt.controllers_drr.DrrController._drr_missing_sources", return_value=[]),
             patch.object(self.window.thread_pool, "start") as start,
         ):
