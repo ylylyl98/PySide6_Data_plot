@@ -13,6 +13,44 @@ from core.loader import DataCube
 COMPARE_PANEL_ORDER = ("KK", "KKp", "KpK", "KpKp")
 
 
+@dataclass(frozen=True)
+class RightAxis:
+    label: str
+    left: tuple[float, ...]
+    right: tuple[float, ...]
+
+    def __post_init__(self):
+        x, y = np.asarray(self.left), np.asarray(self.right)
+        if (x.size < 2 or x.shape != y.shape or not np.all(np.isfinite(x))
+                or not np.all(np.isfinite(y)) or not np.all(np.diff(x) > 0)
+                or not (np.all(np.diff(y) > 0) or np.all(np.diff(y) < 0))):
+            raise ValueError('Right y-axis requires a finite, one-to-one measured coordinate mapping.')
+
+    @staticmethod
+    def _interp(values, x, y):
+        x, y = np.asarray(x), np.asarray(y)
+        if x[0] > x[-1]:
+            x, y = x[::-1], y[::-1]
+        v = np.asarray(values)
+        result = np.interp(v, x, y)
+        # Extend the endpoint slopes so zooming to cell edges stays invertible.
+        result = np.where(v < x[0], y[0] + (v-x[0]) * (y[1]-y[0])/(x[1]-x[0]), result)
+        return np.where(v > x[-1], y[-1] + (v-x[-1]) * (y[-1]-y[-2])/(x[-1]-x[-2]), result)
+
+    def forward(self, values):
+        return self._interp(values, self.left, self.right)
+
+    def inverse(self, values):
+        return self._interp(values, self.right, self.left)
+
+
+def add_right_axis(ax, mapping):
+    if mapping is not None:
+        axis = ax.secondary_yaxis('right', functions=(mapping.forward, mapping.inverse))
+        axis.set_ylabel(mapping.label)
+        return axis
+
+
 def _format_heatmap_cursor_value(value):
     return "n/a" if not np.isfinite(float(value)) else f"{float(value):.6g}"
 
@@ -66,6 +104,7 @@ class HeatmapParams:
     center_zero: bool = False
     clip_outliers: bool = False
     split_scale: SplitColorScale | None = None
+    right_axis: RightAxis | None = None
 
 
 @dataclass
@@ -282,6 +321,7 @@ def plot_heatmap(ax: Axes, cube: DataCube, params: HeatmapParams):
         ax.set_yscale("log")
         plain_log_ticks(ax.yaxis)
     ax.set_ylim((ymin, ymax))
+    add_right_axis(ax, params.right_axis)
     return HeatmapRender(
         primary=images[0],
         secondary=(images[1] if len(images) > 1 else None),

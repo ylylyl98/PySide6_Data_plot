@@ -3,6 +3,24 @@ from tests.test_drr_dual_view_regressions import DrrDualViewRegressionTests
 
 
 class DrrPlotReuseTests(DrrDualViewRegressionTests):
+    def test_full_resolution_survives_color_update(self):
+        from core.loader import DataCube
+        w = self.window
+        cube = DataCube(np.linspace(-2, 2, 1340), np.linspace(-1, 1, 301),
+                        np.ones((301, 1340)), 'Gate', 'large', 'DR/R')
+        cube.Z[150, 671] = 12345
+        w.loaded.cube = cube
+        w.drr_split_scale_chk.setChecked(False)
+        w.drr_clip_chk.setChecked(False)
+        w._plot_mode('DRR')
+        mesh = w._drr_heatmap_renders['raw'].primary
+        self.assertEqual(mesh.get_array().shape, cube.Z.shape)
+        self.assertEqual(mesh.get_array()[150, 671], 12345)
+        self._set_silently(w.drr_spins['vmax'], 10)
+        w._plot_mode('DRR')
+        self.assertIs(w._drr_heatmap_renders['raw'].primary, mesh)
+        np.testing.assert_array_equal(mesh.get_array(), cube.Z)
+
     def test_three_region_reuse_updates_middle_and_colorbar_endpoints(self):
         w = self.window
         w.drr_region_count_combo.setCurrentIndex(2)

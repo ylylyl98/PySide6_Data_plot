@@ -174,19 +174,33 @@ class DrrInteractionOptimizationTests(unittest.TestCase):
         # Axis boundary antialiasing can differ between full draw and blit.
         self.assertLess(float(np.mean(np.abs(actual.astype(float) - expected))), .5)
 
-    def test_display_preview_reuses_same_data_and_invalidates_replacement(self):
+    def test_display_preserves_every_sample_at_any_window_size(self):
         c = self.controller
         large = DataCube(np.linspace(1, 2, 1000), np.arange(1000.),
                          np.ones((1000, 1000)), "Gate", "large", "DR/R")
         self.owner.loaded.cube = large
         a = c._drr_display_preview(large)
         self.assertIs(a, c._drr_display_preview(large))
-        self.assertLessEqual(a.Z.size, 250_000)
+        self.assertIs(a, large)
         self.assertEqual(large.Z.shape, (1000, 1000))
+        self.figure.set_size_inches(2, 1)
+        self.assertIs(c._drr_display_preview(large), large)
         large.Z = np.full((1000, 1000), 2.)
         b = c._drr_display_preview(large)
-        self.assertIsNot(a, b)
+        self.assertIs(b, large)
         np.testing.assert_array_equal(b.Z, 2.)
+
+    def test_raw_inspection_preserves_full_grid_and_narrow_peak(self):
+        from ui_qt.drr_raw_dialog import DrrRawDialog
+        cube = DataCube(np.linspace(1, 2, 1340), np.linspace(0, 1, 301),
+                        np.ones((301, 1340)), 'Gate', 'raw', 'Intensity')
+        cube.Z[150, 671] = 12345
+        dialog = SimpleNamespace(
+            preview=SimpleNamespace(cube=cube, spectrum_only=False),
+            figure=self.figure, _preferred_gate=.5, gate_label=Mock(),
+            gate_spin=Mock(), toolbar=Mock(), _gate_changed=Mock())
+        DrrRawDialog._draw(dialog)
+        np.testing.assert_array_equal(dialog.heatmap_ax.collections[0].get_array(), cube.Z)
 
 
 if __name__ == "__main__":

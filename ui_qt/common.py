@@ -85,6 +85,7 @@ class LoadedState:
     primary_file: str | None = None
     selected_files: List[str] = field(default_factory=list)
     baseline_files: List[str] = field(default_factory=list)
+    drr_axis_coordinates: dict = field(default_factory=dict)
     cube: DataCube | None = None
     compare_cubes: Dict[str, DataCube] | None = None
     compare_sources: Dict[str, str] = field(default_factory=dict)
@@ -166,6 +167,7 @@ class ExportOptions:
     drr_raw_sg_polyorder: int = 0
     drr_second_sg_window: int = 0
     drr_second_sg_polyorder: int = 0
+    drr_second_y_window: int = 0
     drr_second_auto_scale: bool = True
     drr_second_scale_xlim: tuple[float, float] | None = None
     drr_second_scale_ylim: tuple[float, float] | None = None

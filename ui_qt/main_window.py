@@ -115,7 +115,6 @@ from core.plotting import (
     SplitColorScale,
     plot_compare_panel,
     plot_drr,
-    downsample_cube_for_display,
     plot_heatmap,
     plot_pl,
     resolve_split_boundary,
@@ -1916,7 +1915,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         layout.setSpacing(4)
 
         combo = QComboBox()
-        combo.addItems(["Auto / Default", "TG", "BG", "Bias", "Advanced..."])
+        combo.addItems(["Auto / Default", "TG+BG", "TG-BG", "TG", "BG", "Bias", "Advanced..."] if prefix == "drr" else self._csv_yaxis_items())
         combo.setToolTip("Choose how the plot y-axis is derived from gate variables.")
         combo.setMinimumWidth(0)
         combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
@@ -2136,6 +2135,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         text = combo.currentText()
         if text == "Auto / Default":
             return "auto"
+        if text in {"TG+BG", "TG-BG"}:
+            return "linear:1,1,0" if text == "TG+BG" else "linear:1,-1,0"
         if text == "TG":
             return "tg"
         if text == "BG":
@@ -2174,6 +2175,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             items = ["Y", "Doping", "Electric field", "Gate voltage", "Custom"]
         else:
             items = self._xlsx_yaxis_items() if xlsx else self._csv_yaxis_items()
+        if prefix == "drr" and not xlsx:
+            items = ["Auto / Default", "TG+BG", "TG-BG", "TG", "BG", "Bias", "Advanced..."]
         current = combo.currentText()
         blocked = combo.blockSignals(True)
         try:
@@ -2522,8 +2525,16 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                           else self.drr_controller._drr_derivative_value())
         if derivative is None:
             return True
-        window = self.drr_controller._enforce_drr_sg_constraints(show_status=False)
+        try:
+            window = self.drr_controller._enforce_drr_sg_constraints(show_status=False, use_mixed=derivative == 2)
+        except ValueError as exc:
+            self.drr_mixed_recommendation.setText(str(exc))
+            self._status(str(exc))
+            return False
         poly = int(self.drr_sg_poly_spin.value())
+        if derivative == 2:
+            from ui_qt.drr_mixed_controls import derivative_key
+            derivative = derivative_key(self)
         if not hasattr(self, '_drr_display_compute'):
             from ui_qt.drr_display_compute import DrrDisplayCompute
             self._drr_display_compute = DrrDisplayCompute(self)
@@ -3266,6 +3277,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.shg_fit_min_spin.editingFinished.connect(self.shg_controller._on_shg_fit_param_changed)
         self.shg_fit_max_spin.editingFinished.connect(self.shg_controller._on_shg_fit_param_changed)
         self.shg_fit_branch_spin.valueChanged.connect(lambda _value: self.shg_controller._on_shg_fit_param_changed())
+        self.drr_right_yaxis_combo.currentTextChanged.connect(
+            lambda _value: self._schedule_plot_redraw("DRR") if self.loaded and self.loaded.mode == "DRR" else None
+        )
         self.drr_yaxis_combo.currentTextChanged.connect(
             lambda _value: self.drr_controller._on_drr_plot_param_changed(self.drr_yaxis_combo)
         )
@@ -3288,6 +3302,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.drr_gate_prev_btn.clicked.connect(lambda: self._step_drr_gate(-1))
         self.drr_gate_next_btn.clicked.connect(lambda: self._step_drr_gate(1))
         self.drr_derivative_combo.currentTextChanged.connect(self.drr_controller._on_drr_derivative_changed)
+        from ui_qt.drr_mixed_controls import changed as mixed_changed
+        self.drr_second_kind_combo.currentIndexChanged.connect(lambda _: mixed_changed(self))
+        self.drr_sg_y_window_spin.valueChanged.connect(lambda _: mixed_changed(self, manual_y=True))
+        self.drr_sg_y_auto_chk.toggled.connect(lambda _: mixed_changed(self))
         self.drr_sg_window_spin.valueChanged.connect(self.drr_controller._on_drr_sg_window_changed)
         self.drr_sg_auto_chk.toggled.connect(self.drr_controller._on_drr_derivative_changed)
         self.drr_sg_poly_spin.valueChanged.connect(self.drr_controller._on_drr_derivative_changed)
@@ -6084,6 +6102,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         return tuple(records)
 
     def _load_task(self, options: LoadOptions, *, progress: Signal, log: Signal) -> LoadedState:
+        loaded = self._load_task_data(options, progress=progress, log=log)
+        if loaded.mode == "DRR" and loaded.cube is not None and Path(loaded.primary_file or "").suffix.lower() == ".csv":
+            from core.drr_axis_coordinates import load_coordinates
+            loaded.drr_axis_coordinates = load_coordinates(
+                loaded.folder, loaded.selected_files, loaded.y_axis_spec, loaded.cube.gate)
+        return loaded
+
+    def _load_task_data(self, options: LoadOptions, *, progress: Signal, log: Signal) -> LoadedState:
         mode = options.mode
         folder = options.folder
         if not options.selected_files:
@@ -6396,7 +6422,18 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return
         if loaded.mode == self._active_load_mode:
             self._active_load_succeeded = True
+        previous = self.loaded
+        if loaded.mode == "DRR" and (
+            previous is None or previous.mode != "DRR"
+            or previous.folder != loaded.folder
+            or previous.selected_files != loaded.selected_files
+            or previous.y_axis_spec != loaded.y_axis_spec
+        ):
+            self._drr_view_limits = None
+            self._drr_limits_from_controls = True
         self.loaded = loaded
+        if loaded.mode == "DRR":
+            self._update_drr_right_axis_options()
         if hasattr(self, 'drr_peak_analysis'):
             self.drr_peak_analysis.loaded_changed()
         if loaded.mode == "DRR":
@@ -7507,9 +7544,29 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             split_scale=self._split_scale_for_mode(mode),
         )
 
+    def _update_drr_right_axis_options(self) -> None:
+        combo = self.drr_right_yaxis_combo
+        coordinates = getattr(self.loaded, "drr_axis_coordinates", {})
+        for index in range(1, combo.count()):
+            item = combo.model().item(index)
+            available = combo.itemText(index) in coordinates
+            item.setEnabled(available)
+            item.setToolTip("" if available else "Unavailable: missing, constant, non-monotonic, or inconsistent across selected files.")
+        if combo.currentText() != "Off" and combo.currentText() not in coordinates:
+            blocked = combo.blockSignals(True)
+            combo.setCurrentText("Off")
+            combo.blockSignals(blocked)
+            self._status("Right y-axis disabled: no consistent one-to-one mapping for this selection.")
+
     def _make_drr_params(self, cube: DataCube, derivative_order: int | None) -> HeatmapParams:
         """Build display parameters with a product-specific color range."""
         params = self._make_params("DRR", cube)
+        choice = self.drr_right_yaxis_combo.currentText()
+        if choice != "Off":
+            from core.plotting import RightAxis
+            values = self.loaded.drr_axis_coordinates.get(choice)
+            if values is not None:
+                params.right_axis = RightAxis(f"{choice} (V)", tuple(self.loaded.cube.gate), tuple(values))
         if derivative_order == 2 and hasattr(self, "drr_second_vmin_spin"):
             params = HeatmapParams(
                 **{
@@ -9532,7 +9589,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     cax = self.figure.add_subplot(cbar_slot)
                     ax2 = self.figure.add_subplot(spectrum_slot, sharex=ax1)
                     if both:
-                        short_title = "ΔR/R" if key == "raw" else "Second derivative"
+                        short_title = "ΔR/R" if key == "raw" else ("Mixed derivative (dXdY)" if self.drr_second_kind_combo.currentData() == "mixed" else "Second derivative")
                         product_params = HeatmapParams(
                             **{
                                 **product_params.__dict__,
@@ -9559,7 +9616,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                                 axis="y", style="sci", scilimits=(-2, 2), useMathText=True,
                             )
                     spectrum_ylabel = (
-                        "d²(DR/R)/dE²"
+                        product_cube.cbar_label
                         if both and key == "second"
                         else product_params.cbar_label
                     )
@@ -10263,6 +10320,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._resolved_cmap(self.drr_second_cmap), bool(getattr(self, "drr_second_auto_scale", True)),
             self._split_scale_key("drr"),
             self._split_scale_key("drr_second"),
+            self.drr_right_yaxis_combo.currentText(),
+            self.drr_second_kind_combo.currentData(), self.drr_sg_y_window_spin.value(),
         )
 
     def _ensure_loaded_matches_drr_params(self) -> bool:
@@ -10692,6 +10751,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             if mode == "DRR":
                 try:
                     drr_raw_cube, _raw_deriv, drr_raw_win, drr_raw_poly = self.drr_controller._drr_cube_with_metadata(None)
+                    from ui_qt.drr_mixed_controls import derivative_key
+                    second_key = derivative_key(self)
                 except ValueError as exc:
                     self._show_error(f"Cannot prepare the DRR export pair: {exc}")
                     return
@@ -10703,15 +10764,15 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 drr_second_win = int(self.drr_sg_window_spin.value())
                 drr_second_poly = int(self.drr_sg_poly_spin.value())
                 cached_second = self._drr_derivative_cache.get(
-                    (id(self.loaded.cube), 2, drr_second_win, drr_second_poly)
+                    (id(self.loaded.cube), second_key, drr_second_win, drr_second_poly)
                 )
                 if cached_second is not None:
                     drr_second_cube, drr_second_win = cached_second
                 drr_second_params = HeatmapParams(
                     **{
                         **drr_raw_params.__dict__,
-                        "title": f"{drr_raw_cube.title} (d2E)",
-                        "cbar_label": "d2(DR/R)/dE2",
+                        "title": f"{drr_raw_cube.title} ({'dXdY' if isinstance(second_key, tuple) else 'd2E'})",
+                        "cbar_label": (f"d2(DR/R)/(dE d{drr_raw_cube.gate_label})" if isinstance(second_key, tuple) else "d2(DR/R)/dE2"),
                         "cmap": self._resolved_cmap(self.drr_second_cmap),
                         "vmin": float(self.drr_second_vmin_spin.value()),
                         "vmax": float(self.drr_second_vmax_spin.value()),
@@ -10838,6 +10899,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 drr_second_cube=drr_second_cube,
                 drr_raw_params=drr_raw_params,
                 drr_second_params=drr_second_params,
+                drr_second_y_window=second_key[1] if isinstance(second_key, tuple) else 0,
                 drr_raw_sg_window=drr_raw_win,
                 drr_raw_sg_polyorder=drr_raw_poly,
                 drr_second_sg_window=drr_second_win,
@@ -11099,7 +11161,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     # Export receives immutable SG settings and performs the
                     # expensive transform off the GUI thread.
                     second_product, second_window = apply_sg_derivative_energy(
-                        loaded.cube, derivative=2, window_length=second_window,
+                        loaded.cube, derivative=(("mixed", options.drr_second_y_window) if options.drr_second_y_window else 2), window_length=second_window,
                         polyorder=second_poly,
                     )
                     second_product.gate_unit = getattr(loaded.cube, "gate_unit", "")
@@ -11111,7 +11173,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                         **{
                             **raw_params.__dict__,
                             "title": f"{second_product.title}",
-                            "cbar_label": "d2(DR/R)/dE2",
+                            "cbar_label": second_product.cbar_label,
                             "split_scale": None,
                         }
                     )
@@ -11138,6 +11200,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     loaded.primary_file, len(loaded.selected_files), loaded.drr_mode_label,
                     2, int(second_window), second_poly, options.drr_sg_mode_label,
                 )
+                if options.drr_second_y_window:
+                    second_base = second_base.replace('_d2E_W', '_dXdY_W').removesuffix('_Regrid') + f'_WY{options.drr_second_y_window}_LocalXY'
                 raw_processing = {
                     **drr_processing, "derivative_order": None,
                     "savgol_window": int(options.drr_raw_sg_window or options.drr_sg_window),
@@ -11149,6 +11213,13 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     "savgol_window": int(second_window), "savgol_polyorder": int(second_poly),
                     "derivative_grid": options.drr_sg_mode_label,
                 }
+                if options.drr_second_y_window:
+                    second_processing.update({
+                        "derivative_axes": "XY", "derivative_order_x": 1, "derivative_order_y": 1,
+                        "savgol_window_y": int(options.drr_second_y_window),
+                        "derivative_grid": "Local polynomial on actual X/Y coordinates",
+                        "y_derivative_coordinate": loaded.cube.gate_label,
+                    })
                 pair_paths = export_drr_pair_pngs_and_dat(
                     folder, raw_cube=raw_product, second_cube=second_product,
                     raw_params=raw_params, second_params=second_params,

@@ -266,6 +266,11 @@ class ExportMetadataTests(unittest.TestCase):
                 metadata_input_files=(("measurement", source.name),),
                 metadata_processing={"mode": "Self"},
             )
+            metadata_path = first['dat'].with_suffix('.metadata.json')
+            legacy = json.loads(metadata_path.read_text())
+            legacy.pop('figures')
+            metadata_path.write_text(json.dumps(legacy))
+            png_time = first['png'].stat().st_mtime_ns
             second = export_drr_png_and_dat(
                 tmp, cube=cube, params=params, export_base="sample", processed_name=output_folder,
                 metadata_input_files=(("measurement", source.name),),
@@ -277,10 +282,12 @@ class ExportMetadataTests(unittest.TestCase):
             self.assertEqual(second["dat"], first["dat"])
             self.assertEqual(second["png"], first["png"])
             self.assertEqual(second.save_status, "reused")
+            self.assertEqual(second['png'].stat().st_mtime_ns, png_time)
+            self.assertIn(first['png'].name, json.loads(metadata_path.read_text())['figures'])
             self.assertEqual(len(list(first["dat"].parent.glob("*.dat"))), 1)
             self.assertEqual(len(list(first["dat"].parent.glob("*.png"))), 1)
 
-    def test_drr_plot_change_updates_png_without_duplicate_dat(self) -> None:
+    def test_drr_plot_change_adds_png_to_shared_metadata_without_rewriting_dat(self) -> None:
         def render(path, *_args, **_kwargs):
             Path(path).write_bytes(b"png")
 
@@ -308,14 +315,37 @@ class ExportMetadataTests(unittest.TestCase):
             }
 
             first = export_drr_png_and_dat(tmp, params=first_params, **kwargs)
+            dat_stat = first['dat'].stat().st_mtime_ns
+            png_stat = first['png'].stat().st_mtime_ns
             second = export_drr_png_and_dat(tmp, params=changed_params, **kwargs)
 
             self.assertEqual(second.save_status, "updated")
             self.assertEqual(second["dat"], first["dat"])
+            self.assertNotEqual(second['png'], first['png'])
+            self.assertEqual(first['dat'].stat().st_mtime_ns, dat_stat)
+            self.assertEqual(first['png'].stat().st_mtime_ns, png_stat)
             self.assertEqual(len(list(second["dat"].parent.glob("*.dat"))), 1)
+            self.assertEqual(len(list(second['dat'].parent.glob('*.metadata.json'))), 1)
             payload = json.loads(second["dat"].with_suffix(".metadata.json").read_text())
+            self.assertEqual(payload['figures'][first['png'].name]['plot']['vmin'], -1.)
+            self.assertEqual(payload['figures'][second['png'].name]['plot']['vmin'], -.5)
+            self.assertIn(first['png'].name, payload['outputs'])
             self.assertEqual(payload["plot"]["vmin"], -0.5)
             self.assertEqual(payload["plot"]["vmax"], 0.5)
+            repeated = export_drr_png_and_dat(tmp, params=first_params, **kwargs)
+            self.assertEqual(repeated['png'], first['png'])
+            self.assertEqual(repeated.save_status, 'reused')
+            # A deleted old PNG must not let a new view overwrite its record.
+            first['png'].unlink()
+            third_params = HeatmapParams(**{**first_params.__dict__, 'xlim': (1.2, 1.8)})
+            third = export_drr_png_and_dat(tmp, params=third_params, **kwargs)
+            self.assertNotEqual(third['png'], first['png'])
+            payload = json.loads(third['dat'].with_suffix('.metadata.json').read_text())
+            self.assertEqual(len(payload['figures']), 3)
+            self.assertEqual(payload['figures'][first['png'].name]['plot']['xlim'], [1., 2.])
+            repaired = export_drr_png_and_dat(tmp, params=first_params, **kwargs)
+            self.assertEqual(repaired['png'], first['png'])
+            self.assertTrue(repaired['png'].is_file())
 
     def test_drr_repeat_recognizes_metadata_written_before_fingerprints(self) -> None:
         def render(path, *_args, **_kwargs):
@@ -346,13 +376,17 @@ class ExportMetadataTests(unittest.TestCase):
             payload = json.loads(metadata_path.read_text(encoding="utf-8"))
             payload.pop("analysis_fingerprint")
             payload.pop("plot_fingerprint")
+            payload.pop("figures")
             metadata_path.write_text(json.dumps(payload), encoding="utf-8")
 
             second = export_drr_png_and_dat(tmp, **kwargs)
 
             self.assertEqual(second.save_status, "updated")
             self.assertEqual(second["dat"], first["dat"])
-            self.assertEqual(second["png"], first["png"])
+            self.assertNotEqual(second["png"], first["png"])
+            self.assertTrue(first['png'].is_file())
+            migrated = json.loads(metadata_path.read_text(encoding='utf-8'))
+            self.assertEqual(set(migrated['figures']), {first['png'].name, second['png'].name})
             self.assertEqual(render_png.call_count, 2)
 
     def test_changed_drr_processing_creates_a_distinct_result(self) -> None:

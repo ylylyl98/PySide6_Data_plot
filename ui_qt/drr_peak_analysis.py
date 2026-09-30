@@ -167,10 +167,12 @@ class DrrPeakAnalysisController(QObject):
             noise_sigma=self.noise.value(), min_width_mev=self.width.value(), max_gap=self.gaps.value())
 
     def key(self):
+        from ui_qt.drr_mixed_controls import enabled
         return (id(self.cube()), repr(self.settings()),
                 tuple(getattr(self.owner, 'drr_selected_files', ())),
                 tuple(getattr(self.owner, 'drr_baseline_files_manual', ())),
-                self.owner.drr_baseline_combo.currentText(), self.owner.drr_baseline_combine_combo.currentText())
+                self.owner.drr_baseline_combo.currentText(), self.owner.drr_baseline_combine_combo.currentText(),
+                enabled(self.owner), self.owner.drr_sg_y_window_spin.value() if enabled(self.owner) else 0)
 
     def selected_count(self):
         cube = self.cube()
@@ -235,6 +237,10 @@ class DrrPeakAnalysisController(QObject):
     def analyze(self):
         cube = self.cube()
         if cube is None or self.workers or getattr(self.owner, '_load_in_progress', False): return
+        from ui_qt.drr_mixed_controls import enabled
+        if enabled(self.owner) and self.source.currentData() != 'raw':
+            self.summary.setText('Peak tracking supports Original DRR and X twice (d2E). Select Original DRR or switch derivative direction; mixed heatmap and linecuts remain available.')
+            return
         from core.drr_peak_analysis import analyze_drr_peaks
         settings = self.settings(); key = self.key()
         if settings.mode == 'seed' and (settings.source == 'both' or settings.polarity == 'both'):
