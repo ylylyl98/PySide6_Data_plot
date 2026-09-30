@@ -2,7 +2,7 @@
 from dataclasses import replace
 
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QToolButton, QCheckBox, QLabel
-from core.plotting import plot_pl, downsample_cube_for_display, resolve_split_boundary
+from core.plotting import plot_pl, resolve_split_boundary
 from core.processing import compute_auto_limits
 
 
@@ -189,7 +189,6 @@ def draw(owner, cube):
     grid = owner.figure.add_gridspec(2, len(names), height_ratios=[1.25, 1], hspace=.4, wspace=.36)
     owner._pl_heatmap_axes = {}
     first = None
-    preview = downsample_cube_for_display(cube)
     for column, name in enumerate(names):
         panel_grid = grid[0, column].subgridspec(1, 2, width_ratios=[1, .035], wspace=.12)
         ax = owner.figure.add_subplot(panel_grid[0, 0], sharex=first, sharey=first)
@@ -198,7 +197,7 @@ def draw(owner, cube):
             first = ax
         owner._pl_heatmap_axes[name] = ax
         panel = params[name]
-        render = plot_pl(ax, preview, replace(panel, title=f'{panel.title} ({name.title()})'))
+        render = plot_pl(ax, cube, replace(panel, title=f'{panel.title} ({name.title()})'))
         owner._add_heatmap_colorbar(render, cax, label=panel.cbar_label)
         if column:
             ax.set_ylabel('')

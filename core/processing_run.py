@@ -1584,10 +1584,15 @@ def _load_canonical(user_folder: str, origin_name: str, *, y_axis: str = "auto")
     available_axes = list(resolved["available_axes"])
     default_axis = str(resolved["default_axis"])
 
+    gate_coordinates = {"TG": vtg, "BG": vbg, "TG+BG": vtg + vbg, "TG-BG": vtg - vbg}
+    if vbias is not None:
+        gate_coordinates["Bias"] = vbias
+
     # canonicalize gate increasing
     if gate_axis[0] > gate_axis[-1]:
         gate_axis = gate_axis[::-1]
         Z_gateE   = Z_gateE[::-1, :]
+        gate_coordinates = {key: values[::-1] for key, values in gate_coordinates.items()}
 
     return {
         "energy": np.array(energy, dtype=float, copy=True),
@@ -1600,6 +1605,7 @@ def _load_canonical(user_folder: str, origin_name: str, *, y_axis: str = "auto")
         # NEW: expose axis options to UI
         "available_axes": available_axes,
         "default_axis": default_axis,
+        "gate_coordinates": {key: np.array(values, copy=True) for key, values in gate_coordinates.items()},
     }
 
 

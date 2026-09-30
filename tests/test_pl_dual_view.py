@@ -19,6 +19,19 @@ from PIL import Image
 
 
 class PlDualViewTests(unittest.TestCase):
+    def test_large_map_retains_narrow_peak_in_both_views(self):
+        cube = DataCube(np.linspace(1, 2, 1340), np.linspace(-1, 1, 301),
+                        np.ones((301, 1340)), 'Gate', 'large', 'Intensity')
+        cube.Z[150, 671] = 12345
+        self.w.loaded.cube = cube
+        self.w.pl_clip_chk.setChecked(False)
+        self.w.pl_view_side_btn.setChecked(True)
+        self.w._plot_mode('PL')
+        for ax in self.w._pl_heatmap_axes.values():
+            values = np.asarray(ax.collections[0].get_array())
+            self.assertEqual(values.shape, (301, 1340))
+            self.assertEqual(values[150, 671], 12345)
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])

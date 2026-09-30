@@ -59,7 +59,6 @@ from core.drr_sources import (
     wavelength_centers_match,
 )
 from core.loader import DataCube
-from core.plotting import downsample_cube_for_display
 from core.processing import apply_sg_derivative_energy, clamp_sg_window, nearest_gate_spectrum
 from ui_qt.common import Worker, WrappedFilenameDelegate
 from ui_qt.theme import alias as theme_alias
@@ -647,7 +646,10 @@ class DrrController:
         text = self.drr_derivative_combo.currentText()
         return None if text == "None" else (1 if text == "dE" else 2)
 
-    def _enforce_drr_sg_constraints(self, *, show_status: bool) -> int:
+    def _enforce_drr_sg_constraints(self, *, show_status: bool, use_mixed: bool = True) -> int:
+        from ui_qt.drr_mixed_controls import enabled, update
+        if use_mixed and enabled(self._owner):
+            return update(self._owner)
         poly = int(self.drr_sg_poly_spin.value())
         req_win = int(self.drr_sg_window_spin.value())
         n_energy = (
@@ -655,6 +657,10 @@ class DrrController:
             if self.loaded and self.loaded.mode == "DRR" and self.loaded.cube is not None
             else 401
         )
+        if enabled(self._owner) and not use_mixed:
+            # Raw/dE preparation must not overwrite the mixed X window with
+            # the legacy energy-only automatic recommendation.
+            return clamp_sg_window(req_win, n_energy=n_energy, polyorder=poly)
         auto_window = getattr(self, "drr_sg_auto_chk", None)
         auto_enabled = auto_window is not None and auto_window.isChecked()
         clamped_request = getattr(self, "_drr_sg_clamped_request", None)
@@ -691,7 +697,10 @@ class DrrController:
         if deriv not in (None, 1, 2):
             raise ValueError("DRR derivative must be None, 1, or 2.")
         poly = int(self.drr_sg_poly_spin.value())
-        req_win = self._enforce_drr_sg_constraints(show_status=True)
+        req_win = self._enforce_drr_sg_constraints(show_status=True, use_mixed=deriv == 2)
+        if deriv == 2:
+            from ui_qt.drr_mixed_controls import derivative_key
+            deriv = derivative_key(self._owner)
         cache_key = (id(self.loaded.cube), deriv, int(req_win), poly)
         cached = self._drr_derivative_cache.get(cache_key)
         if cached is not None:
@@ -718,23 +727,8 @@ class DrrController:
         return cube
 
     def _drr_display_preview(self, cube: DataCube) -> DataCube:
-        """Cache bounded display copies for the current immutable load products."""
-        source = self.loaded.cube
-        if getattr(self, "_drr_preview_source", None) is not source:
-            self._drr_preview_source = source
-            self._drr_preview_cache = {}
-        # Bucket dimensions to avoid new copies for every pixel of a resize.
-        width, height = self.figure.bbox.size
-        budget = max(32_000, min(250_000, int(width * height / 2) // 16_000 * 16_000))
-        key = (id(cube), id(cube.Z), id(cube.energy), id(cube.gate), budget)
-        cache = self._drr_preview_cache
-        if key not in cache:
-            if len(cache) >= 2:
-                cache.pop(next(iter(cache)))
-            # Keep the input arrays alive with the key to prevent id reuse.
-            cache[key] = (cube, cube.Z, cube.energy, cube.gate,
-                          downsample_cube_for_display(cube, max_points=budget))
-        return cache[key][-1]
+        """Keep every measured cell, including narrow peaks, in the app view."""
+        return cube
 
     def _drr_baseline_key(self) -> str:
         text = self.drr_baseline_combo.currentText()
@@ -826,7 +820,11 @@ class DrrController:
             update_label()
         self._invalidate_pending_drr_fit("Fit discarded: derivative changed.")
         self._invalidate_export_move_sources()
-        self._enforce_drr_sg_constraints(show_status=True)
+        try:
+            self._enforce_drr_sg_constraints(show_status=True, use_mixed=self._drr_plot_view != "raw")
+        except ValueError as exc:
+            self._status(str(exc))
+            return
         if self.loaded and self.loaded.mode == "DRR" and not self._suspend_drr_autoplot:
             self._refresh_automatic_ranges("DRR", refresh_split=True)
             self._schedule_plot_redraw("DRR")

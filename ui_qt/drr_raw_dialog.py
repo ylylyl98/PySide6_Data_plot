@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 from core.drr_raw_preview import load_preview
-from core.plotting import HeatmapParams, plot_heatmap, downsample_cube_for_display
+from core.plotting import HeatmapParams, plot_heatmap
 from core.processing import compute_auto_limits
 from ui_qt.common import Worker, QComboBox, QDoubleSpinBox
 from ui_qt.matplotlib_theme import QtFontFigureCanvasQTAgg
@@ -182,7 +182,7 @@ class DrrRawDialog(QDialog):
             bounds = compute_auto_limits(cube)
             params = HeatmapParams(cube.title, 'Photon energy (eV)', cube.gate_label, cube.cbar_label,
                 bounds.vmin, bounds.vmax, (bounds.xmin, bounds.xmax), (bounds.ymin, bounds.ymax))
-            render = plot_heatmap(self.heatmap_ax, downsample_cube_for_display(cube), params)
+            render = plot_heatmap(self.heatmap_ax, cube, params)
             self.figure.colorbar(render.primary, cax=cax, label=cube.cbar_label)
             self.gate_line = self.heatmap_ax.axhline(self._preferred_gate, color='#dd7733', linestyle='--')
         self.gate_label.setText(cube.gate_label)

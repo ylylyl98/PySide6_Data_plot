@@ -1187,6 +1187,9 @@ def apply_sg_derivative_energy(
     window_length: int,
     polyorder: int = 2,
 ) -> tuple[DataCube, int]:
+    if isinstance(derivative, tuple) and len(derivative) == 2 and derivative[0] == 'mixed':
+        from core.drr_mixed_derivative import mixed_derivative
+        return mixed_derivative(cube, window_length, derivative[1], polyorder)
     if derivative not in (None, 1, 2):
         raise ValueError("derivative must be None, 1, or 2.")
     if derivative is None:

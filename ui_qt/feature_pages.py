@@ -561,7 +561,7 @@ class FeatureTabsMixin:
         self.drr_sg_poly_spin.setAccessibleName("Second derivative polynomial order")
         self.drr_sg_poly_spin.setFixedWidth(UI_METRICS["spin_w"])
         self.drr_sg_poly_spin.setMinimumHeight(UI_METRICS["input_h"])
-        self.drr_sg_auto_chk = QCheckBox("Auto window")
+        self.drr_sg_auto_chk = QCheckBox("Auto X window")
         self.drr_sg_auto_chk.setChecked(True)
         self.drr_sg_auto_chk.setToolTip(
             "Use 11 points for up to 512 energy samples, otherwise 21 (including 1024 / 1340). "
@@ -583,15 +583,17 @@ class FeatureTabsMixin:
             spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             spin.setMinimumHeight(UI_METRICS["input_h"])
 
-        self.drr_second_controls = QGroupBox("Second derivative (d2E)")
+        self.drr_second_controls = QGroupBox("Second derivative")
         second_form = QFormLayout(self.drr_second_controls)
         second_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         second_form.setVerticalSpacing(UI_METRICS["row_spacing"])
-        second_note = QLabel("Side by side: left ΔR/R, right d2E.")
+        second_note = QLabel("Side by side: left ΔR/R, right selected derivative.")
         second_note.setWordWrap(True)
         second_form.addRow(second_note)
         second_form.addRow(self.drr_sg_auto_chk)
-        second_form.addRow("Window points", self.drr_sg_window_spin)
+        second_form.addRow("X window points", self.drr_sg_window_spin)
+        from ui_qt.drr_mixed_controls import build as build_mixed_controls
+        build_mixed_controls(self, second_form)
         second_form.addRow("Polynomial order", self.drr_sg_poly_spin)
         second_form.addRow("Cmap", self.drr_second_cmap)
 
@@ -631,7 +633,15 @@ class FeatureTabsMixin:
         _drr_yc_h.setSpacing(6)
         _drr_yc_h.addWidget(self.drr_yaxis_combo, 1)
         cfg.addRow("DRR Baseline", baseline_cmap_row)
-        cfg.addRow("Y-axis", _drr_yc_row)
+        cfg.addRow("Left Y-axis", _drr_yc_row)
+        self.drr_right_yaxis_combo = QComboBox()
+        self.drr_right_yaxis_combo.setObjectName("drr_right_yaxis_combo")
+        self.drr_right_yaxis_combo.setAccessibleName("Right Y-axis")
+        self.drr_right_yaxis_combo.addItems(["Off", "TG+BG", "TG-BG", "TG", "BG", "Bias"])
+        self.drr_right_yaxis_combo.setToolTip("Show a second coordinate scale from the same measured rows. Unavailable choices have no consistent one-to-one mapping.")
+        self.drr_right_yaxis_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self._style_combo_popup(self.drr_right_yaxis_combo)
+        cfg.addRow("Right Y-axis", self.drr_right_yaxis_combo)
         cfg.addRow("", self.drr_yaxis_advanced_box)
         self._set_form_label_width(cfg, UI_METRICS["label_col_width"])
         params_layout.addLayout(cfg)
@@ -665,7 +675,7 @@ class FeatureTabsMixin:
         basic_form.addRow("Color scale", self.drr_region_count_combo)
         basic_form.addRow(self.drr_split_scale_panel)
         self.drr_second_split_expander = self._make_expander(
-            "d2E split color scale", self.drr_second_split_scale_panel, expanded=False
+            "Derivative split color scale", self.drr_second_split_scale_panel, expanded=False
         )
         second_form.addRow(self.drr_second_split_expander)
         basic_form.addRow(

@@ -27,13 +27,13 @@ def products_for_display(owner):
         products.append(('raw', raw, owner._make_drr_params(raw, None), None, win, poly))
     owner.loaded.drr_derivative_label = ('Advanced first derivative (dE)'
         if advanced == 1 and owner._drr_plot_view == 'raw'
-        else {'raw': 'None', 'second': 'd2E'}.get(owner._drr_plot_view, 'None'))
+        else {'raw': 'None', 'second': ('dXdY' if owner.drr_second_kind_combo.currentData() == 'mixed' else 'd2E')}.get(owner._drr_plot_view, 'None'))
     return products
 
 
 def structure(params):
     return (params.title, params.xlabel, params.ylabel, params.cbar_label,
-            params.xlim, params.ylim, params.log_scale, params.y_axis_log,
+            params.xlim, params.ylim, params.log_scale, params.y_axis_log, params.right_axis,
             None if params.split_scale is None else (params.split_scale.split_x, params.split_scale.split_x2, params.split_scale.show_boundary))
 
 

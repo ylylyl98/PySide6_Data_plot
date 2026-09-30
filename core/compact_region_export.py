@@ -90,7 +90,10 @@ def compact_colorbars(fig, render, *, left, right, bottom, label, drr_header=Fal
             axis.set_title(name, fontsize=8, pad=2, fontweight='bold')
     if drr_header:
         y = (max(box.y1 for box in header_boxes) + 2) / fig.bbox.height
-        fig.text((left+right)/2, y, label, ha='center', va='bottom',
+        # A mixed derivative names both coordinates; anchor its longer label
+        # at the colorbar's right edge to keep it inside the exported image.
+        mixed = str(label).startswith('d2(DR/R)/(dE d')
+        fig.text(right if mixed else (left+right)/2, y, label, ha='right' if mixed else 'center', va='bottom',
                  fontsize=16 if count == 1 else 9, fontweight='bold', gid='drr-colorbar-quantity')
     else:
         fig.text((left+right)/2, .964, label, ha='center', va='top', fontsize=9)

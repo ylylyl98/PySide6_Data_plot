@@ -526,6 +526,9 @@ def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *,
         ax.set_yscale("log")
         plain_log_ticks(ax.yaxis)
     ax.set_ylim(params.ylim)
+    if split_render is None:
+        from core.plotting import add_right_axis
+        add_right_axis(ax, params.right_axis)
 
     cbar_w = (0.42 if split_render is not None else 0.24) * axpos.width
     cbar_h = 0.018
@@ -1030,6 +1033,32 @@ def export_drr_png_and_dat(
     plot_matches = prior_payload.get("plot_fingerprint") == plot_fingerprint
     if prior and not prior_payload.get("plot_fingerprint"):
         plot_matches = _fingerprint_json(prior_payload.get("plot", {})) == plot_fingerprint
+    figures = dict(prior_payload.get("figures", {})) if drr_style else {}
+    if drr_style:
+        # Import the single-picture record on the first save after upgrading.
+        if prior and not figures and png_path.is_file():
+            figures[png_path.name] = {
+                "plot": prior_payload.get("plot", {}),
+                "plot_fingerprint": prior_payload.get("plot_fingerprint"),
+                "created_utc": prior_payload.get("created_utc"),
+                "data_file": dat_path.name,
+            }
+        matching_name = next((name for name, record in figures.items()
+                              if record.get("plot_fingerprint") == plot_fingerprint
+                              and Path(name).name == name), None)
+        if matching_name is not None:
+            png_path = out_dir / matching_name
+            plot_matches = True
+        elif prior and (png_path.is_file() or png_path.name in figures):
+            # Changing a view never overwrites a previous PNG, including a
+            # legacy image whose render fingerprint is unknown.
+            for number in range(1, 10000):
+                candidate = out_dir / f"{safe}_view_{number:03d}.png"
+                if candidate.name not in figures and not candidate.exists():
+                    png_path = candidate
+                    break
+            else:
+                raise FileExistsError(f"No free PNG view name for {safe!r}.")
     needs_dat = not dat_path.is_file()
     needs_png = not png_path.is_file() or not plot_matches
     if needs_dat:
@@ -1044,8 +1073,16 @@ def export_drr_png_and_dat(
     if prior and (needs_dat or needs_png):
         save_status = "updated"
     paths = ExportPathResult({"png": png_path, "dat": dat_path}, save_status=save_status)
-    if save_status == "reused":
+    if save_status == "reused" and (not drr_style or figures == prior_payload.get("figures")):
         return paths
+    if drr_style:
+        figures[png_path.name] = {
+            "plot": _metadata_jsonable(params),
+            "plot_fingerprint": plot_fingerprint,
+            "created_utc": figures.get(png_path.name, {}).get("created_utc") or datetime.now(timezone.utc).isoformat(),
+            "data_file": dat_path.name,
+        }
+    figure_paths = [out_dir / name for name in figures] if drr_style else [png_path]
     run_step('Writing metadata', write_export_metadata,
         folder,
         [dat_path],
@@ -1054,14 +1091,17 @@ def export_drr_png_and_dat(
         input_files=input_files,
         processing=processing,
         plot=params,
-        outputs=paths.values(),
+        outputs=[dat_path, *figure_paths],
         extra={
             **(metadata_extra or {}),
             **({"display_title": display_title(params.title), "title_policy_version": 1} if drr_style else {}),
             "analysis_fingerprint": analysis_fingerprint,
             "plot_fingerprint": plot_fingerprint,
+            **({"figures": figures,
+                "created_utc": prior_payload.get("created_utc") or datetime.now(timezone.utc).isoformat(),
+                "updated_utc": datetime.now(timezone.utc).isoformat()} if drr_style else {}),
         },
-        output_manifest=(("data", dat_path), ("figure", png_path)),
+        output_manifest=[("data", dat_path), *(("figure", path) for path in figure_paths)],
         source_descriptors=sources,
     )
     return paths
