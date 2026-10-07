@@ -291,12 +291,16 @@ def _drr_scroll_anchor(widget):
     return None, 0
 
 
-def _sync_drr_rows(widget, rows, *, preserve_view=False, select_first=False):
+def _sync_drr_rows(widget, rows, *, preserve_view=False, select_first=False, key_aliases=None):
     """Update identities in place and keep the visible file at its pixel offset."""
     current = widget.currentItem()
     current_key = current.data(Qt.UserRole) if current is not None else None
     selected = {item.data(Qt.UserRole) for item in widget.selectedItems()}
     anchor_key, anchor_offset = _drr_scroll_anchor(widget) if preserve_view else (None, 0)
+    aliases = key_aliases or {}
+    current_key = aliases.get(current_key, current_key)
+    selected = {aliases.get(key, key) for key in selected}
+    anchor_key = aliases.get(anchor_key, anchor_key)
     scroll = widget.verticalScrollBar()
     old_scroll = scroll.value()
     wanted = {item.data(Qt.UserRole) for item in rows}
@@ -1747,7 +1751,7 @@ class DrrController:
                 file_list.setUpdatesEnabled(True)
                 file_list.viewport().update()
 
-        def _refresh_groups(*, preserve_view=False) -> None:
+        def _refresh_groups(*, preserve_view=False, key_aliases=None) -> None:
             nonlocal group_search_text
             needle = filter_edit.text().strip().casefold()
             all_history = show_all.isChecked() or bool(needle)
@@ -1756,6 +1760,8 @@ class DrrController:
                 if group_list.currentItem() is not None
                 else None
             )
+            aliases = key_aliases or {}
+            current_key = aliases.get(current_key, current_key)
             visible = []
             for group in groups:
                 if not baseline_mode and group.is_background and not include_backgrounds.isChecked():
@@ -1771,6 +1777,7 @@ class DrrController:
                     anchor_key, _ = _drr_scroll_anchor(group_list)
                     keep = {current_key, anchor_key}
                     keep.update(item.data(Qt.UserRole) for item in group_list.selectedItems())
+                    keep = {aliases.get(key, key) for key in keep}
                     recent.extend(group for group in visible[25:] if group.key in keep)
                 visible = recent
             if not visible and str(type_combo.currentData() or "REF") == "REF":
@@ -1860,7 +1867,8 @@ class DrrController:
                         font = item.font(); font.setBold(not group.processed); item.setFont(font)
                     rows.append(item)
                     group_rows_cache[cache_key] = QListWidgetItem(item)
-                _sync_drr_rows(group_list, rows, preserve_view=preserve_view, select_first=True)
+                _sync_drr_rows(group_list, rows, preserve_view=preserve_view,
+                               select_first=True, key_aliases=aliases)
             finally:
                 group_list.blockSignals(signals_blocked)
                 group_list.setUpdatesEnabled(True)
@@ -1902,11 +1910,24 @@ class DrrController:
             # file selection/scroll position while they are using the picker.
             if groups and updated_groups == groups and group_list.count():
                 return
+            # Grid representatives can change when a repeat arrives. Follow
+            # surviving members so selection/scroll do not depend on a digest.
+            updated_keys = {group.key for group in updated_groups}
+            member_keys = {source.source: group.key for group in updated_groups for source in group.files}
+            aliases = {}
+            for row in range(group_list.count()):
+                item = group_list.item(row)
+                if item.data(Qt.UserRole) in updated_keys:
+                    continue
+                members = item.data(Qt.UserRole + 4) or ()
+                replacements = {member_keys.get(source) for source in members}
+                if len(replacements) == 1 and None not in replacements:
+                    aliases[item.data(Qt.UserRole)] = replacements.pop()
             groups = updated_groups
             groups_by_key = {group.key: group for group in groups}
             group_search_text = {group.key: _group_search_text(group) for group in groups}
             measurement_center = self._drr_selected_wavelength_center()
-            _refresh_groups(preserve_view=True)
+            _refresh_groups(preserve_view=True, key_aliases=aliases)
             _update_type_hint()
 
         def _apply_catalog_completion(folder: str, success: bool) -> None:

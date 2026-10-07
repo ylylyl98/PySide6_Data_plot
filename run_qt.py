@@ -76,6 +76,10 @@ def load_app_icon() -> QIcon:
 
 def main() -> int:
     enable_crash_diagnostics()
+    if "--peak-analysis" in sys.argv:
+        index = sys.argv.index("--peak-analysis")
+        from run_peak_analysis import main as peak_main
+        return peak_main(sys.argv[index + 1:])
     if "--drr-analysis" in sys.argv:
         index = sys.argv.index("--drr-analysis")
         from run_drr_analysis import main as analysis_main

@@ -322,6 +322,7 @@ def plot_heatmap(ax: Axes, cube: DataCube, params: HeatmapParams):
         plain_log_ticks(ax.yaxis)
     ax.set_ylim((ymin, ymax))
     add_right_axis(ax, params.right_axis)
+    ax._dptk_heatmap_params = params
     return HeatmapRender(
         primary=images[0],
         secondary=(images[1] if len(images) > 1 else None),

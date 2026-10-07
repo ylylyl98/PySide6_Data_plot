@@ -55,6 +55,155 @@ pip install -r requirements.txt
 python run_qt.py
 ```
 
+## Peak Analysis
+
+Plot a PL, DRR, Compare intensity, or Power Dependent intensity map, then select
+**Peak Analysis...** at the right of the plot toolbar. The English analysis
+window runs in a separate process with its own data snapshot. PL supports peaks
+and optional multi-peak Lorentzian/Gaussian fits; DRR supports peaks and dips for
+each displayed product. Compare/Power intensity channels use the PL adapter.
+VP is excluded. Repeated scan coordinates currently need to be separated or
+aggregated before tracking.
+
+The older DRR workspace remains available under **Tools → Data Organization →
+Open DRR Analysis**. Its shortcut has been removed from the source bar beside
+**Open File**; use the plot toolbar for analysis of the currently plotted data.
+
+Snapshots inherit the main map's colormap, color limits, log/zero-centered
+normalization, and two- or three-region color scales. DRR files have visible
+**ΔR/R / 2nd derivative** tabs above the plot. Files use a separate tab strip;
+with one file, only its name is shown (no file dropdown).
+Tabs retain separate branches/results and share the selected scan coordinate.
+Display and send a missing product from the main app to enable its tab. Opening
+the same data again refreshes its display settings while preserving analysis;
+older saved snapshots need this handoff to receive the new display metadata.
+
+1. In **Find & filter**, choose **Local extrema** (SciPy `find_peaks`, no smoothing)
+   or **SG + extrema** (Savitzky–Golay order-2 smoothing followed by the same
+   detector). DRR dips use the inverted supplied signal. SG does not differentiate
+   an already processed product. It regrids uneven energy coordinates per finite
+   segment; windows shorten to fit, and segments below five samples stay unsmoothed.
+2. **Find all peaks** scans every spectrum and immediately overlays candidates on
+   the heatmap. **Candidate floor** is a fraction of each full spectrum's range;
+   new PL and raw ΔR/R datasets default to **SG + extrema**, with an **11-sample
+   window**. DRR derivative products default to **Local extrema**, avoiding an
+   additional smoothing pass. The method description explains the recommendation;
+   its optional smoothing tab is explicitly labeled **Extra SG**. Recorded upstream
+   SG window/order are shown for derivative snapshots; older snapshots report that
+   these settings are unavailable instead of assuming unsmoothed input. Provenance
+   comes from the displayed transform cache, never pending main-window controls.
+   Adjust derivative generation in the main DRR tab and import the updated product
+   to compare window sizes. Either method can still be selected manually. Both defaults use a **0.01
+   candidate floor** and the **Balanced** quality preset below. Set the floor to `0` only
+   when intentionally retaining all local extrema; there is no peak-count cap.
+   Existing saved parameters and per-product manual choices are preserved.
+   New handoff defaults are applied by the analysis process, so this recommendation
+   update requires only **More → Restart Analysis**, even if the main app is already
+   running. Previously saved datasets retain their chosen method. All work runs
+   in the analysis process's background worker with progress and cancellation.
+3. Select **Balanced**, **Sensitive**, or **Strict** to filter the cache without
+   repeating detection. The filter heading identifies the current product profile.
+   New datasets start with product-specific **Balanced** filters:
+
+   | Product | Minimum SNR | Prominence fraction | Support out of 5 |
+   | --- | ---: | ---: | ---: |
+   | PL intensity (including Compare/Power intensity) | 5 | 0.05 | 3 |
+   | DRR ΔR/R | 5 | 0.08 | 3 |
+   | DRR 2nd derivative | 7 | 0.10 | 4 |
+
+   Other explicitly labeled DRR derivatives use the derivative profile too.
+   **Sensitive** lowers SNR by 2, halves prominence, and lowers support by 1;
+   **Strict** raises SNR by 2, multiplies prominence by 1.5, and raises support by 1.
+   Width thresholds adapt to the median energy sample interval: **Sensitive** uses
+   2 intervals, **Balanced** 3, and **Strict** 4. Same-polarity spacing starts at
+   2 intervals for all presets. Both are converted to meV, rounded to the controls'
+   4 decimal places, and bounded to their supported range (0.0001–1000 meV).
+   For example, at 0.2 meV/sample, Balanced uses a 0.6 meV width and 0.4 meV spacing.
+   Check narrow/nearby features and adjust these values rather than treating the
+   sampling-based threshold as an instrument-resolution measurement.
+   Button tooltips list all preset thresholds. Width/spacing tips explain their
+   sampling basis; the SG window tooltip shows its approximate full-grid span in meV.
+   These are starting points, not assurances that every kept point is physical.
+   Stronger support can shorten a branch near where it appears or disappears;
+   lower support to inspect these endpoints instead of increasing smoothing.
+   Presets clear maximum-width/count caps; range, polarity and detector settings
+   remain as selected. Manual adjustments display **Custom filters**. Existing
+   workspaces retain their settings and cached results; choose a preset explicitly
+   to apply the new profile. New app handoffs get current defaults in the child
+   process even while the main app is running; reimporting a known dataset keeps
+   its existing analysis choices.
+   **X/Y bounds**, **Both/Peaks/Dips**, **Min SNR**, **Min prominence**, **Min width**,
+   and **Support (of 5)** are directly visible. **Full / View / Custom** selects the
+   filter range; editing a bound selects Custom and reuses the cache. View follows
+   the heatmap limits, with one refilter after a pan/zoom gesture. Custom bounds
+   are preserved when switching ranges, including existing saved custom sessions.
+   **More filters** holds spacing, neighbor drift, maximum width
+   and per-row count; `0` means no cap/off as indicated. **Reset filters** restores all cached
+   candidates; **Show rejected candidates** draws excluded points as gray crosses.
+   The page reports kept/total counts and the actual cached method. Rebuild only
+   when changing method, SG window or detection floor; lowering a filter below the
+   cached floor cannot recover candidates omitted during detection. Width is full
+   width at half prominence, not fitted FWHM. The original candidate pool is saved.
+   SNR is prominence divided by robust noise estimated on the **cached detection
+   signal**, separately per finite energy segment. Noise is MAD / 0.67448975 of
+   the residual after removing an order-2 SG baseline of up to 51 samples; this
+   baseline is used only for noise estimation, never to move or refit extrema.
+   Segments shorter than 7 samples have no noise estimate and are rejected when
+   the SNR filter is enabled. This heuristic ratio is not a confidence probability.
+   Same-polarity support is counted after shape/SNR filtering, before range cropping
+   and branch association, in sorted scan coordinates. The default matching
+   tolerance is `1.5 meV` per neighboring row, doubled for the second neighbor.
+   Required support scales with available rows at map edges; a scan gap above
+   1.5 times the median step breaks the neighborhood. Single spectra are retained
+   without requiring unavailable neighbors. Counts do not recursively promote points.
+   Saved analyses keep their prior settings/results. Choosing a preset on an old
+   cache computes the missing noise metrics once in the worker; subsequent filters
+   reuse them. The SG window is directly visible when smoothing is selected;
+   **Detection options** exposes the less frequently adjusted acquisition floor.
+   Plot-toolbar **Size** controls heatmap marker area (default `9 pt²`, previously
+   `25 pt²`). It updates existing artists without detection, filtering or rebuilding
+   the heatmap, and is retained in workspace saves, exports and overlay packets.
+4. In **Branches**, double-click to rename, check to include, or **Exclude branch**.
+   Names/IDs/colors survive reversible filter splits. **Connect selected branches**
+   conservatively connects cached positions in adjacent scan rows; ambiguous
+   matches remain isolated crosses and missing rows break connections. **Pick seed**
+   enables the separate manual tracking workflow; gap/noise settings apply there.
+   Click the heatmap or move **Spectrum** to inspect a measured spectrum.
+   The cursor readout above **Spectrum** shows mouse X/Y coordinates and axis
+   labels. On a heatmap it also shows **Z (nearest)** from the input grid, before
+   color clipping/normalization or extra detection smoothing. Hover over the
+   readout for the signal label and sampled cell coordinates, marked as the last
+   reading after leaving the plot and cleared when the data/view changes. Log scan axes use
+   their displayed cell boundaries while reporting physical scan values.
+   Spectrum and residual plots show the mouse Y coordinate without snapping to
+   a curve. Missing/out-of-grid Z values and inactive coordinates show `—`.
+   Moving the mouse only updates this text (at most about 30 times per second);
+   it does not change the selected spectrum, run analysis, or redraw the heatmap.
+5. For PL, optionally use **Fit selected branches** and **Show residual**.
+   Choose detected positions or valid fitted centers for the overlay.
+6. Use **Apply overlay** to send positions to matching main-app heatmaps. Changed
+   numeric data invalidates the overlay; zoom and color limits do not rerun analysis.
+7. **Results** opens a table on demand, including SNR, supporting/available rows,
+   prominence and measured width. CSV exports also include noise and support metrics.
+   **Export...** creates a new folder with
+   CSV, JSON and PNG files. Progress and cancellation stay in the status bar;
+   this workflow does not automatically open the app's bottom log/results docks.
+
+The workspace is saved on close under `%LOCALAPPDATA%/DPTK/Peak Analysis` on
+Windows. **More → Restart Analysis** saves it and starts a fresh analysis process.
+The initial toolbar installation requires one main-app restart. During source
+development, edits to the analysis window, controls, and algorithms take effect
+after restarting only that window. Changes to the main-app bridge or shared
+main-window overlay rendering still require
+an app restart. Packaged EXE changes require a rebuild; restarting the page does
+not replace bundled Python code.
+
+PL-specific detection/fitting lives in `core/pl_peak_analysis.py`; DRR-specific
+behavior lives in `core/drr_peak_adapter.py`. They share tracking, plotting,
+persistence and `ui_qt/peak_analysis_window.py`, rather than maintaining duplicate
+pages for each tab. `ui_qt/peak_analysis_bridge.py` owns the toolbar integration
+and `run_peak_analysis.py` starts the independent process.
+
 ## Building PowerPoint slides
 
 Open the **Slides** workflow to assemble processed PNG plots into a PowerPoint

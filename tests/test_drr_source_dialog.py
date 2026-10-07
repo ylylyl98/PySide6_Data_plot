@@ -400,8 +400,10 @@ class DrrSourceMetadataAndGridTests(unittest.TestCase):
             initial.mkdir(parents=True)
             first = initial / "sample_rep1_1.csv"
             second = initial / "sample_rep1_2.csv"
+            different_grid = initial / "sample_rep1_3.csv"
             _csv(first, [(0, 0)] * 101)
-            _csv(second, [(0, 0)] * 203)
+            _csv(second, [(0, 0)] * 101)
+            _csv(different_grid, [(0, 0)] * 203)
             processed = root / "Processed Data" / "DRR"
             processed.mkdir(parents=True)
             (processed / "one.metadata.json").write_text(json.dumps({
@@ -414,10 +416,13 @@ class DrrSourceMetadataAndGridTests(unittest.TestCase):
 
             by_name = {source.filename: source for source in sources}
             self.assertEqual(by_name[first.name].frame_count, 101)
-            self.assertEqual(by_name[second.name].frame_count, 203)
-            self.assertEqual(len(groups), 1)
-            self.assertEqual(groups[0].processed_count, 1)
-            self.assertEqual(groups[0].frame_count_range, (101, 203))
+            self.assertEqual(by_name[second.name].frame_count, 101)
+            self.assertEqual(by_name[different_grid.name].frame_count, 203)
+            self.assertEqual(len(groups), 2)
+            repeats = next(group for group in groups if len(group.files) == 2)
+            self.assertEqual(repeats.processed_count, 1)
+            self.assertFalse(repeats.processed)
+            self.assertEqual(repeats.frame_count_range, (101, 101))
 
     def test_seven_repeat_group_exposes_five_of_seven_processed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -425,13 +430,8 @@ class DrrSourceMetadataAndGridTests(unittest.TestCase):
             initial = root / "Initial Data"
             initial.mkdir(parents=True)
             repeats = [initial / f"pe_760_rep1_{index}.csv" for index in range(1, 8)]
-            for index, path in enumerate(repeats):
-                gates = (
-                    [(100.0 * frame / 202.0, 0.0) for frame in range(203)]
-                    if index == 1
-                    else [(float(frame), 0.0) for frame in range(101)]
-                )
-                _csv(path, gates)
+            for path in repeats:
+                _csv(path, [(float(frame), 0.0) for frame in range(101)])
             processed = root / "Processed Data" / "DRR"
             processed.mkdir(parents=True)
             (processed / "pe.metadata.json").write_text(json.dumps({

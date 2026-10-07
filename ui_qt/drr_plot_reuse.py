@@ -88,6 +88,7 @@ def try_update(owner):
     for helper in getattr(owner, '_drr_region_blitters', {}).values():
         helper.invalidate()
     for meshes, layers, params in updates:
+        meshes[0].axes._dptk_heatmap_params = params
         for mesh, (values, norm) in zip(meshes, layers):
             mesh.set_array(values)
             if type(mesh.norm) is type(norm):

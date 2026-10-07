@@ -133,6 +133,30 @@ class WatchRefreshTests(unittest.TestCase):
         match.assert_not_called()
         load.assert_not_called()
 
+    def test_new_compatible_representative_extends_only_fully_selected_groups(self):
+        from core.drr_sources import discover_drr_sources, DrrSourceCache
+        from ui_qt.controllers_drr import DrrController
+        w = self.w
+        initial = self.root / 'Initial Data'
+        for repeat in (2, 3):
+            (initial / f'sample_1.67KREF_rep{repeat}.csv').write_text(
+                'Vbg,740,760,780\n0,1,2,3\n1,2,3,4\n')
+        old = discover_drr_sources(self.root)
+        (initial / 'sample_1.67KREF_rep10.csv').write_text(
+            'Vbg,740.0000001,760,780\n0,1,2,3\n1,2,3,4\n')
+        updated = discover_drr_sources(self.root)
+        for fully_selected in (True, False):
+            with self.subTest(fully_selected=fully_selected):
+                w.drr_available_sources = old
+                selected = [s.source for s in (old if fully_selected else old[:1])]
+                w.drr_selected_files = selected.copy()
+                with patch.object(DrrController, '_refresh_auto_external', return_value=True):
+                    w._on_drr_catalog_refresh_result(
+                        (str(self.root), updated, DrrSourceCache(load_on_init=False)),
+                        w._drr_refresh_generation, True, {s.source for s in old})
+                self.assertEqual(set(w.drr_selected_files),
+                                 {s.source for s in updated} if fully_selected else set(selected))
+
     def test_new_unwatched_file_is_published_even_after_picker_cancel(self):
         from core.drr_sources import discover_drr_sources
         first = self.root / 'Initial Data/sample_REF_760nm_1.csv'

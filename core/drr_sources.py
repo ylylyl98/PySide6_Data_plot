@@ -7,6 +7,7 @@ from threading import RLock
 from functools import lru_cache
 from datetime import datetime
 import csv
+import hashlib
 import json
 import math
 import os
@@ -1971,14 +1972,56 @@ def _assemble_drr_sources(experiment_root: Path, inspected: list[dict], *, inclu
     return sorted(sources, key=lambda item: (-item.modified_time, item.filename.casefold()))
 
 
+def _same_drr_acquisition_grid(first: DrrSource, second: DrrSource) -> bool:
+    """Use the same full-grid check for picker groups and automatic repeats."""
+    if any(not item.grid_complete or not item.gate_grid or len(item.spectral_grid) < 2
+           for item in (first, second)):
+        return False
+    if tuple(label.strip().casefold() for label in first.gate_labels) != tuple(
+        label.strip().casefold() for label in second.gate_labels
+    ):
+        return False
+    for left, right in ((first.gate_grid, second.gate_grid),
+                        (first.spectral_grid, second.spectral_grid)):
+        left_array, right_array = np.asarray(left, float), np.asarray(right, float)
+        if left_array.shape != right_array.shape or not np.allclose(
+            left_array, right_array, rtol=1e-9, atol=1e-10,
+        ):
+            return False
+    return True
+
+
+def _drr_grid_digest(source: DrrSource) -> str:
+    identity = (tuple(label.strip().casefold() for label in source.gate_labels),
+                source.gate_grid, source.spectral_grid, source.frame_count)
+    return hashlib.sha256(repr(identity).encode("utf-8")).hexdigest()
+
+
 def group_drr_sources(sources: Sequence[DrrSource]) -> list[DrrSourceGroup]:
-    grouped: dict[tuple[str, str, bool, str, tuple[object, ...]], list[DrrSource]] = {}
-    for source in sources:
-        # A reverse sweep has the same filename-derived condition as its
-        # forward counterpart in some instrument exports.  Keep known sweep
-        # directions separate while retaining same-direction repeats in one
-        # group.  Unknown grids remain grouped by their filename condition;
-        # compatibility checks still reject them from automatic additions.
+    grouped: dict[str, list[DrrSource]] = {}
+    grid_buckets: dict[tuple[object, ...], list[str]] = {}
+    # Pick representatives deterministically, independent of discovery order.
+    for source in sorted(sources, key=lambda item: (item.filename.casefold(), item.source.casefold())):
+        role = "background" if source.is_background else "measurement"
+        if source.grid_complete and source.gate_grid and len(source.spectral_grid) >= 2:
+            # Calendar midnight does not split measurement repeats. Background
+            # sessions retain their dates for time-based baseline matching.
+            session = source.session_date if source.is_background else ""
+            bucket = (source.group_key, source.is_background, session,
+                      tuple(label.strip().casefold() for label in source.gate_labels),
+                      len(source.gate_grid), len(source.spectral_grid))
+            candidates = grid_buckets.setdefault(bucket, [])
+            group_id = next((key for key in candidates
+                             if _same_drr_acquisition_grid(grouped[key][0], source)), None)
+            if group_id is None:
+                group_id = f"{session}|{source.group_key}|{role}|grid-{_drr_grid_digest(source)}"
+                candidates.append(group_id)
+            grouped.setdefault(group_id, []).append(source)
+            continue
+
+        # Retain date/range grouping for legacy unknown grids, without mixing
+        # them into verified complete groups. Partial grids also retain their
+        # sampled points so different in-progress sweeps cannot collapse.
         direction_key = source.gate_direction.strip().casefold() if source.gate_direction.strip() else "unknown"
         labels = tuple(label.strip().casefold() for label in source.gate_labels)
         ranges = tuple(
@@ -1990,14 +2033,15 @@ def group_drr_sources(sources: Sequence[DrrSource]) -> list[DrrSourceGroup]:
             if labels and len(labels) == len(ranges)
             else ("unknown",)
         )
-        grouped.setdefault(
-            (source.session_date, source.group_key, source.is_background, direction_key, gate_identity),
-            [],
-        ).append(source)
+        group_id = (f"{source.session_date}|{source.group_key}|{role}"
+                    f"|gate-{direction_key}|range-{gate_identity!r}")
+        if source.gate_grid or source.spectral_grid:
+            group_id += f"|partial-{_drr_grid_digest(source)}"
+        grouped.setdefault(group_id, []).append(source)
     result: list[DrrSourceGroup] = []
-    for (session_date, key, is_background, direction_key, gate_identity), files in grouped.items():
+    for group_id, files in grouped.items():
         ordered = tuple(sorted(files, key=lambda item: (item.filename.casefold(), item.modified_time)))
-        latest = max((item.modified_time for item in ordered), default=0.0)
+        newest = max(ordered, key=lambda item: (item.modified_time, item.source.casefold()))
         frame_counts = [item.frame_count for item in ordered if item.frame_count is not None]
         linked_backgrounds = tuple(dict.fromkeys(
             path for item in ordered for path in item.linked_backgrounds
@@ -2011,15 +2055,12 @@ def group_drr_sources(sources: Sequence[DrrSource]) -> list[DrrSourceGroup]:
         complete = bool(ordered) and all(item.grid_complete for item in ordered)
         result.append(
             DrrSourceGroup(
-                key=(
-                    f"{session_date}|{key}|{'background' if is_background else 'measurement'}"
-                    f"|gate-{direction_key}|range-{gate_identity!r}"
-                ),
-                title=key,
-                session_date=session_date,
+                key=group_id,
+                title=ordered[0].group_key,
+                session_date=newest.session_date,
                 files=ordered,
-                modified_time=latest,
-                is_background=is_background,
+                modified_time=newest.modified_time,
+                is_background=ordered[0].is_background,
                 processed=all(item.processed for item in ordered),
                 classification=(
                     "background"
@@ -2066,33 +2107,7 @@ def compatible_drr_repeats(
     for source in catalog:
         if source.is_background or source.group_key != reference.group_key:
             continue
-        if not source.grid_complete or not source.gate_grid or len(source.spectral_grid) < 2:
-            continue
-        if len(source.gate_grid) != len(reference.gate_grid):
-            continue
-        reference_gate_array = np.asarray(reference.gate_grid, float)
-        source_gate_array = np.asarray(source.gate_grid, float)
-        if reference_gate_array.shape != source_gate_array.shape:
-            continue
-        if tuple(label.casefold() for label in source.gate_labels) != tuple(
-            label.casefold() for label in reference.gate_labels
-        ):
-            continue
-        if len(source.spectral_grid) != len(reference.spectral_grid):
-            continue
-        if not np.allclose(
-            source_gate_array,
-            reference_gate_array,
-            rtol=1e-9,
-            atol=1e-10,
-        ):
-            continue
-        if not np.allclose(
-            np.asarray(source.spectral_grid, float),
-            np.asarray(reference.spectral_grid, float),
-            rtol=1e-9,
-            atol=1e-10,
-        ):
+        if not _same_drr_acquisition_grid(source, reference):
             continue
         compatible.append(source)
     return tuple(item.source for item in sorted(compatible, key=lambda item: (item.filename.casefold(), item.modified_time)))
