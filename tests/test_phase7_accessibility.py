@@ -96,10 +96,9 @@ class Phase7AccessibilityTests(unittest.TestCase):
             order = [window.recent_folder_combo, window.browse_btn, window.open_file_btn, window.refresh_btn]
             positions = [window.data_source_context.mapFromGlobal(widget.mapToGlobal(widget.rect().topLeft())).x() for widget in order]
             self.assertEqual(positions, sorted(positions))
-            self.assertEqual(window.data_source_context.layout().count(), 7)
+            self.assertEqual(window.data_source_context.layout().count(), 6)
             self.assertEqual(window.data_source_context.layout().itemAt(1).widget(), window.recent_folder_combo)
-            self.assertIs(window.data_source_context.layout().itemAt(5).widget(), window.drr_analysis_entry_btn)
-            self.assertIs(window.data_source_context.layout().itemAt(6).widget(), window.data_state_label)
+            self.assertIs(window.data_source_context.layout().itemAt(5).widget(), window.data_state_label)
         finally:
             window.close()
 
@@ -114,7 +113,7 @@ class Phase7AccessibilityTests(unittest.TestCase):
             source = window.data_source_context
             self.assertGreater(source.width(), 0)
             self.assertTrue(source.isVisible())
-            for control in (window.browse_btn, window.open_file_btn, window.refresh_btn, window.drr_analysis_entry_btn):
+            for control in (window.browse_btn, window.open_file_btn, window.refresh_btn):
                 self.assertTrue(control.isVisible())
                 self.assertTrue(source.contentsRect().contains(control.geometry()))
             self.assertFalse(window.menu_toolbar_host.source_separator_action.isSeparator() and not window.menu_toolbar_host.source_widget_action.isVisible())
@@ -136,7 +135,7 @@ class Phase7AccessibilityTests(unittest.TestCase):
             context = window.data_source_context
             self.assertEqual(context.metaObject().className(), "QWidget")
             self.assertEqual(context.sizePolicy().horizontalPolicy(), QSizePolicy.Expanding)
-            self.assertEqual(context.layout().count(), 7)
+            self.assertEqual(context.layout().count(), 6)
             self.assertEqual(context.height(), context.sizeHint().height())
             combo = window.recent_folder_combo
             self.assertEqual(combo.sizePolicy().horizontalPolicy(), QSizePolicy.Ignored)

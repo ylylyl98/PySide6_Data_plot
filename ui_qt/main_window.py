@@ -1645,10 +1645,6 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         folder_grid.addWidget(self.browse_btn)
         folder_grid.addWidget(self.open_file_btn)
         folder_grid.addWidget(self.refresh_btn)
-        self.drr_analysis_entry_btn = QPushButton("DRR Analysis…")
-        self.drr_analysis_entry_btn.setToolTip("Open the independent multi-dataset DRR analysis workspace")
-        self.drr_analysis_entry_btn.clicked.connect(lambda: self._open_drr_analysis())
-        folder_grid.addWidget(self.drr_analysis_entry_btn)
         folder_grid.addWidget(self.data_state_label)
         QWidget.setTabOrder(self.recent_folder_combo, self.browse_btn)
         QWidget.setTabOrder(self.browse_btn, self.open_file_btn)
@@ -2858,6 +2854,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.canvas = ThemeAwareFigureCanvasQTAgg(self.figure)
         self.toolbar = _PlotToolbar(self.canvas, box)
         layout.addWidget(self.toolbar)
+        from ui_qt.peak_analysis_bridge import PeakAnalysisBridge
+        self.peak_analysis_bridge = PeakAnalysisBridge(self, self.toolbar)
         self.drr_plot_view_bar = QFrame()
         self.drr_plot_view_bar.setFrameShape(QFrame.NoFrame)
         self.drr_plot_view_bar.setVisible(False)
@@ -5064,12 +5062,13 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         old_drr_groups = group_drr_sources(self.drr_available_sources)
         selected_before = set(self.drr_selected_files)
         selected_missing_before = set(self.drr_controller._drr_missing_sources(self.drr_selected_files))
-        selected_complete_group_keys = {
-            group.key
+        selected_complete_group_sources = {
+            source.source
             for group in old_drr_groups
             if group.files
             and {source.source for source in group.files}.issubset(selected_before)
             and not selected_missing_before
+            for source in group.files
         }
         self.drr_available_sources = sources
         self._catalog_ready_modes.add("DRR")
@@ -5079,15 +5078,16 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         # Preserve chosen identities, including files removed from the
         # filtered catalog.  The dialog and load boundary display/block them.
         self.drr_selected_files = list(dict.fromkeys(self.drr_selected_files))
-        if selected_complete_group_keys:
+        if selected_complete_group_sources:
             selected_now = set(self.drr_selected_files)
             for group in group_drr_sources(sources):
-                if group.key not in selected_complete_group_keys:
-                    continue
                 if group.is_background:
                     continue
+                # A new compatible repeat can become the grid representative
+                # and change its digest. Surviving file paths retain intent.
                 selected_members = [
-                    source for source in group.files if source.source in selected_now
+                    source for source in group.files
+                    if source.source in selected_complete_group_sources
                 ]
                 if not selected_members:
                     continue

@@ -158,6 +158,72 @@ class DrrPickerStabilityTests(unittest.TestCase):
         with patch('ui_qt.controllers_drr.QMessageBox.question', return_value=16384):
             self.open_picker(execute)
 
+    def test_picker_adds_same_grid_repeats_across_midnight_and_merges_finished_sweep(self):
+        from PySide6.QtWidgets import QPushButton
+
+        w = self.window
+        full_grid = tuple((v, 0.0) for v in (-1, -.5, 0, .5, 1))
+        w.drr_available_sources = [
+            replace(w.drr_available_sources[0],
+                    source=f"sample_REF_rep{i:02}.csv", filename=f"sample_REF_rep{i:02}.csv",
+                    modified_time=float(i), session_date="2026-10-04" if i < 3 else "2026-10-05",
+                    gate_labels=("Vbg", "Vtg"), spectral_grid=(740., 760., 780.),
+                    gate_grid=grid, frame_count=len(grid), grid_complete=True,
+                    gate_ranges=((-1., grid[-1][0]), (0., 0.)),
+                    gate_direction="Vbg increasing, Vtg constant")
+            for i, grid in enumerate([full_grid[::2], *[full_grid] * 4, full_grid[:-1]])
+        ]
+
+        def execute(dialog):
+            groups = dialog.findChild(QListWidget, "drr_source_group_list")
+            files = dialog.findChild(QListWidget, "drr_source_file_list")
+            self.assertEqual(groups.count(), 3)
+            row = next(i for i in range(groups.count()) if "rep01" in groups.item(i).text())
+            groups.setCurrentRow(row)
+            self.assertEqual(files.count(), 4)
+            add = next(button for button in dialog.findChildren(QPushButton)
+                       if button.text() == "Add Entire Group")
+            add.click()
+            chosen = dialog.findChild(QListWidget, "drr_source_chosen_list")
+            self.assertEqual({chosen.item(i).data(Qt.UserRole) for i in range(chosen.count())}, {
+                "sample_REF_rep01.csv", "sample_REF_rep02.csv",
+                "sample_REF_rep03.csv", "sample_REF_rep04.csv",
+            })
+            w.drr_available_sources[-1] = replace(w.drr_available_sources[-1],
+                gate_grid=full_grid, frame_count=5, gate_ranges=((-1., 1.), (0., 0.)))
+            w.drr_catalog_refresh_finished.emit(w.current_folder, True)
+            self.assertEqual(groups.count(), 2)
+            self.assertEqual(files.count(), 5)
+            self.assertEqual(chosen.count(), 4)
+            return QDialog.Rejected
+
+        self.open_picker(execute)
+
+    def test_grid_representative_change_preserves_current_picker_group(self):
+        w = self.window
+        source = replace(w.drr_available_sources[0], source="sample_REF_rep2.csv",
+                         filename="sample_REF_rep2.csv", gate_labels=("Vbg",),
+                         gate_grid=((0.,), (1.,)), spectral_grid=(740., 760., 780.),
+                         grid_complete=True)
+        w.drr_available_sources = [source, replace(source, group_key="other",
+            source="other_REF.csv", filename="other_REF.csv", modified_time=100.)]
+
+        def execute(dialog):
+            groups = dialog.findChild(QListWidget, "drr_source_group_list")
+            files = dialog.findChild(QListWidget, "drr_source_file_list")
+            groups.clearSelection()
+            groups.setCurrentRow(next(i for i in range(groups.count())
+                                      if "rep2" in groups.item(i).text()))
+            w.drr_available_sources.append(replace(source, source="sample_REF_rep10.csv",
+                filename="sample_REF_rep10.csv", spectral_grid=(740.0000001, 760., 780.)))
+            w.drr_catalog_refresh_finished.emit(w.current_folder, True)
+            self.assertEqual({files.item(i).data(Qt.UserRole) for i in range(files.count())},
+                             {"sample_REF_rep2.csv", "sample_REF_rep10.csv"})
+            self.assertEqual(len(groups.selectedItems()), 1)
+            return QDialog.Rejected
+
+        self.open_picker(execute)
+
     def test_first_painted_rows_fit_wrapped_filenames(self):
         self.window.drr_available_sources = [
             replace(self.window.drr_available_sources[0], group_key=f"session-{i}")
