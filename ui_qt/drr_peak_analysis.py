@@ -8,11 +8,11 @@ import numpy as np
 from PySide6.QtCore import QObject, Qt
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QFormLayout, QHBoxLayout, QPushButton, QComboBox,
-    QDoubleSpinBox, QSpinBox, QLabel, QCheckBox, QTableWidget, QTableWidgetItem,
+    QDoubleSpinBox, QLabel, QCheckBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView,
 )
 
-from ui_qt.common import Worker
+from ui_qt.common import Worker, QSpinBox
 from ui_qt.compact_spinbox import CompactDoubleSpinBox as QDoubleSpinBox
 
 

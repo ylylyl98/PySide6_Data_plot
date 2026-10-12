@@ -9,6 +9,7 @@ class CompactDoubleSpinBox(QDoubleSpinBox):
 
     def __init__(self,*args,**kwargs):
         super().__init__(*args,**kwargs)
+        self.setKeyboardTracking(False)
         self._user_edit_pending=False
         self.lineEdit().textEdited.connect(self._mark_user_edit)
         self.editingFinished.connect(self._finish_user_edit)

@@ -3,6 +3,34 @@ from tests.test_drr_dual_view_regressions import DrrDualViewRegressionTests
 
 
 class DrrPlotReuseTests(DrrDualViewRegressionTests):
+    def test_unsplit_range_edit_reuses_axes_mesh_and_matches_rebuild(self):
+        w = self.window
+        w.drr_region_count_combo.setCurrentIndex(0)
+        w.drr_split_scale_chk.setChecked(False)
+        self._wait_derivative()
+        w._plot_mode('DRR')
+        axes = tuple(w.figure.axes)
+        mesh = w._drr_heatmap_renders['raw'].primary
+        colorbar = mesh.colorbar
+        w.drr_spins['xmin'].setValue(-1.5)
+        w.drr_spins['xmax'].setValue(1.5)
+        w.drr_spins['ymin'].setValue(-.5)
+        w.drr_spins['ymax'].setValue(.5)
+        w._plot_redraw_timers['DRR'].stop()
+        w._run_scheduled_plot_redraw('DRR')
+        self.assertEqual(tuple(w.figure.axes), axes)
+        self.assertIs(w._drr_heatmap_renders['raw'].primary, mesh)
+        self.assertIs(mesh.colorbar, colorbar)
+        self._assert_visible_limits((-1.5, 1.5), (-.5, .5))
+        w.canvas.draw()
+        updated = np.asarray(w.canvas.buffer_rgba()).copy()
+        w._drr_reuse_state = None
+        w._last_plot_params_key = None
+        w._plot_mode('DRR')
+        w.canvas.draw()
+        np.testing.assert_array_equal(updated, np.asarray(w.canvas.buffer_rgba()))
+        self.errors.assert_not_called()
+
     def test_full_resolution_survives_color_update(self):
         from core.loader import DataCube
         w = self.window

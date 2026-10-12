@@ -8,6 +8,7 @@ from PySide6.QtWidgets import QListWidgetItem
 
 from core.shg import ShgSettings, process_shg_sweep
 from core.shg_fit import ShgFitSettings, fit_shg_angular_result, fit_shg_twist_comparison
+from ui_qt.common import focused_numeric_input
 from ui_qt.theme import alias as theme_alias
 from ui_qt.source_picker_dialog import SourcePickerDialog
 
@@ -617,7 +618,7 @@ class ShgController:
         if timer is None:
             timer = QTimer(self._owner)
             timer.setSingleShot(True)
-            timer.setInterval(100)
+            timer.setInterval(180)
             timer.timeout.connect(self._start_shg_reprocess)
             object.__setattr__(self, "_shg_reprocess_timer", timer)
         object.__setattr__(
@@ -642,6 +643,10 @@ class ShgController:
         object.__setattr__(self, "_shg_loaded_processing_key", None)
 
     def _start_shg_reprocess(self, pending_payload=None) -> None:
+        focused = focused_numeric_input(self._owner)
+        if focused is not None and focused.lineEdit().isModified():
+            self._request_shg_reprocess()
+            return
         object.__setattr__(self, "_shg_reprocess_timer_source_key", None)
         loaded = self.loaded
         if not loaded or loaded.mode != "SHG Processing" or loaded.shg_data is None:

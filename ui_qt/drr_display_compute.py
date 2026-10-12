@@ -1,6 +1,7 @@
 """One in-flight transform, keyed by source, derivative and SG settings."""
 from PySide6.QtCore import QObject, Signal, Slot
 from core.processing import apply_sg_derivative_energy
+from core.load_cancellation import LoadCancellation
 from ui_qt.common import Worker
 
 
@@ -23,15 +24,37 @@ class DrrDisplayCompute(QObject):
         self.desired = None
         self.error = False
 
+    def clear(self):
+        self.desired = None
+        if self.worker is not None:
+            self.worker.cancellation.cancel()
+
+    def invalidate_parameters(self, cube, window, poly, second):
+        if self.worker is None:
+            return
+        active = self.active_key
+        second_changed = active[1] not in (None, 1) and active[1] != second
+        if active[0] != id(cube) or active[2:] != (int(window), int(poly)) or second_changed:
+            self.clear()
+
     def request(self, cube, derivative, window, poly):
         key = (id(cube), derivative, int(window), int(poly))
-        if key in self.owner._drr_derivative_cache:
+        if self.worker is not None:
+            active = self.active_key
+            # dE and the second product are both needed for the same SG/source.
+            # Two different second-product kinds/Y windows supersede each other.
+            second_changed = (active[1] not in (None, 1) and derivative not in (None, 1)
+                              and active[1] != derivative)
+            if active[0] != key[0] or active[2:] != key[2:] or second_changed:
+                self.desired = key
+                self.worker.cancellation.cancel()
+        if self.owner._drr_derivative_cache.get(key) is not None:
             return True
         self.desired = key
         if self.worker is None:
             self.error = False
             self.active_key = key
-            self.worker = Worker(compute, cube, key)
+            self.worker = Worker(compute, cube, key, cancellation=LoadCancellation())
             self.worker.signals.result.connect(self._result)
             self.worker.signals.error.connect(self._error)
             self.worker.signals.finished.connect(self._finished)
@@ -41,7 +64,8 @@ class DrrDisplayCompute(QObject):
     @Slot(object)
     def _result(self, payload):
         cube, key, result, window = payload
-        if (getattr(getattr(self.owner, 'loaded', None), 'cube', None) is not cube
+        if (getattr(self.owner, '_is_closing', False) or self.worker.cancellation.cancelled
+                or getattr(getattr(self.owner, 'loaded', None), 'cube', None) is not cube
                 or self.desired is None or self.desired[0] != key[0]
                 or self.desired[2:] != key[2:]):
             return
@@ -49,12 +73,13 @@ class DrrDisplayCompute(QObject):
         # Both remain valid for identical source/SG settings; retain each
         # under its own key so neither request starves the other.
         cache = self.owner._drr_derivative_cache
-        if len(cache) >= 12:
-            cache.pop(next(iter(cache)))
         cache[key] = result, int(window)
 
     @Slot(str)
     def _error(self, message):
+        if (getattr(self.owner, '_is_closing', False) or self.worker.cancellation.cancelled
+                or self.desired is None):
+            return
         self.error = True
         if (self.desired is not None and self.desired[2:] == self.active_key[2:]
                 and id(getattr(getattr(self.owner, 'loaded', None), 'cube', None)) == self.active_key[0]):
@@ -63,6 +88,8 @@ class DrrDisplayCompute(QObject):
     @Slot()
     def _finished(self):
         self.worker = None
+        if self.desired is None or getattr(self.owner, '_is_closing', False):
+            return
         if (not self.error or self.desired != self.active_key
                 or id(getattr(getattr(self.owner, 'loaded', None), 'cube', None)) != self.active_key[0]):
             self.ready.emit()

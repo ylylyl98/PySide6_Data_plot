@@ -1,4 +1,5 @@
 from __future__ import annotations
+from core.load_cancellation import check_load_cancelled
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -339,6 +340,7 @@ def _validate_drr_external_spectral_grids(
     try:
         reference = inspect_csv_spectral_grid(resolve_source_path(folder, all_files[0]))
         for name in all_files[1:]:
+            check_load_cancelled()
             current = inspect_csv_spectral_grid(resolve_source_path(folder, name))
             first = np.asarray(reference, dtype=float)
             second = np.asarray(current, dtype=float)

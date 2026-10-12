@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import unittest
 import os
-import shutil
 import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -100,18 +100,17 @@ class DrrDualViewWidgetTests(unittest.TestCase):
     def setUpClass(cls):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6.QtWidgets import QApplication
-        from PySide6.QtCore import QSettings
         cls.app = QApplication.instance() or QApplication([])
-        cls._settings_tmp = tempfile.mkdtemp(prefix="drr-dual-settings-")
-        QSettings.setDefaultFormat(QSettings.IniFormat)
-        QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, cls._settings_tmp)
-
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(cls._settings_tmp, ignore_errors=True)
 
     def setUp(self):
         from ui_qt.main_window import MainWindow
+        from PySide6.QtCore import QSettings
+        directory = tempfile.TemporaryDirectory(prefix='drr-dual-settings-')
+        self.addCleanup(directory.cleanup)
+        settings = QSettings(str(Path(directory.name) / 'ui.ini'), QSettings.IniFormat)
+        settings_patch = patch('ui_qt.main_window.QSettings', return_value=settings)
+        settings_patch.start()
+        self.addCleanup(settings_patch.stop)
         with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
             self.window = MainWindow()
         self.cube = DataCube(

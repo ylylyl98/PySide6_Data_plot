@@ -7,6 +7,7 @@ import tempfile
 import unittest
 import time
 from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -25,20 +26,14 @@ class DrrDualViewRegressionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
-        cls.settings_dir = tempfile.TemporaryDirectory(prefix="drr-review-settings-")
-        cls.old_settings_format = QSettings.defaultFormat()
-        QSettings.setDefaultFormat(QSettings.IniFormat)
-        QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, cls.settings_dir.name)
-
-    @classmethod
-    def tearDownClass(cls):
-        QSettings.setDefaultFormat(cls.old_settings_format)
-        cls.settings_dir.cleanup()
 
     def setUp(self):
-        settings = QSettings("DPTK", "PySide6_Data_Plot")
-        settings.clear()
-        settings.sync()
+        directory = tempfile.TemporaryDirectory(prefix='drr-review-settings-')
+        self.addCleanup(directory.cleanup)
+        settings = QSettings(str(Path(directory.name) / 'ui.ini'), QSettings.IniFormat)
+        settings_patch = patch('ui_qt.main_window.QSettings', return_value=settings)
+        settings_patch.start()
+        self.addCleanup(settings_patch.stop)
         with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
             self.window = MainWindow()
         self.errors = Mock()

@@ -21,7 +21,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
     QDialogButtonBox,
-    QDoubleSpinBox,
     QHBoxLayout,
     QInputDialog,
     QLayout,
@@ -36,6 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from ui_qt.matplotlib_theme import ThemeAwareFigureCanvasQTAgg
+from ui_qt.common import QDoubleSpinBox
 from ui_qt.time_format import format_local_timestamp
 
 

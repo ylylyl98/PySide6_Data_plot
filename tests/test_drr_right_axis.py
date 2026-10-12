@@ -80,7 +80,12 @@ class RightAxisUiTests(unittest.TestCase):
                 options = LoadOptions('DRR', tmp, ['scan.csv'], [], False, 'Self (last frame)', 'last', False,
                                       y_axis_spec='linear:1,1,0', drr_assignments=(DrrMeasurementAssignment('scan.csv'),))
                 signals = WorkerSignals()
-                loaded = w._load_task(options, progress=signals.progress, log=signals.log)
+                from core import processing_run as P
+                from core.raw_spectrum_cache import RawSpectrumCache
+                with patch.object(P, '_RAW_SPECTRUM_CACHE', RawSpectrumCache(max_bytes=0)), \
+                        patch.object(P, '_parse_raw_spectrum', wraps=P._parse_raw_spectrum) as parse:
+                    loaded = w._load_task(options, progress=signals.progress, log=signals.log)
+                self.assertEqual(parse.call_count, 1, 'Right-axis lookup reloaded the spectrum')
                 np.testing.assert_allclose(loaded.cube.gate, [-1.5, 0., 1.5])
                 np.testing.assert_allclose(loaded.drr_axis_coordinates['Bias'], [.965, .990, 1.015])
                 w._ensure_loaded_matches_ui_params = lambda mode: False

@@ -2,6 +2,7 @@
 import numpy as np
 from scipy.signal import find_peaks, peak_widths
 from core.loader import DataCube
+from core.load_cancellation import check_load_cancelled
 
 
 def validate_axis(axis):
@@ -66,6 +67,7 @@ def _first_derivative(values, axis, window, poly):
     rows = z.reshape(-1, len(x))
     result = np.full_like(rows, np.nan)
     for i in range(len(x)):
+        check_load_cancelled()
         start = min(max(0, i-window//2), len(x)-window)
         offsets = x[start:start+window] - x[i]
         scale = np.max(np.abs(offsets))
@@ -78,15 +80,18 @@ def _first_derivative(values, axis, window, poly):
         supported = (~complete & np.isfinite(rows[:, i])
                      & (finite.sum(axis=1) >= poly + 1))
         for row in np.flatnonzero(supported):
+            check_load_cancelled()
             mask = finite[row]
             coefficients, _, rank, _ = np.linalg.lstsq(
                 design[mask], samples[row, mask], rcond=None)
             if rank == poly + 1:
                 result[row, i] = coefficients[1]/scale
+    check_load_cancelled()
     return result.reshape(z.shape)
 
 
 def mixed_derivative(cube, window_x, window_y, poly=2):
+    check_load_cancelled()
     x, y = validate_axis(cube.energy), validate_axis(cube.gate)
     if not 1 <= int(poly) <= 6:
         raise ValueError('Mixed derivative polynomial order must be 1 to 6.')

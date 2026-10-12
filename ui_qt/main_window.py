@@ -107,6 +107,9 @@ from core.export import (
 )
 from core.loader import DataCube, resolve_dat_y_axis
 from core.workflow_request import LatestRequest, RequestToken
+from core.drr_derivative_cache import DrrDerivativeCache
+from core.load_cancellation import LoadCancellation, check_load_cancelled
+from core.load_timing import collect_load_timings, time_load_stage
 from core.provenance import WorkingCopyRecord, cleanup_working_copy, verify_initial_data_working_file
 from core.plotting import (
     COMPARE_PANEL_ORDER,
@@ -168,7 +171,9 @@ from ui_qt.common import (
     WrappedFilenameDelegate,
     Worker,
     WorkerSignals,
+    focused_numeric_input,
 )
+from ui_qt.drr_display_memory import guarded_auto, second_is_protected
 
 
 class _OwnedRunnable(QRunnable):
@@ -379,13 +384,20 @@ class _PlotToolbar(NavigationToolbar2QT):
                 self.canvas.figure.savefig(path)
                 return
             owner = self.window()
-            job = save_figure_async(self.canvas.figure, path)
+            from ui_qt.drr_display_memory import capture_visible, remember_shared
+            from core.drr_display_settings import save_snapshot
+            display_snapshot = capture_visible(owner)
+            after_save = (lambda: save_snapshot(*display_snapshot)) if display_snapshot else None
+            job = save_figure_async(self.canvas.figure, path, after_save=after_save)
+            job.worker.signals.log.connect(owner._append_log)
             self._png_save_job = job
             if hasattr(owner, '_status'):
                 owner._status('Saving PNG in background…')
             def complete():
                 if not isValid(owner):
                     return
+                if not job.error and display_snapshot:
+                    remember_shared(owner, display_snapshot[1])
                 message = ('PNG save failed: ' + job.error.splitlines()[0] if job.error
                            else 'PNG saved: ' + path)
                 if hasattr(owner, '_status'):
@@ -699,7 +711,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._drr_refresh_pending_old_sources: set[str] | None = None
         self._drr_refresh_pending_selected_sources: set[str] | None = None
         self._drr_refresh_workers: list[Worker] = []
-        self._drr_derivative_cache: dict[tuple[int, int | None, int, int], tuple[DataCube, int]] = {}
+        self._drr_derivative_cache = DrrDerivativeCache()
         self.drr_selected_files: List[str] = []
         self.drr_baseline_files_manual: List[str] = []
         self.drr_baseline_files_found: List[str] = []
@@ -853,6 +865,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._active_load_succeeded = False
         self._load_requests: dict[str, LatestRequest[LoadOptions]] = {}
         self._active_load_token: RequestToken | None = None
+        self._active_load_cancel: LoadCancellation | None = None
+        self._active_load_options: LoadOptions | None = None
         self._last_draw_identity: dict[str, tuple[str, ...]] = {}
         self._shown_draw_mode: str | None = None
         self._shown_draw_identity: tuple[str, ...] = ()
@@ -909,6 +923,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._update_action_states()
         from ui_qt.drr_regions import restore_settings, settings_state
         restore_settings(self)
+        from ui_qt.drr_display_memory import restore_global_geometry
+        restore_global_geometry(self)
         self._drr_region_settings_baseline = settings_state(self)
         self._restore_last_folder()
         self.setAcceptDrops(True)
@@ -924,8 +940,17 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
         """Invalidate background callbacks and let active file reads finish."""
         from ui_qt.drr_regions import save_settings
+        from ui_qt.drr_display_memory import save_global_geometry
+        save_global_geometry(self)
         save_settings(self)
         self._is_closing = True
+        cancellation = getattr(self, '_active_load_cancel', None)
+        if cancellation is not None:
+            cancellation.cancel()
+        if hasattr(self, '_drr_display_compute'):
+            self._drr_display_compute.clear()
+        if hasattr(self, '_drr_color_compute'):
+            self._drr_color_compute.clear()
         self.drr_controller._cancel_auto_external()
         batch_peaks = getattr(self, 'drr_peak_analysis', None)
         if batch_peaks is not None:
@@ -1477,8 +1502,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._status_progress = self.status_bar_view.progress
         self._update_status_button = self.status_bar_view.update_button
         self._update_status_button.clicked.connect(self._on_update_status_clicked)
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
+        from ui_qt.buffered_log import BufferedLog
+        self.log_text = BufferedLog(self.log_lines)
         self.dock_host = DockHost(
             self,
             log_content=self.log_text,
@@ -2478,6 +2503,15 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
     def _schedule_plot_redraw(self, mode: str, delay_ms: int = 90) -> None:
         """Queue one redraw for *mode*, coalescing control signal bursts."""
+        focused = focused_numeric_input(self)
+        cursor_controls = [getattr(self, name, {}).get("gate") for name in
+                           ("pl_spins", "cmp_spins", "power_spins", "drr_spins")]
+        cursor_controls.extend((getattr(self, "drr_gate_toolbar_spin", None),
+                                getattr(self, "shg_angle_cursor_spin", None)))
+        if delay_ms == 90 and focused is not None and focused not in cursor_controls:
+            # Held arrows repeat at intervals longer than the normal 90 ms
+            # debounce. Keep those expensive redraws trailing the last step.
+            delay_ms = 180
         timer = self._plot_redraw_timers.get(mode)
         if timer is None:
             timer = QTimer(self)
@@ -2504,6 +2538,24 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             # controller must never draw into a shared canvas owned by the
             # currently visible page.
             return
+        # A redraw queued by the previous field must not interrupt typing in
+        # the next field or overwrite its uncommitted text with automatic limits.
+        focused = focused_numeric_input(self)
+        text_editor = QApplication.focusWidget()
+        label_pending = mode == "PL" and isinstance(text_editor, QLineEdit) and text_editor in (
+            getattr(self, "pl_dat_yaxis_label_edit", None), getattr(self, "pl_dat_yaxis_unit_edit", None)
+        ) and text_editor.isModified()
+        if (focused is not None and focused.lineEdit().isModified()) or label_pending:
+            self._schedule_plot_redraw(mode)
+            return
+        if mode == 'DRR':
+            from ui_qt.drr_display_memory import resume_pending
+            resume_pending(self)
+        if mode == "DRR" and getattr(self, "_drr_display_ready_deferred", False):
+            # The ready callback will apply its retained automatic ranges and
+            # schedule a single immediate redraw after this edit has committed.
+            self._on_drr_display_ready()
+            return
         self._plot_redraw_pending.discard(mode)
         if self._load_in_progress or not self.loaded or self.loaded.mode != mode:
             return
@@ -2518,6 +2570,15 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             center = self._pending_range_refresh.pop(mode)
             self._refresh_automatic_ranges(mode, refresh_split=True, center_split=center)
         self._plot_mode(mode)
+
+    def _invalidate_drr_display_derivative_parameters(self) -> None:
+        coordinator = getattr(self, '_drr_display_compute', None)
+        if coordinator is None:
+            return
+        second = (('mixed', int(self.drr_sg_y_window_spin.value()))
+                  if self.drr_second_kind_combo.currentData() == 'mixed' else 2)
+        coordinator.invalidate_parameters(getattr(self.loaded, 'cube', None),
+            self.drr_sg_window_spin.value(), self.drr_sg_poly_spin.value(), second)
 
     def _prepare_drr_display_derivative(self, derivative=None) -> bool:
         if not self.loaded or self.loaded.mode != 'DRR' or self.loaded.cube is None:
@@ -2548,9 +2609,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         return ready
 
     def _on_drr_display_error(self, message):
+        self._drr_display_ready_deferred = False
         self._drr_pending_ranges = None
         self._drr_pending_second_split = None
         self._drr_pending_second_auto = None
+        self._drr_pending_raw_auto = None
         self._drr_pending_split_sides = {}
         self._drr_pending_auto_limits_cube = None
         if not self._is_closing:
@@ -2559,6 +2622,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
     def _on_drr_display_ready(self):
         if self._is_closing:
             return
+        focused = focused_numeric_input(self)
+        if focused is not None and focused.lineEdit().isModified():
+            self._drr_display_ready_deferred = True
+            self._schedule_plot_redraw('DRR')
+            return
+        self._drr_display_ready_deferred = False
         pending = getattr(self, '_drr_pending_ranges', None)
         self._drr_pending_ranges = None
         if pending is not None and pending[0] is getattr(self.loaded, 'cube', None):
@@ -2566,7 +2635,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         pending_split = getattr(self, '_drr_pending_second_split', None)
         self._drr_pending_second_split = None
         if pending_split is not None and pending_split[0] is getattr(self.loaded, 'cube', None):
-            self._refresh_drr_second_split_ranges(center_split=pending_split[1])
+            self._refresh_drr_second_split_ranges(center_split=pending_split[1], force=True)
         pending_auto = getattr(self, '_drr_pending_second_auto', None)
         self._drr_pending_second_auto = None
         if pending_auto is not None and pending_auto is getattr(self.loaded, 'cube', None):
@@ -2580,6 +2649,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._drr_pending_auto_limits_cube = None
         if pending_limits is not None and pending_limits is getattr(self.loaded, 'cube', None):
             self._apply_auto_limits_for_loaded()
+        pending_raw = getattr(self, '_drr_pending_raw_auto', None)
+        self._drr_pending_raw_auto = None
+        if pending_raw is not None and pending_raw[0] is getattr(self.loaded, 'cube', None) and self._drr_plot_view == 'raw':
+            from ui_qt.drr_color_limits import _context
+            if pending_raw[1] == _context(self, pending_raw[2]):
+                self.drr_controller._auto_drr_vrange()
         self._schedule_plot_redraw('DRR', delay_ms=0)
 
     def _on_drr_plot_view_changed(self, view: str, *, redraw: bool = True) -> None:
@@ -2590,6 +2665,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if view != self._drr_plot_view:
             self.drr_controller._invalidate_drr_analysis_product()
         self._drr_plot_view = view
+        if view == 'second':
+            self._refresh_drr_second_split_ranges(force=True)
         buttons = {"raw": self.drr_view_raw_btn, "second": self.drr_view_second_btn}
         for key, button in buttons.items():
             blocked = button.blockSignals(True)
@@ -2675,6 +2752,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
     def _on_drr_side_by_side_changed(self, checked: bool) -> None:
         self._capture_drr_view_limits()
         self._drr_side_by_side = bool(checked)
+        if checked:
+            self._refresh_drr_second_split_ranges(force=True)
         # Side-by-side is a layout preference.  Keep the selected product
         # independent so switching it never changes what Save exports.
         if self.last_plotted_mode == "DRR" and self.loaded and self.loaded.mode == "DRR":
@@ -2682,7 +2761,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
     def _on_drr_second_scale_changed(self) -> None:
         self.drr_second_auto_scale = False
-        self._on_drr_plot_view_changed(self._drr_plot_view, redraw=True)
+        if self.loaded and self.loaded.mode == "DRR":
+            self._schedule_plot_redraw("DRR")
 
     def _update_drr_advanced_derivative_label(self) -> None:
         label = getattr(self, "drr_advanced_derivative_label", None)
@@ -2692,6 +2772,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         label.setText("Advanced: first derivative (dE)" if text == "dE" else f"Advanced: {text}")
 
     def _auto_drr_second_vrange(self) -> None:
+        if second_is_protected(self):
+            return
         if not self.loaded or self.loaded.mode != "DRR":
             return
         self.drr_second_auto_scale = True
@@ -2700,15 +2782,17 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return
         try:
             cube, _derivative, _window, _poly = self.drr_controller._drr_cube_with_metadata(2)
-            limits = compute_auto_limits(cube, log_scale=False,
-                xlim=tuple(self.drr_spins[k].value() for k in ('xmin', 'xmax')),
-                ylim=tuple(self.drr_spins[k].value() for k in ('ymin', 'ymax')))
+            from ui_qt.drr_color_limits import bounds, roi_request
+            limits = bounds(self, [cube], roi_request(self, log=False, zero=False, policy='legacy'),
+                            prefix='drr_second')
+            if limits is None:
+                return
         except (TypeError, ValueError) as exc:
             self._status(f"State: Auto d2E vmin/vmax skipped ({exc}).")
             return
         for spin, value in (
-            (self.drr_second_vmin_spin, limits.vmin),
-            (self.drr_second_vmax_spin, limits.vmax),
+            (self.drr_second_vmin_spin, limits[0]),
+            (self.drr_second_vmax_spin, limits[1]),
         ):
             blocked = spin.blockSignals(True)
             try:
@@ -2716,21 +2800,25 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             finally:
                 spin.blockSignals(blocked)
         self.drr_second_auto_scale = True
-        self._status(f"State: Auto d2E vmin/vmax = {limits.vmin:.4g}, {limits.vmax:.4g}")
+        self._status(f"State: Auto d2E vmin/vmax = {limits[0]:.4g}, {limits[1]:.4g}")
         self._schedule_plot_redraw("DRR")
 
     def _sync_drr_second_auto_scale(self, cube: DataCube) -> None:
+        if second_is_protected(self):
+            return
         if not getattr(self, "drr_second_auto_scale", True):
             return
         try:
-            limits = compute_auto_limits(cube, log_scale=False,
-                xlim=tuple(self.drr_spins[k].value() for k in ('xmin', 'xmax')),
-                ylim=tuple(self.drr_spins[k].value() for k in ('ymin', 'ymax')))
+            from ui_qt.drr_color_limits import bounds, roi_request
+            limits = bounds(self, [cube], roi_request(self, log=False, zero=False, policy='legacy'),
+                            prefix='drr_second')
+            if limits is None:
+                return
         except (TypeError, ValueError):
             return
         for spin, value in (
-            (self.drr_second_vmin_spin, limits.vmin),
-            (self.drr_second_vmax_spin, limits.vmax),
+            (self.drr_second_vmin_spin, limits[0]),
+            (self.drr_second_vmax_spin, limits[1]),
         ):
             blocked = spin.blockSignals(True)
             try:
@@ -3110,7 +3198,15 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         index = self._results_page_indices.get(mode or "", self._results_empty_index)
         self.results_stack.setCurrentIndex(index)
 
+    def _on_pl_axis_text_committed(self) -> None:
+        editor = self.sender()
+        if isinstance(editor, QLineEdit):
+            editor.setModified(False)
+        self.pl_controller._on_pl_plot_param_changed()
+
     def _wire_actions(self) -> None:
+        from ui_qt.drr_display_memory import wire_controls
+        wire_controls(self)
         self.browse_btn.clicked.connect(self._browse_folder)
         self.open_file_btn.clicked.connect(self._open_file)
         self.refresh_btn.clicked.connect(lambda: self._refresh_file_lists())
@@ -3138,8 +3234,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             )
             split_spins: Dict[str, QDoubleSpinBox] = getattr(self, f"{prefix}_split_spins")
             for spin in split_spins.values():
-                spin.editingFinished.connect(
-                    lambda p=prefix: self._on_split_scale_param_changed(p)
+                spin.valueChanged.connect(
+                    lambda _value, p=prefix: self._on_split_scale_param_changed(p)
                 )
             split_fix_checks: Dict[str, QCheckBox] = getattr(
                 self, f"{prefix}_split_fix_checks"
@@ -3163,8 +3259,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.pl_auto_y_btn.clicked.connect(self.pl_controller._auto_pl_yrange)
         self.pl_yaxis_combo.currentTextChanged.connect(self.pl_controller._on_pl_plot_param_changed)
         self.pl_yaxis_combo.currentTextChanged.connect(self.pl_controller._on_pl_dat_y_axis_changed)
-        self.pl_dat_yaxis_label_edit.textChanged.connect(lambda _text: self.pl_controller._on_pl_plot_param_changed())
-        self.pl_dat_yaxis_unit_edit.textChanged.connect(lambda _text: self.pl_controller._on_pl_plot_param_changed())
+        self.pl_dat_yaxis_label_edit.editingFinished.connect(self._on_pl_axis_text_committed)
+        self.pl_dat_yaxis_unit_edit.editingFinished.connect(self._on_pl_axis_text_committed)
         self.pl_yaxis_a_spin.valueChanged.connect(self.pl_controller._on_pl_plot_param_changed)
         self.pl_yaxis_b_spin.valueChanged.connect(self.pl_controller._on_pl_plot_param_changed)
         self.pl_yaxis_c_spin.valueChanged.connect(self.pl_controller._on_pl_plot_param_changed)
@@ -3228,12 +3324,6 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.power_background_auto_chk.toggled.connect(self.power_controller._on_power_background_mode_changed)
         for key in ("vmin", "vmax", "xmin", "xmax", "ymin", "ymax", "gate"):
             self.power_spins[key].valueChanged.connect(lambda _value, widget=self.power_spins[key]: self.power_controller._on_power_plot_param_changed(widget))
-        # Commit numeric edits on Return/focus loss.  Intermediate keystrokes
-        # are otherwise interpreted as separate expensive redraw requests.
-        for spin_map in (self.pl_spins, self.cmp_spins, self.power_spins):
-            for spin in spin_map.values():
-                if hasattr(spin, "setKeyboardTracking"):
-                    spin.setKeyboardTracking(False)
         self.power_cmap.currentTextChanged.connect(lambda _text: self.power_controller._on_power_plot_param_changed(self.power_cmap))
         self.power_log_chk.toggled.connect(lambda _checked: self.power_controller._on_power_plot_param_changed(self.power_log_chk))
         self.power_clip_chk.toggled.connect(lambda _checked: self.power_controller._on_power_plot_param_changed(self.power_clip_chk))
@@ -3268,18 +3358,18 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self.shg_angle_scale_spin,
             self.shg_angle_offset_spin,
         ):
-            spin.editingFinished.connect(self.shg_controller._on_shg_param_changed)
+            spin.valueChanged.connect(lambda _value: self.shg_controller._on_shg_param_changed())
         for spin in (
             self.shg_cosmic_threshold_spin,
             self.shg_cosmic_window_spin,
             self.shg_cosmic_max_width_spin,
         ):
-            spin.editingFinished.connect(self.shg_controller._on_shg_cosmic_param_changed)
+            spin.valueChanged.connect(lambda _value: self.shg_controller._on_shg_cosmic_param_changed())
         self.shg_fit_enable_chk.toggled.connect(lambda _checked: self.shg_controller._on_shg_fit_param_changed())
         self.shg_fit_weighted_chk.toggled.connect(lambda _checked: self.shg_controller._on_shg_fit_param_changed())
         self.shg_fit_include_excluded_chk.toggled.connect(lambda _checked: self.shg_controller._on_shg_fit_param_changed())
-        self.shg_fit_min_spin.editingFinished.connect(self.shg_controller._on_shg_fit_param_changed)
-        self.shg_fit_max_spin.editingFinished.connect(self.shg_controller._on_shg_fit_param_changed)
+        self.shg_fit_min_spin.valueChanged.connect(lambda _value: self.shg_controller._on_shg_fit_param_changed())
+        self.shg_fit_max_spin.valueChanged.connect(lambda _value: self.shg_controller._on_shg_fit_param_changed())
         self.shg_fit_branch_spin.valueChanged.connect(lambda _value: self.shg_controller._on_shg_fit_param_changed())
         self.drr_right_yaxis_combo.currentTextChanged.connect(
             lambda _value: self._schedule_plot_redraw("DRR") if self.loaded and self.loaded.mode == "DRR" else None
@@ -3462,8 +3552,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.log_dock.setVisible(not self.log_dock.isVisible())
 
     def _clear_log(self) -> None:
-        self.log_lines.clear()
-        self.log_text.clear()
+        self.log_text.clear_messages()
 
     def _unified_mcd_settings_snapshot(self) -> dict[str, Any]:
         return {
@@ -4127,11 +4216,23 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         active = getattr(self, "_active_load_mode", None)
         if active and (mode is None or active == mode):
             self._invalidated_load_modes.add(active)
+            cancellation = getattr(self, '_active_load_cancel', None)
+            if cancellation is not None:
+                cancellation.cancel()
         pending = getattr(self, "_pending_load_mode", None)
         if pending and (mode is None or pending == mode):
             self._invalidated_load_modes.add(pending)
             self._pending_load_mode = None
             self._pending_load_options = None
+        if mode is None or mode == "MCD":
+            # These older MCD continuations must not overtake the next captured
+            # request. New MCD edits can schedule their own updates afterwards.
+            self._mcd_reload_pending = False
+            controller = getattr(self, 'mcd_controller', None)
+            if controller is not None:
+                controller._mcd_reapply_pending = False
+                controller._mcd_load_after_angle_generation = None
+                controller._mcd_auto_apply_timer.stop()
 
     def _record_workflow_event(self, *, workflow: str, request_id: int,
                                phase: str, source_key: Any = ()) -> None:
@@ -4147,9 +4248,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         })
 
     def _append_log(self, text: str) -> None:
-        self.log_lines.append(text)
-        self.log_text.setPlainText("\n".join(self.log_lines))
-        self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+        self.log_text.append_message(text)
 
     def _set_stage(self, stage: str) -> None:
         self._status(f"State: {stage}")
@@ -5198,6 +5297,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
     def _reset_workflow_state_for_folder_change(self) -> None:
         """Prevent selections and plots from one experiment leaking into another."""
+        if hasattr(self, '_drr_display_compute'):
+            self._drr_display_compute.clear()
+        self._drr_derivative_cache.clear()
         self.available_files = []
         self.available_map_files = []
         self.pl_available_files = []
@@ -5209,15 +5311,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 previous = widget.blockSignals(True)
                 widget.clear()
                 widget.blockSignals(previous)
-        self._load_lifecycle_generation += 1
-        self._invalidated_load_modes.update(
-            mode for mode in (
-                getattr(self, "_active_load_mode", None),
-                getattr(self, "_pending_load_mode", None),
-            ) if mode
-        )
-        self._pending_load_mode = None
-        self._pending_load_options = None
+        self._invalidate_active_load()
         self.mcd_controller._invalidate_mcd_peak_shift(queue_reload=False)
         self.loaded = None
         self.last_plotted_mode = None
@@ -5287,7 +5381,15 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._update_action_states()
 
     def _clear_loaded_drr_view(self) -> None:
+        self._invalidate_active_load("DRR")
         self._invalidate_export_move_sources()
+        if hasattr(self, '_drr_display_compute'):
+            self._drr_display_compute.clear()
+        self._drr_derivative_cache.clear()
+        self._drr_second_split_deferred = None
+        self._drr_pending_raw_auto = None
+        if hasattr(self, '_drr_color_compute'):
+            self._drr_color_compute.clear()
         if self.loaded and self.loaded.mode == "DRR":
             self.loaded = None
         if self.last_plotted_mode == "DRR":
@@ -5308,7 +5410,6 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._last_plot_params_key = None
 
     def _invalidate_drr_for_background_selection(self, message: str) -> None:
-        self._invalidate_active_load("DRR")
         self._clear_loaded_drr_view()
         self._set_stage("Background required")
         self._status(message)
@@ -5584,12 +5685,26 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
     def _launch_load_options(self, options: LoadOptions) -> None:
         """Launch an already captured immutable load request."""
         mode = options.mode
+        if getattr(self, '_load_in_progress', False):
+            cancellation = getattr(self, '_active_load_cancel', None)
+            if (options == getattr(self, '_active_load_options', None)
+                    and (cancellation is None or not cancellation.cancelled)
+                    and getattr(self, '_pending_load_options', None) is None):
+                return
+            self._invalidate_active_load()
+            self._pending_load_mode = mode
+            self._pending_load_options = options
+            self._invalidated_load_modes.add(mode)
+            return
         trackers = getattr(self, "_load_requests", None)
         if trackers is None:
             trackers = {}
             self._load_requests = trackers
         tracker = trackers.setdefault(mode, LatestRequest())
         token, should_start = tracker.submit(mode, str(options.folder).casefold(), options)
+        if not should_start and token == tracker.active_token:
+            # finish() can promote a queued token before its worker starts.
+            should_start = True
         if not should_start:
             self._pending_load_mode = mode
             self._pending_load_options = options
@@ -5600,14 +5715,18 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._load_in_progress = True
         self._active_load_mode = mode
         self._active_load_token = token
+        self._active_load_cancel = LoadCancellation()
+        self._active_load_options = options
         self._active_load_succeeded = False
         recorder = getattr(self, "_record_workflow_event", None)
         if callable(recorder):
             recorder(workflow=mode, request_id=token.generation, phase="enqueue",
                      source_key=tuple(options.selected_files))
-        worker = Worker(self._load_task, options)
+        worker = Worker(self._load_task, options, cancellation=self._active_load_cancel)
         worker.signals.log.connect(self._append_log)
         load_generation = self._mcd_source_generation if mode == "MCD" else None
+        if load_generation is not None:
+            worker.signals.setProperty('mcd_source_generation', load_generation)
         worker.signals.result.connect(
             lambda loaded, token=token, generation=load_generation:
             self._on_loaded(loaded, generation, request_token=token)
@@ -5632,11 +5751,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if self._is_closing:
             return
         if self._load_in_progress and not getattr(self, "_capture_pending_load", False):
-            self._load_lifecycle_generation = getattr(self, "_load_lifecycle_generation", 0) + 1
-            active_mode = getattr(self, "_active_load_mode", None)
-            if active_mode:
-                self._invalidated_load_modes.add(active_mode)
-            self._pending_load_mode = mode
+            # A newer attempt supersedes both the active and queued requests,
+            # even if its controls fail validation. Capture publishes the new
+            # mode/options together only after validation succeeds.
+            self._invalidate_active_load()
             self._invalidated_load_modes.add(mode)
             # Re-enter the option collection path while the worker remains
             # active.  This snapshots the latest controls without starting a
@@ -5646,7 +5764,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self._start_load(mode, drr_resolution=drr_resolution)
             finally:
                 self._capture_pending_load = False
-            self._status("State: Load in progress; latest update queued.")
+            if self._pending_load_options is not None:
+                self._status("State: Load in progress; latest update queued.")
             return
         capturing_pending = bool(getattr(self, "_capture_pending_load", False))
         has_pending_snapshot = (
@@ -5685,6 +5804,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self._load_in_progress = True
                 self._active_load_mode = mode
                 self._active_load_token = token
+                self._active_load_cancel = None
+                self._active_load_options = None
                 self._active_load_succeeded = False
                 recorder = getattr(self, "_record_workflow_event", None)
                 if callable(recorder):
@@ -5964,6 +6085,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             drr_baseline_text=drr_baseline,
             drr_baseline_which=drr_baseline_which,
             compare_log_scale=cmp_log,
+            drr_restore_files=self.drr_memory_files_chk.isChecked(),
+            drr_restore_centers=self.drr_memory_centers_chk.isChecked(),
             y_axis_spec=y_axis_spec,
             compare_sources=compare_sources,
             power_group_key=power_group_key,
@@ -6032,41 +6155,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._pending_load_options = options
             return
 
-        self._set_stage("Loading...")
-        trackers = getattr(self, "_load_requests", None)
-        if trackers is None:
-            trackers = {}
-            self._load_requests = trackers
-        tracker = trackers.setdefault(mode, LatestRequest())
-        token, should_start = tracker.submit(mode, str(options.folder).casefold(), options)
-        if not should_start:
-            self._pending_load_mode = mode
-            self._invalidated_load_modes = {mode}
-            return
-        self._load_lifecycle_generation = getattr(self, "_load_lifecycle_generation", 0) + 1
-        self._load_in_progress = True
-        self._active_load_mode = mode
-        self._active_load_token = token
-        self._active_load_succeeded = False
-        recorder = getattr(self, "_record_workflow_event", None)
-        if callable(recorder):
-            recorder(workflow=mode, request_id=token.generation, phase="enqueue", source_key=tuple(options.selected_files))
-        worker = Worker(self._load_task, options)
-        worker.signals.log.connect(self._append_log)
-        load_generation = self._mcd_source_generation if mode == "MCD" else None
-        if load_generation is not None:
-            worker.signals.setProperty("mcd_source_generation", load_generation)
-        worker.signals.result.connect(
-            lambda loaded, token=token, generation=load_generation:
-            self._on_loaded(loaded, generation, request_token=token)
-        )
-        worker.signals.error.connect(
-            lambda message, token=token: self._on_load_error(message, token)
-        )
-        worker.signals.finished.connect(
-            lambda token=token: self._on_load_finished(request_token=token)
-        )
-        self.thread_pool.start(worker)
+        self._launch_load_options(options)
 
     def _drr_provenance_records(
         self, folder: str, selected: Sequence[str], baselines: Sequence[str]
@@ -6075,6 +6164,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         pairs = [("measurement", name) for name in selected]
         pairs.extend(("background", name) for name in baselines)
         for role, name in pairs:
+            check_load_cancelled()
             records.append(
                 verify_initial_data_working_file(name, folder, workflow="DRR", role=role)
             )
@@ -6094,6 +6184,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             pairs = [(f"source_{key}", name) for key, name in options.compare_sources.items()]
         records: list[WorkingCopyRecord] = []
         for role, name in pairs:
+            check_load_cancelled()
             path = Path(name)
             if not path.is_absolute():
                 path = Path(options.folder) / path
@@ -6108,11 +6199,29 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         return tuple(records)
 
     def _load_task(self, options: LoadOptions, *, progress: Signal, log: Signal) -> LoadedState:
-        loaded = self._load_task_data(options, progress=progress, log=log)
-        if loaded.mode == "DRR" and loaded.cube is not None and Path(loaded.primary_file or "").suffix.lower() == ".csv":
-            from core.drr_axis_coordinates import load_coordinates
-            loaded.drr_axis_coordinates = load_coordinates(
-                loaded.folder, loaded.selected_files, loaded.y_axis_spec, loaded.cube.gate)
+        with collect_load_timings() as durations, time_load_stage('worker_total'):
+            check_load_cancelled()
+            with time_load_stage('data_load'):
+                loaded = self._load_task_data(options, progress=progress, log=log)
+            check_load_cancelled()
+            with time_load_stage('display_memory'):
+                if loaded.mode == "DRR":
+                    from core.drr_display_settings import find_candidates, source_names
+                    if options.drr_restore_files or options.drr_restore_centers:
+                        loaded.drr_display_candidates = find_candidates(loaded.folder, source_names(
+                            loaded.folder, loaded.selected_files, loaded.provenance_records),
+                            restore_files=options.drr_restore_files, restore_centers=options.drr_restore_centers)
+                    else:
+                        loaded.drr_display_candidates = {'exact': None, 'template': None, 'center': None,
+                                                         'revision': None, 'requested': (False, False)}
+            with time_load_stage('coordinates'):
+                if loaded.mode == "DRR" and loaded.cube is not None and Path(loaded.primary_file or "").suffix.lower() == ".csv":
+                    loaded.drr_axis_coordinates = loaded.cube.gate_coordinates
+            check_load_cancelled()
+        loaded.load_timings = dict(durations)
+        if log is not None:
+            details = ', '.join(f'{name} {seconds:.3f} s' for name, seconds in durations.items())
+            log.emit(f'{loaded.mode} load worker: {details} (inclusive stages; excludes plotting)')
         return loaded
 
     def _load_task_data(self, options: LoadOptions, *, progress: Signal, log: Signal) -> LoadedState:
@@ -6121,7 +6230,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if not options.selected_files:
             raise ValueError("Select required files before loading.")
         log.emit(f"Loading {mode} ...")
-        provenance_records = self._provenance_records_for_load(options)
+        with time_load_stage('provenance'):
+            provenance_records = self._provenance_records_for_load(options)
 
         if mode == "PL":
             cube = data_io.load_pl_cube(
@@ -6394,6 +6504,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         )
 
     def _on_load_error(self, message: str, request_token: RequestToken | None = None) -> None:
+        cancellation = getattr(self, '_active_load_cancel', None)
+        if (getattr(self, '_is_closing', False)
+                or (request_token is not None and cancellation is not None and cancellation.cancelled)):
+            return
         if request_token is not None:
             mode = request_token.workflow
             tracker = self._load_requests.get(mode)
@@ -6405,6 +6519,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
     def _on_loaded(self, loaded: LoadedState, load_generation: int | None = None,
                    *, request_token: RequestToken | None = None) -> None:
+        cancellation = getattr(self, '_active_load_cancel', None)
+        if (getattr(self, '_is_closing', False)
+                or (request_token is not None and cancellation is not None and cancellation.cancelled)):
+            return
         if request_token is not None:
             tracker = self._load_requests.get(request_token.workflow)
             if (
@@ -6448,7 +6566,13 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 str(getattr(loaded, "drr_background_selection", {}).get("selection_method", ""))
                 == "automatic_per_measurement"
             )
+        if hasattr(self, '_drr_display_compute'):
+            self._drr_display_compute.clear()
         self._drr_derivative_cache.clear()
+        self._drr_second_split_deferred = None
+        self._drr_pending_raw_auto = None
+        if hasattr(self, '_drr_color_compute'):
+            self._drr_color_compute.clear()
         self.last_plotted_mode = None
         self._last_plot_params_key = None
         self._last_plot_cube = None
@@ -6581,6 +6705,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self.shg_angle_cursor_spin.setValue(float(loaded.shg_result.measured_angle_deg[selected]))
                 self.shg_angle_cursor_spin.blockSignals(blocked)
             self.shg_controller._shg_update_summary()
+        from ui_qt.drr_display_memory import prepare_restore
+        prepare_restore(self, loaded)
         self._apply_auto_limits_for_loaded()
         if loaded.mode == "MCD" and loaded.mcd_result is not None:
             # Candidate scoring was completed beside CSV processing in the
@@ -6608,7 +6734,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         # shared canvas.
         active_mode = self._active_mode()
         if request_token is None or active_mode == plot_mode:
-            self._plot_mode(plot_mode, auto=True)
+            if plot_mode == 'DRR' and getattr(self, '_drr_memory_pending', None) is not None:
+                self._schedule_plot_redraw('DRR')
+            else:
+                self._plot_mode(plot_mode, auto=True)
         else:
             self._status(f"Loaded {loaded.mode}; switch to its page to display it.")
         if plot_mode == "MCD Peak Shift" and loaded.mcd_result is not None:
@@ -6632,13 +6761,21 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return
         finished_mode = self._active_load_mode
         succeeded = self._active_load_succeeded
+        cancellation = getattr(self, '_active_load_cancel', None)
+        cancelled = ((cancellation is not None and cancellation.cancelled)
+                     or finished_mode in getattr(self, '_invalidated_load_modes', ()))
         self._load_in_progress = False
         self._data_state_loading = False
         self._active_load_mode = None
         self._active_load_token = None
+        self._active_load_cancel = None
+        self._active_load_options = None
         self._active_load_succeeded = False
         self._status_progress.setVisible(False)
-        if not succeeded and (finished_mode or getattr(self, "_data_state_error", None)):
+        if cancelled:
+            self._data_state_error = None
+            self._refresh_data_state_label()
+        elif not succeeded and (finished_mode or getattr(self, "_data_state_error", None)):
             self._data_state_error = "failed"
             self._refresh_data_state_label()
         elif succeeded:
@@ -6666,7 +6803,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     QTimer.singleShot(0, self, lambda mode=pending_mode: self._start_load(mode))
             elif pending_mode is None:
                 self._invalidated_load_modes.clear()
-        if finished_mode == "PL" and self._pl_auto_next_active:
+        if finished_mode == "PL" and self._pl_auto_next_active and not cancelled:
             if succeeded:
                 self._pl_auto_next_active = False
                 self._pl_auto_next_queue = []
@@ -6975,7 +7112,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     pass
         return self._split_auto_cubes(mode)
 
-    def _refresh_drr_second_split_ranges(self, *, center_split: bool = False) -> bool:
+    @guarded_auto
+    def _refresh_drr_second_split_ranges(self, *, center_split: bool = False, force: bool = False) -> bool:
         """Refresh unlocked d2E split limits from the current derivative cube."""
         toggle = getattr(self, "drr_second_split_scale_chk", None)
         if toggle is None or (
@@ -6985,6 +7123,38 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return False
         if not self.loaded or self.loaded.mode != "DRR" or self.loaded.cube is None:
             return False
+        from ui_qt.drr_regions import is_triple, initialize_boundaries
+        if is_triple(self):
+            initialize_boundaries(self, center=center_split)
+        else:
+            xmin, xmax = sorted(self.drr_spins[key].value() for key in ('xmin', 'xmax'))
+            x0 = self.drr_split_spins['x0'].value()
+            if (center_split and not self.drr_split_fix_checks['x0'].isChecked()) or not xmin < x0 < xmax:
+                requested = .5 * (xmin + xmax)
+                try:
+                    _, x0 = resolve_split_boundary(self.loaded.cube.energy, requested)
+                except ValueError:
+                    x0 = requested
+                self._set_spin_value_silent(self.drr_split_spins['x0'], x0)
+        for key in ('x0', 'x1'):
+            self._set_spin_value_silent(self.drr_second_split_spins[key], self.drr_split_spins[key].value())
+        if not force and self._drr_plot_view == 'raw' and not self._drr_side_by_side:
+            # Seed valid placeholders without calculating the hidden product.
+            # The export worker replaces only the still-automatic fields.
+            for side in ('left', 'middle', 'right'):
+                lo_key, hi_key = side + '_vmin', side + '_vmax'
+                lo, hi = (self.drr_second_split_spins[key].value() for key in (lo_key, hi_key))
+                if hi <= lo:
+                    limits = self.drr_second_vmin_spin.value(), self.drr_second_vmax_spin.value()
+                    for key, value in zip((lo_key, hi_key), limits):
+                        if not self.drr_second_split_fix_checks[key].isChecked():
+                            self._set_spin_value_silent(self.drr_second_split_spins[key], value)
+            deferred = getattr(self, '_drr_second_split_deferred', None)
+            if deferred is None or deferred[0] is not self.loaded.cube:
+                self._drr_second_split_deferred = (self.loaded.cube, {
+                    key: spin.value() for key, spin in self.drr_second_split_spins.items()
+                    if not key.startswith('x')})
+            return False
         if not self._prepare_drr_display_derivative(2):
             previous = getattr(self, '_drr_pending_second_split', None)
             self._drr_pending_second_split = (self.loaded.cube, center_split or bool(previous and previous[0] is self.loaded.cube and previous[1]))
@@ -6993,6 +7163,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             second_cube = self.drr_controller._drr_cube_with_metadata(2)[0]
         except (TypeError, ValueError):
             return False
+        self._drr_second_split_deferred = None
         from ui_qt.drr_regions import is_triple, refresh
         if is_triple(self):
             return refresh(self, "drr_second", [second_cube])
@@ -7003,7 +7174,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         x0 = float(self.drr_split_spins["x0"].value())
         self._set_spin_value_silent(split_spins["x0"], x0)
         changed = False
-        if (center_split and not self.drr_split_fix_checks["x0"].isChecked()) or not xmin < x0 < xmax:
+        boundary_fixed = self.drr_split_fix_checks["x0"].isChecked()
+        if (center_split and not boundary_fixed) or not xmin < x0 < xmax:
             requested = 0.5 * (xmin + xmax)
             try:
                 _index, x0 = resolve_split_boundary(np.asarray(second_cube.energy, float), requested)
@@ -7024,7 +7196,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     self._set_spin_value_silent(split_spins[vmax_key], float(self.drr_second_vmax_spin.value()))
         for side in ("left", "right"):
             bounds = self._color_bounds_for_cubes(
-                "DRR", [second_cube], side=side, split_x=x0
+                "DRR", [second_cube], side=side, split_x=x0, target_prefix='drr_second'
             )
             if bounds is None:
                 continue
@@ -7048,56 +7220,31 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         *,
         side: str | None = None,
         split_x: float | None = None,
+        target_prefix: str = 'drr',
     ) -> tuple[float, float] | None:
         """Calculate robust limits from the data currently visible to the user."""
         spins = self._mode_spins(mode)
-        xmin, xmax = sorted((float(spins["xmin"].value()), float(spins["xmax"].value())))
-        ymin, ymax = sorted((float(spins["ymin"].value()), float(spins["ymax"].value())))
-        values: list[np.ndarray] = []
-        for cube in cubes:
-            x = np.asarray(cube.energy, float).ravel()
-            y = np.asarray(cube.gate, float).ravel()
-            z = np.asarray(cube.Z, float)
-            xmask = (x >= xmin) & (x <= xmax)
-            if side is not None:
-                if split_x is None:
-                    continue
-                try:
-                    split_index, _boundary = resolve_split_boundary(x, split_x)
-                except ValueError:
-                    continue
-                columns = np.arange(x.size)
-                xmask &= columns < split_index if side == "left" else columns >= split_index
-            ymask = (y >= ymin) & (y <= ymax)
-            if not np.any(xmask) or not np.any(ymask):
-                continue
-            finite = z[np.ix_(ymask, xmask)]
-            finite = finite[np.isfinite(finite)]
-            if self._mode_log(mode):
-                finite = finite[finite > 0.0]
-            if finite.size:
-                values.append(finite)
-        if not values:
-            return None
-        combined = np.concatenate(values)
-        vmin, vmax = (float(value) for value in np.nanpercentile(combined, [0.01, 99.99]))
+        from core.color_limits import ColorRequest, calculate_bounds
         center_zero = (
             mode == "DRR" and bool(self.drr_center_zero_chk.isChecked())
         ) or (
             mode == "MCD" and bool(self.mcd_center_zero_chk.isChecked())
         )
-        if center_zero and not self._mode_log(mode):
-            bound = max(abs(vmin), abs(vmax), 1e-12)
-            return -bound, bound
-        if vmax <= vmin:
-            pad = max(1e-12, abs(vmin) * 0.01)
-            vmin -= pad
-            vmax += pad
-        if self._mode_log(mode):
-            vmin = max(vmin, 1e-12)
-            vmax = max(vmax, vmin * 1.01)
-        return vmin, vmax
+        if side is not None and split_x is None:
+            return None
+        request = ColorRequest(tuple(spins[k].value() for k in ('xmin', 'xmax')),
+            tuple(spins[k].value() for k in ('ymin', 'ymax')),
+            () if side is None else (split_x,),
+            None if side is None else (0 if side == 'left' else 1), self._mode_log(mode), center_zero)
+        try:
+            if mode == 'DRR':
+                from ui_qt.drr_color_limits import bounds
+                return bounds(self, cubes, request, prefix=target_prefix, side=side)
+            return calculate_bounds(cubes, request)
+        except ValueError:
+            return None
 
+    @guarded_auto
     def _refresh_automatic_ranges(
         self,
         mode: str,
@@ -7149,7 +7296,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                         self._set_spin_value_silent(spins[key], value)
                         changed = True
 
-            bounds = self._color_bounds_for_cubes(mode, cubes)
+            bounds = None if all(self._mode_fix_value(mode, key) for key in ('vmin', 'vmax')) else self._color_bounds_for_cubes(mode, cubes)
             if bounds is not None:
                 if not skip_compare_vp_color:
                     for key, value in zip(("vmin", "vmax"), bounds):
@@ -7175,7 +7322,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             split_fixes: Dict[str, QCheckBox] = getattr(self, f"{prefix}_split_fix_checks")
             xmin, xmax = sorted((float(spins["xmin"].value()), float(spins["xmax"].value())))
             x0 = float(split_spins["x0"].value())
-            if (center_split and not split_fixes["x0"].isChecked()) or not xmin < x0 < xmax:
+            boundary_fixed = split_fixes["x0"].isChecked()
+            if (center_split and not boundary_fixed) or not xmin < x0 < xmax:
                 requested = 0.5 * (xmin + xmax)
                 try:
                     _index, x0 = resolve_split_boundary(np.asarray(cubes[0].energy, float), requested)
@@ -7185,6 +7333,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 changed = True
 
             for side in ("left", "right"):
+                if all(split_fixes[side + '_' + key].isChecked() for key in ('vmin', 'vmax')):
+                    continue
                 side_bounds = self._color_bounds_for_cubes(mode, cubes, side=side, split_x=x0)
                 if side_bounds is None:
                     continue
@@ -7220,6 +7370,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         from ui_qt.drr_regions import is_triple, refresh
         if is_triple(self, prefix):
             refresh(self, prefix, cubes, side=side)
+            if prefix == 'drr_second':
+                from ui_qt.drr_regions import note_second_region_auto
+                note_second_region_auto(self, side)
             # Do not refresh all regions here: a region-specific Auto must
             # preserve the other region's manually entered values.
             self.drr_controller._on_drr_plot_param_changed()
@@ -7233,38 +7386,18 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._status("Set x0 strictly between xmin and xmax before auto scaling.")
             return
 
-        values: list[np.ndarray] = []
-        for cube in cubes:
-            x = np.asarray(cube.energy, float).ravel()
-            y = np.asarray(cube.gate, float).ravel()
-            z = np.asarray(cube.Z, float)
-            try:
-                split_index, _applied_boundary = resolve_split_boundary(x, x0)
-            except ValueError:
-                continue
-            column_index = np.arange(x.size)
-            side_mask = column_index < split_index if side == "left" else column_index >= split_index
-            xmask = side_mask & (x >= xmin) & (x <= xmax)
-            ymask = (y >= ymin) & (y <= ymax)
-            if not np.any(xmask) or not np.any(ymask):
-                continue
-            region = z[np.ix_(ymask, xmask)]
-            finite = region[np.isfinite(region)]
-            if self._mode_log(mode):
-                finite = finite[finite > 0.0]
-            if finite.size:
-                values.append(finite)
-        if not values:
+        from core.color_limits import ColorRequest, calculate_bounds
+        request = ColorRequest((xmin, xmax), (ymin, ymax), (x0,),
+                               0 if side == 'left' else 1, self._mode_log(mode), False, 'explicit')
+        if mode == 'DRR':
+            from ui_qt.drr_color_limits import bounds
+            result = bounds(self, cubes, request, prefix=prefix, side=side)
+        else:
+            result = calculate_bounds(cubes, request)
+        if result is None:
             self._status(f"Auto {side} scale skipped: no finite values in that x region.")
             return
-        combined = np.concatenate(values)
-        vmin, vmax = (float(v) for v in np.nanpercentile(combined, [0.01, 99.99]))
-        if vmax <= vmin:
-            pad = max(1e-12, abs(vmin) * 0.01, 1e-12)
-            vmin -= pad
-            vmax += pad
-            if self._mode_log(mode):
-                vmin = max(vmin, 1e-12)
+        vmin, vmax = result
         split_fix_checks: Dict[str, QCheckBox] = getattr(
             self, f"{prefix}_split_fix_checks"
         )
@@ -7309,6 +7442,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._status(
             f"Auto {side} color scale = {candidate_vmin:.4g}, {candidate_vmax:.4g}{detail}."
         )
+        if prefix == 'drr_second':
+            from ui_qt.drr_regions import note_second_region_auto
+            note_second_region_auto(self, side)
         self._on_split_scale_param_changed(prefix)
 
     def _mode_spins(self, mode: str) -> Dict[str, QDoubleSpinBox]:
@@ -7430,6 +7566,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._apply_auto_limits_for_loaded()
         return True
 
+    @guarded_auto
     def _apply_auto_limits_for_loaded(self) -> None:
         if not self.loaded:
             return
@@ -7463,7 +7600,17 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         else:
             return
 
-        limits = compute_auto_limits(cube, log_scale=self._mode_log(mode))
+        # DRR percentile work follows the exact ROI below. Only axis geometry
+        # is needed to initialize a newly loaded large view here.
+        from ui_qt.drr_color_limits import ASYNC_CELLS
+        if mode == 'DRR' and (cube.Z.size >= ASYNC_CELLS or
+                all(self._mode_fix_value(mode, key) for key in ('vmin', 'vmax'))):
+            from core.processing import Limits
+            limits = Limits(self.drr_spins['vmin'].value(), self.drr_spins['vmax'].value(),
+                float(np.nanmin(cube.energy)), float(np.nanmax(cube.energy)),
+                float(np.nanmin(cube.gate)), float(np.nanmax(cube.gate)))
+        else:
+            limits = compute_auto_limits(cube, log_scale=self._mode_log(mode))
         spins = self._mode_spins(mode)
         if not self._mode_fix_value(mode, "vmin"):
             self._set_spin_value_silent(spins["vmin"], limits.vmin)
@@ -7497,7 +7644,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self, f"{prefix}_split_fix_checks"
             )
             xmin, xmax = sorted((float(spins["xmin"].value()), float(spins["xmax"].value())))
-            if not xmin < float(split_spins["x0"].value()) < xmax:
+            triple = mode == "DRR" and self.drr_region_count_combo.currentData() == 3
+            if not triple and not xmin < float(split_spins["x0"].value()) < xmax:
                 blocked = split_spins["x0"].blockSignals(True)
                 try:
                     split_spins["x0"].setValue(0.5 * (xmin + xmax))
@@ -9468,6 +9616,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 return
             if mode == 'DRR' and not self._prepare_drr_display_derivative():
                 return
+            if (mode == 'DRR' and self.last_plotted_mode is None
+                    and hasattr(self, '_drr_color_compute') and self._drr_color_compute.is_pending()):
+                self._drr_color_plot_pending = True
+                self._status('Computing DRR color limits in background…')
+                return
             plot_key = self._current_plot_params_key(mode)
             gate_only_update = mode == "DRR" and self.drr_controller._is_drr_gate_only_change(plot_key)
             if gate_only_update and self._last_plot_cube is not None:
@@ -10896,6 +11049,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 cleanup_verified_sources=bool(self.clean_verified_sources_chk.isChecked()),
             )
         elif mode == "DRR":
+            from ui_qt.drr_display_memory import capture
+            from ui_qt.drr_regions import deferred_auto_keys
             options = ExportOptions(
                 mode=mode,
                 params=params,
@@ -10904,13 +11059,17 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 drr_peak_result=self.drr_peak_analysis.snapshot(),
                 drr_second_cube=drr_second_cube,
                 drr_raw_params=drr_raw_params,
+                drr_display_state=capture(self, drr_raw_params, drr_second_params),
                 drr_second_params=drr_second_params,
                 drr_second_y_window=second_key[1] if isinstance(second_key, tuple) else 0,
                 drr_raw_sg_window=drr_raw_win,
                 drr_raw_sg_polyorder=drr_raw_poly,
                 drr_second_sg_window=drr_second_win,
                 drr_second_sg_polyorder=drr_second_poly,
-                drr_second_auto_scale=bool(getattr(self, "drr_second_auto_scale", True)),
+                drr_second_auto_scale=bool(getattr(self, "drr_second_auto_scale", True)) and not second_is_protected(self),
+                drr_second_split_auto_keys=deferred_auto_keys(self),
+                drr_pending_color_limits=(self._drr_color_compute.export_requests()
+                    if hasattr(self, '_drr_color_compute') else ()),
                 drr_second_scale_xlim=tuple(self.drr_spins[k].value() for k in ('xmin', 'xmax')),
                 drr_second_scale_ylim=tuple(self.drr_spins[k].value() for k in ('ymin', 'ymax')),
                 drr_derivative_order=drr_deriv,
@@ -11197,6 +11356,15 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                         )
                     except (TypeError, ValueError):
                         pass
+                if options.drr_second_split_auto_keys:
+                    from core.drr_auto_regions import auto_region_params
+                    second_params = auto_region_params(second_product, second_params,
+                        options.drr_second_split_auto_keys, xlim=options.drr_second_scale_xlim,
+                        ylim=options.drr_second_scale_ylim)
+                if options.drr_pending_color_limits:
+                    from core.color_limits import apply_pending_colors
+                    raw_params, second_params = apply_pending_colors(raw_product, second_product,
+                        raw_params, second_params, options.drr_pending_color_limits)
                 raw_base = build_drr_export_base(
                     loaded.primary_file, len(loaded.selected_files), loaded.drr_mode_label,
                     None, int(options.drr_raw_sg_window or options.drr_sg_window),
@@ -11226,6 +11394,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                         "derivative_grid": "Local polynomial on actual X/Y coordinates",
                         "y_derivative_coordinate": loaded.cube.gate_label,
                     })
+                if options.drr_display_state is not None:
+                    from ui_qt.drr_display_memory import finalize
+                    metadata_extra = {**(metadata_extra or {}), 'display_save_pending': True, 'ui_state': finalize(
+                        options.drr_display_state, raw_params, second_params)}
                 pair_paths = export_drr_pair_pngs_and_dat(
                     folder, raw_cube=raw_product, second_cube=second_product,
                     raw_params=raw_params, second_params=second_params,
@@ -11237,6 +11409,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     metadata_extra=metadata_extra,
                     export_progress=lambda message: log.emit('DRR export: ' + message),
                 )
+                if options.drr_display_state is not None:
+                    from core.drr_display_settings import complete_metadata_snapshots
+                    complete_metadata_snapshots((pair_paths['raw_dat'], pair_paths['second_dat']))
                 save_status = getattr(pair_paths, "save_status", "created")
                 log.emit(
                     f"DRR pair: {pair_paths['raw_dat'].name}, {pair_paths['raw_png'].name}; "
@@ -11596,6 +11771,15 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             if cleaned:
                 log.emit(f"Cleaned {cleaned} verified temporary source copy(s).")
         moved = 0
+        display_state = None
+        if mode == 'DRR' and options.drr_display_state is not None:
+            from core.drr_display_settings import save_snapshot
+            from ui_qt.drr_display_memory import finalize
+            display_state = finalize(options.drr_display_state, raw_params, second_params)
+            try:
+                save_snapshot(folder, display_state)
+            except OSError as error:
+                log.emit(f'DRR export: image saved; display index unavailable: {error}')
         if mode == 'DRR':
             log.emit(f'DRR export: worker completed in {perf_counter() - export_started:.3f} s')
         return {
@@ -11607,6 +11791,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             "cleaned": cleaned,
             "mode": mode,
             "save_status": save_status,
+            "drr_display_state": display_state,
         }
 
     def _on_export_error(self, message: str) -> None:
@@ -11657,6 +11842,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._active_export_request_key = ""
         self._update_action_states()
         if isinstance(result, dict):
+            display_state = result.get('drr_display_state')
+            from ui_qt.drr_display_memory import remember_shared
+            remember_shared(self, display_state)
             out_folder = str(result.get("out_folder", self.current_folder or ""))
             moved = int(result.get("moved", 0))
             source_files = list(result.get("source_files", []))

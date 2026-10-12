@@ -77,6 +77,7 @@ def derivative_key(owner):
 
 
 def changed(owner, *, manual_y=False):
+    owner._invalidate_drr_display_derivative_parameters()
     if manual_y:
         blocked = owner.drr_sg_y_auto_chk.blockSignals(True)
         owner.drr_sg_y_auto_chk.setChecked(False)

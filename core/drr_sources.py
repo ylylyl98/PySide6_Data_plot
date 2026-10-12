@@ -21,6 +21,7 @@ from typing import Iterable, Sequence
 import numpy as np
 
 from core.processing import split_group_and_sort_key
+from core.load_cancellation import check_load_cancelled
 
 
 SUPPORTED_DRR_SUFFIXES = {".csv", ".xlsx"}
@@ -1088,6 +1089,7 @@ def resolve_drr_background_assignments(
     unresolved: list[str] = []
     reasons: list[str] = []
     for measurement in selected:
+        check_load_cancelled()
         identity = str(resolve_source_path(experiment_root, measurement)).casefold()
         history = records_by_measurement.get(identity, [])
         assignment: DrrMeasurementAssignment | None = None

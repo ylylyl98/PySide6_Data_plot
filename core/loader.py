@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 import json
 from pathlib import Path
@@ -9,6 +9,9 @@ from typing import Any, Optional, Sequence, Tuple
 import numpy as np
 
 from core import processing_run as P
+from core.drr_axis_coordinates import CoordinateAccumulator
+from core.streaming_average import StreamingNanMean
+from core.load_cancellation import check_load_cancelled
 if False:  # pragma: no cover - type-only imports are deferred to avoid a cycle.
     from core.drr_sources import DrrMeasurementAssignment
 
@@ -42,6 +45,7 @@ class DataCube:
     cbar_label: str
     gate_unit: str = ""
     y_axis_semantic: str = ""
+    gate_coordinates: dict[str, np.ndarray] = field(default_factory=dict)
 
 
 def _dat_sidecar_candidates(path: Path) -> tuple[Path, ...]:
@@ -456,6 +460,8 @@ def load_drr_avg(
         gate_label=res.get("gate_label", "Gate (V)"),
         title=res.get("title", "DR/R"),
         cbar_label=cbar,
+        gate_coordinates={key: np.array(values, dtype=float, copy=True)
+                          for key, values in res.get('gate_coordinates', {}).items()},
     )
 
 
@@ -522,6 +528,7 @@ def _native_external_baseline(
     # frame vector, sources are aligned to the first baseline grid and then
     # averaged.  Only the resulting baseline is aligned to the measurement.
     for baseline_file in assignment.baseline_files:
+        check_load_cancelled()
         data = P._load_canonical(user_folder, baseline_file, y_axis=y_axis)
         energy = _validated_interp_axis(data["energy"], context=f"Baseline {baseline_file}")
         z = np.asarray(data["Z"], dtype=float)
@@ -633,25 +640,26 @@ def load_drr_resolved_avg(
         return cube
 
     effective_y_axis = P.resolve_shared_y_axis_request(selected, y_axis)
-    canonical: list[dict[str, Any]] = [
-        P._load_canonical(user_folder, item, y_axis=effective_y_axis) for item in selected
-    ]
-    first_energy = _validated_interp_axis(canonical[0]["energy"], context=f"Measurement {selected[0]}")
-    first_gate = _validated_interp_axis(canonical[0]["gate_axis"], context=f"Measurement {selected[0]} gate") if np.asarray(canonical[0]["gate_axis"]).size >= 2 else np.asarray(canonical[0]["gate_axis"], float).ravel()
-    if first_gate.size < 1 or not np.all(np.isfinite(first_gate)) or np.unique(first_gate).size != first_gate.size:
-        raise ValueError(f"Measurement {selected[0]} gate axis is invalid.")
-    gate_label = str(canonical[0].get("gate_label", "Gate"))
-    corrected: list[np.ndarray] = []
-    for name, assignment, data in zip(selected, ordered, canonical):
+    for index, (name, assignment) in enumerate(zip(selected, ordered)):
+        check_load_cancelled()
+        data = P._load_canonical(user_folder, name, y_axis=effective_y_axis)
         energy = _validated_interp_axis(data["energy"], context=f"Measurement {name}")
         gate = np.asarray(data["gate_axis"], dtype=float).ravel()
         if gate.size < 1 or not np.all(np.isfinite(gate)) or np.unique(gate).size != gate.size:
             raise ValueError(f"Measurement {name} gate axis is invalid.")
+        if index == 0:
+            first_energy = energy.copy()
+            first_gate = _validated_interp_axis(gate, context=f"Measurement {name} gate") if gate.size >= 2 else gate.copy()
+            gate_label = str(data.get('gate_label', 'Gate'))
+            title = str(data.get('title_name', selected[0]))
+            corrected_average = StreamingNanMean((first_gate.size, first_energy.size))
+            coordinates = CoordinateAccumulator(first_gate)
         if str(data.get("gate_label", "Gate")) != gate_label:
             raise ValueError("DRR assignments use incompatible gate semantics.")
         z = np.asarray(data["Z"], dtype=float)
         if z.shape != (gate.size, energy.size):
             raise ValueError(f"Measurement {name} data does not match its grid.")
+        coordinates.add(gate, data.get('gate_coordinates', {}))
         if assignment.baseline_mode == "External":
             baseline = _native_external_baseline(
                 user_folder, assignment, energy, y_axis=effective_y_axis
@@ -667,8 +675,12 @@ def load_drr_resolved_avg(
             native = _interp_rows_no_extrapolation(native, energy, first_energy, context=f"Measurement {name}")
         if gate.shape != first_gate.shape or not np.array_equal(gate, first_gate):
             native = _interp_rows_no_extrapolation(native.T, gate, first_gate, context=f"Measurement {name} gate").T
-        corrected.append(native)
-    result = np.nanmean(np.stack(corrected, axis=0), axis=0)
+        check_load_cancelled()
+        corrected_average.add(native)
+        del data, z, native
+    check_load_cancelled()
+    result = corrected_average.mean()
+    del corrected_average
     if derivative in (1, 2):
         result = P.sg_derivative_origin_rows(
             result, first_energy, deriv=derivative,
@@ -676,10 +688,12 @@ def load_drr_resolved_avg(
             oversample=dE_oversample, interp_kind=dE_interp_kind,
             origin_like=dE_origin_like, pad_flat_edges=dE_pad_flat_edges,
         )
+    check_load_cancelled()
     cube = DataCube(
         energy=first_energy.copy(), gate=first_gate.copy(), Z=result,
-        gate_label=gate_label, title=str(canonical[0].get("title_name", selected[0])),
+        gate_label=gate_label, title=title,
         cbar_label="DR/R" if derivative is None else ("d(DR/R)/dE" if derivative == 1 else "d2(DR/R)/dE2"),
+        gate_coordinates=coordinates.result(),
     )
     cube.drr_numerical_path = "heterogeneous"
     cube.drr_assignments = tuple(item.to_dict() for item in ordered)

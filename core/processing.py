@@ -9,6 +9,7 @@ import numpy as np
 from scipy.signal import savgol_filter
 
 from core.loader import DataCube
+from core.load_cancellation import check_load_cancelled
 
 
 REP_SUB_SUFFIX_RE = re.compile(r"_rep(?P<rep>\d+)_(?P<sub>\d+)$", re.IGNORECASE)
@@ -1187,6 +1188,7 @@ def apply_sg_derivative_energy(
     window_length: int,
     polyorder: int = 2,
 ) -> tuple[DataCube, int]:
+    check_load_cancelled()
     if isinstance(derivative, tuple) and len(derivative) == 2 and derivative[0] == 'mixed':
         from core.drr_mixed_derivative import mixed_derivative
         return mixed_derivative(cube, window_length, derivative[1], polyorder)
@@ -1246,6 +1248,7 @@ def apply_sg_derivative_energy(
             origin_like=False,
             pad_flat_edges=True,
         )
+    check_load_cancelled()
     cbar = "d(DR/R)/dE" if int(derivative) == 1 else "d2(DR/R)/dE2"
     title = cube.title if cube.title else "DR/R"
     title = f"{title} ({cbar})"
@@ -1253,7 +1256,8 @@ def apply_sg_derivative_energy(
         DataCube(
             energy=np.asarray(cube.energy, float).copy(),
             gate=np.asarray(cube.gate, float).copy(),
-            Z=np.asarray(z_out, float).copy(),
+            # Both filters allocate an independent writable result already.
+            Z=z_out,
             gate_label=cube.gate_label,
             title=title,
             cbar_label=cbar,

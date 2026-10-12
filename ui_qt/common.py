@@ -10,6 +10,7 @@ compatibility with existing tests and callers.
 from __future__ import annotations
 
 import traceback
+from core.load_cancellation import LoadCancelled, check_load_cancelled, load_scope
 import hashlib
 import json
 from pathlib import Path
@@ -23,6 +24,7 @@ from PySide6.QtCore import QObject, QPointF, QRect, QRunnable, QSize, Qt, Signal
 from PySide6.QtGui import QTextLayout, QTextOption
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractSpinBox,
     QComboBox as _QComboBox,
     QDoubleSpinBox as _QDoubleSpinBox,
     QListWidget,
@@ -30,6 +32,7 @@ from PySide6.QtWidgets import (
     QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
+    QWidget,
 )
 
 from core.loader import DataCube
@@ -58,14 +61,22 @@ UI_METRICS = {
 
 
 class QDoubleSpinBox(_QDoubleSpinBox):
-    """A double spin box that cannot be changed by mouse-wheel scrolling."""
+    """Commit typed numbers on Return/focus loss and ignore wheel scrolling."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setKeyboardTracking(False)
 
     def wheelEvent(self, event) -> None:
         event.ignore()
 
 
 class QSpinBox(_QSpinBox):
-    """An integer spin box that cannot be changed by mouse-wheel scrolling."""
+    """Commit typed numbers on Return/focus loss and ignore wheel scrolling."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setKeyboardTracking(False)
 
     def wheelEvent(self, event) -> None:
         event.ignore()
@@ -78,6 +89,16 @@ class QComboBox(_QComboBox):
         event.ignore()
 
 
+def focused_numeric_input(parent: QWidget) -> QAbstractSpinBox | None:
+    """Find the focused spin box, including focus on its child line editor."""
+    focused = QApplication.focusWidget()
+    while focused is not None and isinstance(parent, QWidget) and parent.isAncestorOf(focused):
+        if isinstance(focused, QAbstractSpinBox):
+            return focused
+        focused = focused.parentWidget()
+    return None
+
+
 @dataclass
 class LoadedState:
     mode: str
@@ -86,6 +107,7 @@ class LoadedState:
     selected_files: List[str] = field(default_factory=list)
     baseline_files: List[str] = field(default_factory=list)
     drr_axis_coordinates: dict = field(default_factory=dict)
+    drr_display_candidates: dict | None = None
     cube: DataCube | None = None
     compare_cubes: Dict[str, DataCube] | None = None
     compare_sources: Dict[str, str] = field(default_factory=dict)
@@ -119,6 +141,7 @@ class LoadedState:
     drr_assignments: tuple[Any, ...] = ()
     y_axis_spec: str = "auto"
     provenance_records: tuple[WorkingCopyRecord, ...] = ()
+    load_timings: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -145,6 +168,8 @@ class LoadOptions:
     drr_background_selection: Dict[str, Any] = field(default_factory=dict)
     drr_assignments: tuple[Any, ...] = ()
     power_role_group_keys: tuple[str, ...] = ()
+    drr_restore_files: bool = True
+    drr_restore_centers: bool = True
 
 
 @dataclass(frozen=True)
@@ -162,6 +187,7 @@ class ExportOptions:
     drr_peak_result: dict | None = None
     drr_second_cube: DataCube | None = None
     drr_raw_params: HeatmapParams | None = None
+    drr_display_state: dict | None = None
     drr_second_params: HeatmapParams | None = None
     drr_raw_sg_window: int = 0
     drr_raw_sg_polyorder: int = 0
@@ -169,6 +195,8 @@ class ExportOptions:
     drr_second_sg_polyorder: int = 0
     drr_second_y_window: int = 0
     drr_second_auto_scale: bool = True
+    drr_second_split_auto_keys: tuple[str, ...] = ()
+    drr_pending_color_limits: tuple = ()
     drr_second_scale_xlim: tuple[float, float] | None = None
     drr_second_scale_ylim: tuple[float, float] | None = None
     drr_derivative_order: int | None = None
@@ -222,17 +250,22 @@ class WorkerSignals(QObject):
 
 
 class Worker(QRunnable):
-    def __init__(self, fn: Callable[..., Any], *args, **kwargs):
+    def __init__(self, fn: Callable[..., Any], *args, cancellation=None, **kwargs):
         super().__init__()
         self.fn = fn
         self.args = args
         self.kwargs = kwargs
+        self.cancellation = cancellation
         self.signals = WorkerSignals()
 
     def run(self) -> None:
         try:
-            result = self.fn(*self.args, progress=self.signals.progress, log=self.signals.log, **self.kwargs)
-            self.signals.result.emit(result)
+            with load_scope(self.cancellation):
+                result = self.fn(*self.args, progress=self.signals.progress, log=self.signals.log, **self.kwargs)
+                check_load_cancelled()
+                self.signals.result.emit(result)
+        except LoadCancelled:
+            pass
         except Exception as exc:
             self.signals.error.emit(f"{exc}\n\n{traceback.format_exc()}")
         finally:

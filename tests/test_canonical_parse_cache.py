@@ -107,6 +107,21 @@ class CanonicalParseTests(unittest.TestCase):
         os.utime(self.path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1000000000))
         np.testing.assert_array_equal(self.load(y_axis='BG')['Z'], [[21, 11], [40, 30]])
 
+    def test_same_size_rewrite_with_restored_mtime_invalidates(self):
+        self.load()
+        stat = self.path.stat()
+        self.path.write_text(self.path.read_text().replace('10,20', '11,21'), encoding='utf-8')
+        os.utime(self.path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        np.testing.assert_array_equal(self.load(y_axis='BG')['Z'], [[21, 11], [40, 30]])
+
+    def test_unavailable_strong_stamp_does_not_cache_parsed_arrays(self):
+        cache = RawSpectrumCache()
+        with patch('core.raw_spectrum_cache._digest_signature', return_value=None), \
+                patch.object(P, '_parse_raw_spectrum', wraps=P._parse_raw_spectrum) as parse:
+            cache.load(self.path, 1, parse)
+            cache.load(self.path, 1, parse)
+        self.assertEqual(parse.call_count, 2)
+
     def test_background_changes_recompute_using_one_raw_parse(self):
         kwargs = dict(user_folder=self.tmp.name, files=[self.path.name], y_axis='BG',
                       plot_interactive=False, save_png=False, save_dat_file=False,

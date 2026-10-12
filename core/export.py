@@ -26,7 +26,8 @@ from matplotlib.ticker import FixedFormatter, FixedLocator, FuncFormatter, NullF
 
 from core.loader import DataCube
 from core.drr_export_title import display_title
-from core.plotting import COMPARE_PANEL_ORDER, HeatmapParams, plot_heatmap, resolve_split_boundary, plain_log_ticks
+from core.plotting import COMPARE_PANEL_ORDER, HeatmapParams, plot_heatmap, resolve_split_boundary, plain_log_ticks, visible_mesh_data
+from core.png_render_timing import TimedPngCanvas, collect_png_timings, time_png_stage
 from core.processing import background_correct_cube, parse_compare_gate_condition, power_group_title, valley_polarization_cube
 from core.processing_run import save_as_dat
 from core.shg import ShgProcessResult, ShgSettings, ShgSweepData
@@ -340,7 +341,8 @@ def _save_heatmap_png(path: Path, cube: DataCube, params: HeatmapParams, *, drr:
             raise ValueError("Log power export needs positive power points.")
         cube = DataCube(cube.energy, np.asarray(cube.gate)[positive], np.asarray(cube.Z)[positive],
                         cube.gate_label, cube.title, cube.cbar_label)
-    fig = _build_streamlit_style_heatmap_fig(cube, params, drr=drr)
+    with time_png_stage('build'):
+        fig = _build_streamlit_style_heatmap_fig(cube, params, drr=drr)
     try:
         # These exports use fixed axes positions, with no automatic layout.
         # Keep the complete figure canvas so every heatmap has the same pixel
@@ -473,15 +475,18 @@ def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *,
     e = np.asarray(cube.energy, float).ravel()
     g = np.asarray(cube.gate, float).ravel()
     z = np.asarray(cube.Z, float)
+    if z.shape != (g.size, e.size):
+        raise ValueError('Heatmap values must have shape (y coordinates, x coordinates).')
 
     triple = params.split_scale is not None and params.split_scale.split_x2 is not None
     fig = plt.figure(figsize=EXPORT_FIGSIZE, dpi=EXPORT_DPI, facecolor="white")
+    TimedPngCanvas(fig)
     ax = fig.add_axes(EXPORT_AXES_RECT)
     axpos = ax.get_position()
 
     split_render = None
     if params.split_scale is not None:
-        split_render = plot_heatmap(ax, cube, params)
+        split_render = plot_heatmap(ax, cube, params, visible_only=drr)
         ax.set_title("")
         im = split_render.primary
         vmin = float(params.split_scale.left_vmin)
@@ -507,10 +512,13 @@ def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *,
             else:
                 norm = Normalize(vmin=vmin, vmax=vmax)
 
+        mesh_data = (_axis_edges_from_centers(e),
+                     _axis_edges_from_centers(g, log_scale=bool(params.y_axis_log)), z)
+        if drr:
+            mesh_data = visible_mesh_data(*mesh_data, params.xlim, params.ylim,
+                                          y_axis_log=params.y_axis_log)
         im = ax.pcolormesh(
-            _axis_edges_from_centers(e),
-            _axis_edges_from_centers(g, log_scale=bool(params.y_axis_log)),
-            z,
+            *mesh_data,
             shading="flat",
             cmap=cmap,
             norm=norm,
@@ -1069,11 +1077,19 @@ def export_drr_png_and_dat(
             processed_name=processed_name,
         )
     if needs_png:
-        run_step('Rendering PNG', _save_heatmap_png_atomic, png_path, cube, params, drr=drr_style)
+        with collect_png_timings(export_progress) as png_times:
+            with time_png_stage('total'):
+                run_step('Rendering PNG', _save_heatmap_png_atomic, png_path, cube, params, drr=drr_style)
+        if export_progress is not None:
+            details = ', '.join(f'{name}={png_times.get(name, 0.):.3f} s'
+                                for name in ('build', 'title', 'draw', 'encode_write', 'total'))
+            export_progress(f'PNG stages: {details} (title included in build)')
     if prior and (needs_dat or needs_png):
         save_status = "updated"
     paths = ExportPathResult({"png": png_path, "dat": dat_path}, save_status=save_status)
-    if save_status == "reused" and (not drr_style or figures == prior_payload.get("figures")):
+    ui_state_changed = (metadata_extra or {}).get('ui_state') is not None and (
+        _metadata_jsonable(metadata_extra['ui_state']) != prior_payload.get('ui_state'))
+    if save_status == "reused" and (not drr_style or figures == prior_payload.get("figures")) and not ui_state_changed:
         return paths
     if drr_style:
         figures[png_path.name] = {
