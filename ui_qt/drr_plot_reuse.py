@@ -1,7 +1,7 @@
 """Reuse DRR artists only when source, layout and mesh coordinates agree."""
 from copy import deepcopy
 import numpy as np
-from core.plotting import HeatmapParams, _norm_from_params, _norm_from_bounds, resolve_split_boundary, split_color_layers
+from core.plotting import HeatmapParams, _norm_from_params, _norm_from_bounds, _sanitize_limits, resolve_split_boundary, split_color_layers
 
 
 def products_for_display(owner):
@@ -32,8 +32,11 @@ def products_for_display(owner):
 
 
 def structure(params):
+    # A linear, unsplit map can change viewport without rebuilding its mesh
+    # or colorbar. Split-region and log-axis layouts retain the full fallback.
+    limits = (params.xlim, params.ylim) if params.split_scale is not None or params.y_axis_log else None
     return (params.title, params.xlabel, params.ylabel, params.cbar_label,
-            params.xlim, params.ylim, params.log_scale, params.y_axis_log, params.right_axis,
+            limits, params.log_scale, params.y_axis_log, params.right_axis,
             None if params.split_scale is None else (params.split_scale.split_x, params.split_scale.split_x2, params.split_scale.show_boundary))
 
 
@@ -82,13 +85,22 @@ def try_update(owner):
         layers = _layers(preview, params)
         if len(layers) != len(meshes):
             return False
-        updates.append((meshes, layers, params))
+        updates.append((meshes, layers, params, preview))
     # Validate all products before changing the first artist. Invalidate blit
     # backgrounds so a gate update cannot restore the old heatmap pixels.
     for helper in getattr(owner, '_drr_region_blitters', {}).values():
         helper.invalidate()
-    for meshes, layers, params in updates:
-        meshes[0].axes._dptk_heatmap_params = params
+    for meshes, layers, params, preview in updates:
+        axis = meshes[0].axes
+        viewport = owner._drr_params_with_view_limits(params)
+        axis._dptk_heatmap_params = viewport
+        xlim = _sanitize_limits(viewport.xlim, float(np.nanmin(preview.energy)), float(np.nanmax(preview.energy)))
+        ylim = _sanitize_limits(viewport.ylim, float(np.nanmin(preview.gate)), float(np.nanmax(preview.gate)))
+        if not params.y_axis_log:
+            if tuple(axis.get_xlim()) != xlim:
+                axis.set_xlim(xlim)
+            if tuple(axis.get_ylim()) != ylim:
+                axis.set_ylim(ylim)
         for mesh, (values, norm) in zip(meshes, layers):
             mesh.set_array(values)
             if type(mesh.norm) is type(norm):

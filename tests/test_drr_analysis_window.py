@@ -88,7 +88,9 @@ class WorkspaceWindowTests(unittest.TestCase):
         page.display_panel.show();self.app.processEvents()
         records=page.records;spin=page.display_bounds[0]
         spin.setFocus();spin.selectAll();QTest.keyClicks(spin,'1.02');QTest.keyClick(spin,Qt.Key_Return)
-        QTest.qWait(250)
+        deadline=time.monotonic()+2
+        while not np.isclose(page.map_axis.get_xlim()[0],1.02) and time.monotonic()<deadline:
+            self.app.processEvents();QTest.qWait(10)
         self.assertEqual(spin.value(),1.02)
         self.assertAlmostEqual(page.map_axis.get_xlim()[0],1.02)
         self.assertIs(page.records,records)

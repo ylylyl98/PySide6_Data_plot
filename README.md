@@ -55,6 +55,151 @@ pip install -r requirements.txt
 python run_qt.py
 ```
 
+## Editing plot controls
+
+Numeric plot and processing controls commit typed values when you press
+**Enter** or move focus to another control. Label and unit edits also wait
+until editing finishes. Arrow buttons still adjust numbers; repeated adjustments
+to display parameters are combined into one refresh after you stop. A pending
+plot refresh or MCD recalculation waits while the next number is being typed.
+Gate and cursor controls retain their existing interactive updates. Ordinary
+DRR range changes reuse the current heatmap instead of rebuilding its axes.
+
+### Remembering DRR display settings
+
+Successful DRR image saves remember the displayed X/Y and color ranges,
+one/two/three-region layout, split boundaries, raw and second-derivative color
+limits, colormaps, and Fix choices. Reloading the same file or selected group
+restores its latest saved display and zoomed viewport, including after restarting
+the app. Both **Save both: PNG + DAT** and the plot toolbar's PNG save remember
+settings; toolbar saves update the experiment's display index.
+
+A new file with the same filename wavelength center (for example, `720nmc`)
+reuses the saved X range and boundaries; Y and color limits remain automatic
+unless you have manually fixed them. On a file change, X geometry follows this
+priority: explicit **Lock X range across files**, the target file's own snapshot,
+compatible manual geometry from the same wavelength center, the target center's
+template, then Auto. Manual X limits and split boundaries expire when the center
+changes; files without a known center keep manual geometry only on a reload of
+that same file. Reloading the current file preserves its unsaved manual edits.
+X limits, region count, and fixed boundaries travel together. Manual Y/color
+locks keep their existing priority. Fixing one axis keeps the saved zoom on the
+other axis. Templates with
+incompatible spectral coverage fall back to Auto. Open **Display memory**
+in the DRR sidebar to disable either behavior, optionally reuse color
+limits, or share center templates across experiment folders. Color reuse and
+sharing are off by default. **Lock X range across files** is also off by default;
+enabling it locks the current X range and active boundaries, including values
+restored from a preset. Its range and region layout survive app restarts. The
+status line and Fix tooltips explain the active scope.
+**Restore Auto for this load** releases remembered ranges and manual fixes and
+turns off the cross-file X lock; **Clear this center template** keeps individual
+file snapshots.
+
+The DRR sidebar identifies each checked Fix by its source: **Fix M** means a
+manual lock (X geometry normally follows the same wavelength), **Fix λ** means a wavelength template,
+and **Fix F** means the current file's saved display. Hover over a Fix for details
+and the wavelength center. Editing a locked value, or unchecking and checking
+its Fix again, turns an inherited lock into a manual lock. File and wavelength
+locks expire outside their scope and are not stored as app-wide manual defaults
+when closing the app. Valid fixed boundaries stay in place. A boundary outside
+a new X range is recentered while keeping its Fix source; three-region boundaries
+are placed inside the range in order, respecting valid fixed boundaries.
+**Auto X/Y/V** and regional **Auto** update unfixed
+limits; uncheck Fix or use **Restore Auto for this load** to release locks.
+
+Snapshots are stored in `Processed Data/DRR/.display_settings.json` and the
+export metadata sidecars, so they travel with the experiment folder. Existing
+DRR export metadata can also supply saved ranges. Settings update only after a
+successful save and use the view captured when saving starts.
+
+DRR loading reuses parsed display history, including missing-file/center lookups,
+and reads only changed sidecars when new exports appear. External edits, source
+path changes, and deleted records invalidate the cache. Disabling both memory
+options skips history queries. Loading also reuses unchanged source-file hashes;
+source cleanup always checks fresh hashes.
+
+In raw view, hidden second-derivative computation and regional Auto colors are
+deferred until switching to second/both, pressing a second-product Auto button,
+or saving both products. Paired export computes deferred colors on its worker
+and remembers the final values while retaining manual and restored limits.
+Raw-only toolbar PNG saves retain pending Auto status for hidden derivative
+colors so their initial placeholders are not restored as saved limits.
+
+Split heatmaps draw nonoverlapping column grids using the original cell edges.
+Two/three-region plots retain every measured point, independent color scales,
+cursor readings and export resolution without duplicating the full matrix in
+each mesh. CSV parsing uses change-sensitive file fingerprints, including
+Windows ChangeTime, so same-size rewrites with restored modification times
+invalidate cached data. Files without a reliable fingerprint are parsed afresh.
+
+For DRR maps with at least 250,000 cells, ROI and regional color percentiles
+run on a background worker. Repeated data/ROI/log/zero/region requests reuse a
+bounded cache, and rapid changes retain the newest queued request per region.
+An initial plot waits for its automatic colors while the interface stays usable.
+Results respect edits, Fix choices and restored settings made during calculation;
+loading another source or changing SG/ROI settings discards obsolete results.
+Paired saves freeze pending requests together with their numerical product and
+complete those colors on the export worker using the saved ROI. Smaller maps
+keep their immediate automatic color updates.
+
+CSV DRR loads collect consistent measured right-axis coordinates during the
+numerical load, avoiding a second spectrum read solely for the right axis.
+Multi-file averages accumulate per-pixel sums and non-NaN counts instead of
+retaining and stacking every raw/corrected matrix. The common baseline path
+keeps its existing align-before-correct order; heterogeneous assignments keep
+native-grid correction before alignment. Raw averages, missing coverage,
+infinities, derivative processing and right-axis consistency checks are preserved.
+The bounded raw CSV parse cache remains separate from these working buffers.
+
+DRR derivative history uses a 128 MiB buffer budget and at most 12 entries,
+evicting older parameter results first. Current full-resolution dE/second
+products stay available together. If those current products alone exceed the
+budget, history is discarded and the current products are retained to avoid
+repeated calculation. This budget covers cached derivative buffers, not total
+application memory.
+
+A newer Load selection replaces the queued request and cooperatively cancels
+the obsolete one. DRR loads check between files and numerical/history stages;
+the current file read or NumPy operation completes before cancellation takes
+effect. Clear and changing experiment folders also invalidate active loads.
+Cancelled loads do not restore old plots or display a loading-failed dialog.
+If the newest selection fails validation, an older queued selection is dropped
+rather than loaded afterwards. Export workers keep their captured data and
+are independent of Load cancellation.
+
+Display derivative jobs also cancel obsolete source/SG/direction/window
+requests between rows, polynomial windows and mixed-derivative passes. Parameter
+edits invalidate the old job even when the second product is hidden or new
+settings fail validation. Useful dE/second jobs with the same source and SG
+settings still complete together. A single uniform-grid SG call completes
+before checking cancellation. Completed derivatives adopt the filter's own
+independent output buffer, avoiding another full-matrix copy.
+
+Logs append plain text in short batches and retain the latest 300 messages,
+including multiline entries. Reading older surviving text keeps that text in
+place as earlier entries expire; scrolling to the bottom follows new messages.
+Clear removes both displayed and queued log messages. Successful Load workers
+log inclusive stage times for data loading, canonical CSV/cache reads, source
+verification, display-memory lookup and coordinate metadata, plus worker total.
+CSV/cache and verification times are included in the data-load total; these
+times exclude UI preparation, derivative display jobs and plotting.
+
+DRR PNG exports fit titles with whole-word measurements and a bounded,
+per-font cache, retaining character wrapping for long identifiers and complete
+math tokens. Export meshes retain original cell boundaries and full resolution
+inside the X/Y view, with adjacent guard cells for clipping. Offscreen cells are
+omitted from the PNG mesh; DAT files and interactive heatmaps retain all data.
+Singular/nearly singular ranges and invalid log bounds retain the full extent
+so Matplotlib's automatic range handling stays consistent. PNG dimensions,
+color normalization, measured right axes and saved-image reuse are preserved.
+
+The export status follows PNG build, title fitting, draw and encoding/writing.
+Each newly rendered Raw/second product logs `build`, `title`, `draw`,
+`encode_write` and `total` elapsed times. Title time is included in build;
+these worker measurements exclude queue delay and GUI publication. Agg still
+draws each PNG once. Timing collection is thread-scoped and reset on failures.
+
 ## Peak Analysis
 
 Plot a PL, DRR, Compare intensity, or Power Dependent intensity map, then select

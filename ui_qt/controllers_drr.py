@@ -719,8 +719,6 @@ class DrrController:
             # truthful for both paired products.
             cube.gate_unit = getattr(self.loaded.cube, "gate_unit", "")
             cube.y_axis_semantic = getattr(self.loaded.cube, "y_axis_semantic", "")
-        if len(self._drr_derivative_cache) >= 12:
-            self._drr_derivative_cache.pop(next(iter(self._drr_derivative_cache)))
         self._drr_derivative_cache[cache_key] = (cube, int(used_win))
         if deriv is not None and used_win != req_win:
             self._status(f"State: SG window adjusted to {used_win}.")
@@ -819,16 +817,24 @@ class DrrController:
         self._on_drr_derivative_changed()
 
     def _on_drr_derivative_changed(self) -> None:
+        self._invalidate_drr_display_derivative_parameters()
         update_label = getattr(self, "_update_drr_advanced_derivative_label", None)
         if update_label is not None:
             update_label()
         self._invalidate_pending_drr_fit("Fit discarded: derivative changed.")
         self._invalidate_export_move_sources()
+        coordinator = getattr(self, '_drr_display_compute', None)
+        active = getattr(coordinator, 'active_key', ())
+        mixed_pending = (coordinator is not None and coordinator.worker is not None
+                         and isinstance(active[1], tuple) and active[1][0] == 'mixed')
         try:
-            self._enforce_drr_sg_constraints(show_status=True, use_mixed=self._drr_plot_view != "raw")
+            self._enforce_drr_sg_constraints(show_status=True,
+                use_mixed=self._drr_plot_view != "raw" or mixed_pending)
         except ValueError as exc:
             self._status(str(exc))
             return
+        # Auto recommendations/clamps update spins with signals blocked.
+        self._invalidate_drr_display_derivative_parameters()
         if self.loaded and self.loaded.mode == "DRR" and not self._suspend_drr_autoplot:
             self._refresh_automatic_ranges("DRR", refresh_split=True)
             self._schedule_plot_redraw("DRR")
@@ -935,55 +941,44 @@ class DrrController:
         if getattr(self._owner, "_drr_plot_view", "raw") == "second":
             self._owner._auto_drr_second_vrange()
             return
-        cube = self._drr_cube_for_display()
-        x = np.asarray(cube.energy, float).ravel()
-        y = np.asarray(cube.gate, float).ravel()
-        z = np.asarray(cube.Z, float)
-        x0, x1 = sorted((float(self.drr_spins["xmin"].value()), float(self.drr_spins["xmax"].value())))
-        y0, y1 = sorted((float(self.drr_spins["ymin"].value()), float(self.drr_spins["ymax"].value())))
-        x_mask = (x >= x0) & (x <= x1)
-        y_mask = (y >= y0) & (y <= y1)
-        if np.any(y_mask) and np.any(x_mask):
-            z_roi = z[np.ix_(y_mask, x_mask)]
-        else:
-            z_roi = z
-        finite = z_roi[np.isfinite(z_roi)]
-        if finite.size == 0:
-            self._status("State: Auto vmin/vmax skipped (no finite values in selected x/y range).")
+        if all(self._mode_fix_value('DRR', key) for key in ('vmin', 'vmax')):
             return
-        if self._mode_log("DRR"):
-            pos = z_roi[np.isfinite(z_roi) & (z_roi > 0)]
-            if pos.size:
-                vmin, vmax = np.nanpercentile(pos, [0.01, 99.99])
-                vmin = float(max(vmin, 1e-12))
-                vmax = float(max(vmax, vmin * 1.01))
-            else:
-                vmin, vmax = float(np.nanmin(finite)), float(np.nanmax(finite))
-        else:
-            vmin, vmax = np.nanpercentile(finite, [0.01, 99.99])
-            vmin, vmax = float(vmin), float(vmax)
+        from ui_qt.drr_color_limits import bounds, roi_request, _context
+        request = roi_request(self._owner, zero=False, policy='legacy', fallback_full=True)
+        derivative = self._drr_derivative_value()
+        if derivative is not None and not self._owner._prepare_drr_display_derivative(derivative):
+            self._owner._drr_pending_raw_auto = (self.loaded.cube, _context(self._owner, request), request)
+            return
+        cube = self._drr_cube_for_display()
+        result = bounds(self._owner, [cube], request)
+        if result is None:
+            return
+        vmin, vmax = result
         spins = self.drr_spins
-        spins["vmin"].setValue(vmin)
-        spins["vmax"].setValue(vmax)
-        self._status(f"State: Auto vmin/vmax (ROI) = {vmin:.4g}, {vmax:.4g}")
+        for key, value in (("vmin", vmin), ("vmax", vmax)):
+            if not self._mode_fix_value("DRR", key):
+                self._set_spin_value_silent(spins[key], value)
+        self._status(f"State: Auto color range (ROI) refreshed; fixed limits kept. Current: {spins['vmin'].value():.4g}, {spins['vmax'].value():.4g}")
         self._schedule_plot_redraw("DRR")
 
     def _auto_drr_xrange(self) -> None:
         if not self.loaded or self.loaded.mode != "DRR":
             return
         cube = self._drr_cube_for_display()
-        self.drr_spins["xmin"].setValue(float(np.nanmin(cube.energy)))
-        self.drr_spins["xmax"].setValue(float(np.nanmax(cube.energy)))
-        self._status("State: Auto xmin/xmax set from energy axis.")
+        for key, value in (("xmin", np.nanmin(cube.energy)), ("xmax", np.nanmax(cube.energy))):
+            if not self._mode_fix_value("DRR", key):
+                self.drr_spins[key].setValue(float(value))
+        self._status("State: Auto X range refreshed from energy axis; fixed limits kept.")
         self._schedule_plot_redraw("DRR")
 
     def _auto_drr_yrange(self) -> None:
         if not self.loaded or self.loaded.mode != "DRR":
             return
         cube = self._drr_cube_for_display()
-        self.drr_spins["ymin"].setValue(float(np.nanmin(cube.gate)))
-        self.drr_spins["ymax"].setValue(float(np.nanmax(cube.gate)))
-        self._status("State: Auto ymin/ymax set from gate axis.")
+        for key, value in (("ymin", np.nanmin(cube.gate)), ("ymax", np.nanmax(cube.gate))):
+            if not self._mode_fix_value("DRR", key):
+                self.drr_spins[key].setValue(float(value))
+        self._status("State: Auto Y range refreshed from gate axis; fixed limits kept.")
         self._schedule_plot_redraw("DRR")
     def _update_drr_selection_labels(self) -> None:
         def _brief(names: List[str]) -> str:

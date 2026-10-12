@@ -1045,6 +1045,9 @@ class SplitScaleControlTests(unittest.TestCase):
         self.assertIn("never alter the PNG", self.window.presentation_widget.caption_combo.toolTip())
 
     def test_enabling_drr_split_centers_boundary_and_scales_both_regions(self) -> None:
+        # Earlier range tests can persist an enabled split in QSettings.
+        # Establish the transition exercised by this test explicitly.
+        self.window.drr_split_scale_chk.setChecked(False)
         cube = DataCube(
             energy=np.array([0.0, 1.0, 2.0, 3.0]),
             gate=np.array([0.0, 1.0]),

@@ -6,6 +6,7 @@ import numpy as np
 from matplotlib.axes import Axes
 from matplotlib.colors import LogNorm, Normalize, TwoSlopeNorm
 from matplotlib.ticker import LogFormatter
+from matplotlib.transforms import nonsingular
 
 from core.loader import DataCube
 
@@ -259,16 +260,45 @@ def split_color_layers(cube, params):
     slices, boundaries = split_region_slices(cube.energy, params.split_scale, params.xlim)
     layers = []
     for region, (vmin, vmax) in zip(slices, params.split_scale.bounds):
-        values = np.minimum(z, vmax) if params.clip_outliers else z
-        mask = np.ones(z.shape, bool)
-        mask[:, region] = False
+        values = z[:, region]
+        if params.clip_outliers:
+            values = np.minimum(values, vmax)
         norm = _norm_from_bounds(values, vmin=vmin, vmax=vmax,
                                 log_scale=params.log_scale, center_zero=params.center_zero)
-        layers.append((np.ma.array(values, mask=mask), norm))
+        layers.append((values, norm))
     return layers, boundaries
 
 
-def plot_heatmap(ax: Axes, cube: DataCube, params: HeatmapParams):
+def visible_mesh_data(x_edges, y_edges, values, xlim, ylim, *, y_axis_log=False):
+    """Slice intersecting cells with an adjacent guard cell and original edges.
+
+    This is an export view only. Limits are resolved from the original product
+    before clipping; neither source data nor color normalization is changed.
+    """
+    if values.shape != (len(y_edges)-1, len(x_edges)-1):
+        raise ValueError('Heatmap values must match the original axis cell dimensions.')
+
+    def cells(edges, limits, log_axis=False):
+        if not np.all(np.isfinite(limits)) or (log_axis and min(limits) <= 0):
+            return slice(0, len(edges)-1)
+        lo, hi = sorted(limits)
+        if nonsingular(lo, hi) != (lo, hi):
+            # Matplotlib expands singular/nearly singular ranges after mesh
+            # creation. Preserve its original data extent for that axis.
+            return slice(0, len(edges)-1)
+        intersects = np.flatnonzero((np.maximum(edges[:-1], edges[1:]) >= lo)
+                                    & (np.minimum(edges[:-1], edges[1:]) <= hi))
+        if not intersects.size:
+            return slice(0, 0)
+        return slice(max(0, int(intersects[0])-1),
+                     min(len(edges)-1, int(intersects[-1])+2))
+
+    columns, rows = cells(x_edges, xlim), cells(y_edges, ylim, y_axis_log)
+    return (x_edges[columns.start:columns.stop+1], y_edges[rows.start:rows.stop+1],
+            values[rows, columns])
+
+
+def plot_heatmap(ax: Axes, cube: DataCube, params: HeatmapParams, *, visible_only=False):
     z = np.asarray(cube.Z, float)
     e = np.asarray(cube.energy, float).ravel()
     g = np.asarray(cube.gate, float).ravel()
@@ -279,11 +309,13 @@ def plot_heatmap(ax: Axes, cube: DataCube, params: HeatmapParams):
         if params.clip_outliers:
             z = np.minimum(z, params.vmax)
         norm = _norm_from_params(z, params)
+        mesh_data = (e_edges, g_edges, z)
+        if visible_only:
+            mesh_data = visible_mesh_data(*mesh_data, params.xlim, params.ylim,
+                                          y_axis_log=params.y_axis_log)
         images = [
             ax.pcolormesh(
-                e_edges,
-                g_edges,
-                z,
+                *mesh_data,
                 shading="flat",
                 cmap=params.cmap,
                 norm=norm,
@@ -292,9 +324,17 @@ def plot_heatmap(ax: Axes, cube: DataCube, params: HeatmapParams):
         applied_split = None
     else:
         layers, boundaries = split_color_layers(cube, params)
+        slices, _ = split_region_slices(e, split, params.xlim)
         applied_split = boundaries[0]
-        images = [ax.pcolormesh(e_edges, g_edges, values, shading="flat",
-                               cmap=params.cmap, norm=norm) for values, norm in layers]
+        # Keep original edges at each seam, particularly for nonuniform axes.
+        # Each measured cell belongs to one full-resolution mesh.
+        images = []
+        for region, (values, norm) in zip(slices, layers):
+            mesh_data = (e_edges[region.start:region.stop+1], g_edges, values)
+            if visible_only:
+                mesh_data = visible_mesh_data(*mesh_data, params.xlim, params.ylim,
+                                              y_axis_log=params.y_axis_log)
+            images.append(ax.pcolormesh(*mesh_data, shading='flat', cmap=params.cmap, norm=norm))
         if split.show_boundary:
             for boundary in boundaries:
                 ax.axvline(boundary, color="#202020", linewidth=0.9,

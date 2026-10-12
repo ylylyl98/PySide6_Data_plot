@@ -7,6 +7,25 @@ from core.plotting import SplitColorScale, split_region_slices
 SETTINGS_KEY = 'drr/region_colors_json'
 
 
+def deferred_auto_keys(owner):
+    deferred = getattr(owner, '_drr_second_split_deferred', None)
+    if deferred is None or deferred[0] is not getattr(owner.loaded, 'cube', None):
+        return ()
+    protected = getattr(owner, '_drr_memory_protected', set())
+    return tuple(key for key, value in deferred[1].items()
+                 if not owner.drr_second_split_fix_checks[key].isChecked()
+                 and 'drr_second.' + key not in protected
+                 and owner.drr_second_split_spins[key].value() == value)
+
+
+def note_second_region_auto(owner, side):
+    deferred = getattr(owner, '_drr_second_split_deferred', None)
+    if deferred is not None and deferred[0] is getattr(owner.loaded, 'cube', None):
+        for key in (side + '_vmin', side + '_vmax'):
+            if not owner.drr_second_split_fix_checks[key].isChecked():
+                deferred[1][key] = owner.drr_second_split_spins[key].value()
+
+
 def is_triple(owner, prefix='drr'):
     return prefix in {'drr', 'drr_second'} and owner.drr_region_count_combo.currentData() == 3
 
@@ -98,7 +117,7 @@ def initialize_boundaries(owner, *, center=False):
         if fixes['x1'].isChecked() and lo < b < hi:
             first = (lo + b) / 2
         for key, value in (('x0', first), ('x1', second)):
-            if not fixes[key].isChecked():
+            if not fixes[key].isChecked() or not lo < spins[key].value() < hi:
                 owner._set_spin_value_silent(spins[key], value)
 
 
@@ -118,8 +137,7 @@ def scale(owner, prefix):
 
 
 def refresh(owner, prefix, cubes, *, side=None, center=False):
-    if center:
-        initialize_boundaries(owner, center=True)
+    initialize_boundaries(owner, center=center)
     spins = getattr(owner, f'{prefix}_split_spins')
     fixes = getattr(owner, f'{prefix}_split_fix_checks')
     shared = owner.drr_split_spins
@@ -127,38 +145,22 @@ def refresh(owner, prefix, cubes, *, side=None, center=False):
     ylim = sorted(owner.drr_spins[k].value() for k in ('ymin', 'ymax'))
     shape = SplitColorScale(shared['x0'].value(), 0, 1, 0, 1,
                             split_x2=shared['x1'].value(), middle_vmin=0, middle_vmax=1)
-    values = {s: [] for s in ('left', 'middle', 'right')}
     for cube in cubes:
         try:
-            slices, _ = split_region_slices(cube.energy, shape, xlim)
+            split_region_slices(cube.energy, shape, xlim)
         except ValueError as exc:
             owner._status(str(exc))
             return False
-        x, y = np.asarray(cube.energy), np.asarray(cube.gate)
-        for s, region in zip(values, slices):
-            mask = np.zeros(x.size, bool)
-            mask[region] = True
-            mask &= (x >= min(xlim)) & (x <= max(xlim))
-            z = np.asarray(cube.Z)[np.ix_((y >= ylim[0]) & (y <= ylim[1]), mask)]
-            z = z[np.isfinite(z)]
-            if owner._mode_log('DRR'):
-                z = z[z > 0]
-            if z.size:
-                values[s].append(z)
+    from ui_qt.drr_color_limits import bounds, roi_request
     changed = False
-    for s, chunks in values.items():
-        if (side is not None and s != side) or not chunks:
+    for index, s in enumerate(('left', 'middle', 'right')):
+        if (side is not None and s != side):
             continue
-        lo, hi = np.percentile(np.concatenate(chunks), [0.01, 99.99])
-        if owner.drr_center_zero_chk.isChecked() and not owner._mode_log('DRR'):
-            hi = max(abs(lo), abs(hi), 1e-12)
-            lo = -hi
-        if hi <= lo:
-            pad = max(1e-12, abs(lo)*.01)
-            lo, hi = lo-pad, hi+pad
-        if owner._mode_log('DRR'):
-            lo = max(lo, 1e-12)
-            hi = max(hi, lo*1.01)
+        result = bounds(owner, cubes, roi_request(owner,
+            boundaries=(shape.split_x, shape.split_x2), region=index), prefix=prefix, side=s)
+        if result is None:
+            continue
+        lo, hi = result
         keys = (s+'_vmin', s+'_vmax')
         candidates = [spins[k].value() if fixes[k].isChecked() else value for k,value in zip(keys,(lo,hi))]
         if candidates[0] >= candidates[1] or (owner._mode_log('DRR') and candidates[0] <= 0):
@@ -182,6 +184,17 @@ def settings_state(owner):
 
 def save_settings(owner):
     state = settings_state(owner)
+    # File/center values have their own history. Do not turn their temporary
+    # locks into app-wide manual preferences when the next window starts.
+    for name, (old, applied) in getattr(owner, '_drr_memory_borrowed', {}).items():
+        if name == 'count' and state['count'] == applied + 1:
+            state['count'] = old + 1
+        elif name == 'boundary' and state['boundary'] == applied:
+            state['boundary'] = old
+        elif '.' in name:
+            prefix, key = name.split('.', 1)
+            if prefix in state and isinstance(state[prefix], dict) and state[prefix].get(key) == applied:
+                state[prefix][key] = old
     if state == getattr(owner, '_drr_region_settings_baseline', None):
         return
     owner.settings.setValue(SETTINGS_KEY, json.dumps(state))

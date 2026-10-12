@@ -1,9 +1,77 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from collections import OrderedDict
 import hashlib
+import os
 from pathlib import Path
 import shutil
+from threading import RLock
+
+_DIGEST_CACHE = OrderedDict()
+_DIGEST_LOCK = RLock()
+
+if os.name == 'nt':
+    import ctypes
+    from ctypes import wintypes
+
+    class _FileBasicInfo(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_int64) for name in
+                    ('creation', 'access', 'write', 'change')] + [('attributes', wintypes.DWORD)]
+
+    _kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    _kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                    ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    _kernel.CreateFileW.restype = wintypes.HANDLE
+    _kernel.GetFileInformationByHandleEx.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                    ctypes.c_void_p, wintypes.DWORD]
+    _kernel.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    _kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel.CloseHandle.restype = wintypes.BOOL
+
+
+def _digest_signature(path):
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    change = stat.st_ctime_ns
+    if os.name == 'nt':
+        # Windows st_ctime is creation time. FILE_BASIC_INFO.ChangeTime also
+        # catches a same-size rewrite whose LastWriteTime was restored.
+        handle = _kernel.CreateFileW(str(path), 0x80, 7, None, 3, 0x02000000, None)
+        if handle == wintypes.HANDLE(-1).value:
+            return None
+        try:
+            info = _FileBasicInfo()
+            if not _kernel.GetFileInformationByHandleEx(handle, 0, ctypes.byref(info), ctypes.sizeof(info)):
+                return None
+            change = info.change
+        finally:
+            _kernel.CloseHandle(handle)
+    return stat.st_mtime_ns, stat.st_size, stat.st_dev, stat.st_ino, change
+
+
+def _cached_load_digest(path):
+    """Reuse stable digests for loading; cleanup always calls sha256_file."""
+    path = Path(path).resolve()
+    before = _digest_signature(path)
+    with _DIGEST_LOCK:
+        cached = _DIGEST_CACHE.get(path)
+        if before is not None and cached is not None and cached[0] == before:
+            _DIGEST_CACHE.move_to_end(path)
+            return cached[1]
+    digest = sha256_file(path)
+    after = _digest_signature(path)
+    if before != after:
+        return None
+    if digest is not None and before is not None:
+        with _DIGEST_LOCK:
+            _DIGEST_CACHE[path] = before, digest
+            _DIGEST_CACHE.move_to_end(path)
+            while len(_DIGEST_CACHE) > 512:
+                _DIGEST_CACHE.popitem(last=False)
+    return digest
 
 
 @dataclass(frozen=True)
@@ -99,7 +167,7 @@ def verify_initial_data_working_file(
         is_canonical_file = False
 
     if is_canonical_file or working.parent != root:
-        digest = sha256_file(working)
+        digest = _cached_load_digest(working)
         return WorkingCopyRecord(
             canonical_source_path=str(working),
             working_copy_path=str(working),
@@ -116,8 +184,8 @@ def verify_initial_data_working_file(
         )
 
     canonical = initial_root / working.name
-    working_hash = sha256_file(working)
-    canonical_hash = sha256_file(canonical)
+    working_hash = _cached_load_digest(working)
+    canonical_hash = _cached_load_digest(canonical)
     is_root_file = working.parent == root
     verified = (
         is_root_file

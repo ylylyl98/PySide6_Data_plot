@@ -51,7 +51,7 @@ class SplitColorScaleTests(unittest.TestCase):
         self.assertEqual(index, 2)
         self.assertAlmostEqual(boundary, 2.5)
 
-    def test_two_regions_use_independent_norms_and_nonoverlapping_masks(self) -> None:
+    def test_two_regions_use_independent_norms_and_nonoverlapping_cells(self) -> None:
         fig, ax = plt.subplots()
         render = plot_heatmap(ax, self.cube, self._params())
         self.assertTrue(render.is_split)
@@ -59,14 +59,11 @@ class SplitColorScaleTests(unittest.TestCase):
         self.assertEqual((render.primary.norm.vmin, render.primary.norm.vmax), (0.0, 5.0))
         self.assertEqual((render.secondary.norm.vmin, render.secondary.norm.vmax), (90.0, 250.0))
 
-        left_mask = np.ma.getmaskarray(render.primary.get_array()).reshape(self.cube.Z.shape)
-        right_mask = np.ma.getmaskarray(render.secondary.get_array()).reshape(self.cube.Z.shape)
-        self.assertTrue(np.all(~left_mask[:, :2]))
-        self.assertTrue(np.all(left_mask[:, 2:]))
-        self.assertTrue(np.all(right_mask[:, :2]))
-        self.assertTrue(np.all(~right_mask[:, 2:]))
-        self.assertFalse(np.any(~left_mask & ~right_mask))
-        self.assertFalse(np.any(left_mask & right_mask))
+        self.assertEqual(sum(m.get_array().size for m in render.images), self.cube.Z.size)
+        np.testing.assert_array_equal(render.primary.get_array(), self.cube.Z[:, :2])
+        np.testing.assert_array_equal(render.secondary.get_array(), self.cube.Z[:, 2:])
+        np.testing.assert_array_equal(render.primary.get_coordinates()[0, :, 0], [.5, 1.5, 2.5])
+        np.testing.assert_array_equal(render.secondary.get_coordinates()[0, :, 0], [2.5, 3.5, 4.5])
         plt.close(fig)
 
     def test_split_position_must_be_inside_visible_x_range(self) -> None:

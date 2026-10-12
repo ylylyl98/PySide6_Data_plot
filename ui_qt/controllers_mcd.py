@@ -30,7 +30,7 @@ from core.mcd import (
     mcd_annotation_layout, pair_window_trace_by_branch,
     suggest_mcd_background_ranges,
 )
-from ui_qt.common import QComboBox, Worker
+from ui_qt.common import QComboBox, Worker, focused_numeric_input
 from ui_qt.theme import alias as theme_alias
 from ui_qt.matplotlib_theme import ThemeAwareFigureCanvasQTAgg
 from ui_qt.source_picker_dialog import SourcePickerDialog
@@ -133,6 +133,12 @@ class McdController:
     def _apply_pending_mcd_settings(self) -> None:
         """Apply the newest MCD settings once after a burst of UI changes."""
         if not self.loaded or self.loaded.mode != "MCD":
+            return
+        focused = focused_numeric_input(self._owner)
+        if focused is not None and focused.lineEdit().isModified():
+            # Source refreshes also use start(0), which changes the timer's
+            # retained interval. Never busy-poll an unfinished edit at 0 ms.
+            self._mcd_auto_apply_timer.start(650)
             return
         if self._load_in_progress:
             self._mcd_reapply_pending = True
@@ -286,6 +292,10 @@ class McdController:
 
     def _apply_pending_mcd_center_refresh(self) -> None:
         if not self.loaded or self.loaded.mode != "MCD":
+            return
+        focused = focused_numeric_input(self._owner)
+        if focused is not None and focused.lineEdit().isModified():
+            self._mcd_center_refresh_timer.start(40)
             return
         # The unified page owns a separate four-panel trace model.  Reuse its
         # artists for center/width edits so the legacy 40 ms coalescing timer

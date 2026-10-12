@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import tempfile
 import unittest
+from unittest.mock import patch
+from core import provenance
 
 from core.provenance import (
     WorkingCopyRecord,
@@ -14,6 +17,75 @@ from core.provenance import (
 
 
 class ProvenanceTests(unittest.TestCase):
+    def pair(self, root):
+        canonical = root / 'Initial Data' / 'sample.csv'
+        canonical.parent.mkdir()
+        canonical.write_bytes(b'original')
+        working = root / canonical.name
+        working.write_bytes(b'original')
+        return canonical, working
+
+    def test_unchanged_load_verification_reuses_content_hashes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, working = self.pair(root)
+            verify_initial_data_working_file(working, root, workflow='DRR', role='measurement')
+            with patch.object(provenance, 'sha256_file', wraps=provenance.sha256_file) as digest:
+                record = verify_initial_data_working_file(working, root, workflow='DRR', role='measurement')
+            self.assertTrue(record.provenance_verified)
+            self.assertEqual(digest.call_count, 0)
+
+    def test_same_size_and_restored_mtime_change_invalidates_load_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, working = self.pair(root)
+            verify_initial_data_working_file(working, root, workflow='DRR', role='measurement')
+            before = working.stat()
+            working.write_bytes(b'modified')
+            os.utime(working, ns=(before.st_atime_ns, before.st_mtime_ns))
+            record = verify_initial_data_working_file(working, root, workflow='DRR', role='measurement')
+            self.assertFalse(record.provenance_verified)
+
+    def test_replacement_and_missing_file_invalidate_load_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, working = self.pair(root)
+            verify_initial_data_working_file(working, root, workflow='DRR', role='measurement')
+            before = working.stat()
+            replacement = root / 'replacement.csv'
+            replacement.write_bytes(b'modified')
+            os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+            replacement.replace(working)
+            self.assertFalse(verify_initial_data_working_file(working, root, workflow='DRR', role='measurement').provenance_verified)
+            working.unlink()
+            self.assertFalse(verify_initial_data_working_file(working, root, workflow='DRR', role='measurement').provenance_verified)
+
+    def test_unstable_hash_is_unverified_and_never_cached(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, working = self.pair(root)
+            original_hash = provenance.sha256_file
+            def mutate(path):
+                value = original_hash(path)
+                if Path(path) == working:
+                    working.write_bytes(b'modified')
+                return value
+            with patch.object(provenance, 'sha256_file', side_effect=mutate):
+                record = verify_initial_data_working_file(working, root, workflow='DRR', role='measurement')
+            self.assertFalse(record.provenance_verified)
+            self.assertFalse(verify_initial_data_working_file(working, root, workflow='DRR', role='measurement').provenance_verified)
+
+    def test_cleanup_uses_fresh_hashes_after_warm_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, working = self.pair(root)
+            record = verify_initial_data_working_file(working, root, workflow='DRR', role='measurement')
+            with patch.object(provenance, 'sha256_file', wraps=provenance.sha256_file) as digest:
+                self.assertTrue(can_cleanup(record, root))
+            self.assertEqual(digest.call_count, 2)
+            working.write_bytes(b'modified')
+            self.assertFalse(can_cleanup(record, root))
+
     def test_copy_records_hashes_and_cleanup_preserves_canonical(self) -> None:
         with tempfile.TemporaryDirectory(dir=".") as tmp:
             root = Path(tmp)

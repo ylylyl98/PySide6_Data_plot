@@ -792,6 +792,11 @@ class FeatureTabsMixin:
         advanced_note.setWordWrap(True)
         advanced_form.addRow(advanced_note)
         params_layout.addWidget(self._make_expander("Advanced derivative", advanced, expanded=False))
+        from ui_qt.drr_display_memory import build_controls
+        memory_controls = build_controls(self)
+        params_layout.addWidget(self._make_expander("Display memory", memory_controls, expanded=False))
+        params_layout.addWidget(self.drr_memory_status)
+        params_layout.addWidget(self.drr_fix_source_legend)
         params_layout.addWidget(self._make_expander("Manual plot ranges", basic, expanded=False))
         layout.addWidget(self._make_expander("Parameters", params, expanded=True))
         from ui_qt.drr_peak_analysis import DrrPeakAnalysisController

@@ -19,12 +19,12 @@ def example():
 
 
 class ThreeRegionTests(unittest.TestCase):
-    def test_three_masks_cover_each_cell_once_and_use_independent_norms(self):
+    def test_three_grids_cover_each_cell_once_and_use_independent_norms(self):
         cube, params = example()
         render = plot_heatmap(Figure().subplots(), cube, params)
         self.assertEqual(len(render.images), 3)
-        np.testing.assert_array_equal(sum(~np.ma.getmaskarray(m.get_array()) for m in render.images),
-                                      np.ones(cube.Z.shape))
+        self.assertEqual(sum(m.get_array().size for m in render.images), cube.Z.size)
+        np.testing.assert_array_equal(np.concatenate([m.get_array() for m in render.images], axis=1), cube.Z)
         self.assertEqual([m.norm.vmax for m in render.images], [3, 30, 300])
         self.assertEqual(render.boundaries, (2.5, 4.5))
 

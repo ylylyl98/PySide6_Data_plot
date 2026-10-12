@@ -85,3 +85,24 @@ class ThreeRegionUiTests(unittest.TestCase):
         self.assertEqual(w.drr_split_spins['x0'].value(), 4.5)
         self.assertGreater(w.drr_split_spins['x1'].value(), 4.5)
         self.assertLess(w.drr_split_spins['x1'].value(), 6)
+
+    def test_outside_fixed_boundaries_are_repaired_without_moving_valid_fixed_boundaries(self):
+        w = self.w
+        w.drr_region_count_combo.setCurrentIndex(2)
+        for key in ('x0', 'x1'):
+            w.drr_split_fix_checks[key].setChecked(True)
+        for bounds, expected in (
+            ((3., 6.), (4., 5.)),
+            ((1., 4.), (2.5, 3.25)),
+            ((3., 4.), (3. + 1./3, 3. + 2./3)),
+        ):
+            with self.subTest(bounds=bounds):
+                for key, value in zip(('xmin', 'xmax'), bounds):
+                    w._set_spin_value_silent(w.drr_spins[key], value)
+                for key, value in zip(('x0', 'x1'), (2.5, 5.)):
+                    w._set_spin_value_silent(w.drr_split_spins[key], value)
+                w._refresh_automatic_ranges('DRR', center_split=True)
+                for key, value in zip(('x0', 'x1'), expected):
+                    self.assertAlmostEqual(w.drr_split_spins[key].value(), value, places=5)
+                    self.assertTrue(w.drr_split_fix_checks[key].isChecked())
+                    self.assertEqual(w.drr_split_fix_checks[key].text(), 'Fix M')

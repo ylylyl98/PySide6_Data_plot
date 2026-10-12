@@ -11,7 +11,7 @@ from PySide6.QtWidgets import QApplication
 from ui_qt.common import Worker
 
 
-def render_snapshot(snapshot, path, options, *, progress, log):
+def render_snapshot(snapshot, path, options, *, progress, log, after_save=None):
     # Snapshot bytes are generated locally from our own figure, never from files
     # supplied by a user. Matplotlib's pickle excludes its live Qt canvas.
     figure = pickle.loads(snapshot)
@@ -21,6 +21,11 @@ def render_snapshot(snapshot, path, options, *, progress, log):
     try:
         figure.savefig(temporary, **options)
         temporary.replace(path)
+        if after_save is not None:
+            try:
+                after_save()
+            except OSError as error:
+                log.emit(f'Image saved; display settings unavailable: {error}')
     finally:
         temporary.unlink(missing_ok=True)
         figure.clear()
@@ -32,7 +37,7 @@ class FigureSaveJob(QObject):
     failed = Signal(str)
     finished = Signal()
 
-    def __init__(self, figure, path, options):
+    def __init__(self, figure, path, options, after_save=None):
         super().__init__(QApplication.instance())
         self.done = False
         self.error = None
@@ -51,7 +56,7 @@ class FigureSaveJob(QObject):
             self.deleteLater()
             raise
         self.snapshot_seconds = perf_counter() - self.started
-        self.worker = Worker(render_snapshot, snapshot, str(path), options)
+        self.worker = Worker(render_snapshot, snapshot, str(path), options, after_save=after_save)
         self.worker.signals.result.connect(self._success)
         self.worker.signals.error.connect(self._failure)
         self.worker.signals.finished.connect(self._finish)
@@ -92,8 +97,8 @@ class FigureSaveJob(QObject):
         self.setParent(None)
 
 
-def save_figure_async(figure, path, **options):
+def save_figure_async(figure, path, *, after_save=None, **options):
     apply_font = getattr(figure.canvas, 'apply_ui_font', None)
     if callable(apply_font):
         apply_font()
-    return FigureSaveJob(figure, path, options)
+    return FigureSaveJob(figure, path, options, after_save=after_save)

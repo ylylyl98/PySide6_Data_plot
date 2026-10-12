@@ -3,32 +3,54 @@ import numpy as np
 import re
 from matplotlib.font_manager import FontProperties
 from matplotlib.ticker import FuncFormatter, NullLocator
+from core.png_render_timing import time_png_stage
 
 
 def complete_title(fig, text, left, right, *, top=.95, bottom=.85, obstacles=()):
     """Fit all text by wrapping and reducing font size, never dropping words."""
+    with time_png_stage('title'):
+        return _fit_title(fig, text, left, right, top=top, bottom=bottom, obstacles=obstacles)
+
+
+def _fit_title(fig, text, left, right, *, top, bottom, obstacles):
     renderer = fig.canvas.get_renderer()
     widths = sorted({(right-left) * fig.bbox.width,
                      *(box.x0 - left * fig.bbox.width - 8 for box in obstacles)}, reverse=True)
     widths = [w for w in widths if 0 < w <= (right-left) * fig.bbox.width]
     height = (top-bottom) * fig.bbox.height
     artist = fig.text(left, top, '', ha='left', va='top', fontweight='bold', linespacing=1.0)
+    words = re.findall(r'\$[^$]*\$|\S+', str(text))
     for size in np.arange(16., .5, -.5):
+        font = FontProperties(size=size, weight='bold')
+        measured = {}
+
+        def measure(value):
+            if value not in measured:
+                if len(measured) >= 4096:
+                    measured.clear()
+                measured[value] = renderer.get_text_width_height_descent(value, font, False)[0]
+            return measured[value]
+
         for width in widths:
-            font = FontProperties(size=size, weight='bold')
             lines, current = [], ''
-            for word in re.findall(r'\$[^$]*\$|\S+', str(text)):
+            for word in words:
                 trial = f'{current} {word}' if current else word
-                if current and renderer.get_text_width_height_descent(trial, font, False)[0] > width:
+                trial_width = measure(trial)
+                if current and trial_width > width:
                     lines.append(current)
                     current = ''
+                    trial = word
+                    trial_width = measure(trial)
                 if word.startswith('$') and word.endswith('$'):
                     current = (current + ' ' + word).strip()
+                    continue
+                if trial_width <= width:
+                    current = trial
                     continue
                 # Long unbroken file identifiers must fit as well.
                 for char in (' ' if current else '') + word:
                     trial = current + char
-                    if current and renderer.get_text_width_height_descent(trial, font, False)[0] > width:
+                    if current and measure(trial) > width:
                         lines.append(current.rstrip())
                         current = char.lstrip()
                     else:

@@ -6,6 +6,10 @@ from typing import Optional, Tuple, Dict, List, Sequence, Literal
 import numpy as np
 import pandas as pd
 from .raw_spectrum_cache import RawSpectrumCache
+from .streaming_average import StreamingNanMean
+from .drr_axis_coordinates import CoordinateAccumulator
+from .load_cancellation import check_load_cancelled
+from .load_timing import time_load_stage
 import matplotlib
 matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
@@ -1563,10 +1567,13 @@ def _load_canonical(user_folder: str, origin_name: str, *, y_axis: str = "auto")
 
     Only parsing is cached. Returned arrays remain independent and writable.
     """
+    check_load_cancelled()
     csv_path = _require_csv_in_root(Path(user_folder), origin_name)
-    energy, vbg, vtg, vbias, Z_gateE = _RAW_SPECTRUM_CACHE.load(
-        csv_path, _RAW_PARSE_VERSION, _parse_raw_spectrum
-    )
+    with time_load_stage('csv_read'):
+        energy, vbg, vtg, vbias, Z_gateE = _RAW_SPECTRUM_CACHE.load(
+            csv_path, _RAW_PARSE_VERSION, _parse_raw_spectrum
+        )
+    check_load_cancelled()
     parts = re.findall(r"\$(.*?)\$", origin_name)
     stem = Path(origin_name).stem
     title_full = _title_from_filename(origin_name)
@@ -1883,6 +1890,7 @@ def sg_derivative_origin_rows(
     out = np.empty_like(Z, float)
 
     for i in range(Z.shape[0]):
+        check_load_cancelled()
         out[i] = sg_derivative_origin_1d(
             E, Z[i],
             deriv=deriv,
@@ -1893,6 +1901,7 @@ def sg_derivative_origin_rows(
             origin_like=origin_like,
             pad_flat_edges=pad_flat_edges,
         )
+    check_load_cancelled()
     return out
 
 def process_ref_avg(
@@ -1928,6 +1937,7 @@ def process_ref_avg(
 ) -> dict:
     if len(files) < 1:
         raise ValueError("process_ref_avg requires at least one file.")
+    check_load_cancelled()
     if bg_mode not in ("self_first", "self_last", "external"):
         raise ValueError("bg_mode must be 'self_first', 'self_last', or 'external'.")
     if seed_external_from_first:
@@ -2005,8 +2015,13 @@ def process_ref_avg(
             )
     mode_map = {"self_first": "first", "self_last": "last", "external": "external"}
     dmode = mode_map[bg_mode]
-    stack = [ _drr_from_Z(Z0, dmode, I0_ext) ]
-    stack_raw = [ Z0 ]
+    corrected_average = StreamingNanMean(Z0.shape)
+    raw_average = StreamingNanMean(Z0.shape)
+    coordinates = CoordinateAccumulator(gate0)
+    coordinates.add(gate0, d0.get('gate_coordinates', {}))
+    corrected_average.add(_drr_from_Z(Z0, dmode, I0_ext))
+    raw_average.add(Z0)
+    del d0, Z0
 
     def _same_axis(a: np.ndarray, b: np.ndarray) -> bool:
         return a.shape == b.shape and np.allclose(a, b, rtol=1e-6, atol=1e-9, equal_nan=True)
@@ -2049,10 +2064,12 @@ def process_ref_avg(
         return np.asarray(z_ge, float)
 
     for f in files[1:]:
+        check_load_cancelled()
         d = _load_canonical(user_folder, f, y_axis=y_axis)
         e_i = np.asarray(d["energy"], float)
         g_i = np.asarray(d["gate_axis"], float)
         z_i = np.asarray(d["Z"], float)
+        coordinates.add(g_i, d.get('gate_coordinates', {}))
         e_match = _same_axis(e_i, energy0)
         g_match = _same_axis(g_i, gate0)
         if not (e_match and g_match):
@@ -2072,16 +2089,22 @@ def process_ref_avg(
             detail = "; ".join(parts) if parts else "axis mismatch"
             print(f"[DRR][warn] Grid mismatch in {f} ({detail}); interpolating to reference grid.")
             z_i = _interp_z_to_ref(z_i, e_i, g_i, energy0, gate0)
-        stack.append(_drr_from_Z(z_i, dmode, I0_ext))
-        stack_raw.append(z_i)
-    Z_avg = np.nanmean(np.stack(stack, axis=0), axis=0)
-    R_avg = np.nanmean(np.stack(stack_raw, axis=0), axis=0)
+        check_load_cancelled()
+        corrected_average.add(_drr_from_Z(z_i, dmode, I0_ext))
+        raw_average.add(z_i)
+        del d, z_i
+    check_load_cancelled()
+    Z_avg = corrected_average.mean()
+    del corrected_average
+    R_avg = raw_average.mean()
+    del raw_average
     Z_out = Z_avg
     key = {"self_first": "first", "self_last": "last", "external": "external"}[bg_mode]
     N = len(files)
     suffix = f"_DR_R_{key}_avg{N}"
     cbar_lbl = "DR/R"
     if derivative in (1, 2):
+        check_load_cancelled()
         Z_out = sg_derivative_origin_rows(
             Z_avg, energy0,
             deriv=derivative,
@@ -2094,6 +2117,7 @@ def process_ref_avg(
         )
         suffix += ("_dE" if derivative == 1 else "_d2E")
         cbar_lbl = "d(DR/R)/dE" if derivative == 1 else "d2(DR/R)/dE2"
+    check_load_cancelled()
     cbar_lbl = _normalize_label_text(cbar_lbl)
     title0 = _normalize_label_text(title0)
     save_base = f"{stem0}{suffix}"
@@ -2151,6 +2175,7 @@ def process_ref_avg(
     title_txt = f"{title0} ({cbar_lbl} {key}, avg {N})" if derivative else f"{title0} (DR/R {key}, avg {N})"
     return {
         "energy": energy0, "gate_axis": gate0, "gate_label": gate_label,
+        "gate_coordinates": coordinates.result(),
         "Z_avg": Z_avg, "Z_out": Z_out,"R_avg": R_avg,
         "png_path": png_path, "dat_path": dat_path,
         "count": N, "bg_mode": bg_mode,
@@ -2228,6 +2253,7 @@ def build_external_baseline_avg(
 
 
     for f in files_zero[1:]:
+        check_load_cancelled()
         d = _load_canonical(user_folder, f)
         energy_i = np.asarray(d["energy"]).ravel()
 
@@ -2255,6 +2281,7 @@ def build_external_baseline_avg(
 
 
     # Average across files (each file contributes one 1D baseline)
+    check_load_cancelled()
     I0_stack = np.stack(I0_list_1d, axis=0)  # shape: (n_files, eN)
     I0_avg   = np.nanmean(I0_stack, axis=0)
 
