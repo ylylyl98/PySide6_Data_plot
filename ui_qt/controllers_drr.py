@@ -63,7 +63,6 @@ from core.processing import apply_sg_derivative_energy, clamp_sg_window, nearest
 from ui_qt.common import Worker, WrappedFilenameDelegate
 from ui_qt.theme import alias as theme_alias
 from ui_qt.source_picker_dialog import SourcePickerDialog
-from ui_qt.axes_region_blitter import AxesRegionBlitter
 
 
 # ``None`` is a valid explicit request for the baseline DR/R product, so the
@@ -2071,6 +2070,10 @@ class DrrController:
                 type_hint.setVisible(False)
 
         def _accept_chosen() -> None:
+            if self._owner._drr_catalog_is_inventory_preview():
+                group_detail.setText('Checking measurement grids and backgrounds; please wait before loading.')
+                details_btn.setChecked(True)
+                return
             paths = [
                 str(selected_list.item(index).data(Qt.UserRole) or selected_list.item(index).text())
                 for index in range(selected_list.count())
@@ -2553,55 +2556,34 @@ class DrrController:
         self._draw_drr_regions()
 
     def _draw_drr_regions(self) -> None:
+        from ui_qt.drr_gate_blitter import DrrGateBlitter
         analysis = getattr(self._owner, 'drr_peak_analysis', None)
         if analysis is not None:
             analysis.draw_overlays()
             if analysis.valid_result() is not None:
                 for helper in getattr(self, '_drr_region_blitters', {}).values():
-                    helper._background = None
-        entries = []
-        for key, axis in (getattr(self, "_drr_spectrum_axes", {}) or {}).items():
-            line = getattr(self, "_drr_spectrum_lines", {}).get(key)
-            if line is not None:
-                entries.append((f"spectrum:{key}", axis, (line,)))
-        axis = getattr(self, "_drr_spectrum_ax", None)
-        line = getattr(self, "_drr_spectrum_line", None)
-        if axis is not None and line is not None and not entries:
-            entries.append(("spectrum", axis, (line,)))
-        gate_lines = getattr(self, "_drr_gate_lines", {}) or {}
-        for key, gate in gate_lines.items():
-            ax = getattr(gate, "axes", None)
-            if ax is not None:
-                entries.append((f"gate:{key}", ax, (gate,)))
-        helpers = getattr(self, "_drr_region_blitters", {})
-        active_keys = {key for key, _, _ in entries}
-        for key in list(helpers):
-            if key not in active_keys:
-                helpers.pop(key).disconnect()
-        full_draw = False
-        for key, axis, artists in entries:
-            overlays = tuple(
-                artist for name in ("_drr_heatmap_peak_artist", "_drr_heatmap_fit_artist",
-                                    "_drr_spectrum_peak_artist", "_drr_spectrum_fit_artist")
-                if (artist := getattr(self, name, None)) is not None and artist.axes is axis
-            )
-            artists = tuple(sorted((*artists, *overlays), key=lambda artist: artist.get_zorder()))
-            helper = helpers.get(key)
-            bbox = tuple(round(float(v), 3) for v in axis.bbox.bounds)
-            if helper is None:
-                helper = AxesRegionBlitter(self.canvas); helpers[key] = helper
-                helper.configure(axis, artists); helper._layout_bbox = bbox
-                full_draw = True
-            elif (helper._layout_bbox != bbox or helper.axes is not axis
-                  or helper.artists != tuple(artists)):
-                helper.configure(axis, artists); helper._layout_bbox = bbox
-                full_draw = True
-            elif helper._background is None or helper._static_signature != helper._signature():
-                full_draw = True
-        self._drr_region_blitters = helpers
-        if full_draw:
-            # Configure all dynamic artists before the shared, coalesced draw.
-            AxesRegionBlitter.restore_many(helpers.values())
-        else:
-            for helper in helpers.values():
-                helper.draw()
+                    helper.invalidate()
+        spectra = tuple(dict.fromkeys((getattr(self, '_drr_spectrum_axes', {}) or {}).values()))
+        if not spectra and self._drr_spectrum_ax is not None:
+            spectra = (self._drr_spectrum_ax,)
+        overlays = list((getattr(self, '_drr_gate_lines', {}) or {}).values())
+        overlays.extend(artist for name in ('_drr_heatmap_peak_artist', '_drr_heatmap_fit_artist')
+                        if (artist := getattr(self, name, None)) is not None
+                        and artist.axes in self.canvas.figure.axes)
+        overlays = tuple(sorted(dict.fromkeys(overlays), key=lambda a: a.get_zorder()))
+        helpers = getattr(self, '_drr_region_blitters', {})
+        helper = helpers.get('gate_view')
+        if helper is None:
+            for previous in helpers.values():
+                previous.disconnect()
+            helper = DrrGateBlitter(self.canvas)
+            helpers.clear()
+            helpers['gate_view'] = helper
+            self._drr_region_blitters = helpers
+        heatmaps = tuple((render.primary.axes, render.colorbar_host)
+                         for render in getattr(self, '_drr_heatmap_renders', {}).values()
+                         if render.colorbar_host is not None)
+        if not helper.matches(spectra, overlays, heatmaps):
+            helper.configure(spectra, overlays, heatmaps)
+        if not helper.draw():
+            self.canvas.draw_idle()

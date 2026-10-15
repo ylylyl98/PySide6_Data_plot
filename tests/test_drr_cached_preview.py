@@ -17,6 +17,40 @@ class DrrCachedPreviewTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
+    def test_filename_preview_can_be_browsed_but_accepted_only_after_validation(self):
+        from PySide6.QtWidgets import QDialogButtonBox
+        from core.drr_sources import preview_drr_sources, discover_drr_sources
+        with patch.object(MainWindow, '_restore_last_folder', lambda self: None):
+            window = MainWindow()
+        self.addCleanup(window.close)
+        with tempfile.TemporaryDirectory() as folder:
+            name = 'sample_1.67KREF_760nmc.csv'
+            Path(folder, name).write_text('Vbg,740,760\n0,1,2\n1,3,4\n')
+            window.current_folder = folder
+            window._drr_include_all_sources = False
+            window._drr_refresh_generation = 1
+            window._drr_refresh_running = True
+            cache = DrrSourceCache(load_on_init=False)
+            def execute(dialog):
+                window._on_drr_catalog_refresh_result(
+                    (folder, preview_drr_sources(folder), cache, True, False, (), 'inventory'),
+                    1, True, set(), catalog_only=True)
+                self.assertGreater(dialog.findChild(QListWidget, 'drr_source_group_list').count(), 0,
+                    repr((window.drr_available_sources, window._catalog_displayed_modes,
+                          window._drr_refresh_generation, window._drr_include_all_sources)))
+                buttons = dialog.findChild(QDialogButtonBox)
+                with patch.object(dialog, 'accept') as accept:
+                    buttons.accepted.emit()
+                    accept.assert_not_called()
+                    window._on_drr_catalog_refresh_result(
+                        (folder, discover_drr_sources(folder), cache, False, False, ()),
+                        1, True, set(), catalog_only=True)
+                    buttons.accepted.emit()
+                    accept.assert_called_once()
+                return QDialog.Rejected
+            with patch.object(QDialog, 'exec', execute):
+                window.drr_controller._open_drr_source_dialog(title='Choose', selected=[name], baseline_mode=False)
+
     def test_open_picker_receives_preview_without_finishing_refresh(self):
         with patch.object(MainWindow, '_restore_last_folder', lambda self: None):
             window = MainWindow()

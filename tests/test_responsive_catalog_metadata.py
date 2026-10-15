@@ -11,6 +11,42 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 class CatalogMetadataTests(unittest.TestCase):
+    def test_known_selected_source_does_not_rescan_its_parent(self):
+        from core.drr_sources import discover_drr_sources, DrrSourceCache
+        from ui_qt.main_window import _scan_drr_catalog_worker
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder, 'known.csv')
+            path.write_text('Vbg,700,701\n0,1,2\n1,2,3\n')
+            sources = discover_drr_sources(folder, include_history=False)
+            with patch('core.drr_catalog.load_drr_catalog', return_value=sources), \
+                    patch('core.drr_sources.discover_drr_sources', side_effect=AssertionError('parent rescan')):
+                result = _scan_drr_catalog_worker(folder, DrrSourceCache(load_on_init=False),
+                    selected_sources=('known.csv', str(path)), progress=None, log=None)
+            self.assertEqual(result[1], sources)
+            self.assertEqual(result[5], ())
+
+    def test_inventory_preview_is_displayed_without_certifying_or_loading(self):
+        from ui_qt.main_window import MainWindow
+        from unittest.mock import Mock
+        sources = []
+        owner = SimpleNamespace(_drr_refresh_generation=3, current_folder='folder',
+            _drr_include_all_sources=False, _catalog_displayed_modes=set(),
+            _catalog_ready_modes=set(), drr_controller=Mock(), _status=Mock(),
+            drr_catalog_preview_ready=Mock(), _is_closing=False)
+        owner._drr_catalog_is_inventory_preview = lambda: MainWindow._drr_catalog_is_inventory_preview(owner)
+        MainWindow._on_drr_catalog_refresh_result(owner,
+            ('folder', sources, None, True, False, (), 'inventory'), 3, True, set())
+        self.assertIs(owner.drr_available_sources, sources)
+        self.assertTrue(owner._drr_catalog_is_inventory_preview())
+        self.assertEqual(owner._catalog_ready_modes, set())
+        owner.drr_controller._refresh_auto_external.assert_not_called()
+        # No load-related attributes are needed: the unvalidated list must
+        # stop at the boundary before background resolution or worker launch.
+        MainWindow._start_load(owner, 'DRR')
+        self.assertIn('please wait', owner._status.call_args.args[0])
+        owner.drr_available_sources = list(sources)
+        self.assertFalse(owner._drr_catalog_is_inventory_preview())
+
     def _window_view(self, owner, center, width):
         # Exercise the real numerical adapter used by the unified view.
         from ui_qt.mcd_unified_page import McdUnifiedView

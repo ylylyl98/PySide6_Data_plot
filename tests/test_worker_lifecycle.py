@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -97,6 +98,44 @@ class WorkerLifecycleTests(unittest.TestCase):
         finally:
             global_release.set()
             self.assertTrue(global_done.wait(1.0))
+
+    def test_close_cancels_active_drr_catalog_scan_before_joining_workers(self) -> None:
+        from core.load_cancellation import LoadCancelled, check_load_cancelled
+
+        entered = threading.Event()
+        cancelled = threading.Event()
+        fallback = threading.Event()
+        errors = []
+
+        def scan(*args, **kwargs):
+            entered.set()
+            try:
+                while not fallback.wait(.01):
+                    check_load_cancelled()
+            except LoadCancelled:
+                cancelled.set()
+                raise
+
+        # Bound the test even if close fails to propagate cancellation.
+        timer = threading.Timer(3, fallback.set)
+        timer.start()
+        try:
+            with tempfile.TemporaryDirectory() as folder, patch(
+                    'ui_qt.main_window._scan_drr_catalog_worker', side_effect=scan):
+                self.window.current_folder = folder
+                self.window._start_drr_catalog_refresh(auto=False, old_source_files=set())
+                worker = self.window._drr_refresh_workers[-1]
+                worker.signals.error.connect(errors.append)
+                self.assertTrue(entered.wait(1.0))
+                self.window.close()
+                self.app.processEvents()
+                self.assertTrue(cancelled.is_set())
+                self.assertEqual(errors, [])
+                self.assertFalse(self.window._owned_workers)
+        finally:
+            fallback.set()
+            timer.cancel()
+            timer.join()
 
     def test_completed_worker_delivers_callbacks_and_destroys_signals_on_gui_thread(self) -> None:
         callbacks = []

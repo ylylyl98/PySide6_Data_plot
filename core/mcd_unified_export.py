@@ -822,6 +822,16 @@ def _plot_pngs(directory: Path, data: Mapping[str, Any], snapshot: Mapping[str, 
     CBA_RECT = (0.83, 0.13, 0.025, 0.772)
     state = snapshot.get("plot_state", {})
     state = state if isinstance(state, Mapping) else {}
+    from core.png_geometry import compact_horizontal_margins, widened_figsize
+    width_scale = state.get("png_width_scale", 1.0)
+    FIGSIZE = widened_figsize(FIGSIZE, width_scale)
+
+    def _save_png(fig, path):
+        if width_scale > 1.0:
+            compact_horizontal_margins(fig)
+            fig.savefig(path, dpi=DPI, bbox_inches=fig.bbox_inches, pad_inches=0)
+        else:
+            fig.savefig(path, dpi=DPI)
     energy = np.asarray(data["energy_ev"], float).ravel()
     fields = np.asarray(data["fields_t"], float).ravel()
     values = np.asarray(data["values"], float)
@@ -954,7 +964,7 @@ def _plot_pngs(directory: Path, data: Mapping[str, Any], snapshot: Mapping[str, 
         cbar.ax.tick_params(labelsize=16)
         cbar.ax.set_title("MCD", fontsize=16, pad=10)
     map_path = directory / f"MCD_map_{export_id}.png"
-    map_fig.savefig(map_path, dpi=DPI)
+    _save_png(map_fig, map_path)
     paths.append(map_path)
 
     # Each retained window gets its own plot and fit table.  This keeps
@@ -1045,7 +1055,7 @@ def _plot_pngs(directory: Path, data: Mapping[str, Any], snapshot: Mapping[str, 
             mcd_axis.legend(loc="lower right", frameon=False, fontsize=16)
         suffix = f"_w{window_index}" if multiple_windows else ""
         mcd_path = directory / f"MCD_vs_B{suffix}_{export_id}.png"
-        mcd_fig.savefig(mcd_path, dpi=DPI)
+        _save_png(mcd_fig, mcd_path)
         paths.append(mcd_path)
 
     # Feature products use only retained, completed tracks.  Every track keeps
@@ -1126,7 +1136,7 @@ def _plot_pngs(directory: Path, data: Mapping[str, Any], snapshot: Mapping[str, 
         if finite_x:
             axis.legend(loc="upper center" if common_context else "best", frameon=False, fontsize=16,
                         ncol=2 if common_context else 1, columnspacing=.8, handlelength=1.5)
-        path = directory / f"{filename}_{export_id}.png"; fig.savefig(path, dpi=DPI); return path
+        path = directory / f"{filename}_{export_id}.png"; _save_png(fig, path); return path
     energy_rows = [row for row in feature_rows if row.get("energy_ev") is not None and row.get("field_t") is not None]
     shift_rows = [row for row in feature_rows if row.get("delta_energy_ev") is not None and row.get("field_t") is not None]
     if energy_rows: paths.append(_feature_plot("energy_ev", "Energy (eV)", "feature_energy"))
@@ -1189,7 +1199,7 @@ def _plot_pngs(directory: Path, data: Mapping[str, Any], snapshot: Mapping[str, 
         if split_x:
             split_axis.legend(loc="upper left", frameon=False, fontsize=16, ncol=1, columnspacing=.8, handlelength=1.5)
         split_path = directory / f"splitting_{export_id}.png"
-        split_fig.savefig(split_path, dpi=DPI)
+        _save_png(split_fig, split_path)
         paths.append(split_path)
 
     # Reflection spectra remain available for callers that explicitly request
@@ -1237,7 +1247,7 @@ def _plot_pngs(directory: Path, data: Mapping[str, Any], snapshot: Mapping[str, 
         if spectrum_axis.lines:
             spectrum_axis.legend(loc="upper left", frameon=False, fontsize=16, ncol=1, columnspacing=.8, handlelength=1.5)
             paths.append(directory / f"spectra_{export_id}.png")
-            spectrum_fig.savefig(paths[-1], dpi=DPI)
+            _save_png(spectrum_fig, paths[-1])
     return paths
 
 
@@ -1297,6 +1307,9 @@ def _mcd_export_fingerprint(snapshot: Mapping[str, Any], windows: Sequence[Mappi
         return _jsonable(value)
 
     content = {"render_version": 5, "snapshot": normalize(snapshot)}
+    state = snapshot.get("plot_state", {})
+    if isinstance(state, Mapping) and state.get("png_width_scale", 1.0) > 1.0:
+        content["wide_layout_version"] = 1
     return hashlib.sha256(json.dumps(content, sort_keys=True).encode("utf-8")).hexdigest()
 
 

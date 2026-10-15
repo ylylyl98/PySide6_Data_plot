@@ -181,10 +181,10 @@ class RegionBlitterTests(unittest.TestCase):
         object.__setattr__(controller, "_drr_gate_lines", {})
         object.__setattr__(controller, "_drr_region_blitters", {})
         controller._draw_drr_regions()
-        self.assertIs(controller._drr_region_blitters["spectrum:raw"].artists[0], raw)
-        self.assertIs(controller._drr_region_blitters["spectrum:second"].artists[0], second)
-        self.assertIsNot(controller._drr_region_blitters["spectrum:raw"],
-                         controller._drr_region_blitters["spectrum:second"])
+        helper = controller._drr_region_blitters['gate_view']
+        self.assertIn(raw, helper.artists)
+        self.assertIn(second, helper.artists)
+        self.assertEqual(helper.spectra, (axis,))
         raw.set_ydata([0.2, 0.9]); second.set_ydata([0.7, 0.1])
         controller._draw_drr_regions()
         self.assertGreater(np.count_nonzero(np.asarray(canvas.buffer_rgba())[:, :, :3]), 100)

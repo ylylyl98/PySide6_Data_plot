@@ -117,11 +117,11 @@ class DisplayComputeTests(unittest.TestCase):
         self.assertIsNone(coordinator.worker)
         self.assertEqual(owner._drr_derivative_cache.history_bytes, 0)
 
-    def test_superseded_sg_stops_after_current_row_and_the_latest_result_is_ready(self):
+    def test_superseded_sg_stops_after_current_batch_and_the_latest_result_is_ready(self):
         from core import processing_run as P
         from ui_qt.drr_display_compute import DrrDisplayCompute
         x = np.linspace(1, 2, 41) ** 1.1
-        cube = DataCube(x, np.arange(7.), np.broadcast_to(x*x, (7, 41)).copy(), 'Gate', 'Data', 'DR/R')
+        cube = DataCube(x, np.arange(70.), np.broadcast_to(x*x, (70, 41)).copy(), 'Gate', 'Data', 'DR/R')
         owner = QObject(); owner.loaded = SimpleNamespace(cube=cube)
         owner.thread_pool = QThreadPool(owner); owner._drr_derivative_cache = {}
         coordinator = DrrDisplayCompute(owner)
@@ -129,16 +129,16 @@ class DisplayComputeTests(unittest.TestCase):
         visited, errors = [], []
         coordinator.failed.connect(errors.append)
         coordinator.ready.connect(lambda: coordinator.request(cube, 2, 11, 2))
-        original = P.sg_derivative_origin_1d
-        def row(*args, **kwargs):
-            window = kwargs['window_pts']
+        original = P.savgol_filter
+        def batch(*args, **kwargs):
+            window = kwargs['window_length']
             visited.append(window)
             if window == 9 and len(visited) == 1:
                 started.set()
                 release.wait(3)
             return original(*args, **kwargs)
         try:
-            with patch.object(P, 'sg_derivative_origin_1d', new=row):
+            with patch.object(P, 'savgol_filter', new=batch):
                 coordinator.request(cube, 2, 9, 2)
                 self.assertTrue(started.wait(2))
                 coordinator.request(cube, 2, 11, 2)
@@ -149,7 +149,7 @@ class DisplayComputeTests(unittest.TestCase):
                     if (id(cube), 2, 11, 2) in owner._drr_derivative_cache and coordinator.worker is None:
                         break
                     time.sleep(.005)
-                self.assertEqual(visited, [9] + [11] * 7)
+                self.assertEqual(visited, [9] + [11] * 3)
                 self.assertEqual(errors, [])
                 self.assertIn((id(cube), 2, 11, 2), owner._drr_derivative_cache)
         finally:
@@ -169,14 +169,14 @@ class DisplayComputeTests(unittest.TestCase):
         visited, errors, ready = [], [], []
         coordinator.failed.connect(errors.append)
         coordinator.ready.connect(lambda: ready.append(True))
-        original = P.sg_derivative_origin_1d
-        def row(*args, **kwargs):
+        original = P.savgol_filter
+        def batch(*args, **kwargs):
             visited.append(True)
             started.set()
             release.wait(3)
             return original(*args, **kwargs)
         try:
-            with patch.object(P, 'sg_derivative_origin_1d', new=row):
+            with patch.object(P, 'savgol_filter', new=batch):
                 coordinator.request(cube, 2, 9, 2)
                 self.assertTrue(started.wait(2))
                 clear = getattr(coordinator, 'clear', lambda: None)
@@ -209,14 +209,14 @@ class DisplayComputeTests(unittest.TestCase):
             cube = DataCube(x, np.arange(7.), np.broadcast_to(x*x, (7, 41)).copy(), 'Gate', 'Data', 'DR/R')
             window.loaded = LoadedState(mode='DRR', folder=folder, cube=cube)
             window._drr_display_compute = DrrDisplayCompute(window)
-            original = P.sg_derivative_origin_1d
-            def row(*args, **kwargs):
+            original = P.savgol_filter
+            def batch(*args, **kwargs):
                 visited.append(True)
                 started.set()
                 release.wait(3)
                 return original(*args, **kwargs)
             try:
-                with patch.object(P, 'sg_derivative_origin_1d', new=row):
+                with patch.object(P, 'savgol_filter', new=batch):
                     window._drr_display_compute.request(cube, 2, 9, 2)
                     self.assertTrue(started.wait(2))
                     window._reset_workflow_state_for_folder_change()
@@ -249,14 +249,14 @@ class DisplayComputeTests(unittest.TestCase):
                 window.drr_sg_auto_chk.setChecked(False)
                 window.drr_sg_window_spin.setValue(9)
                 window.loaded = LoadedState(mode='DRR', folder=folder, cube=cube)
-                original = P.sg_derivative_origin_1d
-                def row(*args, **kwargs):
+                original = P.savgol_filter
+                def batch(*args, **kwargs):
                     visited.append(True)
                     started.set()
                     release.wait(3)
                     return original(*args, **kwargs)
                 try:
-                    with patch.object(P, 'sg_derivative_origin_1d', new=row):
+                    with patch.object(P, 'savgol_filter', new=batch):
                         self.assertFalse(window._prepare_drr_display_derivative(2))
                         self.assertTrue(started.wait(2))
                         cancellation = window._drr_display_compute.worker.cancellation

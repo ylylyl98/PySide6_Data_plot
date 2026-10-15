@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import os
 import re
 import textwrap
 from functools import lru_cache
@@ -28,6 +29,7 @@ from core.loader import DataCube
 from core.drr_export_title import display_title
 from core.plotting import COMPARE_PANEL_ORDER, HeatmapParams, plot_heatmap, resolve_split_boundary, plain_log_ticks, visible_mesh_data
 from core.png_render_timing import TimedPngCanvas, collect_png_timings, time_png_stage
+from core.png_geometry import widened_figsize
 from core.processing import background_correct_cube, parse_compare_gate_condition, power_group_title, valley_polarization_cube
 from core.processing_run import save_as_dat
 from core.shg import ShgProcessResult, ShgSettings, ShgSweepData
@@ -479,7 +481,9 @@ def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *,
         raise ValueError('Heatmap values must have shape (y coordinates, x coordinates).')
 
     triple = params.split_scale is not None and params.split_scale.split_x2 is not None
-    fig = plt.figure(figsize=EXPORT_FIGSIZE, dpi=EXPORT_DPI, facecolor="white")
+    wide = params.png_width_scale > 1.0
+    fig = plt.figure(figsize=widened_figsize(EXPORT_FIGSIZE, params.png_width_scale),
+                     dpi=EXPORT_DPI, facecolor="white")
     TimedPngCanvas(fig)
     ax = fig.add_axes(EXPORT_AXES_RECT)
     axpos = ax.get_position()
@@ -549,12 +553,12 @@ def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *,
         from core.compact_region_export import complete_title
         cbar_w = .34 * axpos.width
         cbar_x = axpos.x1 - cbar_w
-        if not drr:
+        if not drr and not wide:
             complete_title(fig, _prettify_title(params.title), title_left, cbar_x - .03)
     elif drr:
         from core.compact_region_export import complete_title
         # DRR title fitting follows colorbar creation to measure occupied space.
-    else:
+    elif not wide:
         title_right = cbar_x - 0.06
         title_wrapped = _wrap_title_to_fig_span(
             fig, params.title, title_left, title_right,
@@ -596,14 +600,15 @@ def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *,
         from core.plotting import HeatmapRender
         compact_colorbars(fig, split_render or HeatmapRender(im), left=cbar_x, right=axpos.x1,
                           bottom=cbar_y, label=params.cbar_label, drr_header=True)
-        renderer = fig.canvas.get_renderer()
-        obstacles = [a.get_tightbbox(renderer) for a in fig.axes[1:]]
-        obstacles += [t.get_window_extent(renderer) for t in fig.texts
-                      if t.get_gid() == 'drr-colorbar-quantity']
-        complete_title(fig, display_title(params.title), title_left, axpos.x1,
-                       obstacles=obstacles)
-        # Keep the title first for existing export consumers.
-        fig.texts.insert(0, fig.texts.pop())
+        if not wide:
+            renderer = fig.canvas.get_renderer()
+            obstacles = [a.get_tightbbox(renderer) for a in fig.axes[1:]]
+            obstacles += [t.get_window_extent(renderer) for t in fig.texts
+                          if t.get_gid() == 'drr-colorbar-quantity']
+            complete_title(fig, display_title(params.title), title_left, axpos.x1,
+                           obstacles=obstacles)
+            # Keep the title first for existing export consumers.
+            fig.texts.insert(0, fig.texts.pop())
 
     elif triple:
         from core.compact_region_export import compact_colorbars
@@ -635,6 +640,11 @@ def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *,
             title=f"{params.cbar_label} | x ≥ {boundary:.6g}",
         )
 
+    if wide:
+        from core.compact_region_export import compact_wide_header
+        from core.png_geometry import compact_horizontal_margins
+        compact_horizontal_margins(fig)
+        compact_wide_header(fig, ax, display_title(params.title) if drr else _prettify_title(params.title))
     return fig
 
 
@@ -832,19 +842,30 @@ def _drr_export_index(out_dir: Path, *, snapshot: dict | None = None) -> dict:
         entries = {}
     current = {}
     changed = []
-    for path in sorted(out_dir.glob('*.metadata.json')):
+    # Windows directory enumeration already supplies size and timestamps.
+    # Keep the DirEntry objects instead of issuing another stat per history
+    # file. Every call still enumerates afresh, including the second product.
+    try:
+        with os.scandir(out_dir) as scan:
+            metadata_entries = sorted(
+                (entry for entry in scan if os.path.normcase(entry.name).endswith('.metadata.json')),
+                key=lambda entry: os.path.normcase(entry.name),
+            )
+    except OSError:
+        metadata_entries = []
+    for entry in metadata_entries:
         try:
-            stat = path.stat()
+            stat = entry.stat()
         except OSError:
             continue
         signature = [stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
-        prior = entries.get(path.name)
+        prior = entries.get(entry.name)
         if (isinstance(prior, dict) and prior.get('signature') == signature
                 and isinstance(prior.get('operation'), str)
                 and isinstance(prior.get('fingerprint'), str)):
-            current[path.name] = prior
+            current[entry.name] = prior
         else:
-            changed.append((path, signature))
+            changed.append((out_dir / entry.name, signature))
 
     def inspect(item):
         path, signature = item
@@ -1011,6 +1032,7 @@ def export_drr_png_and_dat(
     plot_fingerprint = _fingerprint_json(
         {
             "render_version": 7 if drr_style else HEATMAP_PNG_RENDER_VERSION,
+            **({"wide_header_version": 2} if params.png_width_scale > 1.0 else {}),
             "params": params,
         }
     )
@@ -1754,6 +1776,7 @@ def export_power_vp_pngs_and_dat(
             y_axis_log=params.y_axis_log,
             center_zero=False,
             clip_outliers=params.clip_outliers,
+            png_width_scale=params.png_width_scale,
         )
 
     for label, cube, base, records, group_key in (
@@ -1774,6 +1797,7 @@ def export_power_vp_pngs_and_dat(
             y_axis_log=params_intensity.y_axis_log,
             center_zero=False,
             clip_outliers=params_intensity.clip_outliers,
+            png_width_scale=params_intensity.png_width_scale,
         )
         png_path = _unique_path(out_dir, base, ".png")
         _save_heatmap_png(png_path, cube, panel_params, drr=False)
@@ -1835,6 +1859,7 @@ def export_power_vp_pngs_and_dat(
         y_axis_log=params.y_axis_log,
         center_zero=True,
         clip_outliers=False,
+        png_width_scale=params.png_width_scale,
     )
     png_path = _unique_path(out_dir, vp_base, ".png")
     _save_heatmap_png(png_path, vp_cube, vp_params, drr=False)
@@ -1973,6 +1998,7 @@ def export_compare_panels(
             center_zero=False,
             clip_outliers=clip_outliers,
             split_scale=params.split_scale,
+            png_width_scale=params.png_width_scale,
         )
         base = corrected_compare_export_base(key, source_files[key], scale_tag)
         png_path = _unique_path(out_dir, base, ".png")
@@ -2057,6 +2083,7 @@ def export_compare_panels(
             log_scale=False,
             center_zero=True,
             clip_outliers=False,
+            png_width_scale=params.png_width_scale,
         )
         base = vp_compare_export_base(source_files, correction_background, scale_tag)
         png_path = _unique_path(out_dir, base, ".png")

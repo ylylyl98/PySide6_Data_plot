@@ -66,6 +66,49 @@ def _fit_title(fig, text, left, right, *, top, bottom, obstacles):
     raise ValueError('Title is too long to fit the fixed export header.')
 
 
+def compact_wide_header(fig, ax, text):
+    """Use the measured header height instead of reserving three title lines.
+
+    Keep the complete canvas and horizontal geometry. The title occupies the
+    left of the header, colorbars occupy the right, and unused vertical space
+    becomes part of the heatmap. Measurements do not require a figure draw.
+    """
+    renderer = fig.canvas.get_renderer()
+    bars = [axis for axis in fig.axes if axis is not ax]
+    labels = list(fig.texts)
+    boxes = [axis.get_tightbbox(renderer) for axis in bars]
+    boxes = [box for box in boxes if box is not None]
+    width, height = fig.bbox.width, fig.bbox.height
+    # The three-region PL header used a fixed y position for its quantity.
+    # Anchor shared quantities just above the actual colorbar decorations.
+    if boxes:
+        label_bottom = (max(box.y1 for box in boxes) + 2.0) / height
+        for label in labels:
+            label.set_verticalalignment('bottom')
+            label.set_y(label_bottom)
+    boxes += [label.get_window_extent(renderer) for label in labels]
+    gap = 4.0 * fig.dpi / 72.0
+    top_margin = 10.0 * fig.dpi / 72.0
+    position = ax.get_position()
+    right = min((box.x0 for box in boxes), default=position.x1 * width)
+    title = complete_title(fig, text, position.x0, (right - gap) / width)
+    title_height = title.get_window_extent(renderer).height
+    bars_height = max((box.y1 for box in boxes), default=ax.bbox.y1) - ax.bbox.y1
+    top = (height - top_margin - max(title_height + gap, bars_height)) / height
+    shift = top - position.y1
+    ax.set_position([position.x0, position.y0, position.width, top - position.y0])
+    for bar in bars:
+        bounds = bar.get_position()
+        bar.set_position([bounds.x0, bounds.y0 + shift, bounds.width, bounds.height])
+    for label in labels:
+        x, y = label.get_position()
+        label.set_position((x, y + shift))
+    title.set_verticalalignment('bottom')
+    title.set_y(top + gap / height)
+    # Match the title-first convention of the original exports.
+    fig.texts.insert(0, fig.texts.pop())
+
+
 def compact_colorbars(fig, render, *, left, right, bottom, label, drr_header=False):
     count = len(render.images)
     names = {1: ('',), 2: ('L', 'R'), 3: ('L', 'M', 'R')}[count]

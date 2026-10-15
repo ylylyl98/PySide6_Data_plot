@@ -63,7 +63,9 @@ until editing finishes. Arrow buttons still adjust numbers; repeated adjustments
 to display parameters are combined into one refresh after you stop. A pending
 plot refresh or MCD recalculation waits while the next number is being typed.
 Gate and cursor controls retain their existing interactive updates. Ordinary
-DRR range changes reuse the current heatmap instead of rebuilding its axes.
+DRR range changes reuse the current heatmap instead of rebuilding its axes,
+including two- and three-region linear maps whose split boundaries stay valid.
+Unchanged colorbars are retained during these updates.
 
 ### Remembering DRR display settings
 
@@ -152,6 +154,50 @@ native-grid correction before alignment. Raw averages, missing coverage,
 infinities, derivative processing and right-axis consistency checks are preserved.
 The bounded raw CSV parse cache remains separate from these working buffers.
 
+DRR source discovery streams CSV rows and retains only gate metadata while
+checking every spectral value for completeness. It avoids retaining the full
+text and parsed spectral table solely for grouping. Empty, incomplete and
+nonfinite channels retain the same compatibility rules. Unchanged sources still
+use the existing inspection cache.
+Large uncached DRR inventories (at least 32 CSV files and 32 MiB) use at most
+two background processes in the app, with four files in flight. Small refreshes
+stay in the existing worker. Cancellation joins the child workers; unavailable
+processes fall back to serial inspection. File signatures are rechecked before
+using a prefetched profile.
+On a cold catalog, file identities appear before spectrum inspection finishes;
+selection confirmation and loading wait for grid/background validation. Refreshing
+an already cataloged selection reuses that catalog. An external selection inspects
+only the requested file, without rescanning all of its sibling measurements.
+
+DRR gate changes retain the heatmap image and redraw the complete linecut axes
+and cursors over it. Spectrum titles, automatic Y ticks and fit overlays update
+without redrawing the heatmaps or colorbars. Source/layout changes, zoom,
+resize and exports invalidate the retained background. PNG/PDF/SVG saves still
+include every spectrum at full resolution. SG changes with no peak overlays no
+longer repaint the old product before the new derivative is ready.
+Moving a split within the same two/three-region layout replaces only the region
+meshes and retains the axes, colorbars and their formatting. Interactive linear
+views skip drawing cells outside the current viewport, with guard cells along
+each edge. All model arrays and exported data keep their original resolution;
+no visible cells are downsampled. Non-affine axes retain the normal draw path.
+Switching between one, two and three regions retains the map axes, measured
+right axes and linecut artists, rebuilding only the region meshes and colorbars.
+Paired views adjust the existing layout margins for the larger three-region
+legends. Theme updates style current and future ticks without requesting tick
+labels and gridlines repeatedly before drawing.
+Color-only edits repaint the affected map and colorbar while retaining the other
+product and linecuts. Updated colorbar labels are included in the cleared area;
+overlapping panels/annotations fall back to a complete redraw. Combined color and
+gate edits still refresh both linecuts. Confirming a numeric edit with Enter or
+leaving the field flushes its pending redraw; held spin arrows remain debounced.
+
+Nonuniform energy derivatives batch complete rows on their shared grid for
+cubic interpolation and Savitzky–Golay filtering. Each batch is limited to 32
+rows and a 65,536-cell target; gappy rows keep the original per-row calculation.
+The measured grid, filter settings, output resolution and DAT precision are
+preserved. Export history validation reuses directory enumeration attributes
+while still checking for changed, added and deleted metadata on every request.
+
 DRR derivative history uses a 128 MiB buffer budget and at most 12 entries,
 evicting older parameter results first. Current full-resolution dE/second
 products stay available together. If those current products alone exceed the
@@ -169,7 +215,7 @@ rather than loaded afterwards. Export workers keep their captured data and
 are independent of Load cancellation.
 
 Display derivative jobs also cancel obsolete source/SG/direction/window
-requests between rows, polynomial windows and mixed-derivative passes. Parameter
+requests between batches, gappy rows, polynomial windows and mixed-derivative passes. Parameter
 edits invalidate the old job even when the second product is hidden or new
 settings fail validation. Useful dE/second jobs with the same source and SG
 settings still complete together. A single uniform-grid SG call completes
@@ -742,7 +788,20 @@ calling those helpers directly is separate from the normal GUI workflow.
   off by default. Missing temperature is resolved from measurement JSON or the
   original CSV before filename fallback, and its provenance is recorded.
 - `Compare`: 2-4 selected files rendered in a compare grid.
-- `Save PNG` exports with fixed Streamlit-style geometry (`8.0 x 6.2 in @ 150 DPI`) independent of window size.
+- Heatmap PNG exports default to `8.0 x 6.2 in @ 150 DPI` (`1200 × 930 px`), independent of window size.
+  The main plot toolbar starts at **PNG 1.0×**, preserving the original export.
+  Select **Wide PNG** next to Save for an optional wider export; its multiplier
+  defaults to **2.00×** and can be adjusted from **1.00×** to **3.00×**.
+  **1.50×** gives `1800 × 930 px`, and **2.00×** gives
+  `2400 × 930 px`. Height, font sizes, data ranges and DAT values stay unchanged.
+  Widened heatmaps fit the top spacing to the title and colorbars, and wide PNGs
+  reduce side margins to the space needed by labels, ticks and colorbars.
+  The canvas size stays unchanged. The wide multiplier is remembered across
+  restarts, while the layout starts at **PNG 1.0×**. The selection applies to PL (including both
+  linear/log panels), DRR (both products), Compare/VP, Power Dependence and MCD
+  heatmaps, plus unified MCD Save Results. The toolbar's PNG save widens its
+  current figure by the same factor; the on-screen plot keeps its current size.
+  Select **PNG 1.0×** at any time for the original export layout.
 - Exported `.dat` files remain tab-delimited numeric matrices for Origin. The
   app can re-open them from the PL tab and optionally restores labels and plot
   metadata from the adjacent `.metadata.json` sidecar (or

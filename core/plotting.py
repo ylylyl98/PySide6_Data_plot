@@ -106,6 +106,7 @@ class HeatmapParams:
     clip_outliers: bool = False
     split_scale: SplitColorScale | None = None
     right_axis: RightAxis | None = None
+    png_width_scale: float = 1.0
 
 
 @dataclass
@@ -115,6 +116,8 @@ class HeatmapRender:
     split_x: float | None = None
     tertiary: object | None = None
     split_x2: float | None = None
+    boundary_artists: tuple = ()
+    colorbar_host: object | None = None
 
     @property
     def images(self):
@@ -298,13 +301,15 @@ def visible_mesh_data(x_edges, y_edges, values, xlim, ylim, *, y_axis_log=False)
             values[rows, columns])
 
 
-def plot_heatmap(ax: Axes, cube: DataCube, params: HeatmapParams, *, visible_only=False):
+def heatmap_meshes(ax: Axes, cube: DataCube, params: HeatmapParams, *, visible_only=False):
+    """Create full-resolution region meshes without changing axes or labels."""
     z = np.asarray(cube.Z, float)
     e = np.asarray(cube.energy, float).ravel()
     g = np.asarray(cube.gate, float).ravel()
     e_edges = _axis_edges_from_centers(e)
     g_edges = _axis_edges_from_centers(g, log_scale=bool(params.y_axis_log))
     split = params.split_scale
+    boundary_artists = []
     if split is None:
         if params.clip_outliers:
             z = np.minimum(z, params.vmax)
@@ -337,14 +342,27 @@ def plot_heatmap(ax: Axes, cube: DataCube, params: HeatmapParams, *, visible_onl
             images.append(ax.pcolormesh(*mesh_data, shading='flat', cmap=params.cmap, norm=norm))
         if split.show_boundary:
             for boundary in boundaries:
-                ax.axvline(boundary, color="#202020", linewidth=0.9,
-                           linestyle="--", alpha=0.8, zorder=15)
+                boundary_artists.append(ax.axvline(
+                    boundary, color="#202020", linewidth=0.9,
+                    linestyle="--", alpha=0.8, zorder=15))
     # Guard matplotlib cursor formatting against inf/nan ranges that can raise in colorizer.
     for image in images:
         try:
             image._format_cursor_data_override = _format_heatmap_cursor_value
         except Exception:
             pass
+    return HeatmapRender(
+        primary=images[0],
+        secondary=(images[1] if len(images) > 1 else None),
+        split_x=applied_split,
+        tertiary=(images[2] if len(images) > 2 else None),
+        split_x2=(boundaries[1] if len(images) > 2 else None),
+        boundary_artists=tuple(boundary_artists),
+    )
+
+
+def plot_heatmap(ax: Axes, cube: DataCube, params: HeatmapParams, *, visible_only=False):
+    render = heatmap_meshes(ax, cube, params, visible_only=visible_only)
     ax.set_title(params.title)
     ax.set_xlabel(params.xlabel)
     ax.set_ylabel(params.ylabel)
@@ -353,6 +371,7 @@ def plot_heatmap(ax: Axes, cube: DataCube, params: HeatmapParams, *, visible_onl
     ax.set_xlim((xmin, xmax))
     if params.y_axis_log:
         if ymin <= 0 or ymax <= 0:
+            g = np.asarray(cube.gate, float).ravel()
             positive = g[np.isfinite(g) & (g > 0)]
             if positive.size == 0:
                 raise ValueError("Log power axis requires positive power values.")
@@ -363,13 +382,7 @@ def plot_heatmap(ax: Axes, cube: DataCube, params: HeatmapParams, *, visible_onl
     ax.set_ylim((ymin, ymax))
     add_right_axis(ax, params.right_axis)
     ax._dptk_heatmap_params = params
-    return HeatmapRender(
-        primary=images[0],
-        secondary=(images[1] if len(images) > 1 else None),
-        split_x=applied_split,
-        tertiary=(images[2] if len(images) > 2 else None),
-        split_x2=(boundaries[1] if len(images) > 2 else None),
-    )
+    return render
 
 
 def plot_pl(ax: Axes, cube: DataCube, params: HeatmapParams):
@@ -377,7 +390,10 @@ def plot_pl(ax: Axes, cube: DataCube, params: HeatmapParams):
 
 
 def plot_drr(ax: Axes, cube: DataCube, params: HeatmapParams):
-    return plot_heatmap(ax, cube, params)
+    render = plot_heatmap(ax, cube, params)
+    for mesh in render.images:
+        mesh._dptk_drr_mesh = True
+    return render
 
 
 def plot_compare_panel(ax: Axes, label: str, cube: DataCube, params: HeatmapParams):

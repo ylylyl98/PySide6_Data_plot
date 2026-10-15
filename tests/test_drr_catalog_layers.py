@@ -6,6 +6,22 @@ from unittest.mock import patch
 from core.drr_sources import discover_drr_sources, refresh_drr_source_history, drr_source_paths
 
 class DrrCatalogLayerTests(unittest.TestCase):
+    def test_exact_source_inspection_skips_siblings_and_preserves_cache(self):
+        from core.drr_sources import DrrSourceCache
+        import core.drr_sources as sources
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = [root / 'one.csv', root / 'two.csv']
+            for path in paths:
+                path.write_text('Vbg,700,701\n0,1,2\n1,2,3\n')
+            cache = DrrSourceCache(root / 'cache.json', load_on_init=False)
+            full = discover_drr_sources(root, cache=cache, include_history=False)
+            with patch.object(sources, 'drr_source_paths', side_effect=AssertionError('enumerated siblings')):
+                one = discover_drr_sources(root, cache=cache, include_history=False, source_paths=(paths[0],))
+            self.assertEqual([s.source for s in one], ['one.csv'])
+            with patch.object(sources, 'inspect_csv_gate', side_effect=AssertionError('cache evicted')):
+                self.assertEqual(discover_drr_sources(root, cache=cache, include_history=False), full)
+
     def test_ref_partition_keeps_legacy_initial_data_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);initial=root/'Initial Data';ref=initial/'REF'
@@ -59,6 +75,34 @@ class DrrCatalogLayerTests(unittest.TestCase):
                 self.assertEqual(refresh_drr_source_history(root, overlay), base)
 
 class DrrCatalogPersistenceTests(unittest.TestCase):
+    def test_cold_inventory_precedes_inspection_and_never_certifies_grids(self):
+        import core.drr_catalog as catalog
+        from core.drr_sources import DrrSourceCache
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'experiment'
+            root.mkdir()
+            (root / 'measurement.csv').write_text('Vbg,700,701\n0,1,2\n1,2,3\n')
+            events = []
+            def preview(sources):
+                self.assertEqual(events, [])
+                self.assertEqual(len(sources), 1)
+                self.assertFalse(sources[0].grid_complete)
+                self.assertEqual(sources[0].spectral_grid, ())
+                events.append('preview')
+            discover = catalog.discover_drr_sources
+            def inspect(*args, **kwargs):
+                self.assertEqual(events, ['preview'])
+                events.append('inspect')
+                return discover(*args, **kwargs)
+            with patch.dict('os.environ', {'LOCALAPPDATA': str(Path(tmp) / 'cache')}), \
+                    patch.object(catalog, 'discover_drr_sources', side_effect=inspect):
+                sources = catalog.load_drr_catalog(root, DrrSourceCache(load_on_init=False),
+                    publish_inventory=preview)
+                self.assertTrue(sources[0].grid_complete)
+                catalog.load_drr_catalog(root, DrrSourceCache(load_on_init=False),
+                    publish_inventory=lambda _: self.fail('inventory on cache hit'))
+            self.assertEqual(events, ['preview', 'inspect'])
+
     def test_all_data_and_ref_caches_are_isolated(self):
         import core.drr_catalog as catalog
         from core.drr_sources import DrrSourceCache

@@ -5,6 +5,7 @@ from contextvars import ContextVar
 from collections import OrderedDict
 from threading import RLock
 from functools import lru_cache
+from itertools import chain, islice
 from datetime import datetime
 import csv
 import hashlib
@@ -1595,25 +1596,23 @@ def inspect_csv_gate_profile(
     source = Path(path)
     try:
         with source.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
-            lines = []
-            for line in handle:
-                if line.strip():
-                    lines.append(line)
-                if max_rows is not None and len(lines) >= max_rows + 1:
-                    break
+            lines = (line for line in handle if line.strip())
+            if max_rows is not None:
+                lines = islice(lines, max(1, max_rows + 1))
+            first = next(lines, None)
+            if first is None:
+                return DrrGateProfile(None, 0)
+            delimiter = max((",", "\t", ";"), key=first.count)
+            return _inspect_csv_gate_rows(csv.reader(chain((first,), lines), delimiter=delimiter))
     except OSError:
         return DrrGateProfile(None, None)
-    if len(lines) < 2:
-        return DrrGateProfile(None, max(0, len(lines) - 1))
 
-    first = lines[0]
-    delimiter = max((",", "\t", ";"), key=first.count)
-    rows = list(csv.reader(lines, delimiter=delimiter))
-    if len(rows) < 2:
-        return DrrGateProfile(None, max(0, len(rows) - 1))
 
-    header = rows[0]
-    header_is_text = any(_as_float(value) is None for value in header)
+def _inspect_csv_gate_rows(rows) -> DrrGateProfile:
+    """Retain only gate columns; validate spectra without per-cell Python calls."""
+    header = next(rows)
+    header_values = [_as_float(value) for value in header]
+    header_is_text = any(value is None for value in header_values)
     if header_is_text:
         normalized = [re.sub(r"[^a-z0-9]+", "", str(value).casefold()) for value in header]
         gate_indices = [
@@ -1622,21 +1621,43 @@ def inspect_csv_gate_profile(
             if name.startswith(("vbg", "vtg", "vbias"))
             or name in {"gate", "gatev", "field", "efield", "doping"}
         ]
-        data_rows = rows[1:]
         spectral_indices = [
-            index for index, value in enumerate(header) if _as_float(value) is not None
+            index for index, value in enumerate(header_values) if value is not None
         ]
-        spectral_grid = tuple(float(_as_float(header[index])) for index in spectral_indices)
+        spectral_grid = tuple(header_values[index] for index in spectral_indices)
         gate_labels = tuple(str(header[index]).strip() for index in gate_indices)
     else:
         gate_indices = [index for index in (0, 1) if index < len(header)]
-        data_rows = rows[1:]
         spectral_indices = [
-            index for index, value in enumerate(header)
-            if _as_float(value) is not None and float(_as_float(value)) > 50.0
+            index for index, value in enumerate(header_values)
+            if value is not None and value > 50.0
         ]
-        spectral_grid = tuple(float(_as_float(header[index])) for index in spectral_indices)
+        spectral_grid = tuple(header_values[index] for index in spectral_indices)
         gate_labels = tuple(f"gate {index + 1}" for index in range(len(gate_indices)))
+
+    spectral_slice = None
+    if spectral_indices and spectral_indices[-1] - spectral_indices[0] + 1 == len(spectral_indices):
+        spectral_slice = slice(spectral_indices[0], spectral_indices[-1] + 1)
+    data_rows, complete_spectra = [], []
+    for row in rows:
+        check_load_cancelled()
+        data_rows.append([row[index] if index < len(row) else '' for index in gate_indices])
+        complete = True
+        if spectral_indices:
+            if spectral_indices[-1] >= len(row):
+                complete = False
+            else:
+                values = row[spectral_slice] if spectral_slice is not None else (row[i] for i in spectral_indices)
+                try:
+                    # csv.reader returns strings; float accepts the same syntax
+                    # as _as_float, including whitespace and numeric underscores.
+                    complete = all(map(math.isfinite, map(float, values)))
+                except (TypeError, ValueError):
+                    complete = False
+        complete_spectra.append(complete)
+    if not data_rows:
+        return DrrGateProfile(None, 0)
+    gate_indices = list(range(len(gate_indices)))
 
     # Some instrument exports include declared gate channels that are not
     # wired for a particular sweep (for example Vbias_set/Vbias_meas).  Empty
@@ -1649,11 +1670,8 @@ def inspect_csv_gate_profile(
         if any(index < len(row) and str(row[index]).strip() for row in data_rows)
     ]
     if len(populated_gate_indices) != len(gate_indices):
+        gate_labels = tuple(gate_labels[index] for index in populated_gate_indices)
         gate_indices = populated_gate_indices
-        if header_is_text:
-            gate_labels = tuple(str(header[index]).strip() for index in gate_indices)
-        else:
-            gate_labels = tuple(f"gate {index + 1}" for index in gate_indices)
 
     if not gate_indices:
         return DrrGateProfile(None, len(data_rows))
@@ -1662,7 +1680,7 @@ def inspect_csv_gate_profile(
     constant_values: list[float] = []
     gate_grid: list[tuple[float, ...]] = []
     grid_complete = True
-    for row in data_rows:
+    for row, spectrum_complete in zip(data_rows, complete_spectra):
         values = tuple(
             float(_as_float(row[index]))
             for index in gate_indices
@@ -1671,10 +1689,7 @@ def inspect_csv_gate_profile(
         if len(values) != len(gate_indices):
             grid_complete = False
             continue
-        if spectral_indices and any(
-            index >= len(row) or _as_float(row[index]) is None
-            for index in spectral_indices
-        ):
+        if not spectrum_complete:
             grid_complete = False
             continue
         if values:
@@ -1762,6 +1777,8 @@ def discover_drr_sources(
     cache: DrrSourceCache | None = None,
     include_history: bool = True,
     include_all: bool = False,
+    parallel_inspection: bool = False,
+    source_paths: Sequence[Path] | None = None,
 ) -> list[DrrSource]:
     """Discover DRR files, reusing unchanged per-file inspections when possible."""
     experiment_root = Path(root).resolve()
@@ -1769,11 +1786,33 @@ def discover_drr_sources(
         if cache is not None:
             cache.clear()
         return []
-    candidates = drr_source_paths(experiment_root, include_all=include_all)
+    candidates = (drr_source_paths(experiment_root, include_all=include_all)
+                  if source_paths is None else list(source_paths))
+
+    profiles = {}
+    signatures = {}
+    if parallel_inspection:
+        for path in candidates:
+            check_load_cancelled()
+            if path.suffix.lower() != '.csv':
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            identity = str(path.resolve()).casefold()
+            if cache is None or cache.get(identity, modified_ns=stat.st_mtime_ns,
+                                          size_bytes=stat.st_size) is None:
+                signatures[path] = stat.st_mtime_ns, stat.st_size
+        # Spawn/import costs outweigh any benefit for small refreshes.
+        if len(signatures) >= 32 and sum(s[1] for s in signatures.values()) >= 32 * 1024**2:
+            from core.drr_inspection_pool import inspect_csv_profiles
+            profiles = inspect_csv_profiles(signatures)
 
     inspected: list[dict] = []
     seen: set[str] = set()
     for path in candidates:
+        check_load_cancelled()
         if path.suffix.lower() not in SUPPORTED_DRR_SUFFIXES:
             continue
         identity = str(path.resolve()).casefold()
@@ -1795,7 +1834,8 @@ def discover_drr_sources(
             else None
         )
         if cached is None:
-            profile = (
+            profile = profiles.pop(path, None) if signatures.get(path) == (modified_ns, size_bytes) else None
+            profile = profile if profile is not None else (
                 inspect_csv_gate(path, max_rows=None, include_profile=True)
                 if path.suffix.lower() == ".csv"
                 else DrrGateProfile(None, None)
@@ -1840,10 +1880,31 @@ def discover_drr_sources(
             }
         )
 
-    if cache is not None:
+    if cache is not None and source_paths is None:
         cache.retain(seen)
 
     return _assemble_drr_sources(experiment_root, inspected, include_history=include_history)
+
+
+def preview_drr_sources(root: str | Path, *, include_all: bool = False) -> list[DrrSource]:
+    """List identities without reading spectra or certifying acquisition grids."""
+    experiment_root = Path(root).resolve()
+    inspected = []
+    for path in drr_source_paths(experiment_root, include_all=include_all):
+        check_load_cancelled()
+        if path.suffix.lower() not in SUPPORTED_DRR_SUFFIXES:
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        center = extract_wavelength_center_nm(path.name)
+        inspected.append(dict(path=path, identity=str(path.resolve()).casefold(),
+                              modified=stat.st_mtime, size_bytes=stat.st_size,
+                              gate_varies=None, frame_count=None,
+                              wavelength_center_nm=center,
+                              wavelength_center_source='filename' if center is not None else ''))
+    return _assemble_drr_sources(experiment_root, inspected, include_history=False)
 
 
 def refresh_drr_source_history(root: str | Path, sources: Sequence[DrrSource]) -> list[DrrSource]:
