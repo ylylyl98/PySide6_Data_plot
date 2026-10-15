@@ -70,7 +70,7 @@ class DrrInteractionOptimizationTests(unittest.TestCase):
             draw.reset_mock()
             o._drr_spectrum_ax.set_ylim(-2, 4)
             c._draw_drr_regions()
-            self.assertEqual(draw.call_count, 1)
+            self.assertEqual(draw.call_count, 0)
             draw.reset_mock()
             c._draw_drr_regions()
             self.assertEqual(draw.call_count, 0)
@@ -86,7 +86,7 @@ class DrrInteractionOptimizationTests(unittest.TestCase):
                                self.cube.energy, np.array([0, 0, 1, 1.5, .1]))
         c._update_drr_spectrum_and_gate_line.assert_called_once_with(self.cube)
 
-    def test_dual_view_initializes_four_regions_with_one_draw(self):
+    def test_dual_view_shares_one_background_and_one_draw(self):
         self.figure.clear()
         axes = self.figure.subplots(2, 2)
         o = self.owner
@@ -97,7 +97,9 @@ class DrrInteractionOptimizationTests(unittest.TestCase):
         with patch.object(self.canvas, "draw", wraps=self.canvas.draw) as draw:
             self.controller._draw_drr_regions()
             self.assertEqual(draw.call_count, 1)
-        self.assertEqual(len(o._drr_region_blitters), 4)
+        helper = o._drr_region_blitters['gate_view']
+        self.assertEqual(helper.spectra, tuple(o._drr_spectrum_axes.values()))
+        self.assertEqual(helper.overlays, tuple(o._drr_gate_lines.values()))
 
     def test_fit_worker_still_solves_uncancelled_data(self):
         from ui_qt.controllers_drr import _drr_multi_lorentz_model

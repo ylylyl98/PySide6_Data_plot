@@ -321,7 +321,13 @@ class DrrPeakAnalysisController(QObject):
         return deepcopy(result) if result is not None else None
 
     def redraw(self, *_):
+        had_artists = bool(self.artists)
         self.draw_overlays()
+        # SG/source changes also invalidate peak analysis when no overlays
+        # exist. The normal DRR update will draw the new product; repainting
+        # the old heatmap here adds a full GUI-thread render for no change.
+        if not had_artists and not self.artists:
+            return
         if hasattr(self.owner, 'canvas'):
             for helper in getattr(self.owner, '_drr_region_blitters', {}).values(): helper._background = None
             self.owner.canvas.draw_idle()

@@ -116,6 +116,25 @@ class PlotInputCommitTests(unittest.TestCase):
             self.window.drr_split_spins["left_vmin"].stepUp()
             changed.assert_called_once_with("drr")
 
+    def test_drr_return_flushes_pending_redraw_but_steps_still_coalesce(self):
+        self.activate('DRR')
+        w = self.window
+        w.loaded = LoadedState(mode='DRR', folder='')
+        spin = w.drr_spins['vmax']
+        spin.setFocus()
+        self.app.processEvents()
+        with patch.object(w, '_run_scheduled_plot_redraw') as run:
+            for _ in range(3):
+                QTest.keyClick(spin, Qt.Key_Up)
+                QTest.qWait(100)
+            run.assert_not_called()
+            spin.selectAll()
+            QTest.keyClicks(spin, '12')
+            QTest.keyClick(spin, Qt.Key_Return)
+            self.assertEqual(w._plot_redraw_timers['DRR'].interval(), 0)
+            self.app.processEvents()
+            run.assert_called_once_with('DRR')
+
     def test_shg_arrows_submit_without_waiting_for_focus_loss(self):
         controller = self.window.shg_controller
         with patch.object(type(controller), "_on_shg_param_changed", autospec=True) as changed:

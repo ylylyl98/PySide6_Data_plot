@@ -18,6 +18,7 @@ from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.ticker import PercentFormatter, ScalarFormatter
 from matplotlib.transforms import Bbox
+from ui_qt.png_export_controls import install_png_width_control, export_width, apply_export_width
 from matplotlib.widgets import SpanSelector
 from PySide6.QtCore import QFileSystemWatcher, QMimeData, QProcess, QSettings, Qt, QRunnable, QThreadPool, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent
@@ -343,7 +344,8 @@ class _PlotToolbar(NavigationToolbar2QT):
             prepare()
         try:
             canvas = self.canvas
-            save = self._save_snapshot if getattr(owner, 'last_plotted_mode', None) == 'DRR' else super().save_figure
+            save = (self._save_snapshot if getattr(owner, 'last_plotted_mode', None) == 'DRR'
+                    or export_width(owner) != 1.0 else super().save_figure)
             publication = getattr(canvas, "publication_context", None)
             if callable(publication):
                 with publication():
@@ -386,9 +388,11 @@ class _PlotToolbar(NavigationToolbar2QT):
             owner = self.window()
             from ui_qt.drr_display_memory import capture_visible, remember_shared
             from core.drr_display_settings import save_snapshot
-            display_snapshot = capture_visible(owner)
+            display_snapshot = (capture_visible(owner)
+                                if getattr(owner, 'last_plotted_mode', None) == 'DRR' else None)
             after_save = (lambda: save_snapshot(*display_snapshot)) if display_snapshot else None
-            job = save_figure_async(self.canvas.figure, path, after_save=after_save)
+            job = save_figure_async(self.canvas.figure, path, after_save=after_save,
+                                    width_scale=export_width(owner))
             job.worker.signals.log.connect(owner._append_log)
             self._png_save_job = job
             if hasattr(owner, '_status'):
@@ -425,8 +429,10 @@ def _scan_drr_catalog_worker(
     """Discover DRR sources away from the GUI thread."""
     from core.drr_catalog import load_drr_catalog
     sources = load_drr_catalog(
-        folder, cache, force=force, include_all=include_all,
+        folder, cache, force=force, include_all=include_all, parallel_inspection=True,
         publish_cached=(lambda sources: publish_cached((folder, sources, cache, True, include_all)))
+        if publish_cached is not None else None,
+        publish_inventory=(lambda sources: publish_cached((folder, sources, cache, True, include_all, (), 'inventory')))
         if publish_cached is not None else None,
     )
     # Prepare the stricter recipe index on this existing background worker,
@@ -448,13 +454,14 @@ def _scan_drr_catalog_worker(
             if not path.is_file():
                 missing_selected.append(selected)
                 continue
-            try:
-                inspected = discover_drr_sources(path.parent, include_all=True, include_history=False)
-            except (OSError, ValueError, TypeError):
-                inspected = []
             identity = str(path.resolve()).casefold()
             if identity in known:
                 continue
+            try:
+                inspected = discover_drr_sources(path.parent, cache=cache, include_history=False,
+                                                 source_paths=(path,))
+            except (OSError, ValueError, TypeError):
+                inspected = []
             for source in inspected:
                 inspected_identity = str(resolve_source_path(path.parent, source.source).resolve()).casefold()
                 if inspected_identity == identity and identity not in known:
@@ -947,6 +954,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         cancellation = getattr(self, '_active_load_cancel', None)
         if cancellation is not None:
             cancellation.cancel()
+        for worker in self._drr_refresh_workers:
+            if worker.cancellation is not None:
+                worker.cancellation.cancel()
         if hasattr(self, '_drr_display_compute'):
             self._drr_display_compute.clear()
         if hasattr(self, '_drr_color_compute'):
@@ -2571,6 +2581,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._refresh_automatic_ranges(mode, refresh_split=True, center_split=center)
         self._plot_mode(mode)
 
+    def _commit_drr_plot_edit(self) -> None:
+        """A finished text edit need not wait for the held-arrow debounce."""
+        if 'DRR' in self._plot_redraw_pending:
+            self._schedule_plot_redraw('DRR', delay_ms=0)
+
     def _invalidate_drr_display_derivative_parameters(self) -> None:
         coordinator = getattr(self, '_drr_display_compute', None)
         if coordinator is None:
@@ -2944,6 +2959,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         layout.addWidget(self.toolbar)
         from ui_qt.peak_analysis_bridge import PeakAnalysisBridge
         self.peak_analysis_bridge = PeakAnalysisBridge(self, self.toolbar)
+        install_png_width_control(self, self.toolbar)
         self.drr_plot_view_bar = QFrame()
         self.drr_plot_view_bar.setFrameShape(QFrame.NoFrame)
         self.drr_plot_view_bar.setVisible(False)
@@ -3207,6 +3223,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
     def _wire_actions(self) -> None:
         from ui_qt.drr_display_memory import wire_controls
         wire_controls(self)
+        for controls in (self.drr_spins, self.drr_split_spins, self.drr_second_split_spins):
+            for spin in controls.values():
+                spin.editingFinished.connect(self._commit_drr_plot_edit)
+        for spin in (self.drr_sg_window_spin, self.drr_sg_poly_spin, self.drr_sg_y_window_spin,
+                     self.drr_second_vmin_spin, self.drr_second_vmax_spin):
+            spin.editingFinished.connect(self._commit_drr_plot_edit)
         self.browse_btn.clicked.connect(self._browse_folder)
         self.open_file_btn.clicked.connect(self._open_file)
         self.refresh_btn.clicked.connect(lambda: self._refresh_file_lists())
@@ -4043,6 +4065,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                             "selected_window_ids": [item.get("window_id", item.get("id")) for item in retained_windows],
                             "feature_omission": selected_retained.get("omission", "")},
                 plot_state={
+                    "png_width_scale": export_width(self),
                     "selected_b_index": view.state.selected_b_index,
                     "selected_field_t": float(result.pair_b[view.state.selected_b_index]) if len(result.pair_b) else None,
                     "spectra_source": view.spectra_source_combo.currentText(),
@@ -5070,6 +5093,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             include_all=bool(getattr(self, "_drr_include_all_sources", False)),
             selected_sources=tuple(selected_sources),
             prepare_history=not catalog_only,
+            cancellation=LoadCancellation(),
         )
         worker.kwargs["publish_cached"] = worker.signals.result.emit
         self._drr_refresh_workers.append(worker)
@@ -5120,10 +5144,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if preview:
             if str(folder).casefold() == str(self.current_folder).casefold() and "DRR" not in self._catalog_displayed_modes:
                 self.drr_available_sources = sources
+                if len(result) > 6 and result[6] == 'inventory':
+                    self._drr_inventory_preview_sources = sources
                 self._catalog_displayed_modes.add("DRR")
                 if not catalog_only:
                     self.drr_controller._update_drr_selection_labels()
-                self._status("Showing cached DRR files; checking for changes…")
+                inventory_only = len(result) > 6 and result[6] == 'inventory'
+                self._status("Showing DRR files; checking measurement grids and backgrounds…"
+                             if inventory_only else "Showing cached DRR files; checking for changes…")
                 self.drr_catalog_preview_ready.emit(str(folder))
             return
         missing_selected = tuple(result[5]) if len(result) > 5 else ()
@@ -5149,6 +5177,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if validation_token is not None:
             from ui_qt.drr_picker_cache import freshness
             freshness(self).complete(validation_token)
+        self._drr_inventory_preview_sources = None
         if catalog_only:
             self.drr_available_sources = sources
             self._drr_source_cache = cache
@@ -5747,8 +5776,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return
         self._launch_load_options(options)
 
+    def _drr_catalog_is_inventory_preview(self) -> bool:
+        return self.drr_available_sources is getattr(self, '_drr_inventory_preview_sources', None)
+
     def _start_load(self, mode: str, *, drr_resolution=None) -> None:
         if self._is_closing:
+            return
+        if mode == 'DRR' and self._drr_catalog_is_inventory_preview():
+            self._status('Checking DRR measurement grids and backgrounds; please wait before loading.')
             return
         if self._load_in_progress and not getattr(self, "_capture_pending_load", False):
             # A newer attempt supersedes both the active and queued requests,
@@ -8191,6 +8226,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         from matplotlib.colors import LogNorm
         from matplotlib.ticker import LogFormatter
         from core.plotting import plain_log_ticks
+
+        render.colorbar_host = cax
 
         def numeric_log_labels(colorbar):
             if isinstance(colorbar.norm, LogNorm):
@@ -11146,6 +11183,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 cleanup_verified_sources=bool(self.clean_verified_sources_chk.isChecked()),
             )
 
+        options = apply_export_width(options, export_width(self))
         source_state: list[tuple[str, int | None, int | None]] = []
         source_names = [*self.loaded.selected_files, *self.loaded.baseline_files]
         source_names.extend((self.loaded.compare_sources or {}).values())

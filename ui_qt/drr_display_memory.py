@@ -309,16 +309,22 @@ def sync_controls(owner):
     sync_visibility(owner)
 
 
-def _range(values, lo, hi, covered=True):
+def _x_range_tolerance(owner):
+    # Saved limits pass through these spin boxes. Their rounding can put an
+    # endpoint just outside the full-precision spectral extent of the same data.
+    return max(0.5 * 10 ** -owner.drr_spins[key].decimals() for key in ('xmin', 'xmax'))
+
+
+def _range(values, lo, hi, covered=True, tolerance=0.0):
     try:
         a, b = map(float, values)
-        overlap = lo <= a < b <= hi if covered else a <= hi and b >= lo
+        overlap = lo - tolerance <= a < b <= hi + tolerance if covered else a <= hi and b >= lo
         return math.isfinite(a) and math.isfinite(b) and a < b and overlap
     except (ValueError, TypeError):
         return False
 
 
-def _valid(state, cube, exact, colors=False):
+def _valid(state, cube, exact, colors=False, x_tolerance=0.0):
     try:
         if not isinstance(state, dict) or state.get('version') != history.VERSION:
             return False
@@ -331,7 +337,8 @@ def _valid(state, cube, exact, colors=False):
                ('ranges', 'regions', 'fixes', 'raw', 'second', 'axis', 'viewport')):
             return False
         ranges = state['ranges']
-        if not _range((ranges['xmin'], ranges['xmax']), np.nanmin(cube.energy), np.nanmax(cube.energy), covered=not exact):
+        if not _range((ranges['xmin'], ranges['xmax']), np.nanmin(cube.energy), np.nanmax(cube.energy),
+                      covered=not exact, tolerance=x_tolerance):
             return False
         regions = state['regions']
         if any(not isinstance(regions.get(key, {}), dict) for key in
@@ -391,7 +398,7 @@ def _scope_manual_geometry(owner, loaded, names, center, exact, template, manual
         fallback = (exact or template or {}).get('ranges', {})
         limits = tuple(manual.get('axis.' + key, fallback.get(key, default))
                        for key, default in (('xmin', lo), ('xmax', hi)))
-        keep = _range(limits, lo, hi)
+        keep = _range(limits, lo, hi, tolerance=_x_range_tolerance(owner))
     controls = _controls(owner)
     if not keep:
         for name in GEOMETRY_FIXES:
@@ -478,7 +485,8 @@ def prepare_restore(owner, loaded, overrides=None):
             template = json.loads(owner.settings.value(GLOBAL_KEY, '{}')).get(center)
         except (ValueError, TypeError, AttributeError):
             template = None
-    if not _valid(template, loaded.cube, False, colors=owner.drr_memory_colors_chk.isChecked()):
+    if not _valid(template, loaded.cube, False, colors=owner.drr_memory_colors_chk.isChecked(),
+                  x_tolerance=_x_range_tolerance(owner)):
         template = None
     _scope_manual_geometry(owner, loaded, names, center, exact, template, manual, edits)
     overrides = {**manual, **edits}

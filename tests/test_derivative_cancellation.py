@@ -27,8 +27,9 @@ class DerivativeCancellationTests(unittest.TestCase):
             with self.assertRaises(LoadCancelled):
                 processing.apply_sg_derivative_energy(cube, derivative=2, window_length=9)
 
-    def test_cancelled_uneven_derivative_stops_before_the_next_row(self):
+    def test_cancelled_gappy_derivative_stops_before_the_next_row(self):
         cube = self.cube(uneven=True)
+        cube.Z[:, 3] = np.nan
         cancellation = LoadCancellation()
         visited = []
         original = P.sg_derivative_origin_1d
@@ -41,6 +42,23 @@ class DerivativeCancellationTests(unittest.TestCase):
             with self.assertRaises(LoadCancelled):
                 processing.apply_sg_derivative_energy(cube, derivative=2, window_length=9)
         self.assertEqual(len(visited), 1)
+
+    def test_cancelled_uneven_batch_stops_before_the_next_filter(self):
+        cube = self.cube(uneven=True)
+        cube.Z = np.tile(cube.Z, (20, 1))
+        cancellation = LoadCancellation()
+        calls = []
+        original = P.savgol_filter
+        def filter(*args, **kwargs):
+            result = original(*args, **kwargs)
+            calls.append(args[0].shape[0])
+            cancellation.cancel()
+            return result
+        with patch.object(P, 'savgol_filter', new=filter), load_scope(cancellation):
+            with self.assertRaises(LoadCancelled):
+                processing.apply_sg_derivative_energy(cube, derivative=2, window_length=9)
+        self.assertEqual(len(calls), 1)
+        self.assertLessEqual(calls[0], 32)
 
     def test_cancelled_mixed_derivative_stops_before_the_next_window(self):
         cube = self.cube()

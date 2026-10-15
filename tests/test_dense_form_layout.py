@@ -256,12 +256,25 @@ class DenseFormRowLayoutTests(unittest.TestCase):
                 self.assertAlmostEqual(window.workspace_splitter.sizes()[0], 380, delta=1)
                 self.assertEqual(row.layout().mode_for_width(width), expected_mode)
                 self.assertLess(row.layout().labelWidget().geometry().bottom(), min(widget.geometry().top() for widget in direct[:5]))
-                first_row_centers = [widget.geometry().center().y() for widget in direct[:4]]
-                self.assertLess(max(first_row_centers) - min(first_row_centers), 12)
+                # The DRR scope labels (Fix, Fix M, Fix λ, Fix F) can make
+                # the two range pairs wider than the sidebar. Each editor
+                # must stay beside its own Fix; the pairs may wrap together.
+                for pair in (direct[:2], direct[2:4]):
+                    centers = [widget.geometry().center().y() for widget in pair]
+                    self.assertLess(max(centers) - min(centers), 12)
+                primary_width = sum(row.layout().safe_min_width(widget) for widget in direct[:4])
+                primary_width += row.layout().spacing() * 3
+                if primary_width <= width:
+                    centers = [widget.geometry().center().y() for widget in direct[:4]]
+                    self.assertLess(max(centers) - min(centers), 12)
+                else:
+                    self.assertGreater(min(widget.geometry().top() for widget in direct[2:4]),
+                                       max(widget.geometry().bottom() for widget in direct[:2]))
                 if expected_mode == "SINGLE_ROW":
                     self.assertLess(abs(direct[4].geometry().center().y() - direct[0].geometry().center().y()), 2)
                 else:
-                    self.assertGreater(direct[4].geometry().top(), direct[0].geometry().bottom())
+                    self.assertGreater(direct[4].geometry().top(),
+                                       max(widget.geometry().bottom() for widget in direct[:4]))
                 self.assertLessEqual(max(w.geometry().right() for w in direct[:5]), row.contentsRect().right())
                 self.assertTrue(all(row.contentsRect().contains(widget.geometry()) for widget in direct[:5]))
                 self.assertFalse(any(a.geometry().intersects(b.geometry()) for i, a in enumerate(direct[:5]) for b in direct[i + 1:5]))

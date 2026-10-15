@@ -75,6 +75,24 @@ class MatplotlibThemeTests(unittest.TestCase):
 
         self.assertEqual(annotation.get_color(), "#ff00ff")
 
+    def test_theme_styles_future_ticks_without_querying_locators(self) -> None:
+        from unittest.mock import patch
+        from matplotlib.ticker import MultipleLocator
+
+        figure, canvas = self._canvas('dark')
+        axis = figure.subplots()
+        axis.grid(True, which='both')
+        axis.xaxis.set_minor_locator(MultipleLocator(.1))
+        with patch.object(axis.xaxis.get_major_locator(), 'tick_values',
+                          side_effect=AssertionError('Theme application ran tick locator')):
+            canvas.apply_display_theme()
+        axis.set_xlim(-2, 4)
+        canvas.draw()
+        for ticks in (axis.xaxis.get_major_ticks(), axis.xaxis.get_minor_ticks()):
+            for tick in ticks:
+                self.assertEqual(tick.label1.get_color(), '#c8c8c8')
+                self.assertEqual(tick.gridline.get_color(), '#5b5b5b')
+
     def test_dark_theme_updates_figure_title_and_figure_legend(self) -> None:
         figure, canvas = self._canvas("dark")
         axis = figure.add_subplot(111)

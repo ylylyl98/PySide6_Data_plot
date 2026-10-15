@@ -9,13 +9,19 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from PySide6.QtCore import QObject, QThreadPool, QTimer, Signal, Slot
 from PySide6.QtWidgets import QApplication
 from ui_qt.common import Worker
+from core.png_geometry import compact_horizontal_margins, widened_figsize
 
 
-def render_snapshot(snapshot, path, options, *, progress, log, after_save=None):
+def render_snapshot(snapshot, path, options, *, progress, log, after_save=None, width_scale=1.0):
     # Snapshot bytes are generated locally from our own figure, never from files
     # supplied by a user. Matplotlib's pickle excludes its live Qt canvas.
     figure = pickle.loads(snapshot)
+    if width_scale != 1.0:
+        figure.set_size_inches(widened_figsize(figure.get_size_inches(), width_scale), forward=False)
+        options = {**options, 'bbox_inches': figure.bbox_inches, 'pad_inches': 0}
     FigureCanvasAgg(figure)
+    if width_scale != 1.0:
+        compact_horizontal_margins(figure)
     path = Path(path)
     temporary = path.with_name(f'.{path.stem}-{uuid4().hex}.tmp{path.suffix}')
     try:
@@ -37,7 +43,7 @@ class FigureSaveJob(QObject):
     failed = Signal(str)
     finished = Signal()
 
-    def __init__(self, figure, path, options, after_save=None):
+    def __init__(self, figure, path, options, after_save=None, width_scale=1.0):
         super().__init__(QApplication.instance())
         self.done = False
         self.error = None
@@ -56,7 +62,8 @@ class FigureSaveJob(QObject):
             self.deleteLater()
             raise
         self.snapshot_seconds = perf_counter() - self.started
-        self.worker = Worker(render_snapshot, snapshot, str(path), options, after_save=after_save)
+        self.worker = Worker(render_snapshot, snapshot, str(path), options,
+                             after_save=after_save, width_scale=width_scale)
         self.worker.signals.result.connect(self._success)
         self.worker.signals.error.connect(self._failure)
         self.worker.signals.finished.connect(self._finish)
@@ -97,8 +104,9 @@ class FigureSaveJob(QObject):
         self.setParent(None)
 
 
-def save_figure_async(figure, path, *, after_save=None, **options):
+def save_figure_async(figure, path, *, after_save=None, width_scale=1.0, **options):
+    widened_figsize(figure.get_size_inches(), width_scale)
     apply_font = getattr(figure.canvas, 'apply_ui_font', None)
     if callable(apply_font):
         apply_font()
-    return FigureSaveJob(figure, path, options, after_save=after_save)
+    return FigureSaveJob(figure, path, options, after_save=after_save, width_scale=width_scale)

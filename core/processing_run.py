@@ -1889,6 +1889,46 @@ def sg_derivative_origin_rows(
     E = np.asarray(energy, float)
     out = np.empty_like(Z, float)
 
+    # Complete rows on the same increasing energy grid share spline and SG
+    # setup. Bound each batch so cancellation and working memory stay bounded;
+    # gappy rows and legacy modes keep the original one-row semantics below.
+    if (not origin_like and interp_kind == "cubic" and Z.ndim == 2
+            and E.ndim == 1 and Z.shape[1] == E.size
+            and E.size >= max(4, polyorder + 2)
+            and np.all(np.isfinite(E)) and np.all(np.diff(E) > 0)):
+        nU = max(len(E), int(np.ceil(len(E) * float(oversample))))
+        Eu = np.linspace(E[0], E[-1], nU)
+        win = int(window_pts)
+        if win % 2 == 0:
+            win += 1
+        win = max(win, polyorder + 3)
+        if win >= len(Eu):
+            win = len(Eu) - (1 - len(Eu) % 2)
+        batch_rows = max(1, min(32, 65536 // max(len(E), nU)))
+        for start in range(0, len(Z), batch_rows):
+            check_load_cancelled()
+            block = Z[start:start + batch_rows]
+            complete = np.all(np.isfinite(block), axis=1)
+            indices = np.flatnonzero(complete)
+            if indices.size:
+                yu = CubicSpline(E, block[indices], axis=1, extrapolate=False)(Eu)
+                check_load_cancelled()
+                yd = savgol_filter(yu, window_length=win, polyorder=polyorder,
+                                   deriv=deriv, delta=Eu[1] - Eu[0], axis=1, mode="interp")
+                for index, row in zip(indices, yd):
+                    check_load_cancelled()
+                    out[start + index] = np.interp(E, Eu, row)
+            for index in np.flatnonzero(~complete):
+                check_load_cancelled()
+                out[start + index] = sg_derivative_origin_1d(
+                    E, block[index], deriv=deriv, window_pts=window_pts,
+                    polyorder=polyorder, oversample=oversample,
+                    interp_kind=interp_kind, origin_like=origin_like,
+                    pad_flat_edges=pad_flat_edges,
+                )
+        check_load_cancelled()
+        return out
+
     for i in range(Z.shape[0]):
         check_load_cancelled()
         out[i] = sg_derivative_origin_1d(

@@ -277,6 +277,32 @@ class DrrDisplayMemoryTests(unittest.TestCase):
         self.load('b_720nmc.csv', bounds=(1.1, 1.3))
         self.assertEqual(tuple(self.window.drr_spins[k].value() for k in ('xmin', 'xmax')), (1.1, 1.3))
 
+    def test_saved_center_range_accepts_control_rounding_at_data_edges(self):
+        self.load(bounds=(1.50004, 1.79996))
+        self.save_view(count=3, x_range=(1.5, 1.8))
+        # Restore in a fresh window so outgoing controls cannot mask whether
+        # the saved center template was accepted.
+        restarted = self.new_window()
+        self.load('b_720nmc.csv', window=restarted, bounds=(1.50004, 1.79996))
+        self.assertIn('Using 720 nm center template', restarted.drr_memory_status.text())
+        self.assertEqual(tuple(restarted.drr_spins[k].value() for k in ('xmin', 'xmax')), (1.5, 1.8))
+        self.assertEqual(restarted.drr_fix_checks['xmin'].property('fixOrigin'), 'center')
+        self.assertEqual(restarted.drr_fix_checks['xmax'].property('fixOrigin'), 'center')
+        self.assertEqual(restarted.drr_region_count_combo.currentData(), 3)
+        self.assertEqual(tuple(restarted.drr_split_spins[k].value() for k in ('x0', 'x1')), (1.61, 1.68))
+        with patch.object(restarted, '_ensure_loaded_matches_ui_params', return_value=True):
+            restarted._plot_mode('DRR')
+        self.assertEqual(restarted._drr_heatmap_ax.get_xlim(), (1.5, 1.8))
+
+    def test_center_range_rejects_edge_overflow_beyond_control_rounding(self):
+        self.write_legacy_view()
+        for bounds in ((1.55006, 1.8), (1.5, 1.73994)):
+            with self.subTest(bounds=bounds):
+                self.load('b_720nmc.csv', bounds=bounds)
+                self.assertIn('no compatible saved display', self.window.drr_memory_status.text())
+                self.assertFalse(self.window.drr_fix_checks['xmin'].isChecked())
+                self.assertFalse(self.window.drr_fix_checks['xmax'].isChecked())
+
     def save_view(self, window=None, count=3, x_range=(1.55, 1.74), after_start=None):
         window = window or self.window
         window.drr_region_count_combo.setCurrentIndex(count - 1)
@@ -879,6 +905,14 @@ class DrrDisplayMemoryTests(unittest.TestCase):
         self.load('next_720nmc.csv', bounds=(1.3, 1.5))
         self.assertEqual(tuple(self.window.drr_spins[k].value() for k in ('xmin', 'xmax')), (1.3, 1.5))
         self.assertFalse(self.window.drr_fix_checks['xmin'].isChecked())
+
+    def test_same_center_manual_range_accepts_control_rounding_at_data_edges(self):
+        self.load('first_720nmc.csv', bounds=(1.50004, 1.79996))
+        self.set_manual_geometry(xmin=1.5, xmax=1.8)
+        self.load('next_720nmc.csv', bounds=(1.50004, 1.79996))
+        self.assertTrue(self.window.drr_fix_checks['xmin'].isChecked())
+        self.assertTrue(self.window.drr_fix_checks['xmax'].isChecked())
+        self.assertEqual(self.window.drr_split_spins['x0'].value(), 1.65)
 
     def test_partial_manual_range_cannot_invert_incoming_template(self):
         self.load('first_720nmc.csv')

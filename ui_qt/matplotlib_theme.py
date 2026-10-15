@@ -88,17 +88,16 @@ def apply_display_theme(figure: Any, theme: MatplotlibDisplayTheme) -> None:
         for spine in axis.spines.values():
             spine.set_edgecolor(theme.spine)
         axis.tick_params(axis="both", which="both", colors=theme.text_secondary,
-                         labelcolor=theme.text_secondary)
+                         labelcolor=theme.text_secondary, grid_color=theme.grid)
         axis.xaxis.label.set_color(theme.text)
         axis.yaxis.label.set_color(theme.text)
         axis.title.set_color(theme.text)
         for text in axis.texts:
             if getattr(text, "_use_theme_text", False):
                 text.set_color(theme.text)
-        for text in (*axis.get_xticklabels(), *axis.get_yticklabels()):
-            text.set_color(theme.text_secondary)
-        for gridline in (*axis.get_xgridlines(), *axis.get_ygridlines()):
-            gridline.set_color(theme.grid)
+        # tick_params styles existing ticks and records defaults for ticks
+        # created on the next draw. Querying labels/gridlines here would run
+        # the locators repeatedly, especially on newly rebuilt colorbars.
         legend = axis.get_legend()
         if legend is not None:
             frame = legend.get_frame()
@@ -178,7 +177,9 @@ class ThemeAwareFigureCanvasQTAgg(QtFontFigureCanvasQTAgg):
     def draw(self, *args: Any, **kwargs: Any) -> Any:
         if not self._suspend_display_theme:
             self.apply_display_theme()
-        return super().draw(*args, **kwargs)
+        from ui_qt.drr_viewport import visible_drr_meshes
+        with visible_drr_meshes(self):
+            return super().draw(*args, **kwargs)
 
     @contextmanager
     def publication_context(self) -> Iterator[None]:

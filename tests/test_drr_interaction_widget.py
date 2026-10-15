@@ -24,3 +24,21 @@ class DrrInteractionWidgetTests(unittest.TestCase):
             for axis in w._drr_spectrum_axes.values():
                 self.assertEqual(len(axis.lines), 1)
         self.errors.assert_not_called()
+
+    def test_empty_peak_analysis_does_not_request_an_obsolete_redraw(self):
+        from unittest.mock import patch
+        w = self.window
+        self.assertFalse(w.drr_peak_analysis.artists)
+        with patch.object(w.canvas, 'draw_idle') as draw:
+            w.drr_peak_analysis.changed()
+        draw.assert_not_called()
+
+    def test_removing_peak_overlay_still_repaints(self):
+        from unittest.mock import patch
+        w = self.window
+        artist = w._drr_heatmap_ax.scatter([0], [0])
+        w.drr_peak_analysis.artists = [artist]
+        with patch.object(w.canvas, 'draw_idle') as draw:
+            w.drr_peak_analysis.clear()
+        draw.assert_called_once()
+        self.assertNotIn(artist, w._drr_heatmap_ax.collections)

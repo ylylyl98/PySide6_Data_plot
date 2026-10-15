@@ -7,6 +7,7 @@ from typing import Callable
 from core.drr_sources import (
     DrrSource, DrrSourceCache, discover_drr_sources, drr_source_paths,
     refresh_drr_source_history,
+    preview_drr_sources,
 )
 from core.source_catalog_cache import SourceCatalogCache
 
@@ -41,7 +42,9 @@ def load_drr_catalog(
     *,
     force: bool = False,
     include_all: bool = False,
+    parallel_inspection: bool = False,
     publish_cached: Callable[[list[DrrSource]], None] | None = None,
+    publish_inventory: Callable[[list[DrrSource]], None] | None = None,
 ) -> list[DrrSource]:
     """Preview persisted history, then update only the layer that changed."""
     suffix = "-all" if include_all else ""
@@ -51,10 +54,13 @@ def load_drr_catalog(
                                  inventory_provider=lambda: drr_history_inventory(folder, include_all=include_all))
 
     def build_raw():
+        if publish_inventory is not None:
+            publish_inventory(preview_drr_sources(folder, include_all=include_all))
         # Avoid loading the much larger per-file inspection cache on a hit in
         # either catalog layer. A forced refresh still reuses valid inspections.
         cache.load()
-        sources = discover_drr_sources(folder, cache=cache, include_history=False, include_all=include_all)
+        sources = discover_drr_sources(folder, cache=cache, include_history=False,
+                                       include_all=include_all, parallel_inspection=parallel_inspection)
         cache.save()
         return sources
 
