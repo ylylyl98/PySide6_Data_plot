@@ -4,7 +4,8 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
-from PySide6.QtCore import QCoreApplication, QObject
+from PySide6.QtCore import QObject
+from PySide6.QtWidgets import QApplication
 
 from ui_qt.main_window import LoadedState, MainWindow
 from core.loader import DataCube
@@ -112,8 +113,13 @@ class _PlFitOwner:
 
 
 class ResponsivenessTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        # A QCoreApplication would prevent later QWidget tests in this process
+        # from creating the QApplication they require.
+        cls.app = QApplication.instance() or QApplication([])
+
     def test_mcd_lifecycle_state_is_controller_local_and_timers_are_parented(self) -> None:
-        QCoreApplication.instance() or QCoreApplication([])
         owner = _McdLifecycleOwner()
         controller = McdController(owner)
 
@@ -252,7 +258,6 @@ class ResponsivenessTests(unittest.TestCase):
         self.assertNotIn("_shg_loaded_processing_key", owner.__dict__)
 
     def test_shg_reprocess_timer_is_parented_to_main_window(self) -> None:
-        QCoreApplication.instance() or QCoreApplication([])
         owner = _ShgQtOwner()
         controller = ShgController(owner)
 

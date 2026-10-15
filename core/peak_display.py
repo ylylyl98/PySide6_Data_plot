@@ -21,11 +21,17 @@ def capture_display(axis):
         for side,mesh in zip(sides,meshes):
             split[side+'_vmin']=float(mesh.norm.vmin)
             split[side+'_vmax']=float(mesh.norm.vmax)
-        edges=first.get_coordinates()[0,:,0]
+        first_edges=first.get_coordinates()[0,:,0]
+        # Region meshes now store only their own cells. Snap against the
+        # complete grid, including joins and any single-cell outer region.
+        edges=np.unique(np.concatenate([mesh.get_coordinates()[0,:,0] for mesh in meshes]))
+        descending=first_edges[0]>first_edges[-1]
+        if descending:
+            edges=edges[::-1]
         for field in ('split_x','split_x2'):
             if split.get(field) is not None:
                 split[field]=float(edges[1:-1][np.argmin(abs(edges[1:-1]-split[field]))])
-        if edges[0]>edges[-1]:
+        if descending:
             for bound in ('vmin','vmax'):
                 split['left_'+bound],split['right_'+bound]=split['right_'+bound],split['left_'+bound]
         display['split_scale']=split

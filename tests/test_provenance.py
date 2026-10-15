@@ -68,7 +68,10 @@ class ProvenanceTests(unittest.TestCase):
             def mutate(path):
                 value = original_hash(path)
                 if Path(path) == working:
-                    working.write_bytes(b'modified')
+                    # Make the mutation observable even if rapid Windows
+                    # writes share the same timestamp. Same-size/restored-
+                    # mtime changes are covered by their own test above.
+                    working.write_bytes(b'modified during hashing')
                 return value
             with patch.object(provenance, 'sha256_file', side_effect=mutate):
                 record = verify_initial_data_working_file(working, root, workflow='DRR', role='measurement')

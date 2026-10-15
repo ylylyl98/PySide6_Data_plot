@@ -23,10 +23,10 @@ class PeakDisplayTests(unittest.TestCase):
         d=create_dataset(cube,'DRR','raw','descending.csv','DRR',{'display':capture_display(axis)})
         heat,*_=build_figure(d)
         def colors(meshes):
-            output=np.zeros((*cube.Z.shape,4))
-            for mesh in meshes:
-                values=mesh.get_array();valid=~np.ma.getmaskarray(values)
-                output[valid]=mesh.to_rgba(values)[valid]
+            # Each region contains its own contiguous columns, with no
+            # full-map masked padding. Reconstruct the complete color grid.
+            output=np.concatenate([mesh.to_rgba(mesh.get_array()) for mesh in meshes],axis=1)
+            self.assertEqual(output.shape,(*cube.Z.shape,4))
             return output
         np.testing.assert_allclose(colors(heat.collections),colors(original.images)[:,::-1])
 
@@ -36,13 +36,19 @@ class PeakDisplayTests(unittest.TestCase):
         cube=sample('DRR')
         for split,log,center in [(None,False,True),
             (SplitColorScale(1.70,-.2,1.2,-.8,.3),False,True),
+            (SplitColorScale(1.6002,-.2,1.2,-.8,.3),False,True),
             (SplitColorScale(1.66,.01,1.2,.03,.7,split_x2=1.74,middle_vmin=.02,middle_vmax=.8),True,False)]:
             with self.subTest(split=split,log=log):
                 axis=Figure().add_subplot()
                 params=HeatmapParams('Main','Energy','Gate','DR/R',-.8 if not log else .01,1.2,
                     (1.60,1.8),(-2,2),cmap=RDBU_R_P0P45_ID,log_scale=log,center_zero=center,split_scale=split)
                 original=plot_heatmap(axis,cube,params)
-                view={'display':capture_display(axis),'xlim':[1.61,1.68],'ylim':[-1,1]}
+                display=capture_display(axis)
+                if split is not None:
+                    boundaries=[display['split_scale'][name] for name in ('split_x','split_x2')
+                                if display['split_scale'][name] is not None]
+                    np.testing.assert_array_equal(boundaries,original.boundaries)
+                view={'display':display,'xlim':[1.61,1.68],'ylim':[-1,1]}
                 d=create_dataset(cube,'DRR','raw','a.csv','DRR',view)
                 key=d['key']
                 with tempfile.TemporaryDirectory() as folder:
