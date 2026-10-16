@@ -807,7 +807,18 @@ class CurieWeissPanel(QWidget):
         from core.mcd_extract import dependency_export_folder
         target = dependency_export_folder(folder, 'Temperature') / datetime.now().strftime('Curie_Weiss_%Y%m%d_%H%M%S_%f')
         target.mkdir(parents=True, exist_ok=False)
+        from core.mcd_curve_export import export_mcd_curve_csvs
+        members = [record for record in self.records
+                   if self.groups.get(record.record_id) == self.group_combo.currentData()
+                   and self._temperature(record) is not None
+                   and np.isfinite(self._temperature(record)) and self._temperature(record) > 0
+                   and self.t_min.value() <= self._temperature(record) <= self.t_max.value()]
+        curve_index = export_mcd_curve_csvs(
+            members, target/'MCD_vs_B', branches=self.branches, energy_groups=self.groups,
+            temperature_mode=self.temperature_combo.currentData(),
+        )
         payload = dict(schema_version=3, series_id=self.series_id,
+            mcd_curves_index=curve_index.relative_to(target).as_posix(),
             fit_method=self.method_combo.currentData(),
             reference='https://doi.org/10.1038/s41565-022-01309-8',
             energy_group=self.group_combo.currentData(), temperature_mode=self.temperature_combo.currentData(),
@@ -850,4 +861,6 @@ class CurieWeissPanel(QWidget):
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, 'Curie–Weiss export', str(exc))
             return
-        QMessageBox.information(self, 'Curie–Weiss export', f'Saved fit, points and figure:\n{target}')
+        QMessageBox.information(self, 'Curie–Weiss export',
+            f'Saved fit, slope points, figure and per-temperature MCD–B CSVs:\n{target}\n'
+            'Full curves and conditions index: MCD_vs_B/index.csv')

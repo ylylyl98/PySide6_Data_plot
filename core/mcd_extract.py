@@ -1166,8 +1166,14 @@ def clear_mcd_trace_cache() -> None:
 def load_branch_traces(
     record: ProcessedMcdRecord,
     branches: Sequence[McdBranch] = BRANCHES,
+    *,
+    primary_only: bool = False,
 ) -> pd.DataFrame:
-    """Return tidy trace rows while keeping the two acquired branches separate."""
+    """Return tidy trace rows while keeping the two acquired branches separate.
+
+    ``primary_only`` reads just the signed-mean signal, including older files
+    without the auxiliary magnitude/integral columns.
+    """
     signature = _path_signature(record.trace_path)
     if signature is None:
         raise OSError(f"MCD trace file is unavailable: {record.trace_path}")
@@ -1175,8 +1181,14 @@ def load_branch_traces(
     if record.workbook_columns is not None:
         # Project only the selected window; never combine equal B values from
         # different windows or sweep branches.
-        table = table[list(record.workbook_columns.values())].rename(
-            columns={column: key for key, column in record.workbook_columns.items()}
+        mapping = record.workbook_columns
+        if primary_only:
+            suffixes = ['increasing' if branch == 'B increasing' else 'decreasing' for branch in branches]
+            keys = {f'{prefix}_{suffix}{unit}' for suffix in suffixes
+                    for prefix, unit in (('B', '_T'), ('corrected_signed_mean', ''))}
+            mapping = {key: column for key, column in mapping.items() if key in keys}
+        table = table[list(mapping.values())].rename(
+            columns={column: key for key, column in mapping.items()}
         )
     blocks: list[pd.DataFrame] = []
     for branch in branches:
@@ -1187,6 +1199,9 @@ def load_branch_traces(
             "corrected_field_signed_absolute_mean": f"corrected_field_signed_absolute_mean_{suffix}",
             "corrected_integral": f"corrected_integral_{suffix}",
         }
+        if primary_only:
+            required = {key: column for key, column in required.items()
+                        if key in ('B_T', 'corrected_signed_mean')}
         missing = [column for column in required.values() if column not in table.columns]
         if missing:
             raise ValueError(f"{record.trace_path.name} is missing columns: {', '.join(missing)}")
@@ -2112,6 +2127,11 @@ def export_mcd_extract(
             csv_path = out / f"{base}_{'Increasing' if branch == 'B increasing' else 'Decreasing'}.csv"
             table.to_csv(csv_path, index=False)
             paths[key] = csv_path
+        from core.mcd_curve_export import export_mcd_curve_csvs
+        curve_folder = out / datetime.now().strftime('MCD_vs_B_%Y%m%d_%H%M%S_%f')
+        paths['mcd_curves_index_csv'] = export_mcd_curve_csvs(
+            ordered_records, curve_folder, branches=branches, energy_groups=resolved_groups,
+        )
     selection = {
         "schema_version": 2,
         "slope_metrics": list(slope_metrics),
@@ -2156,7 +2176,7 @@ def export_mcd_extract(
             }
             for record in ordered_records
         ],
-        "outputs": [path.name for path in paths.values()],
+        "outputs": [path.relative_to(out).as_posix() for path in paths.values()],
     }
     settings_path.write_text(json.dumps(selection, indent=2, sort_keys=True), encoding="utf-8")
     return paths

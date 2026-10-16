@@ -185,7 +185,12 @@ class McdOrganizerWindow(QMainWindow):
         self.output_label = QLabel()
         self.output_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.output_btn = QPushButton("Change output…")
-        self.export_csv_chk = QCheckBox("Also create branch CSV files")
+        self.export_csv_chk = QCheckBox("MCD–B CSVs (all + per condition)")
+        self.export_csv_chk.setChecked(True)
+        self.export_csv_chk.setToolTip(
+            "Save branch overview CSVs plus one complete MCD–B CSV per condition/window, "
+            "organized by energy group with a conditions index."
+        )
         self.export_btn = QPushButton("Export selected series")
         self.theta_compare_btn = QPushButton('Compare θCW…')
         self.theta_compare_btn.clicked.connect(self._compare_theta)
@@ -1667,9 +1672,12 @@ class McdOrganizerWindow(QMainWindow):
         if self._export_worker is None or self._closing:
             return
         self.selection_summary.setText("Export complete")
+        files = [path.name for key, path in paths.items() if key != 'mcd_curves_index_csv']
+        if 'mcd_curves_index_csv' in paths:
+            files.append(f"MCD–B curves and index:\n{paths['mcd_curves_index_csv'].parent}")
         QMessageBox.information(
             self, "MCD export complete",
-            "Created:\n" + "\n".join(path.name for path in paths.values()),
+            "Created:\n" + "\n".join(files),
         )
 
     def _on_export_error(self, message: str) -> None:

@@ -139,6 +139,8 @@ class LoadedState:
     drr_baseline_which: str = "last"
     drr_background_selection: Dict[str, Any] = field(default_factory=dict)
     drr_assignments: tuple[Any, ...] = ()
+    drr_fitted_settings: dict = field(default_factory=dict)
+    drr_fitted_references: tuple[Any, ...] = ()
     y_axis_spec: str = "auto"
     provenance_records: tuple[WorkingCopyRecord, ...] = ()
     load_timings: Dict[str, float] = field(default_factory=dict)
@@ -167,6 +169,7 @@ class LoadOptions:
     mcd_candidate_energy_range: tuple[float, float] | None = None
     drr_background_selection: Dict[str, Any] = field(default_factory=dict)
     drr_assignments: tuple[Any, ...] = ()
+    drr_fitted_settings: dict = field(default_factory=dict)
     power_role_group_keys: tuple[str, ...] = ()
     drr_restore_files: bool = True
     drr_restore_centers: bool = True

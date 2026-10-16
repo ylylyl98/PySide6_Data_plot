@@ -724,6 +724,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.drr_baseline_files_found: List[str] = []
         self._drr_assignments: tuple[DrrMeasurementAssignment, ...] = ()
         self._drr_assignments_automatic = False
+        self._drr_fitted_settings = {}
         self._drr_baseline_user_selected = False
         self._drr_background_guess = None
         self.loaded: LoadedState | None = None
@@ -951,6 +952,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         save_global_geometry(self)
         save_settings(self)
         self._is_closing = True
+        background_dialog = getattr(self, '_drr_background_dialog', None)
+        if background_dialog is not None:
+            background_dialog.close()
         cancellation = getattr(self, '_active_load_cancel', None)
         if cancellation is not None:
             cancellation.cancel()
@@ -2842,6 +2846,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 spin.blockSignals(blocked)
 
     def _open_drr_raw_preview(self) -> None:
+        if self.loaded and self.loaded.drr_fitted_references:
+            self._open_drr_fitted_background()
+            return
         from core.drr_raw_preview import snapshot_from_loaded
         from ui_qt.drr_raw_dialog import DrrRawDialog
         try:
@@ -2865,6 +2872,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             dialog.deleteLater()
         dialog.finished.connect(release_dialog)
         dialog.show()
+
+    def _open_drr_fitted_background(self) -> None:
+        from ui_qt.drr_background_dialog import open_background_dialog
+        open_background_dialog(self)
 
     def _capture_drr_view_limits(self) -> None:
         """Snapshot the shared map viewport before a DRR layout rebuild."""
@@ -5893,6 +5904,17 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             pl_log = False
             cmp_log = False
             drr_baseline = self.drr_baseline_combo.currentText()
+            if drr_baseline == 'Fitted (sample)':
+                from dataclasses import asdict
+                from core.drr_fitted_background import BackgroundFitSettings, validate_recipe
+                if not self._drr_fitted_settings:
+                    self._drr_fitted_settings = asdict(BackgroundFitSettings(automatic_protection=True))
+                try:
+                    validate_recipe(self._drr_fitted_settings, selected)
+                except (TypeError, ValueError) as exc:
+                    self._invalidate_drr_for_background_selection(str(exc))
+                    return
+                baselines = []
             which_map = {
                 "Last frame from each file, then average": "last",
                 "First frame from each file, then average": "first",
@@ -5920,7 +5942,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     "Missing DRR source(s): " + ", ".join(missing)
                 )
                 return
-            if selected and not data_io.is_xlsx_map_file(selected[0]):
+            if selected and not data_io.is_xlsx_map_file(selected[0]) and drr_baseline != 'Fitted (sample)':
                 if self._drr_assignments_automatic and not self.drr_pin_baseline_chk.isChecked():
                     drr_assignments = tuple(self._drr_assignments)
                     # The combo boxes show a readable summary only.  Keep the
@@ -6169,6 +6191,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 else {}
             ),
             drr_assignments=drr_assignments,
+            drr_fitted_settings=dict(self._drr_fitted_settings) if mode == 'DRR' and drr_baseline == 'Fitted (sample)' else {},
         )
         if drr_selection_metadata:
             options = LoadOptions(**{
@@ -6302,6 +6325,22 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     y_axis_spec=options.y_axis_spec,
                     provenance_records=provenance_records,
                 )
+            if options.drr_baseline_text == 'Fitted (sample)':
+                from core.drr_fitted_background import load_fitted_group
+                cube, references = load_fitted_group(folder, options.selected_files, options.drr_fitted_settings,
+                    y_axis=options.y_axis_spec, progress=progress.emit)
+                for reference in references:
+                    for warning in reference.diagnostics.get('warnings', ()):
+                        log.emit(f'Background review · {reference.source}: {warning}')
+                log.emit(f'Fitted backgrounds: {sum(ref.cache_hit for ref in references)}/{len(references)} cached; '
+                         f'{sum(bool(ref.diagnostics.get("warnings")) for ref in references)} need review.')
+                return LoadedState(mode='DRR', folder=folder, primary_file=options.selected_files[0],
+                    selected_files=list(options.selected_files), cube=cube, drr_mode_label='DR/R Fitted',
+                    drr_baseline_text='Fitted (sample)', drr_baseline_which=options.drr_baseline_which,
+                    drr_fitted_settings=dict(options.drr_fitted_settings), drr_fitted_references=references,
+                    drr_background_selection={'fitted_background': dict(options.drr_fitted_settings),
+                        'fitted_background_diagnostics': [reference.metadata() for reference in references]},
+                    y_axis_spec=options.y_axis_spec, provenance_records=provenance_records)
             assignments = tuple(options.drr_assignments)
             if not assignments and options.selected_files:
                 explicit_mode = options.drr_baseline_text
@@ -6591,8 +6630,13 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._drr_view_limits = None
             self._drr_limits_from_controls = True
         self.loaded = loaded
+        background_dialog = getattr(self, '_drr_background_dialog', None)
+        if background_dialog is not None:
+            background_dialog.loaded_changed(loaded)
         if loaded.mode == "DRR":
             self._update_drr_right_axis_options()
+            if loaded.drr_fitted_references:
+                self.drr_controller._update_drr_selection_labels()
         if hasattr(self, 'drr_peak_analysis'):
             self.drr_peak_analysis.loaded_changed()
         if loaded.mode == "DRR":
@@ -9646,6 +9690,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             busy_before = bool(getattr(self, "_load_in_progress", False))
             lifecycle_before = getattr(self, "_load_lifecycle_generation", 0)
             self._ensure_loaded_matches_ui_params(mode)
+            # A rejected recipe (for example, empty manual protection)
+            # clears the stale view without starting
+            # a worker. Preserve its setup hint and stop this redraw as well.
+            if not self.loaded or self.loaded.mode != mode:
+                return
             request_changed = request_before != getattr(self, "_active_load_token", None)
             lifecycle_changed = lifecycle_before != getattr(self, "_load_lifecycle_generation", 0)
             pending_changed = bool(getattr(self, "_pending_load_options", None))
@@ -10518,6 +10567,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._split_scale_key("drr_second"),
             self.drr_right_yaxis_combo.currentText(),
             self.drr_second_kind_combo.currentData(), self.drr_sg_y_window_spin.value(),
+            repr(p.get('fitted_settings', {})),
         )
 
     def _ensure_loaded_matches_drr_params(self) -> bool:
@@ -10528,6 +10578,13 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         baselines = list(p["baseline_files"])
         baseline_text = p["baseline_mode"]
         y_axis_spec = str(p["y_axis_spec"])
+        if baseline_text == 'Fitted (sample)' and selected and not data_io.is_xlsx_map_file(selected[0]):
+            if (selected != list(self.loaded.selected_files) or self.loaded.drr_baseline_text != baseline_text
+                    or y_axis_spec != self.loaded.y_axis_spec
+                    or p.get('fitted_settings', {}) != getattr(self.loaded, 'drr_fitted_settings', {})):
+                self._start_load('DRR')
+                return False
+            return False  # Existing API: False means no synchronous reload; caller checks the load state.
         try:
             assignments = tuple(
                 DrrMeasurementAssignment.from_mapping(item)
@@ -11297,11 +11354,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 loaded.drr_baseline_text == "None"
                 or loaded.drr_mode_label == "DR/R Map"
             )
+            is_fitted = loaded.drr_baseline_text == 'Fitted (sample)'
             drr_assignments = [
                 item.to_dict() if hasattr(item, "to_dict") else dict(item)
                 for item in getattr(loaded, "drr_assignments", ())
             ]
-            if not drr_assignments and loaded.selected_files and not is_precomputed_map:
+            if not drr_assignments and loaded.selected_files and not is_precomputed_map and not is_fitted:
                 if loaded.drr_baseline_text == "Automatic":
                     resolved = resolve_drr_background_assignments(
                         folder, discover_drr_sources(folder), loaded.selected_files,
@@ -11351,6 +11409,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     "numerical_path": export_numerical_path,
                     **current_selection,
                 })
+            if is_fitted:
+                from core.drr_fitted_background import export_references
+                if not loaded.drr_fitted_references:
+                    raise ValueError('Fitted background is unavailable. Reload DRR before saving.')
+                background_files = export_references(folder, loaded.drr_fitted_references)
+                drr_processing.update(selection_method='fitted_sample',
+                    fitted_background_files=background_files)
+                log.emit(f'Exported {len(background_files)} fitted background matrix/matrices with fit metadata.')
             pair_requested = options.drr_raw_cube is not None and options.drr_raw_params is not None
             if pair_requested:
                 raw_product = options.drr_raw_cube
