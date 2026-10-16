@@ -65,7 +65,7 @@ WORKFLOWS = ["PL", "DRR", "Compare", "Power", "MCD", "MCD Peak Shift", "SHG", "T
 # intentionally excluded (for example Auto V, Display and VP).
 SAFE_EXPANDERS = {
     "PL": {"Measurement File", "Parameters", "Manual plot ranges", "Spectrum Analysis"},
-    "DRR": {"Data", "Parameters", "Manual plot ranges", "Spectrum Analysis"},
+    "DRR": {"More display settings", "Advanced derivative", "Single spectrum / fit"},
     "Compare": {"Data Selection", "Parameters", "Manual plot ranges"},
     "Power": {"Power Sweep Files", "Parameters", "Plot Setup", "Manual plot ranges"},
     "MCD": {"Source", "Correction", "Advanced", "Diagnostics", "Plot"},

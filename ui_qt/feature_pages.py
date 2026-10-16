@@ -50,6 +50,7 @@ from core.mcd_peak_export import (
 )
 from core.plotting import COMPARE_PANEL_ORDER
 from ui_qt.common import UI_METRICS, QComboBox, QDoubleSpinBox, QSpinBox, Worker
+from ui_qt.compact_spinbox import CompactDoubleSpinBox
 from ui_qt.fluent_ui.style import set_fluent_property
 from ui_qt.status_badge import StatusBadge
 from ui_qt.mcd_source_summary import McdSourceSummary
@@ -398,13 +399,8 @@ class FeatureTabsMixin:
     def _build_drr_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(6)
-
-        files = QGroupBox("Files")
-        files_layout = QVBoxLayout(files)
-        files_layout.setContentsMargins(6, 6, 6, 6)
-        files_layout.setSpacing(6)
 
         meas_row = QWidget()
         meas_grid = QGridLayout(meas_row)
@@ -424,7 +420,6 @@ class FeatureTabsMixin:
         meas_grid.setColumnStretch(0, 1)
         meas_grid.addWidget(self.drr_edit_measurements_btn, 1, 1)
         meas_grid.addWidget(self.drr_clear_measurements_btn, 1, 2)
-        files_layout.addWidget(meas_row)
 
         base_row = QWidget()
         self.drr_external_baseline_row = base_row
@@ -434,9 +429,6 @@ class FeatureTabsMixin:
         base_grid.setVerticalSpacing(4)
         self.drr_baseline_summary = QLabel("Using last frame")
         self.drr_baseline_summary.setWordWrap(True)
-        self.drr_baseline_summary.setFixedHeight(
-            2 * self.drr_baseline_summary.fontMetrics().lineSpacing() + 4
-        )
         self.drr_edit_baselines_btn = QPushButton("Select...")
         self.drr_edit_baselines_btn.setMinimumHeight(UI_METRICS["input_h"])
         self.drr_edit_baselines_btn.setMinimumWidth(110)
@@ -447,11 +439,9 @@ class FeatureTabsMixin:
         )
         self.drr_baseline_autofind_btn.setMinimumHeight(UI_METRICS["input_h"])
         self.drr_baseline_autofind_btn.setMaximumWidth(104)
-        base_grid.addWidget(self.drr_baseline_summary, 0, 0, 1, 3)
         base_grid.setColumnStretch(0, 1)
-        base_grid.addWidget(self.drr_edit_baselines_btn, 1, 1)
-        base_grid.addWidget(self.drr_baseline_autofind_btn, 1, 2)
-        files_layout.addWidget(base_row)
+        base_grid.addWidget(self.drr_edit_baselines_btn, 0, 1)
+        base_grid.addWidget(self.drr_baseline_autofind_btn, 0, 2)
 
         self.drr_baseline_combine_combo = QComboBox()
         self.drr_baseline_combine_combo.addItems(
@@ -461,28 +451,32 @@ class FeatureTabsMixin:
                 "Average all frames in each file, then average files",
             ]
         )
-        self.drr_baseline_combine_combo.setMaximumWidth(320)
+        self.drr_baseline_combine_combo.setMinimumWidth(0)
+        self.drr_baseline_combine_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self._style_combo_popup(self.drr_baseline_combine_combo)
-        files_layout.addWidget(self.drr_baseline_combine_combo)
+        base_grid.addWidget(self.drr_baseline_combine_combo, 1, 0, 1, 3)
         self.drr_pin_baseline_chk = QCheckBox("Keep background")
         self.drr_pin_baseline_chk.setAccessibleName("Pin background when measurement changes")
         self.drr_pin_baseline_chk.setToolTip(
             "Keep this manually selected background for another measurement group. "
             "The wavelength center and spectral grid are still validated."
         )
-        files_layout.addWidget(self.drr_pin_baseline_chk)
-        # Keep the baseline area stable while Self/External changes; the
-        # controller enables the applicable controls for the selected mode.
-        self.drr_external_baseline_row.setVisible(True)
-        self.drr_baseline_combine_combo.setVisible(True)
-        self.drr_pin_baseline_chk.setVisible(True)
+        base_grid.addWidget(self.drr_pin_baseline_chk, 2, 0, 1, 3)
+        self.drr_external_baseline_row.hide()
         self.drr_edit_baselines_btn.setEnabled(False)
         self.drr_baseline_autofind_btn.setEnabled(False)
         self.drr_baseline_combine_combo.setEnabled(False)
         self.drr_pin_baseline_chk.setEnabled(False)
-        layout.addWidget(self._make_expander("Data", files, expanded=True))
+        data = QGroupBox("Data")
+        data.setObjectName("drr_data_controls")
+        data.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Maximum)
+        self.drr_data_controls = data
+        data_layout = QVBoxLayout(data)
+        data_layout.setContentsMargins(4, 4, 4, 4)
+        data_layout.setSpacing(6)
+        data_layout.addWidget(meas_row)
 
-        params = QGroupBox("Plot Options")
+        params = QWidget()
         params.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         params_layout = QVBoxLayout(params)
         params_layout.setContentsMargins(6, 6, 6, 4)
@@ -503,20 +497,8 @@ class FeatureTabsMixin:
             "Advanced first derivative processing is labeled separately from the two standard DRR products."
         )
         _grid, spins, log_chk, clip_chk, cmap, fix_checks = self._build_common_range_grid("drr", "RdBu_r")
-        # d2E keeps its own two-region limits.  The panel is placed in a
-        # collapsed expander below the compact single-scale row so the
-        # derivative controls do not consume the narrow sidebar by default.
+        # Each product retains its existing independent color controls.
         self._build_split_scale_controls("drr_second")
-        # x0 and the boundary marker are global DRR controls.  The d2E panel
-        # keeps the state entries for serialization, but hides its duplicate
-        # row so users edit the single shared control above.
-        second_layout = self.drr_second_split_scale_panel.layout()
-        if isinstance(second_layout, QGridLayout):
-            for index in range(second_layout.count()):
-                item = second_layout.itemAt(index)
-                row, _column, _row_span, _column_span = second_layout.getItemPosition(index)
-                if row <= 1 and item.widget() is not None:
-                    item.widget().hide()
         self.drr_second_cmap = QComboBox()
         for index in range(cmap.count()):
             self.drr_second_cmap.addItem(cmap.itemText(index), cmap.itemData(index))
@@ -531,17 +513,13 @@ class FeatureTabsMixin:
             s.setMaximumWidth(120)
             s.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             s.setMinimumHeight(UI_METRICS["input_h"])
-        self.drr_baseline_combo.setMinimumWidth(210)
-        self.drr_baseline_combo.setMaximumWidth(320)
+        self.drr_baseline_combo.setMinimumWidth(0)
         self.drr_baseline_combo.setMinimumHeight(UI_METRICS["input_h"])
-        self.drr_baseline_combo.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.drr_baseline_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.drr_yaxis_controls = self._build_y_axis_controls("drr")
-        self.drr_yaxis_combo.setMinimumWidth(200)
-        self.drr_yaxis_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        cmap.setMinimumWidth(90)
-        cmap.setMaximumWidth(115)
+        self.drr_yaxis_combo.setMinimumWidth(0)
+        self.drr_yaxis_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         cmap.setMinimumHeight(UI_METRICS["input_h"])
-        cmap.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.drr_derivative_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.drr_derivative_combo.setMinimumContentsLength(3)
         self.drr_derivative_combo.setFixedWidth(UI_METRICS["deriv_combo_w"])
@@ -572,8 +550,8 @@ class FeatureTabsMixin:
         # sharing the DRR axis and cursor controls.  Keep these lightweight
         # fields close to the existing range controls so the values are part
         # of the normal plot snapshot and export request.
-        self.drr_second_vmin_spin = QDoubleSpinBox()
-        self.drr_second_vmax_spin = QDoubleSpinBox()
+        self.drr_second_vmin_spin = CompactDoubleSpinBox(significant_digits=4)
+        self.drr_second_vmax_spin = CompactDoubleSpinBox(significant_digits=4)
         self.drr_second_auto_scale = True
         for spin, value in ((self.drr_second_vmin_spin, -1.0), (self.drr_second_vmax_spin, 1.0)):
             spin.setDecimals(8)
@@ -583,11 +561,18 @@ class FeatureTabsMixin:
             spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             spin.setMinimumHeight(UI_METRICS["input_h"])
 
-        self.drr_second_controls = QGroupBox("Second derivative")
+        processing = QWidget()
+        processing_layout = QVBoxLayout(processing)
+        processing_layout.setContentsMargins(4, 4, 4, 4)
+        self.drr_second_controls = QGroupBox("Derivative processing")
+        # Calculate wrapped form height at the actual sidebar width, rather
+        # than the wider preferred width of the direction choices.
+        self.drr_second_controls.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         second_form = QFormLayout(self.drr_second_controls)
+        second_form.setContentsMargins(4, 6, 4, 6)
         second_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         second_form.setVerticalSpacing(UI_METRICS["row_spacing"])
-        second_note = QLabel("Side by side: left ΔR/R, right selected derivative.")
+        second_note = QLabel("Used for the derivative view and paired export.")
         second_note.setWordWrap(True)
         second_form.addRow(second_note)
         second_form.addRow(self.drr_sg_auto_chk)
@@ -595,10 +580,8 @@ class FeatureTabsMixin:
         from ui_qt.drr_mixed_controls import build as build_mixed_controls
         build_mixed_controls(self, second_form)
         second_form.addRow("Polynomial order", self.drr_sg_poly_spin)
-        second_form.addRow("Cmap", self.drr_second_cmap)
 
-        # DRR range actions are real push buttons so their readable content
-        # width participates in the dense row's metric-based packing.
+        # Keep the existing range actions and their signal bindings.
         self.drr_auto_v_btn = QPushButton()
         self.drr_second_auto_v_btn = QPushButton("Auto V")
         self.drr_auto_x_btn = QPushButton()
@@ -607,38 +590,24 @@ class FeatureTabsMixin:
         self.drr_center_zero_chk.setToolTip("When enabled, DRR colormap is centered at zero.")
         self.drr_center_zero_chk.setChecked(False)
 
-        # Config rows outside Axis Ranges — mirrors PL tab structure
-        cfg = QFormLayout()
-        cfg.setRowWrapPolicy(QFormLayout.WrapLongRows)
-        cfg.setHorizontalSpacing(6)
-        cfg.setVerticalSpacing(UI_METRICS["row_spacing"])
-        cfg.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        baseline_cmap_row = QWidget()
-        baseline_cmap_h = QVBoxLayout(baseline_cmap_row)
-        baseline_cmap_h.setContentsMargins(0, 0, 0, 0)
-        baseline_cmap_h.setSpacing(4)
-        baseline_cmap_h.addWidget(self.drr_baseline_combo)
+        background_form = QFormLayout()
+        background_form.setContentsMargins(0, 0, 0, 0)
+        background_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        background_form.addRow("Background", self.drr_baseline_combo)
+        data_layout.addLayout(background_form)
+        data_layout.addWidget(self.drr_baseline_summary)
+        data_layout.addWidget(base_row)
         self.drr_background_fit_btn = QPushButton('Fit / view background…')
         self.drr_background_fit_btn.setAccessibleName('Fit or inspect the DRR sample background')
         self.drr_background_fit_btn.setToolTip('Protect resonance regions, fit the sample background, and inspect it against raw spectra at each gate.')
         self.drr_background_fit_btn.clicked.connect(self._open_drr_fitted_background)
-        baseline_cmap_h.addWidget(self.drr_background_fit_btn)
-        drr_cmap_row = QWidget()
-        drr_cmap_h = QHBoxLayout(drr_cmap_row)
-        drr_cmap_h.setContentsMargins(0, 0, 0, 0)
-        drr_cmap_h.setSpacing(4)
-        drr_cmap_h.addWidget(QLabel("Cmap"))
+        data_layout.addWidget(self.drr_background_fit_btn)
+        self.drr_background_fit_btn.hide()
         cmap.setMinimumWidth(0)
+        cmap.setMaximumWidth(16777215)
         cmap.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        drr_cmap_h.addWidget(cmap, 1)
-        baseline_cmap_h.addWidget(drr_cmap_row)
-        _drr_yc_row = QWidget()
-        _drr_yc_h = QHBoxLayout(_drr_yc_row)
-        _drr_yc_h.setContentsMargins(0, 0, 0, 0)
-        _drr_yc_h.setSpacing(6)
-        _drr_yc_h.addWidget(self.drr_yaxis_combo, 1)
-        cfg.addRow("DRR Baseline", baseline_cmap_row)
-        cfg.addRow("Left Y-axis", _drr_yc_row)
+        self.drr_second_cmap.setMinimumWidth(0)
+        self.drr_second_cmap.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.drr_right_yaxis_combo = QComboBox()
         self.drr_right_yaxis_combo.setObjectName("drr_right_yaxis_combo")
         self.drr_right_yaxis_combo.setAccessibleName("Right Y-axis")
@@ -646,50 +615,54 @@ class FeatureTabsMixin:
         self.drr_right_yaxis_combo.setToolTip("Show a second coordinate scale from the same measured rows. Unavailable choices have no consistent one-to-one mapping.")
         self.drr_right_yaxis_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self._style_combo_popup(self.drr_right_yaxis_combo)
-        cfg.addRow("Right Y-axis", self.drr_right_yaxis_combo)
-        cfg.addRow("", self.drr_yaxis_advanced_box)
-        self._set_form_label_width(cfg, UI_METRICS["label_col_width"])
-        params_layout.addLayout(cfg)
 
         basic = QGroupBox("Axis Ranges")
         basic.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         basic_form = QFormLayout(basic)
         basic_form.setContentsMargins(
-            4,
+            0,
             UI_METRICS["group_margin"],
-            4,
+            0,
             UI_METRICS["group_margin"],
         )
         basic_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         basic_form.setHorizontalSpacing(4)
         basic_form.setVerticalSpacing(UI_METRICS["row_spacing"])
         basic_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        raw_colors = QWidget()
+        raw_form = QFormLayout(raw_colors)
+        raw_form.setContentsMargins(0, 0, 0, 0)
+        raw_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        raw_form.addRow("Color map", cmap)
+        from ui_qt.drr_sidebar import range_row
+        self.drr_single_color_row = range_row(
+            spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"],
+            self.drr_auto_v_btn, "Color", adaptive_step=True)
+        raw_form.addRow(self.drr_single_color_row)
+        raw_form.addRow(self.drr_split_scale_panel)
+        second_colors = QWidget()
+        second_color_form = QFormLayout(second_colors)
+        second_color_form.setContentsMargins(0, 0, 0, 0)
+        second_color_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        second_color_form.addRow("Color map", self.drr_second_cmap)
+        second_scale = range_row(
+            self.drr_second_vmin_spin, self.drr_second_vmax_spin, None, None,
+            self.drr_second_auto_v_btn, "Derivative color", adaptive_step=True)
+        self.drr_second_single_color_row = second_scale
+        second_color_form.addRow(second_scale)
+        second_color_form.addRow(self.drr_second_split_scale_panel)
         basic_form.addRow(
-            self._make_axis_range_row(spins["vmin"], spins["vmax"], fix_checks["vmin"], fix_checks["vmax"], self.drr_auto_v_btn, "Auto V", dense=True, label_text="vmin / vmax"),
-        )
-        second_scale = QWidget()
-        second_scale_h = QHBoxLayout(second_scale)
-        second_scale_h.setContentsMargins(0, 0, 0, 0)
-        second_scale_h.setSpacing(4)
-        second_scale_h.addWidget(QLabel("vmin"))
-        second_scale_h.addWidget(self.drr_second_vmin_spin, 1)
-        second_scale_h.addWidget(QLabel("vmax"))
-        second_scale_h.addWidget(self.drr_second_vmax_spin, 1)
-        second_scale_h.addWidget(self.drr_second_auto_v_btn)
-        second_form.addRow("Color limits", second_scale)
-        basic_form.addRow("Color scale", self.drr_region_count_combo)
-        basic_form.addRow(self.drr_split_scale_panel)
-        self.drr_second_split_expander = self._make_expander(
-            "Derivative split color scale", self.drr_second_split_scale_panel, expanded=False
-        )
-        second_form.addRow(self.drr_second_split_expander)
-        basic_form.addRow(
-            self._make_axis_range_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.drr_auto_x_btn, "Auto X", dense=True, label_text="xmin / xmax"),
+            range_row(spins["xmin"], spins["xmax"], fix_checks["xmin"], fix_checks["xmax"], self.drr_auto_x_btn, "X"),
         )
         basic_form.addRow(
-            self._make_axis_range_row(spins["ymin"], spins["ymax"], fix_checks["ymin"], fix_checks["ymax"], self.drr_auto_y_btn, "Auto Y", dense=True, label_text="ymin / ymax"),
+            range_row(spins["ymin"], spins["ymax"], fix_checks["ymin"], fix_checks["ymax"], self.drr_auto_y_btn, "Y"),
         )
-        basic_form.addRow("Cursor Gate", spins["gate"])
+        basic_form.addRow("Left Y-axis", self.drr_yaxis_combo)
+        basic_form.addRow(self.drr_yaxis_advanced_box)
+        # Retain the serialized value and signal bindings; the plot toolbar
+        # owns the only visible gate editor.
+        spins["gate"].setParent(tab)
+        spins["gate"].hide()
         flags = QWidget()
         flags_h = QVBoxLayout(flags)
         flags_h.setContentsMargins(0, 0, 0, 0)
@@ -697,8 +670,6 @@ class FeatureTabsMixin:
         flags_h.addWidget(log_chk)
         flags_h.addWidget(clip_chk)
         flags_h.addWidget(self.drr_center_zero_chk)
-        basic_form.addRow("Scale / Clip", flags)
-        self._set_form_label_width(basic_form, UI_METRICS["label_col_width"])
 
         analysis_box = QGroupBox("")
         analysis_form = QFormLayout(analysis_box)
@@ -787,23 +758,33 @@ class FeatureTabsMixin:
         self.drr_analysis_text.setPlaceholderText("Peak/fit results will appear here after detection.")
         analysis_form.addRow("", self.drr_analysis_text)
         set_fluent_property(self.drr_fit_status, "appRole", "fitStatus")
-        params_layout.addWidget(self.drr_second_controls)
+        processing_layout.addWidget(self.drr_second_controls)
         advanced = QWidget()
         advanced_form = QFormLayout(advanced)
         advanced_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         advanced_form.addRow("Derivative", self.drr_derivative_combo)
         advanced_form.addRow(self.drr_advanced_derivative_label)
-        advanced_note = QLabel("dE uses the same SG settings. Side by side always shows ΔR/R and d2E.")
+        advanced_note = QLabel("dE uses the same SG settings. Paired views keep ΔR/R on the left and the selected second derivative on the right.")
         advanced_note.setWordWrap(True)
         advanced_form.addRow(advanced_note)
-        params_layout.addWidget(self._make_expander("Advanced derivative", advanced, expanded=False))
+        processing_layout.addWidget(self._make_expander("Advanced derivative", advanced, expanded=False))
         from ui_qt.drr_display_memory import build_controls
         memory_controls = build_controls(self)
-        params_layout.addWidget(self._make_expander("Display memory", memory_controls, expanded=False))
+        params_layout.addWidget(basic)
+        from ui_qt.drr_sidebar import build_color_editor, build_sidebar
+        params_layout.addWidget(build_color_editor(self, raw_colors, second_colors))
+        more = QWidget()
+        more_form = QFormLayout(more)
+        more_form.setContentsMargins(0, 0, 0, 0)
+        more_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        more_form.addRow("Right Y-axis", self.drr_right_yaxis_combo)
+        more_form.addRow(flags)
+        more_form.addRow(memory_controls)
+        self.drr_fix_source_legend.setToolTip("Each Fix retains its current manual, wavelength-template, or saved-file scope.")
+        more_form.addRow(self.drr_fix_source_legend)
+        params_layout.addWidget(self._make_expander("More display settings", more, expanded=False))
         params_layout.addWidget(self.drr_memory_status)
-        params_layout.addWidget(self.drr_fix_source_legend)
-        params_layout.addWidget(self._make_expander("Manual plot ranges", basic, expanded=False))
-        layout.addWidget(self._make_expander("Parameters", params, expanded=True))
+        params_layout.addStretch(1)
         from ui_qt.drr_peak_analysis import DrrPeakAnalysisController
         self.drr_peak_analysis = DrrPeakAnalysisController(self)
         peak_controls = self.drr_peak_analysis.build_controls()
@@ -811,14 +792,9 @@ class FeatureTabsMixin:
         # its independent dataset workspace instead of duplicating visible panels.
         peak_controls.setParent(tab)
         peak_controls.hide()
-        analysis_entry = QPushButton("Add current DRR to Analysis…")
-        analysis_entry.clicked.connect(lambda: self._open_drr_analysis(add_current=True))
-        layout.addWidget(analysis_entry)
-        open_analysis = QPushButton("Open DRR Analysis workspace…")
-        open_analysis.clicked.connect(lambda: self._open_drr_analysis())
-        layout.addWidget(open_analysis)
-        layout.addWidget(self._make_expander("Single spectrum / fit", analysis_box, expanded=False))
-        layout.addStretch(1)
+        processing_layout.addWidget(self._make_expander("Single spectrum / fit", analysis_box, expanded=False))
+        processing_layout.addStretch(1)
+        build_sidebar(self, tab, data, params, processing)
         return tab
 
     def _build_compare_tab(self) -> QWidget:

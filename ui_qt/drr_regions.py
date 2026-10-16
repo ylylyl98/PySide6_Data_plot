@@ -1,7 +1,7 @@
 """Optional DRR three-region controls, automatic limits, and saved state."""
 import json
 import numpy as np
-from PySide6.QtWidgets import QCheckBox, QComboBox, QLabel, QToolButton
+from PySide6.QtWidgets import QCheckBox, QComboBox, QGridLayout, QLabel, QToolButton, QWidget
 from core.plotting import SplitColorScale, split_region_slices
 
 SETTINGS_KEY = 'drr/region_colors_json'
@@ -45,31 +45,31 @@ def build_panel(owner, prefix, grid, spins, fixes, boundary, left_auto, right_au
     setattr(owner, f'{prefix}_split_auto_middle_btn', middle_auto)
     middle_auto.clicked.connect(lambda: owner._auto_split_vrange(prefix, 'middle'))
     extra = []
-    grid.addWidget(QLabel('Boundary 1'), 0, 0)
-    grid.addWidget(spins['x0'], 0, 1, 1, 2)
-    grid.addWidget(fixes['x0'], 0, 3)
-    grid.addWidget(boundary, 1, 0, 1, 4)
+    # Shared X boundaries stay outside the product-specific color panels.
+    boundaries = QWidget(grid.parentWidget())
+    boundary_grid = QGridLayout(boundaries)
+    boundary_grid.setContentsMargins(0, 0, 0, 0)
+    boundary_grid.addWidget(QLabel('Boundary 1'), 0, 0)
+    boundary_grid.addWidget(spins['x0'], 0, 1, 1, 2)
+    boundary_grid.addWidget(fixes['x0'], 0, 3)
+    boundary_grid.addWidget(boundary, 2, 0, 1, 4)
     for column, widget in ((0, QLabel('Boundary 2')), (1, spins['x1']), (3, fixes['x1'])):
-        grid.addWidget(widget, 2, column, 1, 2 if column == 1 else 1)
+        boundary_grid.addWidget(widget, 1, column, 1, 2 if column == 1 else 1)
         extra.append(widget)
     if prefix == 'drr_second':
-        for widget in extra:
-            widget.hide()
+        boundaries.hide()
         extra = []  # Boundaries are shared; no duplicate controls in d2E.
-    for row, side, auto in ((3, 'left', left_auto), (6, 'middle', middle_auto), (9, 'right', right_auto)):
-        title = QLabel(side.title())
-        grid.addWidget(title, row, 0, 1, 3)
-        grid.addWidget(auto, row, 3)
-        widgets = [title, auto]
-        for offset, bound in ((1, 'min'), (2, 'max')):
-            key = f'{side}_v{bound}'
-            label = QLabel(bound)
-            grid.addWidget(label, row + offset, 0)
-            grid.addWidget(spins[key], row + offset, 1, 1, 2)
-            grid.addWidget(fixes[key], row + offset, 3)
-            widgets.extend((label, spins[key], fixes[key]))
+    else:
+        owner.drr_region_boundaries = boundaries
+    for row, side, auto in ((0, 'left', left_auto), (1, 'middle', middle_auto), (2, 'right', right_auto)):
+        # Use the same two-column editor as axes, retaining independent locks.
+        from ui_qt.drr_sidebar import range_row
+        editor = range_row(
+            spins[f'{side}_vmin'], spins[f'{side}_vmax'],
+            fixes[f'{side}_vmin'], fixes[f'{side}_vmax'], auto, side.title(), adaptive_step=True)
+        grid.addWidget(editor, row, 0)
         if side == 'middle':
-            extra.extend(widgets)
+            extra.append(editor)
     setattr(owner, f'{prefix}_three_region_widgets', extra)
     for widget in extra:
         widget.hide()
@@ -82,6 +82,8 @@ def sync_visibility(owner):
             widget.setVisible(triple)
         getattr(owner, f'{prefix}_split_scale_panel').setTitle(
             'Three X-Region Color Limits' if triple else 'Two X-Region Color Limits')
+    from ui_qt.drr_sidebar import sync_color_visibility
+    sync_color_visibility(owner)
 
 
 def select_count(owner):

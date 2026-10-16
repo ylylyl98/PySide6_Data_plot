@@ -67,6 +67,37 @@ DRR range changes reuse the current heatmap instead of rebuilding its axes,
 including two- and three-region linear maps whose split boundaries stay valid.
 Unchanged colorbars are retained during these updates.
 
+### DRR sidebar
+
+The sidebar keeps a standalone **Data** section above the **Display** and
+**Processing** pages. Measurement selection and background settings remain
+available while switching or scrolling either parameter page;
+external-file controls appear for External backgrounds, and the fit inspector
+appears for Fitted backgrounds. **Display** contains shared axis ranges and
+colors. **Processing** contains derivative/SG settings and single-spectrum fits;
+Y-window controls appear only for the mixed derivative.
+
+In Display → Colors, the **ΔR/R** and **Derivative** tabs select which color
+controls to edit without changing the plotted view. Each product retains its own color map and limits;
+region count and X boundaries are shared. Auto changes the selected product's
+unfixed limits. Minimum and maximum editors are side by side, with their Fix
+controls below them. **More display settings** contains the right Y axis,
+scale/clip options and display-memory preferences. Hidden controls retain their
+values for plotting and paired exports.
+
+DRR range editors show up to four significant digits when idle, using scientific
+notation for small values. Focusing an editor reveals its full configured
+precision. Formatting does not change the stored limits, calculations or exports.
+Color-limit arrows use approximately 0.5% of their own min/max span, rounded to
+a 1/2/5 step (for example, −100 to 100 steps by 1; −0.01 to 0.01 by 0.0001).
+Each product and each color region adapts independently, including after Auto
+or restoring a saved view. Steps never fall below the input's numeric resolution;
+equal bounds use their magnitude, or 0.01 when both are zero. Typing a number
+still commits that exact value at the editor's configured precision.
+
+Use the plot toolbar for Gate and previous/next steps. The **Analysis…** menu
+offers both adding the current DRR data and opening the analysis workspace.
+
 ### Remembering DRR display settings
 
 Successful DRR image saves remember the displayed X/Y and color ranges,
@@ -87,7 +118,7 @@ that same file. Reloading the current file preserves its unsaved manual edits.
 X limits, region count, and fixed boundaries travel together. Manual Y/color
 locks keep their existing priority. Fixing one axis keeps the saved zoom on the
 other axis. Templates with
-incompatible spectral coverage fall back to Auto. Open **Display memory**
+incompatible spectral coverage fall back to Auto. Open **Display → More display settings**
 in the DRR sidebar to disable either behavior, optionally reuse color
 limits, or share center templates across experiment folders. Color reuse and
 sharing are off by default. **Lock X range across files** is also off by default;

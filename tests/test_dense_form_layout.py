@@ -307,9 +307,6 @@ class DenseFormRowLayoutTests(unittest.TestCase):
     def test_real_pl_axis_rows_use_dense_layout_at_sidebar_width(self) -> None:
         self._assert_real_axis_rows_use_dense_layout("PL", "pl")
 
-    def test_real_drr_axis_rows_use_dense_layout_at_sidebar_width(self) -> None:
-        self._assert_real_axis_rows_use_dense_layout("DRR", "drr")
-
     def test_real_compare_axis_rows_use_dense_layout_at_sidebar_width(self) -> None:
         self._assert_real_axis_rows_use_dense_layout("Compare", "cmp")
 

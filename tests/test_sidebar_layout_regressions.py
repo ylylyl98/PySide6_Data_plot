@@ -180,13 +180,14 @@ class SidebarLayoutRegressionTests(unittest.TestCase):
     def test_drr_flags_keep_checkbox_content_inside_compact_form(self) -> None:
         window = self._window("DRR", 320)
         try:
-            self._expand(window, "Manual plot ranges")
+            window.drr_sidebar_tabs.setCurrentIndex(0)
+            self._expand(window, "More display settings")
             for width in (320, 380):
                 window.workspace_splitter.setSizes([width, max(1, window.workspace_splitter.width() - width)])
                 self.app.processEvents()
                 flags = window.drr_center_zero_chk.parentWidget()
                 self.assertIsNotNone(flags)
-                window.drr_tab_scroll.ensureWidgetVisible(flags)
+                window.drr_display_tab_scroll.ensureWidgetVisible(flags)
                 self.app.processEvents()
                 checkboxes = flags.findChildren(QCheckBox, options=Qt.FindDirectChildrenOnly)
                 self.assertEqual({check.text() for check in checkboxes}, {"Log Scale", "Clip Outliers", "Center Zero"})
@@ -208,6 +209,12 @@ class SidebarLayoutRegressionTests(unittest.TestCase):
                     window.drr_edit_baselines_btn,
                     window.drr_baseline_autofind_btn,
                 ):
+                    # Data commands stay above both parameter pages; lay out
+                    # the applicable External recipe before checking geometry.
+                    window.drr_baseline_combo.setCurrentText("External")
+                    self.app.processEvents()
+                    window.drr_data_controls.layout().activate()
+                    self.app.processEvents()
                     parent = button.parentWidget()
                     self.assertIsNotNone(parent)
                     self.assertTrue(
@@ -215,6 +222,8 @@ class SidebarLayoutRegressionTests(unittest.TestCase):
                         f"{button.text()} rect={button.geometry()} parent={parent.geometry()} contents={parent.contentsRect()}",
                     )
                     self.assertGreaterEqual(button.height(), button.sizeHint().height(), button.text())
+                window.drr_sidebar_tabs.setCurrentIndex(0)
+                self.app.processEvents()
                 for control in (
                     window.drr_baseline_combo,
                     window.drr_cmap,
@@ -234,6 +243,7 @@ class SidebarLayoutRegressionTests(unittest.TestCase):
     def test_drr_external_and_sg_controls_fit_conditionally_at_compact_width(self) -> None:
         window = self._window("DRR", 320)
         try:
+            window.drr_sidebar_tabs.setCurrentIndex(0)
             window.drr_baseline_combo.setCurrentText("External")
             window.drr_derivative_combo.setCurrentText("dE")
             self.app.processEvents()
@@ -255,11 +265,15 @@ class SidebarLayoutRegressionTests(unittest.TestCase):
                     window.drr_sg_window_spin,
                     window.drr_sg_poly_spin,
                 ):
+                    window.drr_sidebar_tabs.setCurrentIndex(0 if control is pin else 1)
+                    self.app.processEvents()
+                    self.app.processEvents()
                     description = control.objectName() or getattr(control, "text", lambda: "")()
                     self.assertTrue(control.isVisible(), description)
                     parent = control.parentWidget()
                     self.assertIsNotNone(parent)
-                    self.assertTrue(parent.contentsRect().contains(control.geometry()))
+                    self.assertTrue(parent.contentsRect().contains(control.geometry()),
+                                    f"{description}: {control.geometry()} in {parent.contentsRect()}")
         finally:
             self._close_window(window)
 

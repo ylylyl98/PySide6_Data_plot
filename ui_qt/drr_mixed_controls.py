@@ -29,12 +29,19 @@ def build(owner, form):
     form.addRow(owner.drr_sg_y_auto_chk)
     form.addRow('Y window points', owner.drr_sg_y_window_spin)
     form.addRow(owner.drr_mixed_recommendation)
+    owner.drr_mixed_controls_form = form
+    for widget in (owner.drr_sg_y_auto_chk, owner.drr_sg_y_window_spin,
+                   owner.drr_mixed_recommendation):
+        form.setRowVisible(widget, False)
     owner.drr_sg_y_auto_chk.setEnabled(False)
     owner.drr_sg_y_window_spin.setEnabled(False)
 
 
 def update(owner):
     active = enabled(owner)
+    for widget in (owner.drr_sg_y_auto_chk, owner.drr_sg_y_window_spin,
+                   owner.drr_mixed_recommendation):
+        owner.drr_mixed_controls_form.setRowVisible(widget, active)
     owner.drr_sg_auto_chk.setToolTip(
         'Mixed mode: recommend an X window from noise and detected feature widths.' if active
         else 'Use 11 points for up to 512 energy samples, otherwise 21; limited to available samples.')
