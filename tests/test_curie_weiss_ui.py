@@ -161,10 +161,46 @@ class CurieWeissUiTests(unittest.TestCase):
                 with (destination/'points.csv').open(encoding='utf-8-sig') as handle:
                     self.assertEqual(len(list(csv.DictReader(handle))), 8)
                 self.assertTrue((destination/'fit.png').is_file())
+                self.assertEqual(saved['mcd_curves_index'], 'MCD_vs_B/index.csv')
+                with (destination/saved['mcd_curves_index']).open(encoding='utf-8-sig') as handle:
+                    curves = list(csv.DictReader(handle))
+                self.assertEqual(len(curves), 4)
+                self.assertEqual({float(row['temperature_K']) for row in curves}, {6., 9., 15., 25.})
+                for row in curves:
+                    with (destination/'MCD_vs_B'/row['csv_file']).open(encoding='utf-8-sig') as handle:
+                        samples = list(csv.DictReader(handle))
+                    self.assertEqual(len(samples), 3)
+                    self.assertEqual([float(s['B_decreasing_T']) for s in samples], [.2, 0., -.2])
                 panel.t_min.setValue(20)
                 panel.refit()
                 self.assertFalse(panel.results)
                 self.assertFalse(panel.export_btn.isEnabled())
+            finally:
+                panel.close()
+                panel.deleteLater()
+
+    def test_curve_export_uses_selected_group_and_measured_temperature_with_saved_slopes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            rr = records(Path(folder))
+            other = replace(rr[0], record_id='other', center_ev=1.61)
+            panel = CurieWeissPanel()
+            try:
+                panel.set_series('s', rr + [other],
+                    {**{r.record_id: 'Group 1' for r in rr}, 'other': 'Group 2'}, ('B decreasing',))
+                panel.temperature_combo.setCurrentIndex(panel.temperature_combo.findData('measured'))
+                panel.t_min.setValue(6)
+                panel.t_max.setValue(16)
+                target = panel.export_to(Path(folder))
+                self.assertFalse(panel.field_refit_chk.isChecked())
+                with (target/'MCD_vs_B'/'index.csv').open(encoding='utf-8-sig') as handle:
+                    curves = list(csv.DictReader(handle))
+                self.assertEqual({float(row['temperature_K']) for row in curves}, {6.01, 9.01, 15.01})
+                self.assertEqual({row['energy_group'] for row in curves}, {'Group 1'})
+                self.assertNotIn('other', {row['record_id'] for row in curves})
+                for row in curves:
+                    with (target/'MCD_vs_B'/row['csv_file']).open(encoding='utf-8-sig') as handle:
+                        reader = csv.DictReader(handle)
+                        self.assertEqual(reader.fieldnames, ['B_decreasing_T', 'MCD_decreasing'])
             finally:
                 panel.close()
                 panel.deleteLater()
@@ -269,6 +305,17 @@ class CurieWeissUiTests(unittest.TestCase):
                 self.assertEqual(first['field_point_count'], 7)
                 self.assertTrue((target/'field_points.csv').is_file())
                 self.assertTrue((target/'field_fit_preview.png').is_file())
+                with (target/'MCD_vs_B'/'index.csv').open(encoding='utf-8-sig') as handle:
+                    curves = list(csv.DictReader(handle))
+                self.assertEqual(len(curves), len(r))
+                with (target/'MCD_vs_B'/curves[0]['csv_file']).open(encoding='utf-8-sig') as handle:
+                    curve = list(csv.DictReader(handle))
+                with r[0].trace_path.open() as handle:
+                    original = list(csv.DictReader(handle))
+                self.assertEqual(len(curve), len(original))
+                for actual, expected in zip(curve, original):
+                    self.assertAlmostEqual(float(actual['MCD_increasing']),
+                                           float(expected['corrected_signed_mean_increasing']))
                 panel.b_min.setValue(-.05)
                 panel.b_max.setValue(.05)
                 panel.refit()

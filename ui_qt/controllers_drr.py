@@ -476,6 +476,8 @@ class DrrController:
         return None
 
     def _restore_saved_drr_recipe(self, resolved: DrrBackgroundResolution | None = None) -> bool:
+        if self.drr_baseline_combo.currentText() == 'Fitted (sample)':
+            return False
         if resolved is None:
             resolved = resolve_drr_background_assignments(
                 self.current_folder, self.drr_available_sources, self.drr_selected_files,
@@ -735,6 +737,8 @@ class DrrController:
         text = self.drr_baseline_combo.currentText()
         if text == "Self (first frame)":
             return "self_first"
+        if text == 'Fitted (sample)':
+            return 'fitted_sample'
         if text == "External":
             return f"external_{self.drr_baseline_combine_combo.currentText()}"
         return "self_last"
@@ -769,6 +773,7 @@ class DrrController:
             "clip": bool(self.drr_clip_chk.isChecked()),
             "center_zero": bool(self.drr_center_zero_chk.isChecked()),
             "drr_assignments": assignments,
+            "fitted_settings": getattr(self, '_drr_fitted_settings', {}),
         }
 
     def _is_drr_gate_only_change(self, new_key: tuple) -> bool:
@@ -874,7 +879,7 @@ class DrrController:
             self._drr_assignments_automatic = False
             self.drr_baseline_combine_combo.setEnabled(True)
             self.drr_pin_baseline_chk.setEnabled(True)
-            if self.drr_baseline_combo.currentText().startswith("Self"):
+            if self.drr_baseline_combo.currentText().startswith("Self") or self.drr_baseline_combo.currentText() == 'Fitted (sample)':
                 self.drr_baseline_files_manual = []
                 self.drr_baseline_files_found = []
                 blocked = self.drr_pin_baseline_chk.blockSignals(True)
@@ -1004,7 +1009,16 @@ class DrrController:
             if self.drr_selected_files
             else "No measurement files selected."
         )
-        if self.drr_baseline_combo.currentText().startswith("Self"):
+        if self.drr_baseline_combo.currentText() == 'Fitted (sample)':
+            loaded = self.loaded
+            references = (getattr(loaded, 'drr_fitted_references', ()) if loaded
+                and list(loaded.selected_files) == self.drr_selected_files else ())
+            warnings = [f'{ref.source}: {message}' for ref in references for message in ref.diagnostics.get('warnings', ())]
+            count = sum(bool(ref.diagnostics.get('warnings')) for ref in references)
+            self.drr_baseline_summary.setText('Background fitted from sample spectra' + (f' · {count} need review' if count else ''))
+            self.drr_baseline_summary.setToolTip('\n'.join(warnings) if warnings else
+                'No external reference. Use Fit / view background to protect resonances and inspect the fitted denominator.')
+        elif self.drr_baseline_combo.currentText().startswith("Self"):
             frame = "first" if "first" in self.drr_baseline_combo.currentText() else "last"
             self.drr_baseline_summary.setText(f"Using {frame} frame")
             self.drr_baseline_summary.setToolTip(
@@ -1086,10 +1100,11 @@ class DrrController:
                 self._clear_loaded_drr_view()
                 self._start_auto_external()
                 return
-            resolution = resolve_drr_background_assignments(
-                self.current_folder, self.drr_available_sources, selected,
-            )
-            self._restore_saved_drr_recipe(resolution)
+            if self.drr_baseline_combo.currentText() != 'Fitted (sample)':
+                resolution = resolve_drr_background_assignments(
+                    self.current_folder, self.drr_available_sources, selected,
+                )
+                self._restore_saved_drr_recipe(resolution)
         self._update_drr_selection_labels()
         if measurement_changed:
             self._clear_loaded_drr_view()

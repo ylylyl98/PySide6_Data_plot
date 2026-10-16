@@ -748,6 +748,95 @@ calling those helpers directly is separate from the normal GUI workflow.
 - `DRR`:
   - `Self (last/first frame)` baseline modes.
   - `External` baseline mode from selected baseline files.
+  - `Fitted (sample)`: select original CSV measurements and choose this baseline
+    to fit and apply the background automatically. On first use, peak protection
+    is estimated separately at each gate of each file, combining 35 and
+    70 meV feature screens. A moving peak only excludes that gate's data, rather
+    than removing its entire swept energy band from every gate. The shared
+    envelope and per-gate intensity/tilt are fitted alternately using these masks.
+    **Fit / view background…** shows the actual applied background, its smooth
+    envelope, and the current gate's protection, with raw-spectrum overlay.
+    To adjust protection, uncheck **Automatically protect peaks at each gate**;
+    this preserves the union of all detected gate regions as manual protection.
+    Then edit resonance intervals in eV (for example,
+    `1.56 1.64; 1.69 1.77`) or enable **Drag to protect a region**. Choose
+    **Fit preview**, inspect the result, then **Use in DRR** to apply the edit.
+    Automatic protection adapts when source data changes; manual recipes retain
+    their explicit intervals. Broad or weak features may still need manual
+    correction. If no narrow features are detected, the smooth fit is applied
+    with a review note; insufficient background support stops the fit.
+    This mode fits a robust shared cubic spline in log intensity outside the
+    protected regions, with a gain and linear energy tilt for each gate. It
+    computes `I / B_fit - 1` per measurement before averaging; existing SG
+    smoothing and derivative controls then operate on that result. No BN file
+    or additional dark subtraction is used. Original intensities must be finite
+    and positive, and protected regions must leave sufficient background support.
+    A good residual outside peaks does not establish background accuracy under
+    the protected peaks; inspect changes with different protection/smoothing.
+    - **Correct shared fine texture (learned outside peaks)** estimates a
+      weak multiplicative spectral response from unprotected data. It requires
+      at least 12 gates. At each energy, the available unprotected gates are
+      split into lower and upper groups in gate order; each needs at least six
+      gates and 15% of the scan, with local agreement between the groups.
+      Each spectrum is detrended on its measured energy coordinates over
+      35 meV before pooling, without interpolating across protected bands.
+      This retains support when a moving peak blocks one fixed half of a scan.
+      The template
+      is learned outside each gate's protection, then applied at supported
+      energies to every gate, including gates with a protected peak there. Unsupported
+      regions receive no correction; transitions taper smoothly. This does not
+      change the SG derivative window. Uncheck it and choose **Fit preview** to
+      compare with the smooth envelope alone. **Shared texture correction (%)**
+      displays the applied response. **Texture coverage** shows the applied
+      weight (0% means no correction, 100% means the full template) alongside
+      the fraction of unprotected gates; grey regions receive no correction.
+      Coverage is not a confidence score. Persistent stripes in unsupported
+      bands cannot be identified reliably from this sample alone.
+      Weak stationary sample features can be
+      indistinguishable from instrument response: protect them manually or leave
+      this correction disabled. Strong automatically detected stationary peaks
+      remain protected. No fitted texture is extrapolated through missing support.
+    **Save both** also writes the actual background matrices and fit parameters
+    to `Processed Data/DRR/Fitted Backgrounds`, including the applied texture and
+    protection at each gate, with links in the DRR metadata.
+    - **Save template / Load template** reuses a named recipe for similar
+      measurement conditions. Templates contain protection and model settings,
+      never the fitted intensity. **Only this file** overrides protection for
+      one source while keeping a common model for the group. Loading a template
+      replaces the group's protection and clears its per-file overrides.
+    - Every opened raw file is screened across all gates for positive and
+      negative narrow features. **Check all files** fits/checks the selected
+      group in the background and lists residuals, review notes, and the worst
+      gate. Double-click a row to inspect it. **Add suggested regions** merges
+      suggestions into that file's protection without shrinking existing regions;
+      it never changes other files. Refit and inspect before applying. Screening
+      is heuristic (35 meV local quadratic, an energy-dependent noise threshold,
+      repeated-gate or strong single-gate features, and 5 meV margins),
+      so broad or weak resonances can be missed. `Checked` is not proof of the
+      background under peaks. Fit diagnostics are retained in exported metadata.
+    - **Compare methods** overlays the current file's robust spline and a
+      degree 2–4 polynomial in log intensity, using identical protection. The
+      plot can switch to both second derivatives with the same SG settings
+      captured when the dialog opens. It reports background differences and
+      prediction errors on up to three held-out anchor bands using up to nine
+      representative gates. This comparison does not automatically change the
+      group's chosen method or establish uncertainty inside protected regions.
+    - Compact fits and quality checks are cached locally across app restarts,
+      keyed by source identity, intensity/coordinate contents, axis, complete
+      fitting settings, and algorithm version. Gate, color, and derivative-view
+      changes do not refit backgrounds. The disposable cache is bounded to
+      256 entries / 128 MiB in the user's application cache directory; missing,
+      corrupt, or unwritable cache entries fall back to fitting. Original CSVs
+      are unchanged; reading/parsing files can still take time on a cache hit.
+    - Per-gate gain/tilt fits run in bounded batches, retaining independent
+      robust weights and convergence for every gate. During the current session,
+      protection-independent feature screening and held-out validation scores
+      are also reused by data content and relevant parameters. Changing only
+      protection rechecks existing feature candidates against the new regions;
+      changing SG settings recalculates derivatives while reusing valid scores.
+      Each review cache holds at most 128 small results / 2 MiB, without retaining
+      raw spectra. Temporary held-out fits calculate predictions; full model
+      fits retain all-gate quality checks.
 - `MCD`: load one B-sweep CSV with numeric `B_T`, angle, and wavelength columns.
   The tab pairs opposite-angle frames, subtracts optional angle-specific dark/offset
   spectra, normalizes each angle with its own near-zero-field reference, and shows

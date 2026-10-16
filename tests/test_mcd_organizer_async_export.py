@@ -115,7 +115,7 @@ class McdOrganizerAsyncExportTests(unittest.TestCase):
                 series.fixed_conditions["Temperature"] = 99.0
                 original_record.acquisition_conditions["E-field"] = (99.0, 100.0)
                 window.palette_combo.setCurrentIndex(window.palette_combo.findData("plasma"))
-                window.export_csv_chk.setChecked(True)
+                window.export_csv_chk.setChecked(False)
                 release.set()
                 self._pump_until(lambda: window._export_worker is None)
 
@@ -124,7 +124,7 @@ class McdOrganizerAsyncExportTests(unittest.TestCase):
                 self.assertEqual(folder_name, str(root))
                 self.assertEqual(records[0].acquisition_conditions["E-field"], (0.0, 0.0))
                 self.assertEqual(options["palette"], "tab10")
-                self.assertFalse(options["export_csv"])
+                self.assertTrue(options["export_csv"])
                 self.assertEqual(options["series_groups"][0].fixed_conditions["Temperature"], 4.0)
                 self.assertEqual(window.selection_summary.text(), "Export complete")
                 message.assert_called_once()

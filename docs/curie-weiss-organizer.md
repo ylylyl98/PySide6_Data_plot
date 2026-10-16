@@ -40,6 +40,32 @@ or controls clears the scan so outdated results are not displayed.
    saves the displayed temperature's branch plots. The selected record ID is
    recorded in JSON. Original experimental files are not overwritten.
 
+## Export each temperature's MCD–B curve
+
+**Save CW fit…** also writes `MCD_vs_B/index.csv` and one curve CSV per included
+record in the selected energy group and temperature interval. This works with
+saved slopes as well as refitted slopes. `points.csv` remains the slope-versus-T
+table; the new files contain the complete processed MCD–B curves, including
+points outside the B fit interval. They contain the corrected signed-mean MCD
+used by the preview, not the raw optical spectra.
+
+Each curve CSV has independent `B_increasing_T`, `MCD_increasing` and/or
+`B_decreasing_T`, `MCD_decreasing` pairs for the enabled branches. Native sweep
+order, unequal field grids and repeated measurements are preserved; no field
+interpolation or temperature averaging is performed. The index lists relative
+CSV paths, record IDs, assigned groups, catalog/setpoint/measured temperatures,
+doping, E-field, bias, window center/width, point counts and source paths.
+With **Measured T only**, filenames and `temperature_K` use measured T.
+
+For **Export selected series**, leave **MCD–B CSVs (all + per condition)**
+checked (the default). In addition to the existing branch-wide CSVs and Excel
+workbooks, this creates a timestamped `MCD_vs_B_…` folder with the same index and
+individual CSV structure. Temperature and E-field exports stay in their separate
+`Temperature_dependence` and `Efield_dependence` folders. Included records and
+manual energy-group assignments are respected; different series remain
+distinguished in the group labels. Unchecking CSV output retains workbook/plot
+export. Neither export changes the slopes or CW fits.
+
 The temperature source defaults to the Organizer's setpoint/catalog value.
 **Measured T only** uses measured temperatures without silently substituting
 setpoints. Assumed default temperatures and missing measurements are omitted.

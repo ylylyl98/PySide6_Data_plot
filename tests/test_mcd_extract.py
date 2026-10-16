@@ -413,6 +413,13 @@ class McdExtractTests(unittest.TestCase):
             self.assertIn("decreasing_csv", paths)
             self.assertIn("_Increasing.csv", paths["increasing_csv"].name)
             self.assertIn("_Decreasing.csv", paths["decreasing_csv"].name)
+            index = paths['mcd_curves_index_csv']
+            row = pd.read_csv(index).iloc[0]
+            curve = pd.read_csv(index.parent/row['csv_file'])
+            self.assertEqual(list(curve['B_increasing_T']), [-.2, 0., .2])
+            self.assertEqual(list(curve['B_decreasing_T']), [.2, 0., -.2])
+            manifest = json.loads(paths['settings'].read_text(encoding='utf-8'))
+            self.assertIn(index.relative_to(paths['settings'].parent).as_posix(), manifest['outputs'])
             table = origin_branch_table([record], "B increasing", "Source")
             self.assertTrue(any(column.endswith("_B_T") for column in table.columns))
             self.assertTrue(any(column.endswith("_MCD") for column in table.columns))
@@ -454,6 +461,31 @@ class McdExtractTests(unittest.TestCase):
                                            branches=('B increasing',), slope_metrics=())
                 self.assertTrue(all(path.parent == root/'exports'/name for path in paths.values()))
                 self.assertTrue(all(path.is_file() for path in paths.values()))
+
+    def test_dependency_csvs_include_only_selected_records_and_keep_assigned_groups(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for t in (2., 4.):
+                for f in (0., 1.):
+                    self._write_result(root, f't{t}f{f}', energy=1.65, doping=2.,
+                                       efield=f, temperature=t)
+            records = discover_processed_mcd(root)
+            selected = records[1:]  # An excluded record must not reappear.
+            assignments = {r.record_id: f'Series {i+1} / Group 3' for i, r in enumerate(selected)}
+            for variable, name in [('Temperature', 'Temperature_dependence'),
+                                   ('E-field', 'Efield_dependence')]:
+                series = organize_mcd_series(records, variable)
+                paths = export_mcd_extract(selected, root/'exports', series_groups=series,
+                    export_csv=True, energy_groups=assignments,
+                    branches=('B decreasing',), slope_metrics=())
+                index = paths['mcd_curves_index_csv']
+                self.assertEqual(index.parent.parent, root/'exports'/name)
+                rows = pd.read_csv(index)
+                self.assertEqual(set(rows['record_id']), set(assignments))
+                self.assertEqual(set(rows['energy_group']), set(assignments.values()))
+                for path in rows['csv_file']:
+                    curve = pd.read_csv(index.parent/path)
+                    self.assertEqual(list(curve), ['B_decreasing_T', 'MCD_decreasing'])
 
 
 if __name__ == "__main__":
