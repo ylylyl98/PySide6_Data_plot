@@ -135,13 +135,18 @@ class SplitScaleControlTests(unittest.TestCase):
             tab_index = next(i for i in range(self.window.tabs.count()) if self.window.tabs.tabText(i) == mode)
             self.window.tabs.setCurrentIndex(tab_index)
             scroll = getattr(self.window, f"{prefix}_tab_scroll")
+            if prefix == "drr":
+                self.window.drr_sidebar_tabs.setCurrentIndex(0)
+                self.window.drr_color_tabs.setCurrentIndex(0)
+                scroll = self.window.drr_display_tab_scroll
             manual_heads = [
                 button
                 for button in scroll.widget().findChildren(QToolButton)
                 if button.text() == "Manual plot ranges"
             ]
-            self.assertEqual(len(manual_heads), 1)
-            manual_heads[0].setChecked(True)
+            self.assertEqual(len(manual_heads), 0 if prefix == "drr" else 1)
+            if manual_heads:
+                manual_heads[0].setChecked(True)
             scroll.widget().layout().activate()
             self.app.processEvents()
             axis_box = next(
@@ -163,7 +168,7 @@ class SplitScaleControlTests(unittest.TestCase):
                 self.assertIs(row, first_fix.parentWidget())
                 self.assertIs(row, second_fix.parentWidget())
                 self.assertIs(row, auto.parentWidget())
-                self.assertTrue(axis_box.contentsRect().contains(row.geometry()))
+                self.assertTrue(row.parentWidget().contentsRect().contains(row.geometry()))
                 self.assertGreater(row.width(), 0)
 
                 row_widgets = [
@@ -172,11 +177,17 @@ class SplitScaleControlTests(unittest.TestCase):
                     if row.layout().itemAt(index).widget() is not None
                     and row.layout().itemAt(index).widget().isVisible()
                 ]
+                if prefix == "drr":
+                    row_widgets = [widget for widget in row.findChildren(
+                        QWidget, options=Qt.FindDirectChildrenOnly) if widget.isVisible()]
                 expected_widgets = [first, first_fix, second, second_fix, auto]
                 label_widget = row.layout().labelWidget() if hasattr(row.layout(), "labelWidget") else None
                 if label_widget is not None and label_widget.isVisible():
                     expected_widgets.insert(0, label_widget)
-                self.assertEqual(row_widgets[:len(expected_widgets)], expected_widgets)
+                if prefix == "drr":
+                    self.assertTrue(set(expected_widgets).issubset(row_widgets))
+                else:
+                    self.assertEqual(row_widgets[:len(expected_widgets)], expected_widgets)
                 for child in row_widgets:
                     self.assertTrue(row.contentsRect().contains(child.geometry()))
                 self.assertLessEqual(
@@ -194,7 +205,7 @@ class SplitScaleControlTests(unittest.TestCase):
                 )
                 self.assertGreaterEqual(first_fix.width(), first_fix.minimumSizeHint().width())
                 self.assertTrue(row.contentsRect().contains(auto.geometry()))
-                self.assertTrue(axis_box.contentsRect().contains(row.geometry()))
+                self.assertTrue(row.parentWidget().contentsRect().contains(row.geometry()))
 
                 if prefix == "power":
                     themed_min_height = max(
@@ -248,6 +259,10 @@ class SplitScaleControlTests(unittest.TestCase):
             tab_index = next(i for i in range(self.window.tabs.count()) if self.window.tabs.tabText(i) == mode)
             self.window.tabs.setCurrentIndex(tab_index)
             page = self.window.tabs.widget(tab_index)
+            if prefix == "drr":
+                self.window.drr_sidebar_tabs.setCurrentIndex(0)
+                self.window.drr_color_tabs.setCurrentIndex(0)
+                self.window.drr_region_count_combo.setCurrentIndex(0)
             head = next((button for button in page.findChildren(QToolButton) if button.text() == "Manual plot ranges"), None)
             if head is not None:
                 head.setChecked(True)
@@ -978,17 +993,24 @@ class SplitScaleControlTests(unittest.TestCase):
 
         # The themed compact page may need vertical scrolling, but every
         # visible control remains reachable without horizontal clipping.
-        for control in (
-            self.window.drr_baseline_combo,
-            self.window.drr_yaxis_combo,
-            self.window.drr_derivative_combo,
+        for page, control in (
+            (None, self.window.drr_baseline_combo),
+            (0, self.window.drr_yaxis_combo),
+            (1, self.window.drr_derivative_combo),
         ):
-            scroll.ensureWidgetVisible(control)
+            if page is not None:
+                self.window.drr_sidebar_tabs.setCurrentIndex(page)
+            if page == 1:
+                for button in self.window.drr_processing_tab_scroll.findChildren(QToolButton):
+                    if button.text() == "Advanced derivative":
+                        button.setChecked(True)
+            page_scroll = scroll if page is None else self.window.drr_sidebar_tabs.currentWidget()
+            page_scroll.ensureWidgetVisible(control)
             self.app.processEvents()
-            top_left = control.mapTo(scroll.viewport(), control.rect().topLeft())
-            bottom_right = control.mapTo(scroll.viewport(), control.rect().bottomRight())
-            self.assertTrue(scroll.viewport().rect().contains(top_left))
-            self.assertTrue(scroll.viewport().rect().contains(bottom_right))
+            top_left = control.mapTo(page_scroll.viewport(), control.rect().topLeft())
+            bottom_right = control.mapTo(page_scroll.viewport(), control.rect().bottomRight())
+            self.assertTrue(page_scroll.viewport().rect().contains(top_left))
+            self.assertTrue(page_scroll.viewport().rect().contains(bottom_right))
 
     def test_workflow_navigation_is_above_the_collapsible_sidebar(self) -> None:
         self.assertFalse(self.window.tabs.tabBar().isVisible())

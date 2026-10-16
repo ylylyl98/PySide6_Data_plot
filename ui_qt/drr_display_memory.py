@@ -223,7 +223,7 @@ def wire_controls(owner):
     for button, keys in (
         (owner.drr_auto_x_btn, ('axis.xmin', 'axis.xmax')),
         (owner.drr_auto_y_btn, ('axis.ymin', 'axis.ymax')),
-        (owner.drr_auto_v_btn, ('axis.vmin', 'axis.vmax', 'second_min', 'second_max')),
+        (owner.drr_auto_v_btn, ('axis.vmin', 'axis.vmax')),
         (owner.drr_second_auto_v_btn, ('second_min', 'second_max')),
     ):
         button.clicked.connect(lambda _on=False, names=keys: [release(owner, key, manual_edit=False) for key in names])

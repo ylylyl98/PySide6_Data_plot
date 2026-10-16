@@ -175,6 +175,7 @@ from ui_qt.common import (
     focused_numeric_input,
 )
 from ui_qt.drr_display_memory import guarded_auto, second_is_protected
+from ui_qt.compact_spinbox import CompactDoubleSpinBox
 
 
 class _OwnedRunnable(QRunnable):
@@ -1734,7 +1735,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         grid.setVerticalSpacing(6)
 
         def spin() -> QDoubleSpinBox:
-            s = QDoubleSpinBox()
+            s = CompactDoubleSpinBox(significant_digits=4) if prefix == 'drr' else QDoubleSpinBox()
             s.setDecimals(4)
             s.setRange(-1e12, 1e12)
             s.setSingleStep(0.1)
@@ -1853,7 +1854,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         toggle.setToolTip("Use independent color limits on the two sides of x0.")
 
         def split_spin() -> QDoubleSpinBox:
-            spin = QDoubleSpinBox()
+            spin = (CompactDoubleSpinBox(significant_digits=4)
+                    if prefix in {'drr', 'drr_second'} else QDoubleSpinBox())
             spin.setDecimals(6)
             spin.setRange(-1e12, 1e12)
             spin.setSingleStep(0.01)
@@ -2670,10 +2672,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._apply_auto_limits_for_loaded()
         pending_raw = getattr(self, '_drr_pending_raw_auto', None)
         self._drr_pending_raw_auto = None
-        if pending_raw is not None and pending_raw[0] is getattr(self.loaded, 'cube', None) and self._drr_plot_view == 'raw':
+        if pending_raw is not None and pending_raw[0] is getattr(self.loaded, 'cube', None):
             from ui_qt.drr_color_limits import _context
             if pending_raw[1] == _context(self, pending_raw[2]):
-                self.drr_controller._auto_drr_vrange()
+                self.drr_controller._auto_drr_vrange(follow_view=False)
         self._schedule_plot_redraw('DRR', delay_ms=0)
 
     def _on_drr_plot_view_changed(self, view: str, *, redraw: bool = True) -> None:
@@ -2683,6 +2685,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._capture_drr_view_limits()
         if view != self._drr_plot_view:
             self.drr_controller._invalidate_drr_analysis_product()
+            self.drr_color_tabs.setCurrentIndex(0 if view == 'raw' else 1)
         self._drr_plot_view = view
         if view == 'second':
             self._refresh_drr_second_split_ranges(force=True)
@@ -3442,7 +3445,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.drr_baseline_autofind_btn.clicked.connect(self.drr_controller._clear_drr_baselines)
         self.drr_pin_baseline_chk.toggled.connect(self.drr_controller._on_drr_pin_baseline_toggled)
         self.drr_baseline_combine_combo.currentTextChanged.connect(self.drr_controller._on_drr_baseline_mode_changed)
-        self.drr_auto_v_btn.clicked.connect(self.drr_controller._auto_drr_vrange)
+        self.drr_auto_v_btn.clicked.connect(
+            lambda: self.drr_controller._auto_drr_vrange(follow_view=False))
         self.drr_second_auto_v_btn.clicked.connect(self._auto_drr_second_vrange)
         self.drr_auto_x_btn.clicked.connect(self.drr_controller._auto_drr_xrange)
         self.drr_auto_y_btn.clicked.connect(self.drr_controller._auto_drr_yrange)
@@ -5648,6 +5652,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         pl_loaded = loaded_mode == "PL"
         drr_loaded = loaded_mode == "DRR"
         self.drr_raw_preview_btn.setEnabled(drr_loaded and not self._load_in_progress)
+        self.drr_add_to_analysis_action.setEnabled(drr_loaded and not self._load_in_progress)
         self._sync_drr_gate_toolbar_state(drr_loaded)
         cmp_loaded = loaded_mode == "Compare"
         power_loaded = loaded_mode == "Power Dependent"

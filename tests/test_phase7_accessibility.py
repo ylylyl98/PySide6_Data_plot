@@ -245,12 +245,15 @@ class Phase7AccessibilityTests(unittest.TestCase):
             for tab_name, head_text in (("PL", "Manual plot ranges"), ("DRR", "Manual plot ranges"), ("Compare", "VP"), ("MCD", "Correction")):
                 index = next(i for i in range(window.tabs.count()) if window.tabs.tabText(i) == tab_name)
                 window.tabs.setCurrentIndex(index)
-                head = next(
-                    button
-                    for button in window.tabs.widget(index).findChildren(QToolButton)
-                    if button.text() == head_text
-                )
-                head.setChecked(True)
+                if tab_name == "DRR":
+                    window.drr_sidebar_tabs.setCurrentIndex(0)
+                else:
+                    head = next(
+                        button
+                        for button in window.tabs.widget(index).findChildren(QToolButton)
+                        if button.text() == head_text
+                    )
+                    head.setChecked(True)
                 self.app.processEvents()
 
             controls = (

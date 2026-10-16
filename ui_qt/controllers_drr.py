@@ -939,10 +939,10 @@ class DrrController:
         if self.loaded and self.loaded.mode == "DRR" and not self._suspend_drr_autoplot:
             self._schedule_plot_redraw("DRR")
 
-    def _auto_drr_vrange(self) -> None:
+    def _auto_drr_vrange(self, *, follow_view: bool = True) -> None:
         if not self.loaded or self.loaded.mode != "DRR":
             return
-        if getattr(self._owner, "_drr_plot_view", "raw") == "second":
+        if follow_view and getattr(self._owner, "_drr_plot_view", "raw") == "second":
             self._owner._auto_drr_second_vrange()
             return
         if all(self._mode_fix_value('DRR', key) for key in ('vmin', 'vmax')):
@@ -1063,13 +1063,13 @@ class DrrController:
         self._repopulate_drr_yaxis()
 
     def _update_drr_baseline_controls(self) -> None:
-        """Keep the baseline area stable while enabling its active recipe."""
+        """Expose only the controls used by the active background recipe."""
         external = self.drr_baseline_combo.currentText() == "External"
         automatic = bool(external and self._drr_assignments_automatic and self._drr_assignments)
         pending = getattr(self, '_drr_external_request', None) is not None
-        self.drr_external_baseline_row.setVisible(True)
-        self.drr_baseline_combine_combo.setVisible(True)
-        self.drr_pin_baseline_chk.setVisible(True)
+        self.drr_external_baseline_row.setVisible(external)
+        self.drr_background_fit_btn.setVisible(
+            self.drr_baseline_combo.currentText() == 'Fitted (sample)')
         self.drr_edit_baselines_btn.setEnabled(external)
         self.drr_baseline_autofind_btn.setEnabled(external)
         self.drr_baseline_combine_combo.setEnabled(external and not automatic and not pending)
