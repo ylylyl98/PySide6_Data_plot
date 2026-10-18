@@ -392,8 +392,10 @@ class _PlotToolbar(NavigationToolbar2QT):
             display_snapshot = (capture_visible(owner)
                                 if getattr(owner, 'last_plotted_mode', None) == 'DRR' else None)
             after_save = (lambda: save_snapshot(*display_snapshot)) if display_snapshot else None
+            include_original_png = getattr(owner, 'last_plotted_mode', None) == 'DRR'
+            width_scale = export_width(owner)
             job = save_figure_async(self.canvas.figure, path, after_save=after_save,
-                                    width_scale=export_width(owner))
+                                    width_scale=width_scale, include_original_png=include_original_png)
             job.worker.signals.log.connect(owner._append_log)
             self._png_save_job = job
             if hasattr(owner, '_status'):
@@ -403,8 +405,9 @@ class _PlotToolbar(NavigationToolbar2QT):
                     return
                 if not job.error and display_snapshot:
                     remember_shared(owner, display_snapshot[1])
+                widths = f' (1.0× + {width_scale:.2f}×)' if include_original_png and width_scale > 1.0 else ''
                 message = ('PNG save failed: ' + job.error.splitlines()[0] if job.error
-                           else 'PNG saved: ' + path)
+                           else 'PNG saved' + widths + ': ' + path)
                 if hasattr(owner, '_status'):
                     owner._status(message)
                 if hasattr(owner, '_append_log'):
@@ -2906,7 +2909,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 "Save unified MCD results" if mcd_active else "Save PNG + DAT"
             )
             self.save_action.setToolTip(
-                "Export both ΔR/R and second-derivative PNG + DAT products"
+                "Export ΔR/R and derivative PNG + DAT; Wide PNG also keeps a 1.0× image"
                 if drr_active else
                 "Export the frozen unified MCD snapshot, spectra, tracks, slopes, and retained windows"
                 if mcd_active else "Export for the active tab"
@@ -11517,14 +11520,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     metadata_processing_second=second_processing,
                     metadata_extra=metadata_extra,
                     export_progress=lambda message: log.emit('DRR export: ' + message),
+                    include_original_png=True,
                 )
                 if options.drr_display_state is not None:
                     from core.drr_display_settings import complete_metadata_snapshots
                     complete_metadata_snapshots((pair_paths['raw_dat'], pair_paths['second_dat']))
                 save_status = getattr(pair_paths, "save_status", "created")
                 log.emit(
-                    f"DRR pair: {pair_paths['raw_dat'].name}, {pair_paths['raw_png'].name}; "
-                    f"{pair_paths['second_dat'].name}, {pair_paths['second_png'].name}"
+                    "DRR pair: " + ', '.join(path.name for path in pair_paths.values())
                 )
                 out_folder = str(pair_paths["raw_png"].parent)
                 paths = pair_paths
@@ -11545,6 +11548,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 )
                 paths = export_drr_png_and_dat(
                     folder, cube=options.drr_cube, params=options.params, export_base=base,
+                    include_original_png=True,
                     processed_name=str(Path("Processed Data") / "DRR"),
                     metadata_input_files=drr_inputs,
                     metadata_processing={
@@ -11558,7 +11562,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 )
                 save_status = getattr(paths, "save_status", "created")
                 out_folder = str(paths["png"].parent)
-                log.emit(f"DRR: {paths['dat'].name} and {paths['png'].name}")
+                log.emit('DRR: ' + ', '.join(path.name for path in paths.values()))
             # Canonical Initial Data and historical background files are never
             # offered for archival. Only verified legacy root working copies are.
             files_to_move = [

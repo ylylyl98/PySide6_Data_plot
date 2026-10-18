@@ -10,8 +10,8 @@ from threading import Event
 from typing import List
 
 import numpy as np
-from PySide6.QtCore import QByteArray, QDataStream, QIODevice, QObject, QRunnable, QSize, Qt, Signal, QItemSelectionModel, QStandardPaths, QTimer, QPoint
-from PySide6.QtGui import QColor, QFont, QPainter, QPalette
+from PySide6.QtCore import QByteArray, QDataStream, QIODevice, QObject, QRunnable, QSize, Qt, Signal, QItemSelectionModel, QTimer, QPoint
+from PySide6.QtGui import QColor, QFont, QPainter, QPalette, QTextOption
 from scipy.optimize import curve_fit
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -211,6 +211,78 @@ def _drr_source_aux(source) -> str:
     return f"{status} · {frames} · {modified}"
 
 
+def format_drr_session_summaries(groups) -> dict[str, str]:
+    """Two-line navigation labels; keep differences ahead of shared settings."""
+    records = []
+    families = {}
+    for group in groups:
+        identities = []
+        fields = {}
+        for source in group.files:
+            conditions = parse_drr_acquisition_conditions(source.filename)
+            identity = " · ".join(filter(None, (
+                conditions.sample.upper() if conditions.sample and conditions.sample.startswith('yz')
+                else conditions.sample,
+                conditions.position,
+            )))
+            if identity and identity not in identities:
+                identities.append(identity)
+            values = _drr_condition_values(source)
+            # Preserve the arm names when in/out rotations differ.
+            if conditions.rotation:
+                values['rotation'] = ' / '.join(
+                    part.replace('rotin=', 'In ').replace('rotout=', 'Out ')
+                    .replace('rotation=', '').replace('rot=', '') + '°'
+                    for part in conditions.rotation.split(';'))
+            for key in ('magnetic_field', 'temperature', 'polarization', 'power', 'exposure'):
+                if value := getattr(conditions, key):
+                    values[key] = value
+            if conditions.accumulation:
+                values['exposure'] = values.get('exposure', '') + '×' + conditions.accumulation
+            for key, value in values.items():
+                fields.setdefault(key, set()).add(value)
+        identity = ' / '.join(identities) or group.title
+        labels = {'rotation': 'Rot ', 'tg': 'TG ', 'bg': 'BG ', 'polarization': 'Pol '}
+        values = {key: labels.get(key, '') + '/'.join(sorted(items))
+                  for key, items in fields.items()}
+        if group.frame_count_range:
+            low, high = group.frame_count_range
+            values['frames'] = f'{low}' + (f'–{high}' if low != high else '') + ' frames'
+        if group.gate_ranges or group.gate_direction:
+            values['grid'] = _compact_drr_gate_text(group)
+        records.append((group, identity, values))
+        families.setdefault(identity, []).append(values)
+
+    summaries = {}
+    order = ('wavelength', 'gate_expression', 'tg', 'bg', 'rotation',
+             'magnetic_field', 'temperature', 'polarization', 'power', 'exposure', 'frames', 'grid')
+    family_differences = {
+        identity: {key for key in order if len({v.get(key, '') for v in peers}) > 1}
+        for identity, peers in families.items()
+    }
+    for group, identity, values in records:
+        changed = [key for key in order if key in family_differences[identity] and key in values]
+        primary = changed or [key for key in ('wavelength', 'gate_expression', 'tg', 'bg') if key in values]
+        secondary = [key for key in order if key in values and key not in primary and key != 'grid']
+        count = len(group.files)
+        status = (f'PROCESSED {count}/{count}' if group.processed_count == count
+                  else f'PARTIAL {group.processed_count}/{count}' if group.processed_count
+                  else 'UNPROCESSED')
+        kind = {'background': 'Background', 'likely_background': 'Likely background',
+                'review': 'Review'}.get(group.classification)
+        first = ' · '.join((identity, *(values[key] for key in primary)))
+        second = ' · '.join(filter(None, (
+            f'{count} file' + ('s' if count != 1 else ''), status, kind,
+            *(values[key] for key in secondary),
+        )))
+        summaries[group.key] = first + '\n' + second
+    return summaries
+
+
+def _drr_search_text(text: str) -> str:
+    return str(text).casefold().replace('−', '-').replace('–', '-')
+
+
 class DrrSourceSummaryDelegate(QStyledItemDelegate):
     """Paint DRR picker summaries in at most four controlled rows."""
 
@@ -262,7 +334,7 @@ class DrrSourceSummaryDelegate(QStyledItemDelegate):
 
 
 class DrrSessionList(QListWidget):
-    """Lay out wrapped session filenames at their final viewport width."""
+    """Keep session rows stable on first paint and sidebar resize."""
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -1209,7 +1281,10 @@ class DrrController:
 
         filter_row = QHBoxLayout()
         filter_edit = QLineEdit()
-        filter_edit.setPlaceholderText("Search group, date, or filename...")
+        filter_edit.setPlaceholderText("Search sample, wavelength, conditions… (space-separated terms)")
+        filter_edit.setClearButtonEnabled(True)
+        filter_edit.setAccessibleName("Search DRR measurement groups")
+        filter_edit.setToolTip("Match every keyword across group details and filenames. Searches include older history.")
         show_all = QCheckBox("Show all history")
         show_all.setChecked(True)
         show_all.setToolTip("Show every matching group. Uncheck to show only the 25 most recent groups.")
@@ -1307,13 +1382,15 @@ class DrrController:
             widget.setItemDelegate(DrrSourceSummaryDelegate(widget))
             _add_copy_filename_menu(widget)
 
-        # Session rows must expose every actual filename, including suffixes
-        # omitted by the grouping title. Grow only these rows when necessary.
-        row_cache_path = (Path(QStandardPaths.writableLocation(QStandardPaths.CacheLocation))
-                          / 'drr-picker-row-heights.json')
-        group_list.setItemDelegate(WrappedFilenameDelegate(group_list, cache_path=row_cache_path))
-        group_list.setWordWrap(True)
-        group_list.setResizeMode(QListWidget.Adjust)
+        # Wrap the compact group summaries as well as full filenames so long
+        # acquisition conditions stay visible when either pane is narrowed.
+        for widget in (group_list, file_list):
+            widget.setItemDelegate(WrappedFilenameDelegate(
+                widget, wrap_mode=(QTextOption.WrapAtWordBoundaryOrAnywhere
+                                   if widget is group_list else QTextOption.WrapAnywhere),
+            ))
+            widget.setWordWrap(True)
+            widget.setResizeMode(QListWidget.Adjust)
 
         chosen_label = QLabel("Chosen files (0)")
 
@@ -1325,14 +1402,14 @@ class DrrController:
             panel_layout.addWidget(widget, 1)
             return panel
 
-        panes.addWidget(_panel("Data history" if baseline_mode else "Measurement sessions", group_list))
-        panes.addWidget(_panel("Files in selected session", file_list))
+        panes.addWidget(_panel("Data history" if baseline_mode else "Measurement groups", group_list))
+        panes.addWidget(_panel("Files in selected group", file_list))
         panes.addWidget(_panel(chosen_label, selected_list))
         panes.setChildrenCollapsible(False)
         panes.setStretchFactor(0, 3)
         panes.setStretchFactor(1, 5)
         panes.setStretchFactor(2, 2)
-        panes.setSizes([320, 520, 260])
+        panes.setSizes([400, 500, 200])
         layout.addWidget(panes, 1)
 
         details_btn = QPushButton("Details")
@@ -1416,6 +1493,7 @@ class DrrController:
         catalog_peers = {}
         file_rows_cache = {}
         group_rows_cache = {}
+        session_summaries = {}
         chosen_paths = set()
 
         def _baseline_measurements():
@@ -1458,7 +1536,7 @@ class DrrController:
 
         def _catalog_groups():
             nonlocal baseline_recommendations, catalog_signature
-            nonlocal catalog_by_path, catalog_peers, file_rows_cache, group_rows_cache, source_kind_cache
+            nonlocal catalog_by_path, catalog_peers, file_rows_cache, group_rows_cache, source_kind_cache, session_summaries
             catalog_signature = _catalog_signature()
             for index, cached in enumerate(presentations):
                 if cached['signature'] == catalog_signature:
@@ -1466,6 +1544,7 @@ class DrrController:
                     catalog_by_path, catalog_peers = cached['paths'], cached['peers']
                     file_rows_cache, group_rows_cache = cached['files'], cached['rows']
                     source_kind_cache = cached['kinds']
+                    session_summaries = cached['summaries']
                     baseline_recommendations = cached['recommendations']
                     return cached['groups']
             # One index per publication/filter rebuild; selecting a group or
@@ -1520,10 +1599,12 @@ class DrrController:
                     -group.modified_time,
                     group.title.casefold(),
                 ))
+            session_summaries = format_drr_session_summaries(result)
             if len(result) <= 2000:
                 presentations.append(dict(signature=catalog_signature, paths=catalog_by_path,
                     peers=catalog_peers, files=file_rows_cache, rows=group_rows_cache,
-                    kinds=source_kind_cache, recommendations=baseline_recommendations, groups=result))
+                    kinds=source_kind_cache, recommendations=baseline_recommendations, groups=result,
+                    summaries=session_summaries))
                 del presentations[:-2]
             return result
 
@@ -1532,9 +1613,10 @@ class DrrController:
         measurement_center = self._drr_selected_wavelength_center()
 
         def _group_search_text(group) -> str:
-            return " ".join(
-                [group.title, group.session_date, *(source.filename for source in group.files)]
-            ).casefold()
+            return _drr_search_text(" ".join(
+                [group.title, group.session_date, session_summaries[group.key],
+                 *(source.source for source in group.files), *(source.filename for source in group.files)]
+            ))
 
         group_search_text = {group.key: _group_search_text(group) for group in groups}
 
@@ -1709,15 +1791,11 @@ class DrrController:
                         detail += f"\nRecommendation: {recommendation.reason}"
                     if source.classification != "measurement":
                         detail += f"\n{source.classification_reason}"
-                    item = QListWidgetItem(
-                        format_drr_source_summary(
-                            source,
-                            group.files,
-                            peer_condition_values=peer_condition_values,
-                        )
-                        + "\n"
-                        + _drr_source_aux(source)
-                    )
+                    file_summary = format_drr_source_summary(
+                        source, group.files, peer_condition_values=peer_condition_values,
+                    ).splitlines()
+                    item = QListWidgetItem('\n'.join((
+                        source.filename, *file_summary[1:], _drr_source_aux(source))))
                     item.setData(Qt.UserRole, source.source)
                     item.setData(Qt.UserRole + 4, source.source)
                     item.setData(Qt.UserRole + 5, True)
@@ -1762,8 +1840,8 @@ class DrrController:
 
         def _refresh_groups(*, preserve_view=False, key_aliases=None) -> None:
             nonlocal group_search_text
-            needle = filter_edit.text().strip().casefold()
-            all_history = show_all.isChecked() or bool(needle)
+            terms = _drr_search_text(filter_edit.text()).split()
+            all_history = show_all.isChecked() or bool(terms)
             current_key = (
                 str(group_list.currentItem().data(Qt.UserRole))
                 if group_list.currentItem() is not None
@@ -1777,7 +1855,7 @@ class DrrController:
                     continue
                 if not baseline_mode and unprocessed_only.isChecked() and group.processed:
                     continue
-                if needle and needle not in group_search_text.get(group.key, ""):
+                if not all(term in group_search_text.get(group.key, "") for term in terms):
                     continue
                 visible.append(group)
             if not all_history:
@@ -1789,15 +1867,19 @@ class DrrController:
                     keep = {aliases.get(key, key) for key in keep}
                     recent.extend(group for group in visible[25:] if group.key in keep)
                 visible = recent
-            if not visible and str(type_combo.currentData() or "REF") == "REF":
+            if not visible:
                 if refresh_in_progress:
                     empty_hint.setText("Loading DRR catalog…")
                 elif baseline_mode and not _baseline_measurements():
                     empty_hint.setText(
                         "No baseline recommendations: selected measurements need complete cached spectral grids."
                     )
-                else:
+                elif terms:
+                    empty_hint.setText("No groups match all keywords. Clear search or adjust filters.")
+                elif str(type_combo.currentData() or "REF") == "REF":
                     empty_hint.setText("No matching REF files; choose All data for PL or unclassified files.")
+                else:
+                    empty_hint.setText("No groups match the current filters.")
             else:
                 empty_hint.clear()
             group_list.setUpdatesEnabled(False)
@@ -1844,17 +1926,7 @@ class DrrController:
                     type_text = " · ".join(
                         f"{kind} {count}" for kind, count in sorted(type_counts.items())
                     )
-                    processed_text = (
-                        "PROCESSED" if group.processed_count == len(group.files)
-                        else "PARTIAL" if group.processed_count
-                        else "UNPROCESSED"
-                    )
-                    processed_text += f" {group.processed_count}/{len(group.files)}"
-                    file_word = "file" if len(group.files) == 1 else "files"
-                    filenames = "\n".join(source.filename for source in group.files)
-                    item = QListWidgetItem(
-                        f"{processed_text} · {len(group.files)} {file_word} · {modified}\n{filenames}"
-                    )
+                    item = QListWidgetItem(session_summaries[group.key])
                     item.setData(Qt.UserRole, group.key)
                     item.setData(Qt.UserRole + 4, tuple(source.source for source in group.files))
                     item.setData(Qt.UserRole + 5, False)
@@ -2168,7 +2240,6 @@ class DrrController:
             # dialog exits; always detach before widgets become unreachable.
             dialog_closed = True
             validation_timer.stop()
-            group_list.itemDelegate().save_size_cache()
             if preview_signal is not None:
                 try:
                     preview_signal.disconnect(_apply_catalog_preview)

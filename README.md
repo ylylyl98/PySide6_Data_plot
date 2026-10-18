@@ -98,6 +98,16 @@ still commits that exact value at the editor's configured precision.
 Use the plot toolbar for Gate and previous/next steps. The **Analysis…** menu
 offers both adding the current DRR data and opening the analysis workspace.
 
+The DRR file chooser keeps measurement groups in a flat list. Each group uses
+a compact summary of sample/position, acquisition conditions, file count and
+processing status; conditions that differ between groups of the same sample
+and position appear first. Summaries wrap to the pane width and rows grow to
+show all conditions. The middle pane wraps full filenames, and tooltips
+and Copy filename retain the original paths. Search accepts space-separated
+keywords in any order (for example, `YZ365 760`), including older history and
+filenames hidden from the group summary. Filtering and browsing groups retain
+the chosen files in the right pane.
+
 ### Remembering DRR display settings
 
 Successful DRR image saves remember the displayed X/Y and color ranges,
@@ -917,8 +927,16 @@ calling those helpers directly is separate from the normal GUI workflow.
   Widened heatmaps fit the top spacing to the title and colorbars, and wide PNGs
   reduce side margins to the space needed by labels, ticks and colorbars.
   The canvas size stays unchanged. The wide multiplier is remembered across
-  restarts, while the layout starts at **PNG 1.0×**. The selection applies to PL (including both
-  linear/log panels), DRR (both products), Compare/VP, Power Dependence and MCD
+  restarts, while the layout starts at **PNG 1.0×**. In DRR, selecting **PNG 1.0×**
+  saves only the original width. Selecting **Wide PNG** also keeps the 1.0×
+  image: at **2.00×**, **Save both · PNG + DAT** creates four PNGs (two widths
+  for each product) and two DAT files; at 1.0× it creates two PNGs and two DATs.
+  The original-width PNG keeps its usual filename; new wide PNGs use the selected
+  multiplier as a suffix, such as `_2.0x.png`. Repeat saves reuse matching images
+  and repair missing selected widths without duplicating DAT files. The DRR
+  toolbar PNG save follows the same rule using one frozen figure. Other wider
+  multipliers, such as 1.50×, also retain the 1.0× image. The width selection
+  applies to PL (including both linear/log panels), DRR (both products), Compare/VP, Power Dependence and MCD
   heatmaps, plus unified MCD Save Results. The toolbar's PNG save widens its
   current figure by the same factor; the on-screen plot keeps its current size.
   Select **PNG 1.0×** at any time for the original export layout.

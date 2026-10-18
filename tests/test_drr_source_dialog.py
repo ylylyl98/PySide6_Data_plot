@@ -12,6 +12,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QListWidget, QListWidgetItem, QStyleOptionViewItem
 
 from core.drr_sources import (
+    DrrSource,
     _read_drr_metadata,
     compatible_drr_repeats,
     discover_drr_sources,
@@ -19,7 +20,7 @@ from core.drr_sources import (
     group_drr_sources,
     is_background_name,
 )
-from ui_qt.controllers_drr import DrrSourceSummaryDelegate, format_drr_source_summary
+from ui_qt.controllers_drr import DrrSourceSummaryDelegate, format_drr_source_summary, format_drr_session_summaries
 
 
 def _csv(path: Path, gates: list[tuple[float, float]], *, axis=(740, 760, 780)) -> None:
@@ -67,6 +68,31 @@ def _write_drr_recipe(
 
 
 class DrrSourceSummaryFormatterTests(unittest.TestCase):
+    def test_session_summary_prioritizes_varying_conditions_without_listing_repeats(self):
+        from dataclasses import replace
+        source = DrrSource('a.csv', 'YZ365_p5n2_REF_760nmc_RotIn90deg_TG-1BG=0.csv',
+                           'first', '2026-10-17', 1., False, wavelength_center_nm=760.)
+        sources = [source, replace(source, source='b.csv', filename=source.filename.replace('.csv', '_repeat.csv')),
+                   replace(source, source='c.csv', group_key='second',
+                           filename=source.filename.replace('90deg', '45deg'))]
+        groups = group_drr_sources(sources)
+        summaries = format_drr_session_summaries(groups)
+        first = next(g for g in groups if len(g.files) == 2)
+        title, detail = summaries[first.key].splitlines()
+        self.assertTrue(title.startswith('YZ365 · p5n2 · Rot In 90°'), title)
+        self.assertIn('2 files · UNPROCESSED', detail)
+        self.assertIn('760 nm', detail)
+        self.assertIn('TG−1BG=0', detail)
+        self.assertNotIn('.csv', summaries[first.key])
+        self.assertNotEqual(*summaries.values())
+
+    def test_unknown_session_name_remains_searchable_and_identifiable(self):
+        source = DrrSource('odd_REF.csv', 'odd_REF.csv', 'unusual_device_condition', '', 1., False)
+        group = group_drr_sources([source])[0]
+        title, detail = format_drr_session_summaries([group])[group.key].splitlines()
+        self.assertEqual(title, 'unusual_device_condition')
+        self.assertIn('1 file', detail)
+
     def test_processing_status_precedes_time_in_file_summary(self):
         from ui_qt.controllers_drr import _drr_source_aux
         source = self._source("sample.csv", modified_time=1700000000)

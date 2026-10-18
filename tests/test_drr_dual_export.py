@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 import tempfile
 import unittest
 from pathlib import Path
@@ -114,6 +115,41 @@ class DrrDualExportTests(unittest.TestCase):
             self.assertEqual(repaired.save_status, "updated")
             self.assertTrue(repaired["second_dat"].exists())
             self.assertEqual(repaired["raw_dat"], first["raw_dat"])
+
+    def test_both_widths_upgrade_existing_exports_and_repair_only_missing_png(self):
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            'core.export._save_heatmap_png',
+            side_effect=lambda path, *_a, **_k: Path(path).write_bytes(b'png'),
+        ) as render:
+            raw = _cube(np.arange(15.).reshape(3, 5), 'raw')
+            second = _cube(np.full((3, 5), 2.), 'second')
+            kwargs = dict(folder=tmp, raw_cube=raw, second_cube=second,
+                          raw_params=_params(raw, -1., 1.), second_params=_params(second, -3., 3.),
+                          raw_export_base='sample_DR_R', second_export_base='sample_d2E')
+            original = export_drr_pair_pngs_and_dat(**kwargs)
+            timestamps = {path: path.stat().st_mtime_ns for path in original.values()}
+            wide_kwargs = {**kwargs, 'raw_params': replace(kwargs['raw_params'], png_width_scale=2.),
+                           'second_params': replace(kwargs['second_params'], png_width_scale=2.)}
+            both = export_drr_pair_pngs_and_dat(**wide_kwargs, include_original_png=True)
+            self.assertEqual(both.save_status, 'updated')
+            self.assertEqual(render.call_count, 4)
+            for product in ('raw', 'second'):
+                self.assertEqual(both[product + '_dat'], original[product + '_dat'])
+                self.assertEqual(both[product + '_png'], original[product + '_png'])
+                self.assertTrue(both[product + '_png_wide'].name.endswith('_2.0x.png'))
+                record = json.loads(both[product + '_dat'].with_suffix('.metadata.json').read_text())
+                self.assertEqual({v['plot']['png_width_scale'] for v in record['figures'].values()}, {1., 2.})
+            again = export_drr_pair_pngs_and_dat(**wide_kwargs, include_original_png=True)
+            self.assertEqual(again, both)
+            self.assertEqual(again.save_status, 'reused')
+            self.assertEqual(render.call_count, 4)
+            both['second_png_wide'].unlink()
+            repaired = export_drr_pair_pngs_and_dat(**wide_kwargs, include_original_png=True)
+            self.assertEqual(repaired, both)
+            self.assertEqual(repaired.save_status, 'updated')
+            self.assertEqual(render.call_count, 5)
+            self.assertEqual(render.call_args.args[2].png_width_scale, 2.)
+            self.assertEqual(timestamps, {path: path.stat().st_mtime_ns for path in original.values()})
 
     def test_pair_helper_validates_both_products_before_writing(self):
         with tempfile.TemporaryDirectory() as tmp:

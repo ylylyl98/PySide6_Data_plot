@@ -458,8 +458,11 @@ class SplitScaleControlTests(unittest.TestCase):
 
             self.assertIn("PARTIAL 5/7", observed["text"])
             self.assertIn("Modified ", observed["tooltip"])
-            self.assertIn("partial_760nmc_3.6KREF", observed["text"])
-            self.assertNotIn("complete_760nmc_3.6KREF", observed["text"])
+            self.assertIn("partial", observed["text"].splitlines()[0])
+            self.assertIn("760 nm", observed["text"])
+            self.assertIn("3.6K", observed["text"])
+            self.assertIn("partial_760nmc_3.6KREF", observed["tooltip"])
+            self.assertNotIn("complete_760nmc_3.6KREF", observed["tooltip"])
 
     @staticmethod
     def _known_grid(*, rows: int = 2) -> tuple[tuple[float, ...], ...]:
