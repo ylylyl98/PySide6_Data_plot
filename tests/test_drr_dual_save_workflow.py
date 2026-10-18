@@ -12,7 +12,7 @@ import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import QApplication
 
 from core.loader import DataCube
@@ -150,20 +150,53 @@ class DrrDualSaveWorkflowTests(unittest.TestCase):
                 w._set_spin_value_silent(spins[side + '_vmin'], -5)
                 w._set_spin_value_silent(spins[side + '_vmax'], 5)
 
-    def test_three_region_save_both_writes_both_real_pngs(self):
+    def test_three_region_save_follows_width_selection_and_preserves_existing_files(self):
+        from PIL import Image
         self._configure_three_regions()
         self._run_save()
+        original_paths = list(self._output_dir().glob('*.png'))
+        self.assertEqual(len(original_paths), 2)
+        self.assertFalse(list(self._output_dir().glob('*_2.0x.png')))
+        for path in original_paths:
+            with Image.open(path) as image:
+                self.assertEqual(image.size, (1200, 930))
+        retained = {path: path.stat().st_mtime_ns for path in self._output_dir().glob('*.dat')}
+        retained.update({path: path.stat().st_mtime_ns for path in original_paths})
+        self.window.png_layout_combo.setCurrentIndex(1)
+        self.window.png_width_spin.setValue(2.)
+        self._run_save()
         paths = list(self._output_dir().glob('*.png'))
-        self.assertEqual(len(paths), 2)
+        self.assertEqual(len(paths), 4)
+        self.assertEqual(len(list(self._output_dir().glob('*.dat'))), 2)
         for path in paths:
             self.assertEqual(path.read_bytes()[:8], b'\x89PNG\r\n\x1a\n')
+            with Image.open(path) as image:
+                self.assertEqual(image.size, (2400 if '_2.0x' in path.stem else 1200, 930))
+        missing_wide = next(self._output_dir().glob('*_2.0x.png'))
+        missing_wide.unlink()
+        self.window.png_layout_combo.setCurrentIndex(0)
+        with patch('core.export._save_heatmap_png', side_effect=AssertionError('Unselected width rendered')):
+            self._run_save()
+        self.assertFalse(missing_wide.exists())
+        self.assertEqual(retained, {path: path.stat().st_mtime_ns for path in retained})
+        self.window.png_layout_combo.setCurrentIndex(1)
+        self._run_save()
+        self.assertTrue(missing_wide.exists())
 
     def test_three_region_toolbar_png_saves_snapshot(self):
         self._configure_three_regions()
-        self.test_toolbar_png_saves_snapshot_in_background()
+        self._check_toolbar_png_save(2.)
 
     def test_toolbar_png_saves_snapshot_in_background(self):
+        self._check_toolbar_png_save(1.)
+
+    def test_toolbar_wide_png_keeps_original_at_selected_width(self):
+        self._check_toolbar_png_save(1.5)
+
+    def _check_toolbar_png_save(self, width):
         import time
+        self.window.png_layout_combo.setCurrentIndex(1 if width > 1. else 0)
+        self.window.png_width_spin.setValue(width)
         self.window._plot_mode('DRR')
         target = self.root / 'toolbar.png'
         reference = self.root / 'reference.png'
@@ -183,6 +216,32 @@ class DrrDualSaveWorkflowTests(unittest.TestCase):
         self.assertEqual(target.read_bytes()[:8], b'\x89PNG\r\n\x1a\n')
         from matplotlib.image import imread
         np.testing.assert_array_equal(imread(reference), imread(target))
+        original = imread(target)
+        companions = list(self.root.glob('toolbar_*x.png'))
+        if width > 1.:
+            self.assertEqual([p.name for p in companions], [f'toolbar_{width}x.png'])
+            wide = imread(companions[0])
+            self.assertEqual(wide.shape[:2], (original.shape[0], int(original.shape[1] * width)))
+        else:
+            self.assertEqual(companions, [])
+
+    def test_drr_toolbar_keeps_width_selection_available(self):
+        from ui_qt.png_export_controls import export_width
+        w = self.window
+        w.setAttribute(Qt.WA_DontShowOnScreen)
+        w.resize(1180, 820)
+        w.show()
+        self.app.processEvents()
+        w._update_plot_view_bar_visibility()
+        self.assertTrue(w.png_layout_combo.isVisible())
+        self.assertTrue(w.png_width_spin.isVisible())
+        self.assertEqual(export_width(w), 1.)
+        w.png_layout_combo.setCurrentIndex(1)
+        w.png_width_spin.setValue(1.5)
+        self.assertEqual(export_width(w), 1.5)
+        w.png_layout_combo.setCurrentIndex(0)
+        self.assertEqual(export_width(w), 1.)
+        self.assertEqual(w.png_width_spin.value(), 1.5)
 
     def test_save_reuses_display_derivative(self):
         self.window.drr_controller._drr_cube_with_metadata(2)
@@ -237,6 +296,13 @@ class DrrDualSaveWorkflowTests(unittest.TestCase):
             self.assertIn(stage, messages)
 
     def test_real_background_save_from_each_visible_drr_view_writes_pair(self) -> None:
+        from dataclasses import asdict
+        rendered = []
+        def record_render(path, _cube, params, **_kwargs):
+            rendered.append(asdict(params))
+            Path(path).write_bytes(b'PNG')
+        self.window.png_layout_combo.setCurrentIndex(1)
+        self.window.png_width_spin.setValue(2.)
         ranges = self.window._mode_spins("DRR")
         ranges["xmin"].setValue(-1.5)
         ranges["xmax"].setValue(1.5)
@@ -246,14 +312,14 @@ class DrrDualSaveWorkflowTests(unittest.TestCase):
             with self.subTest(view=view, side_by_side=side_by_side):
                 with patch(
                     "core.export._save_heatmap_png",
-                    side_effect=lambda path, *_args, **_kwargs: Path(path).write_bytes(b"PNG"),
+                    side_effect=record_render,
                 ):
                     self.window._last_export_request_key = ""
                     result_count = len(self.results)
                     self._run_save(view=view, side_by_side=side_by_side)
                     self.assertEqual(len(self.results), result_count + 1)
                 output_dir = self._output_dir()
-                self.assertEqual(len(list(output_dir.glob("*.png"))), 2)
+                self.assertEqual(len(list(output_dir.glob("*.png"))), 4, rendered)
                 self.assertEqual(len(list(output_dir.glob("*.dat"))), 2)
         metadata = [
             json.loads(path.read_text(encoding="utf-8"))

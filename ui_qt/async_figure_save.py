@@ -12,7 +12,7 @@ from ui_qt.common import Worker
 from core.png_geometry import compact_horizontal_margins, widened_figsize
 
 
-def render_snapshot(snapshot, path, options, *, progress, log, after_save=None, width_scale=1.0):
+def _render_snapshot_file(snapshot, path, options, *, width_scale=1.0):
     # Snapshot bytes are generated locally from our own figure, never from files
     # supplied by a user. Matplotlib's pickle excludes its live Qt canvas.
     figure = pickle.loads(snapshot)
@@ -27,14 +27,24 @@ def render_snapshot(snapshot, path, options, *, progress, log, after_save=None, 
     try:
         figure.savefig(temporary, **options)
         temporary.replace(path)
-        if after_save is not None:
-            try:
-                after_save()
-            except OSError as error:
-                log.emit(f'Image saved; display settings unavailable: {error}')
     finally:
         temporary.unlink(missing_ok=True)
         figure.clear()
+    return str(path)
+
+
+def render_snapshot(snapshot, path, options, *, progress, log, after_save=None,
+                    width_scale=1.0, include_original_png=False):
+    path = Path(path)
+    targets = (((path, 1.0), (path.with_name(f'{path.stem}_{float(width_scale)}x{path.suffix}'), width_scale))
+               if include_original_png and width_scale > 1.0 else ((path, width_scale),))
+    for target, scale in targets:
+        _render_snapshot_file(snapshot, target, options, width_scale=scale)
+    if after_save is not None:
+        try:
+            after_save()
+        except OSError as error:
+            log.emit(f'Image saved; display settings unavailable: {error}')
     return str(path)
 
 
@@ -43,7 +53,7 @@ class FigureSaveJob(QObject):
     failed = Signal(str)
     finished = Signal()
 
-    def __init__(self, figure, path, options, after_save=None, width_scale=1.0):
+    def __init__(self, figure, path, options, after_save=None, width_scale=1.0, include_original_png=False):
         super().__init__(QApplication.instance())
         self.done = False
         self.error = None
@@ -63,7 +73,7 @@ class FigureSaveJob(QObject):
             raise
         self.snapshot_seconds = perf_counter() - self.started
         self.worker = Worker(render_snapshot, snapshot, str(path), options,
-                             after_save=after_save, width_scale=width_scale)
+                             after_save=after_save, width_scale=width_scale, include_original_png=include_original_png)
         self.worker.signals.result.connect(self._success)
         self.worker.signals.error.connect(self._failure)
         self.worker.signals.finished.connect(self._finish)
@@ -104,9 +114,10 @@ class FigureSaveJob(QObject):
         self.setParent(None)
 
 
-def save_figure_async(figure, path, *, after_save=None, width_scale=1.0, **options):
+def save_figure_async(figure, path, *, after_save=None, width_scale=1.0, include_original_png=False, **options):
     widened_figsize(figure.get_size_inches(), width_scale)
     apply_font = getattr(figure.canvas, 'apply_ui_font', None)
     if callable(apply_font):
         apply_font()
-    return FigureSaveJob(figure, path, options, after_save=after_save, width_scale=width_scale)
+    return FigureSaveJob(figure, path, options, after_save=after_save,
+                         width_scale=width_scale, include_original_png=include_original_png)

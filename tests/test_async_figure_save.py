@@ -45,3 +45,33 @@ class AsyncFigureSaveTests(unittest.TestCase):
                     self.app.processEvents(); time.sleep(.005)
             self.assertTrue(job.error)
             self.assertEqual(path.read_bytes(), b'original')
+
+    def test_both_widths_use_one_snapshot_and_remember_only_after_both_succeed(self):
+        from ui_qt.async_figure_save import save_figure_async
+        with tempfile.TemporaryDirectory() as folder:
+            fig = Figure(figsize=(3, 2), dpi=100)
+            fig.subplots().plot([0, 1], [2, 3])
+            target = Path(folder) / 'paired.png'
+            with patch('ui_qt.async_figure_save.pickle.dumps', wraps=__import__('pickle').dumps) as snapshot:
+                after = unittest.mock.Mock()
+                job = save_figure_async(fig, target, width_scale=2., include_original_png=True, after_save=after, dpi=100)
+                snapshot.assert_called_once()
+            fig.clear()
+            deadline = time.monotonic() + 10
+            while not job.done and time.monotonic() < deadline:
+                self.app.processEvents(); time.sleep(.005)
+            self.assertTrue(job.done)
+            self.assertIsNone(job.error)
+            self.assertEqual(imread(target).shape[:2], (200, 300))
+            self.assertEqual(imread(target.with_name('paired_2.0x.png')).shape[:2], (200, 600))
+            after.assert_called_once()
+
+            with patch('ui_qt.async_figure_save._render_snapshot_file', side_effect=[str(target), OSError('wide failed')]):
+                after.reset_mock()
+                failed = save_figure_async(Figure(), target, width_scale=2., include_original_png=True, after_save=after)
+                deadline = time.monotonic() + 10
+                while not failed.done and time.monotonic() < deadline:
+                    self.app.processEvents(); time.sleep(.005)
+            self.assertTrue(failed.done)
+            self.assertIn('wide failed', failed.error)
+            after.assert_not_called()

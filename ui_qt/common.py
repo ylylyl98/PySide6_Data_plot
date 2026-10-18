@@ -276,13 +276,15 @@ class Worker(QRunnable):
 
 
 class WrappedFilenameDelegate(QStyledItemDelegate):
-    """Paint complete filenames as dynamically sized, wrapped list rows."""
+    """Paint complete text as dynamically sized, wrapped list rows."""
 
     HORIZONTAL_PADDING = 8
     VERTICAL_PADDING = 6
 
-    def __init__(self, parent=None, *, cache_path=None) -> None:
+    def __init__(self, parent=None, *, cache_path=None,
+                 wrap_mode=QTextOption.WrapAnywhere) -> None:
         super().__init__(parent)
+        self._wrap_mode = wrap_mode
         # Wrapped rows are queried repeatedly while QListView lays out and
         # repaints.  Bounding-rect calculation is surprisingly expensive for
         # long paths, so keep the result for each viewport width/text/font pair.
@@ -338,7 +340,7 @@ class WrappedFilenameDelegate(QStyledItemDelegate):
                      opt.fontMetrics.height(), opt.fontMetrics.averageCharWidth(),
                      view.logicalDpiX(), view.logicalDpiY(), view.devicePixelRatioF(),
                      view.style().metaObject().className(), qVersion(),
-                     self.HORIZONTAL_PADDING, self.VERTICAL_PADDING)
+                     self.HORIZONTAL_PADDING, self.VERTICAL_PADDING, self._wrap_mode.value)
         cached = self._size_hint_cache.get(cache_key)
         if cached is not None:
             self._size_hint_cache.move_to_end(cache_key)
@@ -394,14 +396,13 @@ class WrappedFilenameDelegate(QStyledItemDelegate):
             .replace("\u2029", "\u2028")
         )
 
-    @staticmethod
-    def _layout_text(text, font, width):
+    def _layout_text(self, text, font, width):
         # Use precisely the same line breaking for measurement and painting.
         # QFontMetrics.boundingRect and QPainter.drawText can disagree at a
         # wrap boundary on Windows, leaving a two-line filename in one row.
         layout = QTextLayout(text, font)
         text_option = QTextOption()
-        text_option.setWrapMode(QTextOption.WrapAnywhere)
+        text_option.setWrapMode(self._wrap_mode)
         layout.setTextOption(text_option)
         layout.beginLayout()
         height = 0.0

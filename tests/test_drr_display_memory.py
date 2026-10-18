@@ -1221,15 +1221,16 @@ class DrrDisplayMemoryTests(unittest.TestCase):
     def test_partial_pair_failure_does_not_publish_new_display_history(self):
         import core.export as exporter
         self.load()
-        original = exporter.export_drr_png_and_dat
-        calls = []
-        def fail_second(*args, **kwargs):
-            calls.append(kwargs)
-            if len(calls) == 2:
-                raise OSError('second image write failed')
-            return original(*args, **kwargs)
-        with patch.object(exporter, 'export_drr_png_and_dat', side_effect=fail_second):
+        self.window.png_layout_combo.setCurrentIndex(1)
+        self.window.png_width_spin.setValue(2.)
+        original = exporter._save_heatmap_png
+        def fail_second_wide(path, *args, **kwargs):
+            if 'd2E' in Path(path).name and '_2.0x' in Path(path).name:
+                raise OSError('second wide image write failed')
+            return original(path, *args, **kwargs)
+        with patch.object(exporter, '_save_heatmap_png', side_effect=fail_second_wide):
             self.save_view(count=2)
+        self.assertEqual(len(list((self.root / 'Processed Data' / 'DRR').glob('*.png'))), 3)
         self.assertFalse((self.root / 'Processed Data' / 'DRR' / '.display_settings.json').exists())
         self.load('b_720nmc.csv')
         self.assertEqual(self.window.drr_spins['xmin'].value(), 1.5)

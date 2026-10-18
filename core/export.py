@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -997,13 +997,33 @@ def export_drr_png_and_dat(
     reuse_existing_analysis: bool = False,
     export_progress=None,
     _history_index: dict | None = None,
+    include_original_png: bool = False,
+    _png_suffix: str = "",
 ) -> Dict[str, Path]:
     """Export one heatmap and its DAT table.
 
     ``drr_style`` preserves the historic DRR colorbar number formatting.  A
     non-DRR map (currently MCD) can use the PL heatmap presentation by passing
     ``False`` while still sharing the same data-export path.
+    ``include_original_png`` adds a 1.0× view when a wider PNG is selected,
+    sharing one DAT and history. At 1.0× it saves only the original image.
     """
+    if include_original_png and params.png_width_scale > 1.0:
+        if not drr_style:
+            raise ValueError("Paired PNG widths require DRR artifact history.")
+        shared = dict(folder=folder, cube=cube, export_base=export_base,
+                      processed_name=processed_name, metadata_input_files=tuple(metadata_input_files),
+                      metadata_processing=metadata_processing, metadata_extra=metadata_extra,
+                      reuse_existing_analysis=reuse_existing_analysis, export_progress=export_progress,
+                      _history_index=_history_index if _history_index is not None else {})
+        original = export_drr_png_and_dat(params=replace(params, png_width_scale=1.0), **shared)
+        wide = export_drr_png_and_dat(params=params,
+                                      _png_suffix=f"_{float(params.png_width_scale)}x", **shared)
+        # The second width shares the first result's DAT and metadata. Adding
+        # it to a newly created analysis should still report a new result.
+        status = ("created" if original.save_status == "created" else
+                  "updated" if "updated" in (original.save_status, wide.save_status) else "reused")
+        return ExportPathResult({**original, "png_wide": wide["png"]}, save_status=status)
     out_dir = ensure_processed_dir(folder, processed_name)
     def run_step(label, function, *args, **kwargs):
         if export_progress is not None:
@@ -1051,14 +1071,14 @@ def export_drr_png_and_dat(
         safe = _unique_result_stem(
             out_dir,
             export_base,
-            (".png", ".dat", ".metadata.json"),
+            (f"{_png_suffix}.png", ".dat", ".metadata.json"),
         )
         prior_payload: dict = {}
         save_status = "created"
     else:
         safe, prior_payload = prior
         save_status = "reused"
-    png_path = out_dir / f"{safe}.png"
+    png_path = out_dir / f"{safe}{_png_suffix}.png"
     dat_path = out_dir / f"{safe}.dat"
     plot_matches = prior_payload.get("plot_fingerprint") == plot_fingerprint
     if prior and not prior_payload.get("plot_fingerprint"):
@@ -1083,7 +1103,7 @@ def export_drr_png_and_dat(
             # Changing a view never overwrites a previous PNG, including a
             # legacy image whose render fingerprint is unknown.
             for number in range(1, 10000):
-                candidate = out_dir / f"{safe}_view_{number:03d}.png"
+                candidate = out_dir / f"{safe}{_png_suffix}_view_{number:03d}.png"
                 if candidate.name not in figures and not candidate.exists():
                     png_path = candidate
                     break
@@ -1181,13 +1201,15 @@ def export_drr_pair_pngs_and_dat(
     metadata_extra: dict | None = None,
     processed_name: str = "Processed Data/DRR",
     export_progress=None,
+    include_original_png: bool = False,
 ) -> ExportPathResult:
     """Export the raw DRR map and its energy second derivative as one pair.
 
     Each product is handed to :func:`export_drr_png_and_dat`, retaining the
     existing source fingerprint and artifact reuse behavior.  The upfront
     validation prevents an invalid second product from leaving a seemingly
-    successful partial pair behind.
+    successful partial pair behind. ``include_original_png`` keeps a 1.0×
+    image alongside each selected wider PNG, sharing the DATs.
     """
     _validate_drr_pair_product(raw_cube, raw_params, label="raw")
     _validate_drr_pair_product(second_cube, second_params, label="second")
@@ -1212,6 +1234,7 @@ def export_drr_pair_pngs_and_dat(
         metadata_extra=metadata_extra,
         export_progress=(lambda message: export_progress('Raw: ' + message)) if export_progress else None,
         _history_index=history_index,
+        include_original_png=include_original_png,
     )
     second_paths = export_drr_png_and_dat(
         folder,
@@ -1223,6 +1246,7 @@ def export_drr_pair_pngs_and_dat(
         metadata_processing=second_processing,
         metadata_extra=metadata_extra,
         _history_index=history_index,
+        include_original_png=include_original_png,
         export_progress=(lambda message: export_progress('d2E: ' + message)) if export_progress else None,
     )
     statuses = (
@@ -1237,10 +1261,8 @@ def export_drr_pair_pngs_and_dat(
         save_status = "reused"
     return ExportPathResult(
         {
-            "raw_png": raw_paths["png"],
-            "raw_dat": raw_paths["dat"],
-            "second_png": second_paths["png"],
-            "second_dat": second_paths["dat"],
+            **{f"raw_{name}": path for name, path in raw_paths.items()},
+            **{f"second_{name}": path for name, path in second_paths.items()},
         },
         save_status=save_status,
     )

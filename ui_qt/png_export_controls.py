@@ -20,7 +20,7 @@ def install_png_width_control(owner, toolbar):
     mode.setAccessibleName('PNG export layout')
     mode.addItem('PNG 1.0×', 'original')
     mode.addItem('Wide PNG', 'wide')
-    mode.setToolTip('PNG 1.0× keeps the original export layout. Select Wide PNG to enable widening.')
+    mode.setToolTip('PNG 1.0× saves only the original width. For DRR, Wide PNG saves both 1.0× and the selected wider version.')
     mode.setAccessibleDescription(mode.toolTip())
     spin = QDoubleSpinBox(toolbar)
     spin.setObjectName('png_width_spin')

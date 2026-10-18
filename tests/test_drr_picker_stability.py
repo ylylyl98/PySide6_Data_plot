@@ -10,11 +10,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt, QTimer, QSettings
 from PySide6.QtTest import QSignalSpy
-from PySide6.QtWidgets import QApplication, QDialog, QLabel, QListWidget, QStyleOptionViewItem
+from PySide6.QtWidgets import QApplication, QDialog, QLabel, QListWidget, QSplitter, QStyleOptionViewItem
 
 from core.drr_sources import DrrSource
 from ui_qt.common import WrappedFilenameDelegate
 from ui_qt.main_window import MainWindow
+from tests.ui_test_helpers import dispose_owned_window
 
 
 class DrrPickerStabilityTests(unittest.TestCase):
@@ -30,7 +31,7 @@ class DrrPickerStabilityTests(unittest.TestCase):
             "ui_qt.main_window.QSettings", return_value=settings
         ), patch.object(MainWindow, "_schedule_automatic_update_check", lambda self: None):
             self.window = MainWindow()
-        self.addCleanup(self.window.close)
+        self.addCleanup(dispose_owned_window, self.window)
         self.window.current_folder = os.getcwd()
         self.window.drr_available_sources = [
             DrrSource(
@@ -178,7 +179,8 @@ class DrrPickerStabilityTests(unittest.TestCase):
             groups = dialog.findChild(QListWidget, "drr_source_group_list")
             files = dialog.findChild(QListWidget, "drr_source_file_list")
             self.assertEqual(groups.count(), 3)
-            row = next(i for i in range(groups.count()) if "rep01" in groups.item(i).text())
+            row = next(i for i in range(groups.count())
+                       if "sample_REF_rep01.csv" in groups.item(i).data(Qt.UserRole + 4))
             groups.setCurrentRow(row)
             self.assertEqual(files.count(), 4)
             add = next(button for button in dialog.findChildren(QPushButton)
@@ -213,7 +215,7 @@ class DrrPickerStabilityTests(unittest.TestCase):
             files = dialog.findChild(QListWidget, "drr_source_file_list")
             groups.clearSelection()
             groups.setCurrentRow(next(i for i in range(groups.count())
-                                      if "rep2" in groups.item(i).text()))
+                                      if "sample_REF_rep2.csv" in groups.item(i).data(Qt.UserRole + 4)))
             w.drr_available_sources.append(replace(source, source="sample_REF_rep10.csv",
                 filename="sample_REF_rep10.csv", spectral_grid=(740.0000001, 760., 780.)))
             w.drr_catalog_refresh_finished.emit(w.current_folder, True)
@@ -224,12 +226,20 @@ class DrrPickerStabilityTests(unittest.TestCase):
 
         self.open_picker(execute)
 
-    def test_first_painted_rows_fit_wrapped_filenames(self):
+    def test_long_group_summaries_wrap_completely_on_first_paint_and_resize(self):
         self.window.drr_available_sources = [
-            replace(self.window.drr_available_sources[0], group_key=f"session-{i}")
+            replace(
+                self.window.drr_available_sources[0], group_key=f"session-{i}",
+                filename=f"YZ354_pan1_9T_1.67KREF_730nmc_0p1sx20_RotIn49deg_TG-1BG={-9-i}.csv",
+                source=f"measurement_REF_{i}.csv", wavelength_center_nm=730., frame_count=211+i,
+                gate_labels=("Vbg_set", "Vtg_set"),
+                gate_ranges=((-10.5-i/10, 10.5), (-19.5, 1.5)),
+                gate_direction="Vbg_set increasing, Vtg_set increasing",
+            )
             for i in range(30)
         ]
         extents = []
+        widths_and_heights = []
         original = WrappedFilenameDelegate.paint
 
         def paint(delegate, painter, option, index):
@@ -240,18 +250,28 @@ class DrrPickerStabilityTests(unittest.TestCase):
                     delegate._normalize_text(opt.text), opt.font,
                     option.rect.width() - 2 * delegate.HORIZONTAL_PADDING,
                 )
-                extents.append((option.rect.height(), layout.boundingRect().height()
-                                + 2 * delegate.VERTICAL_PADDING))
+                extents.append((option.rect.height(),
+                                layout.boundingRect().height() + 2 * delegate.VERTICAL_PADDING))
             original(delegate, painter, option, index)
 
         def execute(dialog):
+            dialog.setAttribute(Qt.WA_DontShowOnScreen)
             dialog.show()
             self.app.processEvents()
+            groups = dialog.findChild(QListWidget, "drr_source_group_list")
+            self.assertIsInstance(groups.itemDelegate(), WrappedFilenameDelegate)
+            self.assertIn("Vbg increasing", groups.item(0).text())
+            self.assertIn("Vtg increasing", groups.item(0).text())
             dialog.grab()
-            for width in (920, 1300, 1000):
-                dialog.resize(width, 560)
+            panes = dialog.findChild(QSplitter)
+            for dialog_width, group_width in ((920, 250), (1300, 440), (1000, 320)):
+                dialog.resize(dialog_width, 560)
+                panes.setSizes([group_width, 500, 200])
                 self.app.processEvents()
                 dialog.grab()
+                widths_and_heights.append((groups.viewport().width(),
+                                          groups.visualItemRect(groups.item(0)).height()))
+                self.assertEqual(groups.horizontalScrollBar().maximum(), 0)
             dialog.close()
             return QDialog.Rejected
 
@@ -259,10 +279,12 @@ class DrrPickerStabilityTests(unittest.TestCase):
             self.open_picker(execute)
         self.assertTrue(extents)
         self.assertTrue(all(actual >= needed for actual, needed in extents), extents)
+        narrowest, *_, widest = sorted(widths_and_heights)
+        self.assertGreater(narrowest[1], widest[1], widths_and_heights)
 
     def test_default_history_includes_older_groups_after_search_and_refresh(self):
         from PySide6.QtTest import QTest
-        from PySide6.QtWidgets import QLineEdit
+        from PySide6.QtWidgets import QLineEdit, QCheckBox
 
         self.window.drr_available_sources = [
             replace(self.window.drr_available_sources[0], group_key=f"session-{i:02}",
@@ -278,9 +300,14 @@ class DrrPickerStabilityTests(unittest.TestCase):
             groups.setCurrentRow(39)
             self.assertEqual(files.item(0).data(Qt.UserRole), "sample_REF_39.csv")
             search = dialog.findChild(QLineEdit)
-            search.setText("sample_REF_39")
+            history = next(w for w in dialog.findChildren(QCheckBox) if w.text() == 'Show all history')
+            history.setChecked(False)
+            self.assertEqual(groups.count(), 25)
+            search.setText("39 sample_REF")
             QTest.qWait(250)
             self.assertEqual(groups.count(), 1)
+            self.assertEqual(files.item(0).data(Qt.UserRole), "sample_REF_39.csv")
+            history.setChecked(True)
             search.clear()
             QTest.qWait(250)
             self.assertEqual(groups.count(), 40)
@@ -292,6 +319,54 @@ class DrrPickerStabilityTests(unittest.TestCase):
             self.assertEqual(groups.count(), 41)
             groups.setCurrentRow(40)
             self.assertEqual(files.item(0).data(Qt.UserRole), "older_REF.csv")
+            return QDialog.Rejected
+
+        self.open_picker(execute)
+
+    def test_group_summaries_keep_full_names_in_files_and_search_retains_choices(self):
+        from PySide6.QtTest import QTest
+        from PySide6.QtWidgets import QLineEdit, QPushButton
+        first, second = self.window.drr_available_sources
+        self.window.drr_available_sources.extend([
+            replace(first, source='YZ354_p1_REF_730nmc.csv', filename='YZ354_p1_REF_730nmc.csv',
+                    group_key='other', wavelength_center_nm=730.),
+            replace(first, source='YZ365_p5n2_REF_730nmc.csv', filename='YZ365_p5n2_REF_730nmc.csv',
+                    group_key='other-wave', wavelength_center_nm=730.),
+        ])
+
+        def execute(dialog):
+            groups = dialog.findChild(QListWidget, 'drr_source_group_list')
+            files = dialog.findChild(QListWidget, 'drr_source_file_list')
+            chosen = dialog.findChild(QListWidget, 'drr_source_chosen_list')
+            search = dialog.findChild(QLineEdit)
+            search.setText('760 yz365 TG−1.087BG=0')
+            QTest.qWait(250)
+            self.assertEqual(groups.count(), 1)
+            self.assertEqual(files.count(), 2)
+            item = groups.item(0)
+            self.assertEqual(len(item.text().splitlines()), 2)
+            self.assertNotIn('.csv', item.text())
+            self.assertEqual(set(item.data(Qt.UserRole + 4)), {first.source, second.source})
+            self.assertIn(first.filename, item.toolTip())
+            self.assertEqual(files.item(0).text().splitlines()[0], first.filename)
+            files.setCurrentRow(0)
+            next(w for w in dialog.findChildren(QPushButton) if w.text() == 'Add Selected Files').click()
+            self.assertEqual(chosen.count(), 1)
+            search.setText('YZ354 730')
+            QTest.qWait(250)
+            self.assertEqual(groups.count(), 1)
+            self.assertIn('YZ354', groups.item(0).text())
+            self.assertEqual(chosen.item(0).data(Qt.UserRole), first.source)
+            search.setText('YZ354 760')
+            QTest.qWait(250)
+            self.assertEqual(groups.count(), 0)
+            self.window.drr_catalog_refresh_finished.emit(self.window.current_folder, True)
+            self.assertIn('match all keywords', dialog.findChild(QLabel, 'drrSourceEmptyHint').text())
+            self.assertEqual(chosen.count(), 1)
+            search.clear()
+            QTest.qWait(250)
+            self.assertEqual(groups.count(), 3)
+            self.assertEqual(chosen.count(), 1)
             return QDialog.Rejected
 
         self.open_picker(execute)
@@ -332,10 +407,11 @@ class DrrPickerStabilityTests(unittest.TestCase):
             if delegate.parent().objectName() == "drr_source_group_list":
                 opt = QStyleOptionViewItem(option)
                 delegate.initStyleOption(opt, index)
-                needed = delegate._layout_text(
+                layout = delegate._layout_text(
                     delegate._normalize_text(opt.text), opt.font,
                     option.rect.width() - 2 * delegate.HORIZONTAL_PADDING,
-                ).boundingRect().height() + 2 * delegate.VERTICAL_PADDING
+                )
+                needed = layout.boundingRect().height() + 2 * delegate.VERTICAL_PADDING
                 painted.append((index.row(), option.rect.height(), needed))
             original_paint(delegate, painter, option, index)
         def execute(dialog):
@@ -406,18 +482,18 @@ class DrrPickerStabilityTests(unittest.TestCase):
             return QDialog.Rejected
         self.open_picker(execute)
 
-    def test_processing_status_is_first_line_even_for_long_filename(self):
+    def test_processing_status_stays_visible_in_second_summary_line(self):
         self.window.settings.setValue("drr/source_unprocessed_only", False)
         def execute(dialog):
             groups = dialog.findChild(QListWidget, "drr_source_group_list")
-            self.assertTrue(groups.item(0).text().startswith("UNPROCESSED"))
+            self.assertIn("UNPROCESSED", groups.item(0).text().splitlines()[1])
             self.window.drr_available_sources[0] = replace(self.window.drr_available_sources[0], processed=True)
             self.window.drr_catalog_refresh_finished.emit(self.window.current_folder, True)
-            self.assertTrue(groups.item(0).text().startswith("PARTIAL"))
+            self.assertIn("PARTIAL", groups.item(0).text().splitlines()[1])
             self.window.drr_available_sources = [replace(s, processed=True)
                                                   for s in self.window.drr_available_sources]
             self.window.drr_catalog_refresh_finished.emit(self.window.current_folder, True)
-            self.assertTrue(groups.item(0).text().startswith("PROCESSED"))
+            self.assertIn("PROCESSED", groups.item(0).text().splitlines()[1])
             return QDialog.Rejected
         self.open_picker(execute)
 
