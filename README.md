@@ -870,7 +870,11 @@ calling those helpers directly is separate from the normal GUI workflow.
       corrupt, or unwritable cache entries fall back to fitting. Original CSVs
       are unchanged; reading/parsing files can still take time on a cache hit.
     - Per-gate gain/tilt fits run in bounded batches, retaining independent
-      robust weights and convergence for every gate. During the current session,
+      robust weights and convergence for every gate. Masked medians are
+      evaluated across the batch without per-gate Python
+      calls. Group loads show fitting progress and the current file; the Run Log
+      records each file's elapsed time and whether its fitted cache was reused.
+      During the current session,
       protection-independent feature screening and held-out validation scores
       are also reused by data content and relevant parameters. Changing only
       protection rechecks existing feature candidates against the new regions;
