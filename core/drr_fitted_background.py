@@ -3,6 +3,7 @@ from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
 from pathlib import Path
+from time import perf_counter
 from uuid import uuid4
 
 import numpy as np
@@ -151,6 +152,19 @@ def _robust_fit(a, y, penalty=None):
     return coefficients
 
 
+def _masked_row_median(values, mask):
+    """Exact finite-sample medians without nanmedian's per-row Python loop.
+
+    Callers provide at least one finite anchor per row and a bounded gate
+    batch. Masked samples sort after every anchor; odd/even counts select the
+    same middle values as independently filtering each row.
+    """
+    ordered = np.sort(np.where(mask, values, np.inf), axis=1)
+    count = mask.sum(axis=1)
+    rows = np.arange(len(values))
+    return ((ordered[rows, (count-1)//2] + ordered[rows, count//2]) * .5)[:, None]
+
+
 def _robust_gain_tilt(x, values, valid=None):
     """Independent two-parameter Huber fits in bounded batches of gates.
 
@@ -187,10 +201,13 @@ def _robust_gain_tilt(x, values, valid=None):
             if mask is not None:
                 mask = mask[remaining]
             residual = y - coefficients[:, :1] - coefficients[:, 1:]*x
-            eligible = residual if mask is None else np.where(mask, residual, np.nan)
-            median_fn = np.median if mask is None else np.nanmedian
-            median = median_fn(eligible, axis=1, keepdims=True)
-            scale = np.maximum(1.4826*median_fn(abs(eligible-median), axis=1, keepdims=True), 1e-5)
+            if mask is None:
+                median = np.median(residual, axis=1, keepdims=True)
+                deviation = np.median(abs(residual-median), axis=1, keepdims=True)
+            else:
+                median = _masked_row_median(residual, mask)
+                deviation = _masked_row_median(abs(residual-median), mask)
+            scale = np.maximum(1.4826*deviation, 1e-5)
             weights = np.minimum(1., 1.5*scale / np.maximum(abs(residual), 1e-12))
             if mask is not None:
                 weights *= mask
@@ -278,7 +295,7 @@ def estimate_background(cube, settings, *, source='', signature=(0, 0), assess_q
                    title=f'{cube.title} (fitted reference)', cbar_label='I/B_fit - 1'), reference
 
 
-def load_fitted_group(folder, files, settings, *, y_axis='auto', progress=None):
+def load_fitted_group(folder, files, settings, *, y_axis='auto', progress=None, log=None):
     from core.processing_run import resolve_shared_y_axis_request
     from core.drr_sources import resolve_source_path
     if not files or any(Path(name).suffix.lower() != '.csv' for name in files):
@@ -286,8 +303,13 @@ def load_fitted_group(folder, files, settings, *, y_axis='auto', progress=None):
     axis = resolve_shared_y_axis_request(files, y_axis)
     references = []
     first = accumulator = None
+    if progress:
+        progress(0)
     for index, name in enumerate(files):
         check_load_cancelled()
+        started = perf_counter()
+        if log:
+            log(f'Fitting background {index + 1}/{len(files)}: {Path(name).name}')
         path = resolve_source_path(folder, name)
         signature = source_signature(path)
         raw = load_intensity(folder, name, y_axis=axis)
@@ -313,6 +335,9 @@ def load_fitted_group(folder, files, settings, *, y_axis='auto', progress=None):
         accumulator.add(values)
         coordinates.add(cube.gate, cube.gate_coordinates)
         references.append(reference)
+        if log:
+            reused = 'cache reused' if reference.cache_hit else 'calculated'
+            log(f'Fitted background {index + 1}/{len(files)}: {reused}, {perf_counter()-started:.2f} s')
         if progress:
             progress(int(90 * (index + 1) / len(files)))
     result = replace(first, Z=accumulator.mean(), gate_coordinates=coordinates.result())

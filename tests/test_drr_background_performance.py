@@ -10,7 +10,8 @@ import numpy as np
 from core import drr_background_quality as quality
 from core import drr_background_review as review
 from core.drr_background_memo import ReviewMemo
-from core.drr_fitted_background import _robust_fit, _robust_gain_tilt, estimate_background
+from core.drr_fitted_background import (_robust_fit, _robust_gain_tilt,
+                                       _masked_row_median, estimate_background)
 from core.load_cancellation import LoadCancellation, LoadCancelled, load_scope
 from tests.test_drr_fitted_background import SETTINGS, synthetic, write_csv
 
@@ -42,6 +43,36 @@ class BackgroundPerformanceTests(unittest.TestCase):
                    side_effect=[None, None, LoadCancelled()]):
             with self.assertRaises(LoadCancelled):
                 _robust_gain_tilt(np.linspace(-1, 1, 100), np.ones((70, 100)))
+
+    def test_masked_medians_match_filtered_rows_with_odd_even_and_sparse_anchors(self):
+        rng = np.random.default_rng(519)
+        values = rng.normal(size=(65, 1340))
+        mask = np.zeros(values.shape, bool)
+        counts = [1, 2, 3, 4, 1339, 1340] + list(rng.integers(24, 1340, 59))
+        for row, count in enumerate(counts):
+            mask[row, rng.choice(values.shape[1], count, replace=False)] = True
+        values[~mask] = np.nan  # Protected values must not influence the median.
+        before = values.copy()
+        expected = np.array([np.median(row[valid]) for row, valid in zip(values, mask)])
+        np.testing.assert_array_equal(_masked_row_median(values, mask)[:, 0], expected)
+        np.testing.assert_array_equal(values, before)
+
+    def test_large_masked_gain_fits_match_scalar_fits_across_batch_boundaries(self):
+        rng = np.random.default_rng(721)
+        x = np.sort(rng.uniform(-1, 1, 1340))
+        values = rng.normal(size=(137, 1)) + rng.normal(size=(137, 1))*x
+        values += rng.normal(0, .02, values.shape)
+        values[::3, 30:55] += 1.5
+        values[1::3, 500:520] -= 2.
+        values[0] = 0.
+        mask = rng.random(values.shape) > .25
+        design = np.column_stack((np.ones_like(x), x))
+        expected = np.array([_robust_fit(design[valid], row[valid])
+                             for row, valid in zip(values, mask)])
+        before = values.copy()
+        np.testing.assert_allclose(_robust_gain_tilt(x, values, mask), expected,
+                                   rtol=1e-10, atol=1e-11)
+        np.testing.assert_array_equal(values, before)
 
     def test_screening_reuses_data_but_reapplies_changed_protection(self):
         raw, _, _ = synthetic()

@@ -4293,6 +4293,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
     def _set_stage(self, stage: str) -> None:
         self._status(f"State: {stage}")
+        if stage == "Loading...":
+            self._status_progress.setRange(0, 0)
         self._status_progress.setVisible(stage == "Loading...")
         self._data_state_loading = stage == "Loading..."
         label = getattr(self, "data_state_label", None)
@@ -5772,6 +5774,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                      source_key=tuple(options.selected_files))
         worker = Worker(self._load_task, options, cancellation=self._active_load_cancel)
         worker.signals.log.connect(self._append_log)
+        if mode == 'DRR' and options.drr_baseline_text == 'Fitted (sample)':
+            worker.signals.progress.connect(
+                lambda value, token=token: self._on_fitted_load_progress(token, value=value))
+            worker.signals.log.connect(
+                lambda message, token=token: self._on_fitted_load_progress(token, message=message))
         load_generation = self._mcd_source_generation if mode == "MCD" else None
         if load_generation is not None:
             worker.signals.setProperty('mcd_source_generation', load_generation)
@@ -5782,6 +5789,18 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         worker.signals.error.connect(lambda message, token=token: self._on_load_error(message, token))
         worker.signals.finished.connect(lambda token=token: self._on_load_finished(request_token=token))
         self.thread_pool.start(worker)
+
+    def _on_fitted_load_progress(self, token: RequestToken, *, value=None, message=None) -> None:
+        cancellation = getattr(self, '_active_load_cancel', None)
+        if (self._is_closing or token != self._active_load_token
+                or cancellation is None or cancellation.cancelled):
+            return
+        if value is not None:
+            self._status_progress.setRange(0, 100)
+            self._status_progress.setValue(value)
+            self.data_state_label.setText(f'Fitting backgrounds… {value}%')
+        if message is not None and message.startswith('Fitting background '):
+            self._status(message)
 
     def _launch_pending_if_current(self, options: LoadOptions, generation: int,
                                    folder: str) -> None:
@@ -6336,7 +6355,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             if options.drr_baseline_text == 'Fitted (sample)':
                 from core.drr_fitted_background import load_fitted_group
                 cube, references = load_fitted_group(folder, options.selected_files, options.drr_fitted_settings,
-                    y_axis=options.y_axis_spec, progress=progress.emit)
+                    y_axis=options.y_axis_spec, progress=progress.emit, log=log.emit)
                 for reference in references:
                     for warning in reference.diagnostics.get('warnings', ()):
                         log.emit(f'Background review · {reference.source}: {warning}')

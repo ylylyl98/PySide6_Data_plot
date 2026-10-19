@@ -283,6 +283,42 @@ class FittedBackgroundUiTests(unittest.TestCase):
             self.assertFalse(dialog.settings().automatic_protection)
             np.testing.assert_allclose(dialog.settings().protected_regions, reference.settings.protected_regions, atol=1e-8)
 
+    def test_fit_progress_is_live_and_ignores_cancelled_or_finished_requests(self):
+        from ui_qt.common import LoadOptions
+        settings = QSettings(str(self.root/'progress.ini'), QSettings.IniFormat)
+        with patch('ui_qt.main_window.QSettings', return_value=settings), patch.object(
+                MainWindow, '_restore_last_folder', lambda _s: None), patch.object(
+                MainWindow, '_schedule_automatic_update_check', lambda _s: None):
+            window = MainWindow()
+        self.widgets.append(window)
+        window.current_folder = str(self.root)
+        options = LoadOptions('DRR', str(self.root), ['sample.csv'], [], False,
+                              FITTED_MODE, 'last', False)
+        with patch.object(window.thread_pool, 'start') as start:
+            window._launch_load_options(options)
+            worker = start.call_args.args[0]
+            token = window._active_load_token
+            worker.signals.progress.emit(45)
+            worker.signals.log.emit('Fitting background 2/4: sample.csv')
+            self.assertEqual(window._status_progress.maximum(), 100)
+            self.assertEqual(window._status_progress.value(), 45)
+            self.assertEqual(window.data_state_label.text(), 'Fitting backgrounds… 45%')
+            self.assertEqual(window.status_bar_view.currentMessage(), 'Fitting background 2/4: sample.csv')
+            window._on_fitted_load_progress(replace(token, generation=token.generation+1), value=80)
+            self.assertEqual(window._status_progress.value(), 45)
+            window._active_load_cancel.cancel()
+            worker.signals.progress.emit(80)
+            worker.signals.log.emit('Fitting background 3/4: obsolete.csv')
+            self.assertEqual(window._status_progress.value(), 45)
+            self.assertEqual(window.status_bar_view.currentMessage(), 'Fitting background 2/4: sample.csv')
+            window._on_load_finished(request_token=token)
+            worker.signals.progress.emit(90)
+            self.assertEqual(window._status_progress.value(), 45)
+            self.assertFalse(window._status_progress.isVisibleTo(window))
+            window._launch_load_options(replace(options, drr_baseline_text='Self (last frame)'))
+            self.assertEqual(window._status_progress.maximum(), 0)
+            window._on_load_finished(request_token=window._active_load_token)
+
     def test_main_window_apply_reload_inspect_and_paired_export(self):
         settings = QSettings(str(self.root/'settings.ini'), QSettings.IniFormat)
         with patch('ui_qt.main_window.QSettings', return_value=settings), patch.object(

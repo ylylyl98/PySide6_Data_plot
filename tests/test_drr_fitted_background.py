@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -104,6 +105,42 @@ class FittedBackgroundTests(unittest.TestCase):
             second_result = estimate_background(second, SETTINGS)[0]
             np.testing.assert_allclose(combined.Z[0], first_result.Z[0], atol=1e-10)
             np.testing.assert_allclose(combined.Z[1:], (first_result.Z[1:]+second_result.Z[:2])/2, atol=1e-10)
+
+    def test_group_reports_current_file_before_fitting_and_cache_reuse_afterwards(self):
+        raw, _, _ = synthetic()
+        with tempfile.TemporaryDirectory() as folder, patch.dict(
+                'os.environ', DPTK_FITTED_CACHE_DIR=folder+'/cache'):
+            write_csv(Path(folder)/'a.csv', raw)
+            write_csv(Path(folder)/'b.csv', raw)
+            for cached in (False, True):
+                events = []
+                progress = lambda value: events.append(('progress', value))
+                log = lambda message: events.append(('log', message))
+                _, references = load_fitted_group(folder, ['a.csv', 'b.csv'], SETTINGS,
+                    y_axis='bg', progress=progress, log=log)
+                self.assertEqual(events[0], ('progress', 0))
+                self.assertEqual(events[1], ('log', 'Fitting background 1/2: a.csv'))
+                self.assertEqual(events[3], ('progress', 45))
+                self.assertEqual(events[4], ('log', 'Fitting background 2/2: b.csv'))
+                self.assertEqual(events[-1], ('progress', 90))
+                self.assertIn('cache reused' if cached else 'calculated', events[2][1])
+                self.assertEqual([ref.cache_hit for ref in references], [cached, cached])
+
+    def test_cancelled_fitted_group_does_not_start_next_file_or_publish_completion(self):
+        raw, _, _ = synthetic()
+        cancellation = LoadCancellation()
+        events = []
+        def log(message):
+            events.append(message)
+            if message.startswith('Fitted background 1/2:'):
+                cancellation.cancel()
+        with tempfile.TemporaryDirectory() as folder, patch.dict(
+                'os.environ', DPTK_FITTED_CACHE_DIR=folder+'/cache'):
+            write_csv(Path(folder)/'a.csv', raw)
+            write_csv(Path(folder)/'b.csv', raw)
+            with load_scope(cancellation), self.assertRaises(LoadCancelled):
+                load_fitted_group(folder, ['a.csv', 'b.csv'], SETTINGS, y_axis='bg', log=log)
+        self.assertFalse(any('2/2' in message for message in events))
 
 
 if __name__ == '__main__':
