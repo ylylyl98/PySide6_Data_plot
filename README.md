@@ -521,10 +521,39 @@ git push origin v1.0.0
 ```
 
 GitHub Actions first verifies that the tag matches `app_version.py`, then runs
-the tests, builds the Windows application and installer, and attaches
+the complete test suite in four parallel shards while building the Windows
+application and installer. A tag must also point to a commit contained in
+`main`. Only after the build and the combined test-report verification succeed
+does the workflow attach
 `DPTK-v1.0.0-Windows-x64.zip`, `DPTK-Setup-v1.0.0-Windows-x64.exe`, and
 `SHA256SUMS.txt` to the corresponding GitHub Release.
 Generated `build/` and `dist/` content stays local and is not committed.
+
+The release test plan is generated from actual `unittest` discovery, so newly
+added tests are included automatically. Repeated discovery of the same test ID
+through imported test classes is recorded in the plan and executed once;
+inherited tests belonging to different classes retain their distinct IDs.
+Unsupported custom discovery or parameterized test instances stop planning
+instead of silently changing the test behavior. Modules run in separate
+processes to isolate Qt object lifetimes and module state; the eight expensive
+fitted-BN modules are split into individual tests. Shard balancing uses recorded local
+timings where available and explicitly labelled estimates for the remaining
+tests and process startup. These weights determine placement, not pass/fail
+criteria or a promised GitHub runtime. Existing skip and expected-failure rules
+are retained.
+
+Each shard uploads its test outcomes, timings and process logs as a
+`release-test-shard-*` artifact, including on test failure where the runner is
+still available. A failed test, abnormal process exit, timeout, or incomplete
+report blocks release. The portable build artifact can finish earlier; its
+presence alone does not mean the release checks passed. Manual **Run workflow**
+runs these same checks without creating a Release.
+
+To inspect the complete assignment without executing tests:
+
+```powershell
+.venv\Scripts\python.exe scripts/run_release_tests.py plan --output build/release-tests/plan.json --shards 4
+```
 
 ## Architecture
 - `core/`: UI-agnostic data loading, processing, plotting primitives, and export.
@@ -1722,7 +1751,8 @@ validation → Run workflow** on the relevant branch. Its eight numerical test
 modules run in separate jobs, with up to four jobs in parallel. All existing
 numerical assertions and feature-protection thresholds are retained. This
 manual workflow is separate from the ordinary BN assignment PR gate; the
-Windows release workflow still runs the full test suite before packaging.
+Windows release workflow runs the full test suite in four parallel shards
+alongside packaging and requires all shard reports to pass before publishing.
 
 Run:
 ```bash
