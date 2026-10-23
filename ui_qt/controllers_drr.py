@@ -1742,11 +1742,20 @@ class DrrController:
         group_rows_cache = {}
         session_summaries = {}
         chosen_paths = set()
+        source_root = str(Path(self.current_folder or '.').resolve()) if background_role else ''
+        absolute_source_keys = {}
 
         def _absolute_source_key(source):
-            # Normalize relative catalog paths and absolute Browse selections
-            # lexically, without inspecting files on the GUI thread.
-            return os.path.normcase(os.path.abspath(os.path.join(self.current_folder or '.', source)))
+            # Resolve the experiment directory once, so Windows short names
+            # and Browse's long paths share the same cached grid evidence.
+            # Relative catalog entries remain lexical; absolute selections
+            # are resolved once per dialog, never on every row refresh.
+            source = str(source)
+            if source not in absolute_source_keys:
+                path = Path(source)
+                absolute = path.resolve() if path.is_absolute() else Path(source_root) / path
+                absolute_source_keys[source] = os.path.normcase(os.path.abspath(absolute))
+            return absolute_source_keys[source]
 
         def _baseline_measurements():
             if independent_background and not background_role:

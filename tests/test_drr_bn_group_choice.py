@@ -205,8 +205,9 @@ class GroupBnChoiceTests(unittest.TestCase):
 
     def test_changed_group_processing_or_active_tab_rejects_old_delivery(self):
         prepared = self.prepared(self.bn1)
-        for change in ('selection', 'sg', 'tab'):
+        for change in ('selection', 'sg', 'tab', 'folder'):
             with self.subTest(change=change):
+                self.owner.current_folder = str(self.root)
                 self.owner.drr_selected_files = list(self.selected)
                 self.owner.drr_sg_window_spin.number = 5
                 self.owner.tabs = SimpleNamespace(currentIndex=lambda: 0, tabText=lambda _: 'DRR')
@@ -217,12 +218,36 @@ class GroupBnChoiceTests(unittest.TestCase):
                     self.owner.drr_selected_files.reverse()
                 elif change == 'sg':
                     self.owner.drr_sg_window_spin.number = 7
+                elif change == 'folder':
+                    self.owner.current_folder = str(self.root / 'different_measurements')
                 else:
                     self.owner.tabs.tabText = lambda _: 'PL'
                 request.complete(prepared)
                 self.owner._on_loaded.assert_not_called()
                 self.assertEqual(self.owner.loaded.drr_assignments, self.plan.resolution.assignments)
                 group.cancel_group_choice(self.owner)
+
+    def use_short_folder_alias(self):
+        if os.name != 'nt':
+            self.skipTest('Windows short directory names are required')
+        import ctypes
+        short = ctypes.create_unicode_buffer(32768)
+        length = ctypes.windll.kernel32.GetShortPathNameW(str(self.root), short, len(short))
+        if not length or length >= len(short) or short.value.casefold() == str(self.root).casefold():
+            self.skipTest('The test volume does not provide an 8.3 directory alias')
+        self.assertEqual(Path(short.value).resolve(), self.root.resolve())
+        self.root = Path(short.value)
+
+    def test_short_folder_alias_keeps_real_precomputed_publication(self):
+        self.use_short_folder_alias()
+        # Exercise both the folder picker and previous loaded result using an
+        # alias while the BN plan and freshly loaded result use the long name.
+        self.owner.loaded.folder = str(self.root)
+        self.test_real_main_window_accepts_precomputed_result_without_reload_or_settings_write()
+
+    def test_short_folder_alias_keeps_real_render_failure_rollback(self):
+        self.use_short_folder_alias()
+        self.test_real_second_product_render_failure_restores_old_meshes_and_toolbar_zoom()
 
     def test_stale_sources_rejected_again_immediately_before_publication(self):
         prepared = self.prepared(self.bn1)

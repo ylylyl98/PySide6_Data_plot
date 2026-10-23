@@ -136,6 +136,11 @@ def _background_switch_controls(owner):
     return controls
 
 
+def background_folder_key(folder):
+    """Compare directory identity across Windows short names and path aliases."""
+    return Path(folder).resolve()
+
+
 def prepare_background_switch(owner):
     """Capture the current view immediately before accepting a BN-only result.
 
@@ -156,7 +161,7 @@ def prepare_background_switch(owner):
         viewport = (tuple(float(value) for value in axis.get_xlim()),
                     tuple(float(value) for value in axis.get_ylim()))
     return _BackgroundSwitchDisplay(
-        str(loaded.folder), tuple(loaded.selected_files), loaded.y_axis_spec,
+        str(background_folder_key(loaded.folder)), tuple(loaded.selected_files), loaded.y_axis_spec,
         np.asarray(loaded.cube.energy).copy(), np.asarray(loaded.cube.gate).copy(),
         tuple((name, _value(widget)) for name, widget in _background_switch_controls(owner).items()),
         viewport, bool(getattr(owner, '_drr_limits_from_controls', False)),
@@ -177,9 +182,9 @@ def restore_background_switch(owner, loaded, snapshot):
     if (not isinstance(snapshot, _BackgroundSwitchDisplay)
             or getattr(owner, 'loaded', None) is not loaded
             or loaded.mode != 'DRR' or loaded.cube is None
-            or str(loaded.folder) != snapshot.folder
+            or background_folder_key(loaded.folder) != Path(snapshot.folder)
             or tuple(loaded.selected_files) != snapshot.selected
-            or str(getattr(owner, 'current_folder', loaded.folder)) != snapshot.folder
+            or background_folder_key(getattr(owner, 'current_folder', loaded.folder)) != Path(snapshot.folder)
             or tuple(getattr(owner, 'drr_selected_files', loaded.selected_files)) != snapshot.selected
             or loaded.y_axis_spec != snapshot.y_axis_spec
             or not np.array_equal(loaded.cube.energy, snapshot.energy, equal_nan=True)

@@ -163,7 +163,7 @@ class BnMatchPlanTests(unittest.TestCase):
         unrelated.write_text('Not a spectral CSV\n')
         reads = []
         def inspect(path, **kwargs):
-            reads.append(Path(path).relative_to(self.root).as_posix())
+            reads.append(Path(path).resolve().relative_to(self.root.resolve()).as_posix())
             return inspect_csv_gate_profile(path, **kwargs)
         with patch('core.drr_bn_matching.inspect_csv_gate_profile', side_effect=inspect):
             plan = self.plan()

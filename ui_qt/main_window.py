@@ -175,7 +175,7 @@ from ui_qt.common import (
     WorkerSignals,
     focused_numeric_input,
 )
-from ui_qt.drr_display_memory import guarded_auto, second_is_protected
+from ui_qt.drr_display_memory import background_folder_key, guarded_auto, second_is_protected
 from ui_qt.compact_spinbox import CompactDoubleSpinBox
 
 
@@ -6781,10 +6781,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         ):
             return
         previous = self.loaded
+        same_drr_folder = (previous is not None and previous.mode == 'DRR' and loaded.mode == 'DRR'
+                           and background_folder_key(previous.folder) == background_folder_key(loaded.folder))
         display_snapshot = None
         if preserve_drr_display:
             if (loaded.mode != 'DRR' or previous is None or previous.mode != 'DRR'
-                    or previous.folder != loaded.folder
+                    or not same_drr_folder
                     or tuple(previous.selected_files) != tuple(loaded.selected_files)
                     or previous.y_axis_spec != loaded.y_axis_spec):
                 raise ValueError('The BN comparison no longer belongs to the displayed measurement group.')
@@ -6795,7 +6797,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._active_load_succeeded = True
         if loaded.mode == "DRR" and (
             previous is None or previous.mode != "DRR"
-            or previous.folder != loaded.folder
+            or not same_drr_folder
             or previous.selected_files != loaded.selected_files
             or previous.y_axis_spec != loaded.y_axis_spec
         ):

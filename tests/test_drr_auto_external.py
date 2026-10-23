@@ -279,7 +279,7 @@ class AppliedPnExternalTests(unittest.TestCase):
         self.assertTrue(result.resolved, result.reason)
         self.assertEqual(len(result.assignments), 1)
         assignment = result.assignments[0]
-        self.assertEqual(assignment.baseline_files, (str(self.version.csv_path.relative_to(self.root)).replace("\\", "/"),))
+        self.assertEqual(assignment.baseline_files, (self.version.csv_path.relative_to(self.root.resolve()).as_posix(),))
         self.assertEqual(assignment.baseline_which, "last")
         self.assertIn(self.version.version_id, assignment.selection_reason)
 

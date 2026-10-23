@@ -154,7 +154,7 @@ class BnManualPickerTests(unittest.TestCase):
         wrong_abs = str((self.root/self.wrong_grid.source).resolve())
         p_abs = str((self.root/self.p.source).resolve())
         compatible_abs = str((self.root/self.bn49.source).resolve())
-        outside = str(self.root/'elsewhere'/'manual_RotIn49deg_BNbackground_009.csv')
+        outside = str((self.root.parent/'elsewhere'/'manual_RotIn49deg_BNbackground_009.csv').resolve())
         def execute(dialog):
             with patch('ui_qt.controllers_drr.QFileDialog.getOpenFileNames',
                        return_value=([wrong_abs, p_abs, compatible_abs, outside], '')):
@@ -166,6 +166,53 @@ class BnManualPickerTests(unittest.TestCase):
             return dialog.result()
         result, _ = self.choose(execute)
         self.assertEqual(result, (compatible_abs, outside))
+
+    def test_directory_aliases_keep_cached_grids_for_selection_browse_and_accept(self):
+        canonical_root = self.root.resolve()
+        alias_root = canonical_root/'directory-alias'
+        original_resolve = Path.resolve
+        resolved_paths = []
+
+        def resolve(path, *args, **kwargs):
+            # Emulate a Windows short-directory alias on every platform.
+            # The native short-name case is the same mapping at the OS boundary.
+            resolved_paths.append(path)
+            try:
+                path = canonical_root/path.relative_to(alias_root)
+            except ValueError:
+                pass
+            return original_resolve(path, *args, **kwargs)
+
+        self.window.current_folder = str(alias_root)
+        self.window.drr_selected_files = [str(alias_root/self.measurement.source)]
+        wrong = str(canonical_root/self.wrong_grid.source)
+        compatible = str(canonical_root/self.bn49.source)
+        outside = str(canonical_root.parent/'elsewhere'/'manual_RotIn49deg_BNbackground_009.csv')
+
+        def execute(dialog):
+            self.assertEqual(self.paths(dialog)[0], self.bn49_newer.source)
+            with patch('ui_qt.controllers_drr.QFileDialog.getOpenFileNames',
+                       return_value=([wrong, str(canonical_root/self.p.source), compatible, outside], '')):
+                self.click(dialog, 'Browse File Anywhere...')
+            chosen = dialog.findChild(QListWidget, 'drr_source_chosen_list')
+            self.assertEqual([chosen.item(i).data(Qt.UserRole) for i in range(chosen.count())],
+                             [compatible, outside])
+            # Final validation must also reject a row inserted under the alias.
+            item = QListWidgetItem(self.wrong_grid.filename)
+            item.setData(Qt.UserRole, str(alias_root/self.wrong_grid.source))
+            chosen.addItem(item)
+            dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.Ok).click()
+            self.assertEqual(dialog.result(), QDialog.Rejected)
+            chosen.takeItem(chosen.count()-1)
+            dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.Ok).click()
+            return dialog.result()
+
+        with patch.object(Path, 'resolve', resolve):
+            result, _ = self.choose(execute)
+        self.assertEqual(result, (compatible, outside))
+        self.assertEqual(resolved_paths.count(alias_root), 1)
+        # Building/sorting the relative catalog must not resolve every CSV.
+        self.assertNotIn(canonical_root/self.bn49_newer.source, resolved_paths)
 
     def test_wrong_angle_remains_explicit_choice_and_is_not_an_automatic_fallback(self):
         self.window.drr_available_sources = [self.measurement, self.bn94, self.p, self.n]
