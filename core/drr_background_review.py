@@ -1,19 +1,18 @@
 """Worker-side group checks and explicit method comparison, without UI state."""
 from dataclasses import asdict, replace
 import numpy as np
-from core.drr_fitted_background import load_intensity, settings_for_source, source_signature
-from core.drr_background_cache import fit_cached
+from core.drr_fitted_background import (prepare_fitted_group, fit_prepared_group,
+                                       settings_for_group, verify_prepared_group)
 from core.drr_background_quality import suggest_regions
-from core.drr_sources import resolve_source_path
 from core.load_cancellation import check_load_cancelled
 from core.drr_background_memo import ReviewMemo, review_key
 
-VALIDATION_VERSION = 2
+VALIDATION_VERSION = 3
 _validation_memo = ReviewMemo()
 
 
 def blocked_validation(cube, reference):
-    """Hold out small contiguous anchor bands on at most nine representative gates."""
+    """Validate the smooth envelope; texture models have separate validation."""
     from core.drr_background_cache import CACHE_VERSION
     key = review_key(dict(version=VALIDATION_VERSION, fit_version=CACHE_VERSION, settings=asdict(reference.settings)),
                      cube.energy, cube.gate, cube.Z, reference.fit_mask, reference.anchor_masks())
@@ -36,13 +35,16 @@ def _blocked_validation(cube, reference):
         center = (start+end)//2
         half = min((end-start)//6, max(2, int(round(.004/np.median(np.diff(cube.energy))))))
         lo, hi = center-half, center+half
-        settings = replace(reference.settings, automatic_protection=False, protected_regions=reference.settings.protected_regions+
+        settings = replace(reference.settings, automatic_protection=False, shared_texture=False, periodic_texture=False,
+                           texture_reference_source='',
+                           protected_regions=reference.settings.protected_regions+
                            ((float(cube.energy[lo]), float(cube.energy[hi])),))
         anchors = None
         if reference.gate_fit_mask is not None:
             anchors = reference.anchor_masks()[indices].copy()
             anchors[:, lo:hi+1] = False
-            settings = replace(reference.settings, shared_texture=False)
+            settings = replace(reference.settings, shared_texture=False, periodic_texture=False,
+                               texture_reference_source='')
         try:
             # These temporary fits supply prediction errors only. Final model
             # fits still screen every gate; repeated peak screening here adds
@@ -54,45 +56,51 @@ def _blocked_validation(cube, reference):
             continue  # Insufficient support is reported as unavailable, never a good score.
     errors = [error for error in errors if error.size]
     return dict(rms_percent=float(100*np.sqrt(np.mean(np.concatenate(errors)**2))) if errors else None,
-                blocks=len(errors), gates=len(indices))
+                blocks=len(errors), gates=len(indices), scope='Smooth envelope only')
 
 
 def check_group(folder, files, axis, recipe, generation, *, progress, log):
-    results = []
-    for index, source in enumerate(files):
-        check_load_cancelled()
-        try:
-            path = resolve_source_path(folder, source)
-            signature = source_signature(path)
-            raw = load_intensity(folder, source, y_axis=axis)
-            regions = recipe.get('protected_regions_by_file', {}).get(source, recipe.get('protected_regions', ()))
-            reference = None
-            if regions or recipe.get('automatic_protection', False):
-                _, reference = fit_cached(raw, settings_for_source(recipe, source), source=source,
-                    signature=signature, source_path=path, y_axis=axis)
-                report = reference.diagnostics
-            else:
-                report = {**suggest_regions(raw), 'status': 'Needs regions',
-                          'warnings': ['Review suggested regions or draw protection, then fit.']}
-            if source_signature(path) != signature:
-                raise ValueError('Source changed during check; retry after acquisition finishes.')
-            results.append(dict(source=source, report=report, reference=reference))
-        except (OSError, ValueError, TypeError, np.linalg.LinAlgError) as exc:
-            results.append(dict(source=source, report=dict(status='Error', warnings=[str(exc)]), reference=None))
-        progress.emit(int(100*(index+1)/len(files)))
-    return dict(kind='checks', generation=generation, results=results)
+    """Check one averaged measurement group atomically, never a partial subset."""
+    files = (files,) if isinstance(files, str) else tuple(files)
+    source = files[0] if files else ''
+    check_load_cancelled()
+    try:
+        prepared = prepare_fitted_group(folder, files, y_axis=axis, progress=progress.emit, log=log.emit)
+        mapping = asdict(recipe) if hasattr(recipe, '__dataclass_fields__') else recipe
+        if not isinstance(mapping, dict):
+            raise ValueError('Background recipe must be a mapping.')
+        overrides = mapping.get('protected_regions_by_file', {})
+        if not isinstance(overrides, dict):
+            raise ValueError('Per-file protected regions must be a mapping.')
+        regions = [overrides.get(name, mapping.get('protected_regions', ()))
+                   for name in files]
+        reference = None
+        if any(regions) or mapping.get('automatic_protection', False):
+            _, reference = fit_prepared_group(prepared, recipe, stage=log.emit)
+            report = reference.diagnostics
+        else:
+            report = {**suggest_regions(prepared.cube), 'status': 'Needs regions',
+                      'warnings': ['Review suggested regions or draw protection on the averaged measurements, then fit.']}
+        verify_prepared_group(prepared)
+        result = dict(source=source, source_files=list(files), report=report, reference=reference)
+    except (OSError, ValueError, TypeError, np.linalg.LinAlgError) as exc:
+        result = dict(source=source, source_files=list(files),
+                      report=dict(status='Error', warnings=[str(exc)]), reference=None)
+    progress.emit(100)
+    return dict(kind='checks', generation=generation, results=[result])
 
 
 def compare_methods(folder, source, axis, settings, generation, window, polyorder, *, progress, log):
     from core.processing import apply_sg_derivative_energy
-    path = resolve_source_path(folder, source)
-    signature = source_signature(path)
-    raw = load_intensity(folder, source, y_axis=axis)
+    files = (source,) if isinstance(source, str) else tuple(source)
+    prepared = prepare_fitted_group(folder, files, y_axis=axis, progress=progress.emit, log=log.emit)
+    raw = prepared.cube
+    settings = settings_for_group(settings, files)
     cubes, references = [], []
     alternate = replace(settings, method='polynomial' if settings.method == 'spline' else 'spline')
     for chosen in (settings, alternate):
         check_load_cancelled()
-        cube, reference = fit_cached(raw, chosen, source=source, signature=signature, source_path=path, y_axis=axis)
+        cube, reference = fit_prepared_group(prepared, chosen, stage=log.emit)
         cubes.append(cube)
         references.append(reference)
     derivatives = [apply_sg_derivative_energy(cube, derivative=2, window_length=window, polyorder=polyorder)
@@ -105,9 +113,9 @@ def compare_methods(folder, source, axis, settings, generation, window, polyorde
     protected = ~primary.fit_mask
     difference = derivatives[1][0].Z-derivatives[0][0].Z
     rms = float(np.sqrt(np.mean(derivatives[0][0].Z**2)))
-    if source_signature(path) != signature:
-        raise ValueError('Source changed during comparison; retry after acquisition finishes.')
-    return dict(kind='compare', generation=generation,
+    verify_prepared_group(prepared)
+    progress.emit(100)
+    return dict(kind='compare', generation=generation, source=files[0], source_files=list(files),
         raw=raw, reference=primary, alternate=other, alternate_background=other.background(),
         derivatives=[item[0] for item in derivatives],
         metrics=dict(background_max_difference_percent=float(np.max(abs(percent[:, protected]))) if protected.any() else None,

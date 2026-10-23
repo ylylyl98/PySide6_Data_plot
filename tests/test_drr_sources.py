@@ -27,6 +27,8 @@ from core.drr_sources import (
     resolve_drr_background_assignments,
 )
 from core.provenance import verify_initial_data_working_file
+from core import drr_sources as sources
+from core.load_cancellation import LoadCancellation, LoadCancelled, load_scope
 
 
 class DrrSourceCatalogTests(unittest.TestCase):
@@ -60,6 +62,39 @@ class DrrSourceCatalogTests(unittest.TestCase):
             )
             self.assertTrue(resolution.resolved)
             self.assertEqual(resolution.assignments[0].baseline_files, (portable_source_name(root, background),))
+
+    def test_resolution_reuses_sample_reads_only_within_one_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            measurement = root / 'sample_760nmc_data.csv'
+            background = root / 'sample_760nmc_back.csv'
+            self._write_drr_csv(measurement, list(range(10, 22)), varying_gates=True)
+            self._write_drr_csv(background, list(range(10, 22)))
+            catalog = discover_drr_sources(root)
+            with patch.object(sources, '_read_csv_spectral_sample_uncached',
+                              wraps=sources._read_csv_spectral_sample_uncached) as read:
+                for request in range(2):
+                    result = resolve_drr_background_assignments(root, catalog, [measurement.name])
+                    self.assertTrue(result.resolved)
+                    self.assertEqual(read.call_count, 2 * (request + 1))
+            self.assertIsNone(sources._SPECTRAL_SAMPLES.get())
+
+    def test_matching_csv_read_cancels_between_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'sample.csv'
+            self._write_drr_csv(path, list(range(10, 22)), varying_gates=True)
+            token = LoadCancellation()
+            original = sources._as_float
+            cells = []
+            def convert(value):
+                cells.append(value)
+                if len(cells) == 50:
+                    token.cancel()
+                return original(value)
+            with load_scope(token), patch.object(sources, '_as_float', side_effect=convert):
+                with self.assertRaises(LoadCancelled):
+                    sources._read_csv_spectral_sample(path, max_frames=64)
+            self.assertLess(len(cells), 100)
 
     def test_auto_resolver_rejects_sparse_joint_background_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

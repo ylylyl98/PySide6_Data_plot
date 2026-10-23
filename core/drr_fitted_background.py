@@ -26,12 +26,22 @@ class BackgroundFitSettings:
     polynomial_degree: int = 3
     automatic_protection: bool = False
     shared_texture: bool = True
+    periodic_texture: bool = False
+    periodic_components: int = 3
+    texture_reference_source: str = ''
 
     def validate(self):
         if not isinstance(self.automatic_protection, bool):
             raise ValueError('Automatic peak protection must be enabled or disabled.')
         if not isinstance(self.shared_texture, bool):
             raise ValueError('Shared texture correction must be enabled or disabled.')
+        if not isinstance(self.periodic_texture, bool):
+            raise ValueError('Periodic gap prediction must be enabled or disabled.')
+        if not isinstance(self.texture_reference_source, str):
+            raise ValueError('Fringe reference source must be a file path or an empty string.')
+        if (isinstance(self.periodic_components, bool) or not isinstance(self.periodic_components, int)
+                or not 1 <= self.periodic_components <= 5):
+            raise ValueError('Maximum periodic components must be an integer between 1 and 5.')
         if not self.protected_regions and not self.automatic_protection:
             raise ValueError('Select protected resonance regions in Fit / view background first.')
         if not isinstance(self.spline_intervals, int) or not 4 <= self.spline_intervals <= 40:
@@ -56,7 +66,9 @@ class BackgroundFitSettings:
         return cls(tuple(tuple(map(float, pair)) for pair in values.get('protected_regions', ())),
                    values.get('spline_intervals', 10), float(values.get('smoothing', .001)),
                    values.get('method', 'spline'), values.get('polynomial_degree', 3),
-                   values.get('automatic_protection', False), values.get('shared_texture', True)).validate()
+                   values.get('automatic_protection', False), values.get('shared_texture', True),
+                   values.get('periodic_texture', False), values.get('periodic_components', 3),
+                   values.get('texture_reference_source', '')).validate()
 
 
 def settings_for_source(settings, source):
@@ -72,8 +84,32 @@ def settings_for_source(settings, source):
 
 
 def validate_recipe(settings, files):
+    settings_for_group(settings, files)
+
+
+def settings_for_group(settings, files):
+    """Migrate legacy manual per-file protection conservatively to one fit."""
+    if isinstance(settings, BackgroundFitSettings):
+        return settings.validate()
+    if not isinstance(settings, dict):
+        raise ValueError('Background recipe must be a mapping.')
+    overrides = settings.get('protected_regions_by_file', {})
+    if not isinstance(overrides, dict):
+        raise ValueError('Per-file protected regions must be a mapping.')
+    if settings.get('automatic_protection', False):
+        return BackgroundFitSettings.from_mapping(settings)
+    regions = []
     for source in files:
-        settings_for_source(settings, source)
+        regions.extend(overrides.get(source, settings.get('protected_regions', ())))
+    merged = []
+    for lo, hi in sorted(tuple(map(float, pair)) for pair in regions):
+        if not np.isfinite([lo, hi]).all() or lo >= hi:
+            raise ValueError('Each protected region needs two finite, increasing energy limits.')
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(hi, merged[-1][1]))
+        else:
+            merged.append((lo, hi))
+    return BackgroundFitSettings.from_mapping({**settings, 'protected_regions': merged})
 
 
 @dataclass
@@ -93,6 +129,7 @@ class FittedReference:
     gate_fit_mask: np.ndarray | None = None
     log_texture: np.ndarray | None = None
     texture_coverage: np.ndarray | None = None
+    input_sources: tuple[dict, ...] = ()
 
     def background(self, *, include_texture=True):
         x = 2 * (self.energy - self.energy[0]) / np.ptp(self.energy) - 1
@@ -109,12 +146,21 @@ class FittedReference:
 
     def metadata(self):
         return dict(source=self.source, signature=list(self.signature), settings=asdict(self.settings),
+                    input_sources=list(self.input_sources),
+                    processing_order=('raw intensity average -> fit one background -> I_mean / B_fit - 1'
+                                      if self.input_sources else 'raw intensity -> fit background -> I / B_fit - 1'),
+                    average_method=('equal file weights on common measured energy/gate support'
+                                    if self.input_sources else None),
                     gate_label=self.gate_label, anchor_rms_percent=self.anchor_rms_percent,
                     method=f'Shared log-intensity {self.settings.method}; symmetric Huber fit; per-frame gain and tilt; '
                         + ('gate-local peak protection; ' if self.gate_fit_mask is not None else 'manual peak protection; ')
-                        + ('repeatable fine-texture correction enabled' if self.settings.shared_texture else 'smooth envelope only'),
+                        + ('repeatable fine-texture correction enabled' if self.settings.shared_texture else 'smooth envelope only')
+                        + ('; external fringe reference selected' if self.settings.texture_reference_source else '')
+                        + ('; validated periodic gap prediction requested' if self.settings.periodic_texture else ''),
                     diagnostics=self.diagnostics,
                     normalization='I / fitted_background - 1', bn_reference_used=False,
+                    fringe_reference_used=self.diagnostics.get('reference_texture', {}).get('applied_fraction', 0.) > 0.,
+                    fringe_reference_role='fringe_only' if self.settings.texture_reference_source else None,
                     caveat='Anchor residual is not uncertainty under protected peaks. No additional dark subtraction.')
 
 
@@ -214,8 +260,12 @@ def _robust_gain_tilt(x, values, valid=None):
     return result
 
 
-def estimate_background(cube, settings, *, source='', signature=(0, 0), assess_quality=True, anchor_masks=None):
+def estimate_background(cube, settings, *, source='', signature=(0, 0), assess_quality=True, anchor_masks=None,
+                        stage=None, texture_reference=None, texture_reference_meta=None):
     settings = BackgroundFitSettings.from_mapping(settings)
+    reference_enabled = settings.shared_texture and bool(settings.texture_reference_source)
+    if reference_enabled and texture_reference is None:
+        raise ValueError('The selected fringe reference was not loaded; supply its raw frames before fitting.')
     energy, gate, raw = (np.asarray(value, float) for value in (cube.energy, cube.gate, cube.Z))
     if (energy.ndim != 1 or gate.ndim != 1 or raw.shape != (len(gate), len(energy))
             or len(energy) < 24 or not len(gate)):
@@ -229,6 +279,8 @@ def estimate_background(cube, settings, *, source='', signature=(0, 0), assess_q
     if np.any(np.diff(energy) <= 0):
         raise ValueError('Background fitting requires distinct energy samples.')
     from core.drr_background_structure import gate_anchor_masks, mask_regions, pooled_profile, shared_texture
+    if stage:
+        stage('Identifying protected peaks')
     gate_mask = gate_anchor_masks(energy, raw) if settings.automatic_protection and anchor_masks is None else None
     if anchor_masks is not None:
         supplied = np.asarray(anchor_masks)
@@ -257,6 +309,8 @@ def estimate_background(cube, settings, *, source='', signature=(0, 0), assess_q
     if mask.sum() < max(24, 3 * design.shape[1]) or np.linalg.matrix_rank(design[mask]) < design.shape[1]:
         raise ValueError('Too little background support. Narrow the protected regions or reduce spline intervals.')
     log_raw = np.log(raw)
+    if stage:
+        stage('Fitting background envelope')
     if gate_mask is None:
         shape = design @ _robust_fit(design[mask], np.median(log_raw, axis=0)[mask], penalty)
         coefficients = _robust_gain_tilt(x[mask], log_raw[:, mask] - shape[mask])
@@ -275,19 +329,83 @@ def estimate_background(cube, settings, *, source='', signature=(0, 0), assess_q
         coefficients = _robust_gain_tilt(x, log_raw-shape, gate_mask)
     reference = FittedReference(source, signature, energy.copy(), gate.copy(), shape, coefficients,
                                 mask, cube.gate_label, settings, 0., gate_fit_mask=gate_mask)
+    periodic_report = dict(status='Disabled', corrected_fraction=0., additional_corrected_fraction=0.)
+    reference_report = dict(status='Disabled', corrected_fraction=0., additional_corrected_fraction=0.,
+                            applied_fraction=0., role='fringe_only',
+                            source_metadata=dict(texture_reference_meta or {}))
+    if settings.texture_reference_source and not settings.shared_texture:
+        reference_report['reason'] = 'Enable shared texture correction to use the selected fringe reference.'
     if settings.shared_texture:
+        if stage:
+            stage('Estimating shared texture')
         residual = log_raw-shape-coefficients[:, :1]-coefficients[:, 1:]*x
         reference.log_texture, reference.texture_coverage, texture_report = shared_texture(
             energy, residual, reference.anchor_masks())
+        if reference_enabled:
+            from core.drr_reference_texture import reference_texture
+            if stage:
+                stage('Validating the selected fringe reference')
+            if not isinstance(texture_reference, DataCube):
+                raise ValueError('The selected fringe reference must contain raw spectral frames.')
+            reference_energy = np.asarray(texture_reference.energy, float)
+            reference_raw = np.asarray(texture_reference.Z, float)
+            if (reference_energy.ndim != 1 or reference_raw.ndim != 2
+                    or reference_raw.shape[1] != len(reference_energy) or not len(reference_raw)
+                    or not np.all(np.isfinite(reference_raw)) or np.any(reference_raw <= 0)):
+                raise ValueError('Fringe reference frames must contain finite positive raw intensities on one energy axis.')
+            reference_order = np.argsort(reference_energy)
+            reference_energy = reference_energy[reference_order]
+            reference_raw = reference_raw[:, reference_order]
+            prediction, coverage, reference_report = reference_texture(
+                energy, log_raw, reference.anchor_masks(), reference_energy, np.log(reference_raw),
+                reference.texture_coverage)
+            if (prediction.shape != energy.shape or coverage.shape != energy.shape
+                    or not np.isfinite(prediction).all() or not np.isfinite(coverage).all()
+                    or np.any((coverage < 0) | (coverage > 1))):
+                raise ValueError('Fringe reference returned invalid correction arrays.')
+            previous_coverage = reference.texture_coverage
+            contribution = (1-previous_coverage)*coverage
+            reference.log_texture = reference.log_texture+(1-previous_coverage)*prediction
+            reference.texture_coverage = previous_coverage+contribution
+            reference_report = {**reference_report, 'role': 'fringe_only',
+                'source_metadata': dict(texture_reference_meta or {}),
+                'applied_fraction': float(np.mean(contribution > 0)),
+                'additional_corrected_fraction': float(np.mean(reference.texture_coverage > .5)
+                                                       - np.mean(previous_coverage > .5))}
+        if settings.periodic_texture:
+            from core.drr_periodic_texture import periodic_texture
+            if stage:
+                stage('Validating periodic predictions across protected bands')
+            prediction, coverage, periodic_report = periodic_texture(
+                energy, residual, reference.anchor_masks(), maximum_components=settings.periodic_components)
+            if (prediction.shape != energy.shape or coverage.shape != energy.shape
+                    or not np.isfinite(prediction).all() or not np.isfinite(coverage).all()
+                    or np.any((coverage < 0) | (coverage > 1))):
+                raise ValueError('Periodic prediction returned invalid correction arrays.')
+            previous_coverage = reference.texture_coverage
+            # Predictions supplement only missing/tapered shared texture. A fully
+            # supported measured template remains bit-for-bit unchanged.
+            contribution = (1-previous_coverage)*coverage
+            reference.log_texture = reference.log_texture + (1-previous_coverage)*prediction
+            reference.texture_coverage = previous_coverage + contribution
+            periodic_report = {**periodic_report,
+                'applied_fraction': float(np.mean(contribution > 0)),
+                'additional_corrected_fraction': float(np.mean(reference.texture_coverage > .5)
+                                                       - np.mean(previous_coverage > .5))}
     else:
         texture_report = dict(status='Disabled', corrected_fraction=0.)
+        if settings.periodic_texture:
+            periodic_report['reason'] = 'Enable shared texture correction to use periodic gap prediction.'
     background = reference.background()
     if not np.isfinite(background).all() or np.any(background <= 0):
         raise ValueError('Background fit is numerically unstable; reduce its complexity or revise protected regions.')
     contrast = raw / background - 1
     reference.anchor_rms_percent = float(100 * np.sqrt(np.mean(contrast[reference.anchor_masks()] ** 2)))
-    reference.diagnostics = dict(shared_texture=texture_report)
+    reference.diagnostics = dict(shared_texture=texture_report, periodic_texture=periodic_report,
+                                 reference_texture=reference_report)
     if assess_quality:
+        if stage:
+            stage('Checking background quality')
         from core.drr_background_quality import inspect_background
         reference.diagnostics.update(inspect_background(replace(cube, energy=energy, Z=raw), reference))
     check_load_cancelled()
@@ -295,67 +413,169 @@ def estimate_background(cube, settings, *, source='', signature=(0, 0), assess_q
                    title=f'{cube.title} (fitted reference)', cbar_label='I/B_fit - 1'), reference
 
 
-def load_fitted_group(folder, files, settings, *, y_axis='auto', progress=None, log=None):
+@dataclass(frozen=True)
+class PreparedFittedGroup:
+    cube: DataCube
+    files: tuple[str, ...]
+    signatures: tuple[tuple[int, int], ...]
+    paths: tuple[str, ...]
+    y_axis: str
+
+    @property
+    def source(self):
+        return self.files[0]
+
+    @property
+    def input_sources(self):
+        return tuple(dict(source=name, path=path, signature=list(signature))
+                     for name, path, signature in zip(self.files, self.paths, self.signatures))
+
+
+def verify_prepared_group(prepared):
+    for name, path, signature in zip(prepared.files, prepared.paths, prepared.signatures):
+        check_load_cancelled()
+        if source_signature(path) != signature:
+            raise ValueError(f'{name}: source changed during averaging/fitting; reload when acquisition is complete.')
+
+
+def prepare_fitted_group(folder, files, *, y_axis='auto', progress=None, log=None):
+    """Align and average raw intensities with equal file weights before any fit.
+
+    Two bounded-memory passes discover common measured support and accumulate
+    intensities. Missing members, invalid samples and changed files fail the
+    whole group rather than silently changing the average's membership.
+    """
     from core.processing_run import resolve_shared_y_axis_request
     from core.drr_sources import resolve_source_path
+    files = tuple(files)
     if not files or any(Path(name).suffix.lower() != '.csv' for name in files):
         raise ValueError('Fitted backgrounds require original CSV intensity measurements.')
+    if len(set(files)) != len(files):
+        raise ValueError('Select each intensity measurement only once for the average.')
     axis = resolve_shared_y_axis_request(files, y_axis)
-    references = []
-    first = accumulator = None
+    paths = tuple(str(resolve_source_path(folder, name).resolve()) for name in files)
+    signatures = tuple(source_signature(path) for path in paths)
+    first = None
+    energy = gate = None
     if progress:
         progress(0)
-    for index, name in enumerate(files):
+
+    def read(index):
         check_load_cancelled()
-        started = perf_counter()
+        if signatures[index] != source_signature(paths[index]):
+            raise ValueError(f'{files[index]}: source changed during averaging; reload DRR.')
+        cube = load_intensity(folder, files[index], y_axis=axis)
+        check_load_cancelled()
+        if signatures[index] != source_signature(paths[index]):
+            raise ValueError(f'{files[index]}: source changed during averaging; reload DRR.')
+        if (cube.Z.shape != (len(cube.gate), len(cube.energy)) or len(cube.energy) < 24
+                or not len(cube.gate) or not np.isfinite(cube.energy).all()
+                or not np.isfinite(cube.gate).all() or not np.isfinite(cube.Z).all()
+                or np.any(cube.Z <= 0)):
+            raise ValueError(f'{files[index]}: averaging for log-background fitting requires finite positive raw intensities and coordinates.')
+        order = np.argsort(cube.energy)
+        if np.any(np.diff(np.asarray(cube.energy)[order]) <= 0) or np.any(np.diff(cube.gate) <= 0):
+            raise ValueError(f'{files[index]}: background averaging requires distinct increasing coordinates.')
+        return replace(cube, energy=np.asarray(cube.energy)[order], Z=np.asarray(cube.Z)[:, order])
+
+    for index, name in enumerate(files):
         if log:
-            log(f'Fitting background {index + 1}/{len(files)}: {Path(name).name}')
-        path = resolve_source_path(folder, name)
-        signature = source_signature(path)
-        raw = load_intensity(folder, name, y_axis=axis)
-        from core.drr_background_cache import fit_cached
-        cube, reference = fit_cached(raw, settings_for_source(settings, name),
-            source=name, signature=signature, source_path=path, y_axis=axis)
-        if signature != source_signature(path):
-            raise ValueError(f'{name}: source changed during fitting; reload when acquisition is complete.')
+            log(f'DRR load: Reading measurement {index + 1}/{len(files)}: {Path(name).name}')
+        cube = read(index)
         if first is None:
             first = cube
-            accumulator = StreamingNanMean(cube.Z.shape)
-            coordinates = CoordinateAccumulator(cube.gate)
+            energy, gate = cube.energy.copy(), cube.gate.copy()
         elif cube.gate_label != first.gate_label:
             raise ValueError('Fitted measurements have different gate-axis meanings.')
+        energy = energy[(energy >= cube.energy[0]) & (energy <= cube.energy[-1])]
+        gate = gate[(gate >= cube.gate[0]) & (gate <= cube.gate[-1])]
+        if len(energy) < 24 or not len(gate):
+            raise ValueError('Fitted measurements need common measured overlap with at least 24 energy samples and one gate.')
+        if progress:
+            progress(int(20 * (index + 1) / len(files)))
+    accumulator = StreamingNanMean((len(gate), len(energy)))
+    coordinates = CoordinateAccumulator(gate)
+    for index, name in enumerate(files):
+        if log:
+            log(f'Averaging raw intensity {index + 1}/{len(files)}: {Path(name).name}')
+        check_load_cancelled()
+        cube = first if index == 0 else read(index)
         values = cube.Z
-        for source_axis, target_axis, transpose in ((cube.energy, first.energy, False), (cube.gate, first.gate, True)):
+        for source_axis, target_axis, transpose in ((cube.energy, energy, False), (cube.gate, gate, True)):
             if not np.array_equal(source_axis, target_axis):
                 if transpose:
                     values = values.T
-                values = _interp_rows_no_extrapolation(values, source_axis, target_axis, context='Fitted DRR alignment')
+                values = _interp_rows_no_extrapolation(values, source_axis, target_axis, context='Raw intensity average')
                 if transpose:
                     values = values.T
+        if not np.isfinite(values).all() or np.any(values <= 0):
+            raise ValueError('All selected files must supply finite positive raw intensity on the common grid.')
         accumulator.add(values)
         coordinates.add(cube.gate, cube.gate_coordinates)
-        references.append(reference)
-        if log:
-            reused = 'cache reused' if reference.cache_hit else 'calculated'
-            log(f'Fitted background {index + 1}/{len(files)}: {reused}, {perf_counter()-started:.2f} s')
         if progress:
-            progress(int(90 * (index + 1) / len(files)))
-    result = replace(first, Z=accumulator.mean(), gate_coordinates=coordinates.result())
-    result.drr_numerical_path = 'heterogeneous'
-    return result, tuple(references)
+            progress(20 + int(20 * (index + 1) / len(files)))
+    averaged = replace(first, energy=energy, gate=gate, Z=accumulator.mean(),
+                       title=first.title if len(files) == 1 else f'Average ({len(files)} files)',
+                       gate_coordinates=coordinates.result())
+    prepared = PreparedFittedGroup(averaged, files, signatures, paths, axis)
+    verify_prepared_group(prepared)
+    return prepared
+
+
+def fit_prepared_group(prepared, settings, *, stage=None):
+    from core.drr_background_cache import fit_cached
+    verify_prepared_group(prepared)
+    result, reference = fit_cached(prepared.cube, settings_for_group(settings, prepared.files),
+        source=prepared.source, signature=prepared.signatures[0], source_path=prepared.paths[0],
+        y_axis=prepared.y_axis, stage=stage, input_sources=prepared.input_sources)
+    verify_prepared_group(prepared)
+    result.drr_numerical_path = 'fitted_raw_average'
+    return result, reference
+
+
+def load_fitted_group(folder, files, settings, *, y_axis='auto', progress=None, log=None):
+    started = perf_counter()
+    prepared = prepare_fitted_group(folder, files, y_axis=y_axis, progress=progress, log=log)
+    def report_stage(message):
+        check_load_cancelled()
+        if log:
+            log(f'DRR load: {message} · Average ({len(prepared.files)} files)')
+    if log:
+        log(f'Fitting one background to average of {len(prepared.files)} files')
+    result, reference = fit_prepared_group(prepared, settings, stage=report_stage)
+    if log:
+        reused = 'cache reused' if reference.cache_hit else 'calculated'
+        log(f'Fitted average background: {reused}, {perf_counter()-started:.2f} s')
+    if progress:
+        progress(90)
+    return result, (reference,)
+
+
+def reference_matches_files(reference, files):
+    files = tuple(files)
+    if reference.input_sources:
+        return tuple(member['source'] for member in reference.input_sources) == files
+    return len(files) == 1 and reference.source == files[0]
 
 
 def read_reference_raw(folder, reference, *, y_axis='auto'):
     from core.drr_sources import resolve_source_path
-    path = resolve_source_path(folder, reference.source)
-    if source_signature(path) != reference.signature:
-        raise ValueError('The source changed after fitting. Reload DRR before inspecting its fitted background.')
-    cube = load_intensity(folder, reference.source, y_axis=y_axis)
-    order = np.argsort(cube.energy)
-    if (source_signature(path) != reference.signature or not np.array_equal(cube.energy[order], reference.energy)
-            or not np.array_equal(cube.gate, reference.gate)):
+    if reference.settings.shared_texture and reference.settings.texture_reference_source:
+        from core.drr_texture_reference_io import verify_texture_reference
+        verify_texture_reference(reference.diagnostics.get('reference_texture', {}).get('source_metadata', {}))
+    members = reference.input_sources or (dict(source=reference.source, signature=reference.signature),)
+    for member in members:
+        path = resolve_source_path(folder, member['source'])
+        if source_signature(path) != tuple(member['signature']):
+            raise ValueError('The source changed after fitting. Reload DRR before inspecting its fitted background.')
+        if member.get('path') and str(path.resolve()) != member['path']:
+            raise ValueError('The source location changed after fitting. Reload DRR before inspecting its fitted background.')
+    prepared = prepare_fitted_group(folder, tuple(member['source'] for member in members), y_axis=y_axis)
+    cube = prepared.cube
+    if (prepared.signatures != tuple(tuple(member['signature']) for member in members)
+            or not np.array_equal(cube.energy, reference.energy) or not np.array_equal(cube.gate, reference.gate)):
         raise ValueError('Source coordinates changed after fitting; reload DRR.')
-    return replace(cube, energy=cube.energy[order].copy(), Z=cube.Z[:, order].copy())
+    return cube
 
 
 def export_references(folder, references):
@@ -372,7 +592,10 @@ def export_references(folder, references):
                    'protected_regions_by_gate_eV': [reference.protected_regions_at_gate(i) for i in range(len(reference.gate))]}
         encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         digest = hashlib.sha256(encoded.encode('utf-8')).hexdigest()[:16]
-        path = directory / f'{Path(reference.source).stem}_fitted_background_{digest}.dat'
+        stem = Path(reference.source).stem
+        if len(reference.input_sources) > 1:
+            stem = f'average_{len(reference.input_sources)}_files_{stem}'
+        path = directory / f'{stem}_fitted_background_{digest}.dat'
         temporary = path.with_name(f'.{uuid4().hex}.tmp')
         metadata = path.with_suffix('.metadata.json')
         try:

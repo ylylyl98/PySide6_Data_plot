@@ -103,6 +103,20 @@ class SlidesLatencyTests(unittest.TestCase):
             self.assertEqual(self.widget.preview._caption_mode, "full")
             self.assertTrue(self.widget.preview._panel_labels)
 
+    def test_title_typing_waits_for_commit_and_reuses_grouping(self) -> None:
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+        with tempfile.TemporaryDirectory() as tmp:
+            self.widget._append_queue_paths([Path(tmp) / "plot.png"])
+            with patch.object(presentation_widget, "plan_presentation_slides",
+                              wraps=presentation_widget.plan_presentation_slides) as planner:
+                QTest.keyClicks(self.widget.title_edit, "New experiment")
+                self.assertNotIn("New experiment", self.widget.slide_list.item(0).text())
+                QTest.keyClick(self.widget.title_edit, Qt.Key_Return)
+                self.assertIn("New experiment", self.widget.slide_list.item(0).text())
+                self.assertTrue(self.widget._slide_title(0, 1).startswith("New experiment"))
+                planner.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

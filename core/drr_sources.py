@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from contextvars import ContextVar
 from collections import OrderedDict
 from threading import RLock
-from functools import lru_cache
+from functools import lru_cache, wraps
 from itertools import chain, islice
 from datetime import datetime
 import csv
@@ -16,6 +16,7 @@ from pathlib import Path
 import random
 import re
 import statistics
+import sys
 import tempfile
 from typing import Iterable, Sequence
 
@@ -23,6 +24,7 @@ import numpy as np
 
 from core.processing import split_group_and_sort_key
 from core.load_cancellation import check_load_cancelled
+from core.drr_background_regions import DrrBackgroundRegion, normalize_regions
 
 
 SUPPORTED_DRR_SUFFIXES = {".csv", ".xlsx"}
@@ -301,6 +303,7 @@ class DrrMeasurementAssignment:
     baseline_which: str = "last"
     source_recipe: str = ""
     selection_reason: str = ""
+    regions: tuple[DrrBackgroundRegion, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.measurement_file, str) or not self.measurement_file.strip():
@@ -326,9 +329,13 @@ class DrrMeasurementAssignment:
             raise ValueError("External DRR assignment requires baseline files.")
         if mode != "External" and files:
             raise ValueError("Self DRR assignment cannot contain baseline files.")
+        regions = normalize_regions(self.regions)
+        if regions and mode != "External":
+            raise ValueError("Background regions require External DRR mode.")
         object.__setattr__(self, "baseline_mode", mode)
         object.__setattr__(self, "baseline_files", files)
         object.__setattr__(self, "baseline_which", which)
+        object.__setattr__(self, "regions", regions)
 
     @property
     def measurement(self) -> str:
@@ -336,14 +343,19 @@ class DrrMeasurementAssignment:
 
     @property
     def background_files(self) -> tuple[str, ...]:
-        return self.baseline_files
+        return self.baseline_source_files
+
+    @property
+    def baseline_source_files(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys((*self.baseline_files,
+            *(name for region in self.regions for name in region.baseline_files))))
 
     @property
     def frame_method(self) -> str:
         return self.baseline_which
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result = {
             "measurement": self.measurement_file,
             "baseline_mode": self.baseline_mode,
             "baseline_files": list(self.baseline_files),
@@ -351,11 +363,19 @@ class DrrMeasurementAssignment:
             "source_recipe": self.source_recipe,
             "selection_reason": self.selection_reason,
         }
+        if self.regions:
+            result.update(schema_version=2, regions=[item.to_dict() for item in self.regions])
+        return result
 
     @classmethod
     def from_mapping(cls, value: object) -> "DrrMeasurementAssignment":
         if not isinstance(value, dict):
             raise ValueError("DRR assignment must be an object.")
+        version = value.get("schema_version", 1)
+        if type(version) is not int or version not in (1, 2):
+            raise ValueError("Unsupported DRR background assignment schema version.")
+        if value.get("regions") and version != 2:
+            raise ValueError("Background regions require DRR assignment schema version 2.")
         measurement = value.get("measurement", value.get("measurement_file"))
         if not isinstance(measurement, str) or not measurement.strip():
             raise ValueError("DRR assignment is missing measurement.")
@@ -383,6 +403,7 @@ class DrrMeasurementAssignment:
             baseline_which=raw_which,
             source_recipe=raw_recipe or "",
             selection_reason=raw_reason or "",
+            regions=normalize_regions(value.get("regions", ())),
         )
 
 
@@ -655,7 +676,11 @@ def _read_drr_metadata(
     root = Path(root).resolve()
     metadata_root = root / 'Processed Data' / 'DRR'
     try:
-        files = tuple(sorted(metadata_root.rglob('*.metadata.json')))
+        files = []
+        for path in metadata_root.rglob('*.metadata.json'):
+            check_load_cancelled()
+            files.append(path)
+        files = tuple(sorted(files))
         signature = tuple((path, _history_file_signature(path)) for path in files)
     except OSError:
         return {}, []
@@ -716,6 +741,7 @@ def _parse_drr_metadata(root: Path, metadata_files: Sequence[Path], *,
     parent_paths = _METADATA_PATHS.get()
     shared_paths = parent_paths if parent_paths is not None else {}
     for path in metadata_files:
+        check_load_cancelled()
         stamp = _history_file_signature(path)
         try:
             payload = _history_payload(path, stamp)
@@ -864,6 +890,11 @@ def _parse_drr_metadata_uncached(
                             or source
                             for source in parsed.baseline_files
                         )
+                        regions = tuple(DrrBackgroundRegion(
+                            region.xmin_ev, region.xmax_ev,
+                            tuple(_metadata_assignment_source(root, source, descriptors, role="background")
+                                  or source for source in region.baseline_files),
+                            region.baseline_which) for region in parsed.regions)
                         if measurement_source is None or any(not str(source).strip() for source in baseline_sources):
                             raise ValueError("assignment source is empty")
                         member_assignments.append(
@@ -874,6 +905,7 @@ def _parse_drr_metadata_uncached(
                                 baseline_which=parsed.baseline_which,
                                 source_recipe=parsed.source_recipe or portable_source_name(root, metadata_path),
                                 selection_reason=parsed.selection_reason,
+                                regions=regions,
                             )
                         )
                     except (TypeError, ValueError):
@@ -931,7 +963,7 @@ def assess_background_gate_files(
         path = resolve_source_path(root, source)
         if path.suffix.lower() != ".csv":
             return DrrBackgroundGateAssessment(False, False, tuple(profiles))
-        profiles.append(inspect_csv_gate_profile(path, max_rows=None))
+        profiles.append(_background_gate_profile(path))
     all_constant = bool(profiles) and all(
         profile.varies is False and bool(profile.constant_values)
         for profile in profiles
@@ -1002,9 +1034,60 @@ def _drr_assignment_signature(assignment: DrrMeasurementAssignment) -> tuple[obj
         assignment.baseline_mode,
         assignment.baseline_which,
         tuple(assignment.baseline_files),
+        tuple(assignment.regions),
     )
 
 
+_SPECTRAL_SAMPLES: ContextVar[OrderedDict | None] = ContextVar('drr_spectral_samples', default=None)
+_SPECTRAL_SAMPLE_BUDGET = 32 * 1024 * 1024
+_RESOLUTION_READS: ContextVar[OrderedDict | None] = ContextVar('drr_resolution_reads', default=None)
+_RESOLUTION_READ_BUDGET = 8 * 1024 * 1024
+
+
+def _remember_resolution_read(cache, key, value, size):
+    if cache is None or size > _RESOLUTION_READ_BUDGET:
+        return
+    while cache and (len(cache) >= 64 or size + sum(entry[1] for entry in cache.values())
+                     > _RESOLUTION_READ_BUDGET):
+        cache.popitem(last=False)
+    cache[key] = (value, size)
+
+
+def _background_gate_profile(path):
+    check_load_cancelled()
+    source = Path(path).resolve()
+    signature = _history_file_signature(source)
+    key = ('gate', source, signature)
+    cache = _RESOLUTION_READS.get()
+    if cache is not None and key in cache:
+        cache.move_to_end(key)
+        return cache[key][0]
+    profile = inspect_csv_gate_profile(source, max_rows=None)
+    check_load_cancelled()
+    if cache is not None and signature is not None and signature == _history_file_signature(source):
+        def tuple_bytes(value):
+            return sys.getsizeof(value) + (sum(tuple_bytes(item) for item in value)
+                                          if isinstance(value, tuple) else 0)
+        size = sys.getsizeof(profile) + sum(tuple_bytes(value) for value in vars(profile).values())
+        _remember_resolution_read(cache, key, profile, size)
+    return profile
+
+
+def _reuse_spectral_samples(function):
+    """Share bounded reads within one resolution, never across load requests."""
+    @wraps(function)
+    def resolve(*args, **kwargs):
+        token = _SPECTRAL_SAMPLES.set(OrderedDict())
+        read_token = _RESOLUTION_READS.set(OrderedDict())
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _RESOLUTION_READS.reset(read_token)
+            _SPECTRAL_SAMPLES.reset(token)
+    return resolve
+
+
+@_reuse_spectral_samples
 def resolve_drr_background_assignments(
     root: str | Path,
     catalog: Sequence[DrrSource],
@@ -1013,6 +1096,7 @@ def resolve_drr_background_assignments(
     explicit_baseline_files: Sequence[str] | None = None,
     explicit_baseline_mode: str | None = None,
     explicit_baseline_which: str = "last",
+    explicit_regions: Sequence[DrrBackgroundRegion] = (),
     allow_guess: bool = True,
     saved_recipes: Sequence[DrrSavedRecipe] | None = None,
 ) -> DrrBackgroundResolution:
@@ -1032,7 +1116,7 @@ def resolve_drr_background_assignments(
         return DrrBackgroundResolution(reason="No DRR measurements selected.")
 
     mode = str(explicit_baseline_mode or "").strip()
-    explicit = explicit_baseline_files is not None or bool(mode)
+    explicit = explicit_baseline_files is not None or bool(mode) or bool(explicit_regions)
     if explicit:
         if not mode:
             mode = "External" if explicit_baseline_files else "Self (last frame)"
@@ -1048,6 +1132,7 @@ def resolve_drr_background_assignments(
                 baseline_files=tuple(explicit_baseline_files or ()),
                 baseline_which=explicit_baseline_which,
                 selection_reason="explicit user baseline selection",
+                regions=tuple(explicit_regions),
             )
         except ValueError as exc:
             return DrrBackgroundResolution(reason=str(exc), unresolved_measurements=selected)
@@ -1058,11 +1143,12 @@ def resolve_drr_background_assignments(
                 baseline_files=assignment.baseline_files,
                 baseline_which=assignment.baseline_which,
                 selection_reason=assignment.selection_reason,
+                regions=assignment.regions,
             )
             for name in selected
         )
         missing = tuple(
-            source for source in assignment.baseline_files
+            source for source in assignment.baseline_source_files
             if not resolve_source_path(experiment_root, source).is_file()
         )
         if missing:
@@ -1144,6 +1230,7 @@ def resolve_drr_background_assignments(
                         baseline_which=member.baseline_which,
                         source_recipe=member.source_recipe,
                         selection_reason=member.selection_reason or "newest saved DRR member assignment",
+                        regions=member.regions,
                     )
                 candidates.append(member)
             if candidates:
@@ -1215,7 +1302,7 @@ def resolve_drr_background_assignments(
 
         if assignment is not None:
             missing = [
-                source for source in assignment.baseline_files
+                source for source in assignment.baseline_source_files
                 if not resolve_source_path(experiment_root, source).is_file()
             ]
             if missing:
@@ -1380,6 +1467,29 @@ def _same_spectral_grid(first: np.ndarray, second: np.ndarray) -> bool:
 def _read_csv_spectral_sample(
     path: str | Path, *, max_frames: int | None
 ) -> tuple[np.ndarray, np.ndarray]:
+    check_load_cancelled()
+    cache = _SPECTRAL_SAMPLES.get()
+    source = Path(path).resolve()
+    signature = _history_file_signature(source)
+    key = (source, signature, max_frames)
+    if cache is not None and key in cache:
+        cache.move_to_end(key)
+        return cache[key]
+    result = _read_csv_spectral_sample_uncached(source, max_frames=max_frames)
+    check_load_cancelled()
+    if cache is not None and signature == _history_file_signature(source):
+        size = sum(array.nbytes for array in result)
+        if size <= _SPECTRAL_SAMPLE_BUDGET:
+            while cache and (len(cache) >= 64 or size + sum(
+                    array.nbytes for pair in cache.values() for array in pair) > _SPECTRAL_SAMPLE_BUDGET):
+                cache.popitem(last=False)
+            cache[key] = result
+    return result
+
+
+def _read_csv_spectral_sample_uncached(
+    path: str | Path, *, max_frames: int | None
+) -> tuple[np.ndarray, np.ndarray]:
     """Read an original spectral grid and a deterministic sample of raw frames."""
     source = Path(path)
     with source.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
@@ -1415,6 +1525,7 @@ def _read_csv_spectral_sample(
         seen = 0
         rng = random.Random(0)
         for row in rows:
+            check_load_cancelled()
             values = [
                 _as_float(row[index]) if index < len(row) else None
                 for index in spectral_indices
@@ -1459,25 +1570,39 @@ def _measurement_spectral_sample(
     return energy0, np.concatenate(samples, axis=0)
 
 
+def _background_file_spectrum(path, which):
+    """Retain the compact reduction even when its raw matrix exceeds the sample budget."""
+    check_load_cancelled()
+    source = Path(path).resolve()
+    signature = _history_file_signature(source)
+    key = ('spectrum', source, signature, which)
+    cache = _RESOLUTION_READS.get()
+    if cache is not None and key in cache:
+        cache.move_to_end(key)
+        return cache[key][0]
+    energy, spectra = _read_csv_spectral_sample(source, max_frames=None)
+    vector = (spectra[0] if which == 'first' else spectra[-1] if which == 'last'
+              else np.nanmean(spectra, axis=0))
+    # A first/last-row view would keep the entire large matrix alive.
+    result = energy.copy(), np.asarray(vector, float).copy()
+    check_load_cancelled()
+    if cache is not None and signature is not None and signature == _history_file_signature(source):
+        _remember_resolution_read(cache, key, result, sum(array.nbytes for array in result))
+    return result
+
+
 def _background_group_spectrum(
     root: str | Path, sources: Sequence[str], which: str
 ) -> tuple[np.ndarray, np.ndarray]:
     energy0: np.ndarray | None = None
     per_file: list[np.ndarray] = []
     for source in sources:
-        energy, spectra = _read_csv_spectral_sample(
-            resolve_source_path(root, source), max_frames=None
-        )
+        energy, spectrum = _background_file_spectrum(resolve_source_path(root, source), which)
         if energy0 is None:
             energy0 = energy
         elif not _same_spectral_grid(energy0, energy):
             raise ValueError("Background group does not use one exact spectral grid.")
-        if which == "first":
-            per_file.append(spectra[0])
-        elif which == "last":
-            per_file.append(spectra[-1])
-        else:
-            per_file.append(np.nanmean(spectra, axis=0))
+        per_file.append(spectrum)
     if energy0 is None or not per_file:
         raise ValueError("No background spectra available.")
     return energy0, np.nanmean(np.stack(per_file, axis=0), axis=0)
@@ -1929,6 +2054,7 @@ def refresh_drr_source_history(root: str | Path, sources: Sequence[DrrSource]) -
 
 
 def _assemble_drr_sources(experiment_root: Path, inspected: list[dict], *, include_history: bool) -> list[DrrSource]:
+    from core.drr_composite_background import is_composite_background
     metadata_roles, metadata_records = _read_drr_metadata(experiment_root) if include_history else ({}, [])
     processed_paths = {
         identity for identity, values in metadata_roles.items() if "measurement" in values
@@ -1958,7 +2084,11 @@ def _assemble_drr_sources(experiment_root: Path, inspected: list[dict], *, inclu
             item["frame_count"] is not None
             and item["frame_count"] <= max(3, int(0.25 * median_frames))
         )
-        if metadata_role == "measurement":
+        if path.suffix.lower() == ".csv" and is_composite_background(path):
+            classification = "background"
+            reason = "saved composite background"
+            metadata_role = "background"
+        elif metadata_role == "measurement":
             classification = "measurement"
             reason = "saved metadata role: measurement"
         elif metadata_role == "background":
@@ -1998,7 +2128,7 @@ def _assemble_drr_sources(experiment_root: Path, inspected: list[dict], *, inclu
                 )
                 if member is None:
                     continue
-                linked_values.extend(member.baseline_files)
+                linked_values.extend(member.baseline_source_files)
             else:
                 # Legacy metadata has one common recipe, so its union remains
                 # the only available provenance representation.

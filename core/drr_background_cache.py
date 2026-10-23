@@ -12,7 +12,7 @@ import numpy as np
 from core.drr_fitted_background import BackgroundFitSettings, FittedReference, estimate_background
 from core.load_cancellation import check_load_cancelled
 
-CACHE_VERSION = 9  # Bump whenever numerical fitting or quality checks change.
+CACHE_VERSION = 14  # Average raw measurements before fitting one group denominator.
 _lock = RLock()
 
 
@@ -24,9 +24,10 @@ def cache_directory():
     return (Path(base) if base else Path.home()/'.cache')/'DPTK'/'fitted-background'
 
 
-def _key(cube, settings, source_path, y_axis):
+def _key(cube, settings, source_path, y_axis, reference_metadata=None, input_sources=()):
     digest = hashlib.sha256(json.dumps(dict(version=CACHE_VERSION, settings=asdict(settings),
-        source=str(Path(source_path).resolve()), y_axis=y_axis), sort_keys=True).encode())
+        source=str(Path(source_path).resolve()), y_axis=y_axis,
+        fringe_reference=reference_metadata, input_sources=input_sources), sort_keys=True).encode())
     for array in (cube.energy, cube.gate, cube.Z):
         check_load_cancelled()
         canonical = np.ascontiguousarray(array, dtype='<f8')
@@ -55,9 +56,18 @@ def _prune(directory):
             pass
 
 
-def fit_cached(cube, settings, *, source, signature, source_path, y_axis='auto'):
+def fit_cached(cube, settings, *, source, signature, source_path, y_axis='auto', stage=None, input_sources=()):
+    if stage:
+        stage('Checking fitted background cache')
     settings = BackgroundFitSettings.from_mapping(settings)
-    key = _key(cube, settings, source_path, y_axis)
+    texture_reference, reference_metadata = None, None
+    if settings.shared_texture and settings.texture_reference_source:
+        from core.drr_texture_reference_io import load_texture_reference, verify_texture_reference
+        if stage:
+            stage('Loading selected fringe reference')
+        texture_reference, reference_metadata = load_texture_reference(
+            settings.texture_reference_source, measurement_path=source_path)
+    key = _key(cube, settings, source_path, y_axis, reference_metadata, input_sources)
     directory = cache_directory()
     path = directory/f'{key}.npz'
     order = np.argsort(cube.energy)
@@ -91,16 +101,26 @@ def fit_cached(cube, settings, *, source, signature, source_path, y_axis='auto')
                 float(saved['anchor_rms'].item()), diagnostics, cache_hit=True,
                 gate_fit_mask=gate_mask.copy() if gate_mask.size else None,
                 log_texture=texture.copy() if texture.size else None,
-                texture_coverage=coverage.copy() if coverage.size else None)
+                texture_coverage=coverage.copy() if coverage.size else None,
+                input_sources=tuple(input_sources))
             background = reference.background()
             if not np.isfinite(background).all() or np.any(background <= 0):
                 raise ValueError('Invalid cached background')
             check_load_cancelled()
+            if reference_metadata is not None:
+                verify_texture_reference(reference_metadata)
             return replace(ordered, Z=ordered.Z/background-1, title=f'{cube.title} (fitted reference)',
                            cbar_label='I/B_fit - 1'), reference
     except (OSError, ValueError, KeyError, EOFError, BadZipFile):
         pass
-    result, reference = estimate_background(cube, settings, source=source, signature=signature)
+    extra = (dict(texture_reference=texture_reference, texture_reference_meta=reference_metadata)
+             if texture_reference is not None else {})
+    result, reference = estimate_background(cube, settings, source=source, signature=signature, stage=stage, **extra)
+    reference.input_sources = tuple(input_sources)
+    if reference_metadata is not None:
+        verify_texture_reference(reference_metadata)
+    if stage:
+        stage('Saving fitted background cache')
     temporary = directory/f'.{uuid4().hex}.tmp'
     try:
         check_load_cancelled()

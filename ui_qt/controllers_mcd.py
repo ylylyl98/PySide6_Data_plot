@@ -15,11 +15,11 @@ from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.transforms import Bbox
 from matplotlib.widgets import SpanSelector
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QObject, QThreadPool, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QDialog, QDialogButtonBox,
-    QDoubleSpinBox, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QPlainTextEdit, QPushButton, QTableWidget, QTableWidgetItem,
     QVBoxLayout,
 )
@@ -30,7 +30,8 @@ from core.mcd import (
     mcd_annotation_layout, pair_window_trace_by_branch,
     suggest_mcd_background_ranges,
 )
-from ui_qt.common import QComboBox, Worker, focused_numeric_input
+from ui_qt.common import QComboBox, QDoubleSpinBox, Worker, focused_numeric_input
+from core.load_cancellation import LoadCancellation
 from ui_qt.theme import alias as theme_alias
 from ui_qt.matplotlib_theme import ThemeAwareFigureCanvasQTAgg
 from ui_qt.source_picker_dialog import SourcePickerDialog
@@ -42,6 +43,94 @@ from core.mcd import format_mcd_energy, suggest_mcd_window_centers
 def _detect_mcd_angles_worker(path: str, signature: tuple[int, int], *, progress, log) -> tuple[str, tuple[int, int], tuple[float, ...]]:
     """Read MCD angle values away from the GUI thread."""
     return path, signature, tuple(float(value) for value in detect_angles(path))
+
+
+def _mcd_background_suggestion_worker(result, generation, protected, *, progress, log):
+    suggestion = suggest_mcd_background_ranges(
+        result, protected_ranges_ev=protected, auto_detect_features=False,
+        use_all_unprotected_bands=True,
+    )
+    return generation, suggestion
+
+
+class _McdBackgroundSuggestions(QObject):
+    """Coalesce protection edits and publish only the latest live request."""
+
+    completed = Signal(object)
+    failed = Signal(str)
+    busy = Signal()
+
+    def __init__(self, result, parent, *, pool=None):
+        super().__init__(parent)
+        self.result = result
+        self.pool = pool if pool is not None else QThreadPool.globalInstance()
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(90)
+        self.timer.timeout.connect(self._launch)
+        self.worker = None
+        self.pending = None
+        self.generation = 0
+        self.active_generation = None
+        self.closed = False
+        parent.destroyed.connect(self.close)
+
+    def request(self, protected):
+        if self.closed:
+            return
+        self.generation += 1
+        self.pending = (self.generation, tuple(protected))
+        if self.worker is not None:
+            self.worker.cancellation.cancel()
+        self.busy.emit()
+        self.timer.start()
+
+    @Slot()
+    def _launch(self):
+        if self.closed or self.worker is not None or self.pending is None:
+            return
+        generation, protected = self.pending
+        self.pending = None
+        self.active_generation = generation
+        worker = Worker(_mcd_background_suggestion_worker, self.result,
+                        generation, protected, cancellation=LoadCancellation())
+        self.worker = worker
+        worker.signals.result.connect(self._ready)
+        worker.signals.error.connect(self._error)
+        worker.signals.finished.connect(self._finished)
+        self.pool.start(worker)
+
+    @Slot(object)
+    def _ready(self, payload):
+        generation, suggestion = payload
+        if not self.closed and generation == self.generation:
+            self.completed.emit(suggestion)
+
+    @Slot(str)
+    def _error(self, message):
+        if not self.closed and self.active_generation == self.generation:
+            self.failed.emit(message)
+
+    @Slot()
+    def _finished(self):
+        self.worker = None
+        if self.closed:
+            self.deleteLater()
+        elif self.pending is not None and not self.timer.isActive():
+            self._launch()
+
+    @Slot()
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.timer.stop()
+        self.pending = None
+        if self.worker is not None:
+            self.worker.cancellation.cancel()
+        else:
+            self.deleteLater()
+
 
 class McdController:
     """Own MCD reactions while sharing the application state through owner."""
@@ -55,6 +144,7 @@ class McdController:
         "_mcd_source_stability_folder",
         "_mcd_source_stability_generation",
         "_mcd_background_suggestion",
+        "_mcd_background_request",
         "_mcd_result_cache",
         "_mcd_result_cache_limit",
         "_mcd_source_observations",
@@ -88,6 +178,7 @@ class McdController:
         object.__setattr__(self, "_mcd_source_stability_folder", "")
         object.__setattr__(self, "_mcd_source_stability_generation", 0)
         object.__setattr__(self, "_mcd_background_suggestion", None)
+        object.__setattr__(self, "_mcd_background_request", None)
         object.__setattr__(self, "_mcd_result_cache", OrderedDict())
         object.__setattr__(self, "_mcd_result_cache_limit", 3)
         object.__setattr__(self, "_mcd_source_observations", {})
@@ -117,6 +208,9 @@ class McdController:
         self._mcd_source_stability_generation += 1
         self._mcd_source_stability_source = ""
         self._mcd_source_stability_folder = ""
+        if self._mcd_background_request is not None:
+            self._mcd_background_request.close()
+            self._mcd_background_request = None
 
     def _on_mcd_params_changed(self) -> None:
         self._invalidate_export_move_sources()
@@ -1133,6 +1227,7 @@ class McdController:
         result = self.loaded.mcd_result
         energy = np.asarray(result.energy_ev, float)
         center = float(self.mcd_window_center_spin.value())
+        window_key = (center, float(self.mcd_window_width_spin.value()))
         if not np.isfinite(center) or center <= float(np.nanmin(energy)) or center >= float(np.nanmax(energy)):
             center = float(np.nanmedian(energy))
         # Protect the active MCD(B) window plus a guard.  Feature protection
@@ -1145,22 +1240,45 @@ class McdController:
             prior_manual = tuple(self._mcd_background_suggestion.manual_protected_ranges)
         elif self.loaded.mcd_settings is not None:
             prior_manual = tuple(self.loaded.mcd_settings.manual_protected_ranges_ev)
-        try:
-            suggestion = suggest_mcd_background_ranges(
-                result,
-                protected_ranges_ev=protected + prior_manual,
-                auto_detect_features=False,
-                use_all_unprotected_bands=True,
-            )
-            suggestion = replace(
-                suggestion,
-                requested_protected_ranges=protected,
+        if self._mcd_background_request is not None:
+            self._mcd_background_request.close()
+        request = _McdBackgroundSuggestions(result, self._owner)
+        self._mcd_background_request = request
+
+        def ready(suggestion):
+            if self._mcd_background_request is not request:
+                return
+            self._mcd_background_request = None
+            request.close()
+            if (getattr(self, '_is_closing', False) or not self.loaded
+                    or self.loaded.mcd_result is not result):
+                return
+            if window_key != (float(self.mcd_window_center_spin.value()),
+                              float(self.mcd_window_width_spin.value())):
+                self._suggest_mcd_background_ranges()
+                return
+            self._show_mcd_background_suggestion_dialog(result, replace(
+                suggestion, requested_protected_ranges=protected,
                 manual_protected_ranges=prior_manual,
-            )
-        except Exception as exc:
-            self._show_error(f"Could not suggest MCD background ranges: {exc}")
-            return
-        self._show_mcd_background_suggestion_dialog(result, suggestion)
+            ))
+
+        def failed(message):
+            if self._mcd_background_request is not request:
+                return
+            self._mcd_background_request = None
+            request.close()
+            if (not getattr(self, '_is_closing', False) and self.loaded
+                    and self.loaded.mcd_result is result):
+                if window_key != (float(self.mcd_window_center_spin.value()),
+                                  float(self.mcd_window_width_spin.value())):
+                    self._suggest_mcd_background_ranges()
+                    return
+                self._show_error(f"Could not suggest MCD background ranges: {message}")
+
+        request.completed.connect(ready)
+        request.failed.connect(failed)
+        self._status("Calculating MCD background suggestions…")
+        request.request(protected + prior_manual)
 
     def _show_mcd_background_suggestion_dialog_legacy(self, suggestion: McdBackgroundSuggestion) -> None:
         dlg = QDialog(self._owner)
@@ -1283,7 +1401,8 @@ class McdController:
         row_sources: list[str] = []
         row_features: list[object | None] = []
         current: dict[str, McdBackgroundSuggestion] = {"value": suggestion}
-        is_refreshing = {"value": False}
+        calculations = _McdBackgroundSuggestions(result, dlg)
+        dlg.finished.connect(calculations.close)
         selection_state: dict[str, object] = {"active": True, "selector": None}
 
         def on_manual_span(left: float, right: float) -> None:
@@ -1423,34 +1542,35 @@ class McdController:
             canvas.draw_idle()
 
         def refresh() -> None:
-            if is_refreshing["value"]:
-                return
-            is_refreshing["value"] = True
-            try:
-                active, automatic, manual, automatic_kinds = selected_windows()
-                selected = merged_enabled_windows()
-                recalculated = suggest_mcd_background_ranges(
-                    result,
-                    protected_ranges_ev=selected,
-                    auto_detect_features=False,
-                    use_all_unprotected_bands=True,
-                )
-                current["value"] = replace(
-                    recalculated,
-                    requested_protected_ranges=active,
-                    manual_protected_ranges=manual,
-                    detected_feature_ranges=automatic,
-                    detected_feature_kinds=automatic_kinds,
-                    feature_baseline=suggestion.feature_baseline,
-                    feature_residual=suggestion.feature_residual,
-                    feature_detection_score=suggestion.feature_detection_score,
-                    detected_features=suggestion.detected_features,
-                )
-                redraw()
-            except Exception as exc:
-                summary.setPlainText(f"No usable fit bands remain for these protection windows:\n{exc}")
-            finally:
-                is_refreshing["value"] = False
+            calculations.request(merged_enabled_windows())
+
+        def pending() -> None:
+            accept.setEnabled(False)
+            summary.setPlainText("Calculating background fit bands for the selected protection windows…")
+
+        def calculated(recalculated) -> None:
+            active, automatic, manual, automatic_kinds = selected_windows()
+            current["value"] = replace(
+                recalculated,
+                requested_protected_ranges=active,
+                manual_protected_ranges=manual,
+                detected_feature_ranges=automatic,
+                detected_feature_kinds=automatic_kinds,
+                feature_baseline=suggestion.feature_baseline,
+                feature_residual=suggestion.feature_residual,
+                feature_detection_score=suggestion.feature_detection_score,
+                detected_features=suggestion.detected_features,
+            )
+            redraw()
+            accept.setEnabled(True)
+
+        def failed(message) -> None:
+            accept.setEnabled(False)
+            summary.setPlainText(f"No usable fit bands remain for these protection windows:\n{message}")
+
+        calculations.busy.connect(pending)
+        calculations.completed.connect(calculated)
+        calculations.failed.connect(failed)
 
         def connect_row(row: int) -> None:
             checkbox = table.cellWidget(row, 0)

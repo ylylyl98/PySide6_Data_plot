@@ -589,10 +589,36 @@ class PowerController:
         if not hasattr(self, "power_background_spin"):
             return 0.0
         if self._power_background_auto_enabled() and cubes:
-            value = estimate_constant_background(cubes, percentile=1.0)
+            owner = object.__getattribute__(self, "_owner")
+            sources = tuple(cubes.values()) if isinstance(cubes, dict) else tuple(cubes)
+            cache_key = tuple(
+                (id(cube), id(cube.Z), getattr(cube, "revision", None)
+                 if getattr(cube, "revision", None) is not None
+                 else getattr(cube, "_revision", getattr(cube, "source_revision", None)))
+                for cube in sources
+            )
+            cached = getattr(owner, "_power_background_cache", None)
+            if (cached is not None and cached[0] == cache_key
+                    and len(cached[1]) == len(sources)
+                    and all(old is current for old, current in zip(cached[1], sources))):
+                value = cached[2]
+            else:
+                value = estimate_constant_background(sources, percentile=1.0)
+                # Retain source references to prevent object-id reuse after a
+                # load; data replacement or an in-place revision invalidates.
+                owner._power_background_cache = (cache_key, sources, value)
             self._power_set_background_spin_silent(value)
             return value
         return float(self.power_background_spin.value())
+
+    def _power_background_source_cubes(self) -> tuple[DataCube, ...]:
+        """Use the displayed raw source set for both plot keys and rendering."""
+        if self._power_has_distinct_role_groups():
+            keys = (self._power_role_group_key("KK"), self._power_role_group_key("KKp"))
+            results = [self._power_result_cache.get(key) for key in keys]
+            return tuple(result.cube for result in results) if all(result is not None for result in results) else ()
+        loaded = getattr(self, "loaded", None)
+        return (loaded.cube,) if loaded and loaded.mode == "Power Dependent" and loaded.cube is not None else ()
 
     def _power_load_group_result(self, group_key: str) -> data_io.PowerSeriesResult:
         cached = self._power_result_cache.get(group_key)

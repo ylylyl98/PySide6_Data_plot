@@ -7,7 +7,8 @@ import unittest
 from unittest.mock import patch
 import numpy as np
 
-from core.drr_fitted_background import estimate_background, load_fitted_group, settings_for_source
+from core.drr_fitted_background import (estimate_background, load_fitted_group,
+                                       settings_for_source, settings_for_group)
 from core.drr_background_cache import fit_cached
 from core.drr_background_quality import suggest_regions, merge_regions
 from core.drr_background_review import check_group, compare_methods
@@ -133,21 +134,43 @@ class BackgroundReviewTests(unittest.TestCase):
         self.assertTrue(sentinel.exists())
         self.assertEqual(len(list(directory.glob('*.npz'))), 257)  # 256 cache entries + sentinel.
 
-    def test_group_uses_file_overrides_and_checks_errors_without_losing_valid_files(self):
+    def test_group_unions_legacy_protection_and_rejects_an_incomplete_selection_atomically(self):
         write_csv(self.root/'a.csv', self.raw)
         write_csv(self.root/'b.csv', self.raw)
         recipe = {**asdict(SETTINGS), 'protected_regions_by_file': {'b.csv': ((1.55, 1.65), (1.75, 1.85))}}
         self.assertNotEqual(settings_for_source(recipe, 'a.csv'), settings_for_source(recipe, 'b.csv'))
         _, refs = load_fitted_group(self.root, ['a.csv', 'b.csv'], recipe, y_axis='bg')
-        self.assertEqual(refs[1].settings.protected_regions, ((1.55, 1.65), (1.75, 1.85)))
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0].settings.protected_regions,
+                         settings_for_group(recipe, ['a.csv', 'b.csv']).protected_regions)
+        self.assertEqual([item['source'] for item in refs[0].input_sources], ['a.csv', 'b.csv'])
         payload = check_group(self.root, ['a.csv', 'missing.csv', 'b.csv'], 'bg', recipe, 3,
                               progress=self.signals, log=self.signals)
         self.assertEqual(payload['generation'], 3)
-        self.assertEqual(payload['results'][1]['report']['status'], 'Error')
-        self.assertTrue(payload['results'][2]['reference'].cache_hit)
+        self.assertEqual(len(payload['results']), 1)
+        self.assertEqual(payload['results'][0]['report']['status'], 'Error')
+        self.assertIsNone(payload['results'][0]['reference'])
+        self.assertEqual(payload['results'][0]['source_files'], ['a.csv', 'missing.csv', 'b.csv'])
+        valid = check_group(self.root, ['a.csv', 'b.csv'], 'bg', recipe, 4,
+                            progress=self.signals, log=self.signals)
+        self.assertEqual(len(valid['results']), 1)
+        self.assertTrue(valid['results'][0]['reference'].cache_hit)
         no_mask = check_group(self.root, ['a.csv'], 'bg', {}, 4, progress=self.signals, log=self.signals)
         self.assertEqual(no_mask['results'][0]['report']['status'], 'Needs regions')
         self.assertTrue(no_mask['results'][0]['report']['suggested_regions'])
+
+    def test_group_reports_malformed_recipe_as_one_error_without_fitting(self):
+        write_csv(self.root/'a.csv', self.raw)
+        for recipe in (None, [], {'protected_regions_by_file': []}, {'protected_regions_by_file': None}):
+            with self.subTest(recipe=recipe), patch('core.drr_background_review.fit_prepared_group') as fit:
+                result = check_group(self.root, ['a.csv'], 'bg', recipe, 2,
+                                     progress=self.signals, log=self.signals)
+            self.assertEqual(len(result['results']), 1)
+            item = result['results'][0]
+            self.assertEqual(item['report']['status'], 'Error')
+            self.assertIn('mapping', item['report']['warnings'][0])
+            self.assertIsNone(item['reference'])
+            fit.assert_not_called()
 
     def test_comparison_preserves_primary_and_uses_fixed_sg_with_heldout_bands(self):
         write_csv(self.root/'a.csv', self.raw)
@@ -161,6 +184,43 @@ class BackgroundReviewTests(unittest.TestCase):
             self.assertGreater(score['blocks'], 0)
             self.assertLess(score['rms_percent'], .1)
         np.testing.assert_array_equal(result['derivatives'][0].energy, result['derivatives'][1].energy)
+
+    def test_comparison_prepares_one_raw_average_for_both_methods(self):
+        import core.drr_background_review as review
+        second = replace(self.raw, Z=3*self.raw.Z*(1+.04*np.exp(-.5*((self.raw.energy-1.6)/.005)**2)))
+        write_csv(self.root/'a.csv', self.raw)
+        write_csv(self.root/'b.csv', second)
+        with patch.object(review, 'prepare_fitted_group', wraps=review.prepare_fitted_group) as prepare:
+            result = compare_methods(self.root, ('a.csv', 'b.csv'), 'bg', SETTINGS, 5, 21, 2,
+                                     progress=self.signals, log=self.signals)
+        self.assertEqual(prepare.call_count, 1)
+        self.assertEqual(result['source'], 'a.csv')
+        self.assertEqual(result['source_files'], ['a.csv', 'b.csv'])
+        average = replace(self.raw, Z=(self.raw.Z+second.Z)/2)
+        np.testing.assert_allclose(result['raw'].Z, average.Z, rtol=1e-11)
+        expected, fitted = estimate_background(average, SETTINGS)
+        np.testing.assert_allclose(result['reference'].background(), fitted.background(), rtol=1e-10)
+        self.assertEqual(len(result['reference'].input_sources), 2)
+        self.assertEqual(result['reference'].input_sources, result['alternate'].input_sources)
+        previous = np.mean([estimate_background(cube, SETTINGS)[0].Z for cube in (self.raw, second)], axis=0)
+        self.assertGreater(float(np.max(abs(expected.Z-previous))), .001)
+
+    def test_comparison_does_not_publish_after_a_nonfirst_member_changes(self):
+        import core.drr_background_review as review
+        write_csv(self.root/'a.csv', self.raw)
+        write_csv(self.root/'b.csv', self.raw)
+        fit = review.fit_prepared_group
+        calls = []
+        def change_member(*args, **kwargs):
+            result = fit(*args, **kwargs)
+            calls.append(result)
+            if len(calls) == 1:
+                (self.root/'b.csv').write_text('changed after averaging', encoding='utf-8')
+            return result
+        with patch.object(review, 'fit_prepared_group', side_effect=change_member):
+            with self.assertRaisesRegex(ValueError, 'changed'):
+                compare_methods(self.root, ['a.csv', 'b.csv'], 'bg', SETTINGS, 6, 21, 2,
+                                progress=self.signals, log=self.signals)
 
 
 if __name__ == '__main__':

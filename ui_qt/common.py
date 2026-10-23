@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.loader import DataCube
+from core.data_io import PowerSeriesSource
 from core.mcd import McdCenterCandidate, McdResult, McdSettings
 from core.plotting import HeatmapParams
 from core.provenance import WorkingCopyRecord
@@ -144,6 +145,7 @@ class LoadedState:
     y_axis_spec: str = "auto"
     provenance_records: tuple[WorkingCopyRecord, ...] = ()
     load_timings: Dict[str, float] = field(default_factory=dict)
+    drr_background_dependencies: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -173,6 +175,10 @@ class LoadOptions:
     power_role_group_keys: tuple[str, ...] = ()
     drr_restore_files: bool = True
     drr_restore_centers: bool = True
+    drr_resolve_background: bool = False
+    drr_source_catalog: tuple[Any, ...] = ()
+    power_source_catalog: tuple[PowerSeriesSource, ...] = ()
+    power_source_signatures: tuple[tuple[str, int | None, int | None], ...] = ()
 
 
 @dataclass(frozen=True)

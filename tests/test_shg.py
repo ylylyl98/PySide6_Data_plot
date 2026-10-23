@@ -1,6 +1,8 @@
 import tempfile
 import unittest
+from dataclasses import fields, replace
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -75,6 +77,27 @@ class ShgLoaderTests(unittest.TestCase):
 
 
 class ShgProcessingTests(unittest.TestCase):
+    def test_local_methods_ignore_previously_loaded_external_background(self) -> None:
+        from core import shg
+        data, _ = _synthetic_data()
+        # A stale background must neither cost a second cleanup nor cause local
+        # processing to fail after switching away from external subtraction.
+        background = replace(data, source_file="old-background.csv",
+                             wavelength_nm=np.array([np.nan]), spectra=np.array([[np.nan]]))
+        for method in ("local_linear", "local_quadratic", "none"):
+            with self.subTest(method=method):
+                settings = ShgSettings(background_method=method)
+                expected = process_shg_sweep(data, settings)
+                with patch.object(shg, '_remove_cosmic_ray_spikes', wraps=shg._remove_cosmic_ray_spikes) as clean:
+                    actual = process_shg_sweep(data, settings, background=background)
+                    self.assertEqual(clean.call_count, 1)
+                for field in fields(actual):
+                    value, reference = getattr(actual, field.name), getattr(expected, field.name)
+                    if isinstance(value, np.ndarray):
+                        np.testing.assert_array_equal(value, reference)
+                    else:
+                        self.assertTrue(value is reference or value == reference, field.name)
+
     def test_cosmic_ray_inside_gate_is_removed_before_integration(self) -> None:
         data, expected_area = _synthetic_data()
         spike_index = int(np.argmin(np.abs(data.wavelength_nm - 513.0)))

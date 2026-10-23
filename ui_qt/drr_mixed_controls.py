@@ -56,6 +56,16 @@ def update(owner):
         owner.drr_mixed_recommendation.setText('Load data for X/Y window recommendations.')
         return int(owner.drr_sg_window_spin.value())
     poly = int(owner.drr_sg_poly_spin.value())
+    held = getattr(owner, '_drr_bn_group_processing_hold', None)
+    if (held is not None and held[0] is cube
+            and held[1:] == (int(owner.drr_sg_window_spin.value()), poly,
+                            int(owner.drr_sg_y_window_spin.value()),
+                            owner.drr_sg_auto_chk.isChecked(), owner.drr_sg_y_auto_chk.isChecked())):
+        wx, wy = held[1], held[3]
+        owner.drr_mixed_recommendation.setText(
+            f'BN comparison: unchanged X {wx} points, Y {wy} points. '
+            'Adjust a processing control to update the windows.')
+        return wx
     cached = getattr(owner, '_drr_mixed_recommendation_cache', None)
     if cached is None or cached[0] is not cube or cached[1] != poly:
         rx = recommend_window(cube.energy, cube.Z, poly, maximum=21)

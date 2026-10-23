@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Sequence
 
@@ -901,7 +901,8 @@ def vp_map(a: np.ndarray, b: np.ndarray, eps: float = 1e-12) -> np.ndarray:
 
 def background_correct_cube(cube: DataCube, background: float, *, title: str | None = None) -> DataCube:
     z = np.asarray(cube.Z, float) - float(background)
-    return DataCube(
+    return replace(
+        cube,
         energy=np.asarray(cube.energy, float).copy(),
         gate=np.asarray(cube.gate, float).copy(),
         Z=z,
@@ -1181,29 +1182,8 @@ def clamp_sg_window(requested: int, *, n_energy: int, polyorder: int) -> int:
     return _clamp_sg_window(requested, n_energy=n_energy, polyorder=polyorder)
 
 
-def apply_sg_derivative_energy(
-    cube: DataCube,
-    *,
-    derivative: int | None,
-    window_length: int,
-    polyorder: int = 2,
-) -> tuple[DataCube, int]:
-    check_load_cancelled()
-    if isinstance(derivative, tuple) and len(derivative) == 2 and derivative[0] == 'mixed':
-        from core.drr_mixed_derivative import mixed_derivative
-        return mixed_derivative(cube, window_length, derivative[1], polyorder)
-    if derivative not in (None, 1, 2):
-        raise ValueError("derivative must be None, 1, or 2.")
-    if derivative is None:
-        return cube, int(window_length)
-
-    z = np.asarray(cube.Z, float)
-    e = np.asarray(cube.energy, float).ravel()
-    if z.ndim != 2 or e.size < 5:
-        raise ValueError("Derivative needs 2D data with at least 5 energy points.")
-
-    used_win = _clamp_sg_window(int(window_length), n_energy=e.size, polyorder=int(polyorder))
-
+def _sg_derivative_energy_rows(z, e, used_win, polyorder, derivative):
+    """Retain the existing uniform and regridded SG numerical paths."""
     diffs = np.diff(e)
     finite_diffs = diffs[np.isfinite(diffs)]
     spacing_uniform = False
@@ -1248,12 +1228,57 @@ def apply_sg_derivative_energy(
             origin_like=False,
             pad_flat_edges=True,
         )
+    return z_out
+
+
+def apply_sg_derivative_energy(
+    cube: DataCube,
+    *,
+    derivative: int | None,
+    window_length: int,
+    polyorder: int = 2,
+) -> tuple[DataCube, int]:
+    check_load_cancelled()
+    if isinstance(derivative, tuple) and len(derivative) == 2 and derivative[0] == 'mixed':
+        from core.drr_mixed_derivative import mixed_derivative
+        return mixed_derivative(cube, window_length, derivative[1], polyorder)
+    if derivative not in (None, 1, 2):
+        raise ValueError("derivative must be None, 1, or 2.")
+    if derivative is None:
+        return cube, int(window_length)
+
+    z = np.asarray(cube.Z, float)
+    e = np.asarray(cube.energy, float).ravel()
+    if z.ndim != 2 or e.size < 5:
+        raise ValueError("Derivative needs 2D data with at least 5 energy points.")
+
+    used_win = _clamp_sg_window(int(window_length), n_energy=e.size, polyorder=int(polyorder))
+    boundaries = getattr(cube, "drr_background_boundaries", ())
+    if boundaries:
+        from core.drr_segmented_derivative import segmented_derivative_rows
+
+        # The uneven/gappy SG path needs poly + 3 samples. Select an odd
+        # window satisfying that minimum so the seam mask matches its fit.
+        def select_window(requested, count, poly):
+            return _clamp_sg_window(max(requested, poly + 3), n_energy=count, polyorder=poly)
+
+        z_out, used_win = segmented_derivative_rows(
+            z, e, boundaries,
+            window_length=used_win,
+            polyorder=int(polyorder),
+            select_window=select_window,
+            differentiate=lambda values, axis, window, poly: _sg_derivative_energy_rows(
+                values, axis, window, poly, int(derivative)),
+        )
+    else:
+        z_out = _sg_derivative_energy_rows(z, e, used_win, int(polyorder), int(derivative))
     check_load_cancelled()
     cbar = "d(DR/R)/dE" if int(derivative) == 1 else "d2(DR/R)/dE2"
     title = cube.title if cube.title else "DR/R"
     title = f"{title} ({cbar})"
     return (
-        DataCube(
+        replace(
+            cube,
             energy=np.asarray(cube.energy, float).copy(),
             gate=np.asarray(cube.gate, float).copy(),
             # Both filters allocate an independent writable result already.
@@ -1261,6 +1286,8 @@ def apply_sg_derivative_energy(
             gate_label=cube.gate_label,
             title=title,
             cbar_label=cbar,
+            gate_coordinates={name: np.asarray(values).copy()
+                              for name, values in cube.gate_coordinates.items()},
         ),
         int(used_win),
     )

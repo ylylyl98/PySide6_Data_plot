@@ -148,7 +148,7 @@ class DrrMissingSelectionTests(unittest.TestCase):
                 self.window._start_load("DRR")
             start.assert_not_called()
 
-    def test_resolved_recipe_missing_baseline_blocks_before_worker(self):
+    def test_deferred_recipe_missing_baseline_blocks_before_reading_measurements(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             measurement = root / "Initial Data" / "run_REF.csv"
@@ -165,10 +165,14 @@ class DrrMissingSelectionTests(unittest.TestCase):
             with (
                 patch("ui_qt.main_window.resolve_drr_background_assignments", return_value=resolved),
                 patch.object(self.window.thread_pool, "start") as start,
+                patch.object(self.window, '_show_error') as error,
+                patch('ui_qt.main_window.data_io.load_drr_resolved_cube') as read,
             ):
                 self.window._start_load("DRR")
-            start.assert_not_called()
-            self.assertIn("Missing DRR source(s)", self.window.statusBar().currentMessage())
+                self.assertEqual(start.call_count, 1)
+                start.call_args.args[0].run()
+            read.assert_not_called()
+            self.assertIn('Missing DRR source(s)', error.call_args.args[0])
 
 
 if __name__ == "__main__":

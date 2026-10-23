@@ -47,19 +47,19 @@ class DrrSidebarTests(unittest.TestCase):
         self.w.drr_sidebar_tabs.setCurrentIndex(index)
         self.app.processEvents()
 
-    def test_background_mode_reveals_only_applicable_controls(self):
+    def test_all_background_modes_show_one_settings_entry_and_summary(self):
         self.page(0)
         w = self.w
-        for mode, external, fitted in (("Self (last frame)", False, False),
-                                       ("External", True, False),
-                                       ("Fitted (sample)", False, True),
-                                       ("Self (first frame)", False, False)):
+        for mode in ("Self (last frame)", "External", "Fitted (sample)", "Self (first frame)"):
             with self.subTest(mode=mode):
                 w.drr_baseline_combo.setCurrentText(mode)
                 self.app.processEvents()
-                self.assertEqual(w.drr_edit_baselines_btn.isVisible(), external)
-                self.assertEqual(w.drr_baseline_combine_combo.isVisible(), external)
-                self.assertEqual(w.drr_background_fit_btn.isVisible(), fitted)
+                self.assertTrue(w.drr_edit_baselines_btn.isVisible())
+                self.assertEqual(w.drr_edit_baselines_btn.text(), "Background settings…")
+                for legacy in (w.drr_baseline_combo, w.drr_pn_background_btn,
+                               w.drr_baseline_combine_combo, w.drr_background_fit_btn,
+                               w.drr_bn_calibration_btn, w.drr_bn_auto_chk):
+                    self.assertFalse(legacy.isVisible(), legacy.objectName())
                 self.assertTrue(w.drr_baseline_summary.isVisible())
                 self.assertTrue(w.drr_data_controls.isVisible())
 
@@ -172,7 +172,8 @@ class DrrSidebarTests(unittest.TestCase):
         QTest.keyClick(w.drr_sidebar_tabs.tabBar(), Qt.Key_Right)
         self.assertEqual(w.drr_sidebar_tabs.currentIndex(), 1)
         self.assertTrue(button.isVisible())
-        self.assertTrue(w.drr_baseline_combo.isVisible())
+        self.assertFalse(w.drr_baseline_combo.isVisible())
+        self.assertTrue(w.drr_edit_baselines_btn.isVisible())
         self.assertTrue(w.drr_baseline_summary.isVisible())
         self.assertEqual(point, button.mapTo(w.left_panel, button.rect().topLeft()))
         QTest.keyClick(w.drr_sidebar_tabs.tabBar(), Qt.Key_Left)

@@ -1,7 +1,8 @@
 """Mixed SG derivatives and conservative, data-dependent window suggestions."""
+from dataclasses import replace
+
 import numpy as np
 from scipy.signal import find_peaks, peak_widths
-from core.loader import DataCube
 from core.load_cancellation import check_load_cancelled
 
 
@@ -100,8 +101,23 @@ def mixed_derivative(cube, window_x, window_y, poly=2):
         raise ValueError('Mixed derivative data must match the Y by X grid.')
     wx = effective_window(window_x, len(x), poly)
     wy = effective_window(window_y, len(y), poly)
-    dx = _first_derivative(z, x, wx, poly)
+    boundaries = getattr(cube, 'drr_background_boundaries', ())
+    if boundaries:
+        from core.drr_segmented_derivative import segmented_derivative_rows
+        dx, wx = segmented_derivative_rows(
+            z, x, boundaries,
+            window_length=wx,
+            polyorder=poly,
+            select_window=effective_window,
+            differentiate=_first_derivative,
+        )
+    else:
+        dx = _first_derivative(z, x, wx, poly)
     result = _first_derivative(dx.T, y, wy, poly).T
     label = f'd2(DR/R)/(dE d{cube.gate_label})'
-    return DataCube(x.copy(), y.copy(), result, cube.gate_label,
-                    f'{cube.title} (dXdY)', label, cube.gate_unit, cube.y_axis_semantic), wx
+    return replace(
+        cube, energy=x.copy(), gate=y.copy(), Z=result,
+        title=f'{cube.title} (dXdY)', cbar_label=label,
+        gate_coordinates={name: np.asarray(values).copy()
+                          for name, values in cube.gate_coordinates.items()},
+    ), wx

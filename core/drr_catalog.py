@@ -48,9 +48,9 @@ def load_drr_catalog(
 ) -> list[DrrSource]:
     """Preview persisted history, then update only the layer that changed."""
     suffix = "-all" if include_all else ""
-    raw = SourceCatalogCache(str(folder), "DRR-raw-v2" + suffix,
+    raw = SourceCatalogCache(str(folder), "DRR-raw-v3-composite" + suffix,
                              inventory_provider=lambda: drr_raw_inventory(folder, include_all=include_all))
-    history = SourceCatalogCache(str(folder), "DRR-history-v2" + suffix,
+    history = SourceCatalogCache(str(folder), "DRR-history-v3-composite" + suffix,
                                  inventory_provider=lambda: drr_history_inventory(folder, include_all=include_all))
 
     def build_raw():

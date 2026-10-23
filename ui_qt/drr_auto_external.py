@@ -6,15 +6,16 @@ from ui_qt.common import Worker
 
 
 class ExternalMatchRequest(QObject):
-    def __init__(self, owner, controller):
+    def __init__(self, owner, controller, *, measured_bn_only=False):
         super().__init__(owner)
         self.controller = controller
         self.folder = owner.current_folder
         self.selected = tuple(owner.drr_selected_files)
+        self.measured_bn_only = bool(measured_bn_only)
         self.cancelled = Event()
         self.worker = Worker(resolve_auto_external, self.folder,
                              tuple(owner.drr_available_sources), self.selected,
-                             cancelled=self.cancelled)
+                             cancelled=self.cancelled, measured_bn_only=self.measured_bn_only)
         self.worker.signals.result.connect(self.complete)
         self.worker.signals.error.connect(self.failed)
         self.worker.signals.finished.connect(self.deleteLater)

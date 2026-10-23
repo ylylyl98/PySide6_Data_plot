@@ -308,6 +308,9 @@ class DrrDualSaveWorkflowTests(unittest.TestCase):
         ranges["xmax"].setValue(1.5)
         ranges["ymin"].setValue(-0.75)
         ranges["ymax"].setValue(0.75)
+        # setUp injects LoadedState without the normal load-time auto ranges.
+        # Start all view-only saves with the real ROI color limits initialized.
+        self.window._refresh_automatic_ranges("DRR", refresh_split=False)
         for view, side_by_side in (("raw", False), ("second", False), ("raw", True)):
             with self.subTest(view=view, side_by_side=side_by_side):
                 with patch(

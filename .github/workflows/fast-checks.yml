@@ -13,7 +13,8 @@ jobs:
   quick-checks:
     name: quick-checks
     runs-on: windows-latest
-    timeout-minutes: 10
+    # BN qualification reruns the full selector on injected weak features.
+    timeout-minutes: 60
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -30,6 +31,18 @@ jobs:
           tests.test_dat_loader
           tests.test_loader
           tests.test_processing_derivative
+          tests.test_drr_bn_calibration
+          tests.test_drr_bn_settings_compatibility
+          tests.test_drr_bn_joint
+          tests.test_drr_bn_joint_independent
+          tests.test_drr_bn_d2_objective
+          tests.test_drr_bn_d2_priority_independent
+          tests.test_drr_bn_shrinkage
+          tests.test_drr_bn_shrinkage_independent
+          tests.test_drr_bn_fingerprint
+          tests.test_drr_bn_derivative_protection
+          tests.test_drr_bn_store
+          tests.test_drr_bn_integration
           tests.test_shg_fit
           tests.test_power_series
           tests.test_compare_vp

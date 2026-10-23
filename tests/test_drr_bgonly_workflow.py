@@ -39,9 +39,15 @@ class DrrBgOnlyWorkflowTests(unittest.TestCase):
                  patch('ui_qt.main_window.resolve_drr_background_assignments', side_effect=resolve), \
                  patch.object(w.thread_pool, 'start', workers.append):
                 w.drr_controller._edit_drr_measurements()
-            self.assertEqual(len(calls), 1)
-            self.assertEqual(len(workers), 1)
-            self.assertEqual(workers[0].args[0].drr_baseline_text, 'Self (last frame)')
+                self.assertEqual(calls, [])
+                self.assertEqual(len(workers), 1)
+                options = workers[0].args[0]
+                self.assertTrue(options.drr_resolve_background)
+                loaded = w._load_task(options, progress=SimpleNamespace(emit=lambda *_: None),
+                                      log=SimpleNamespace(emit=lambda *_: None))
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(loaded.drr_baseline_text, 'Self (last frame)')
+                w._on_load_finished(request_token=w._active_load_token)
 
     @classmethod
     def setUpClass(cls) -> None:

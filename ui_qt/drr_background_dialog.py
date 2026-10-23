@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
-    QPushButton, QLineEdit, QCheckBox, QDialogButtonBox, QInputDialog,
+    QPushButton, QLineEdit, QCheckBox, QDialogButtonBox, QInputDialog, QFileDialog,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QWidget, QScrollArea, QFrame, QSizePolicy)
 from matplotlib.figure import Figure
@@ -15,11 +15,10 @@ from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 from matplotlib.widgets import SpanSelector
 
 from core.drr_fitted_background import (BackgroundFitSettings, FITTED_MODE,
-    read_reference_raw, source_signature, load_intensity, validate_recipe)
-from core.drr_background_cache import fit_cached
+    read_reference_raw, validate_recipe, prepare_fitted_group, fit_prepared_group,
+    settings_for_group, reference_matches_files)
 from core.drr_background_quality import merge_regions, suggest_regions
 from core.drr_background_review import check_group, compare_methods
-from core.drr_sources import resolve_source_path
 from core.processing_run import resolve_shared_y_axis_request
 from core.load_cancellation import LoadCancellation
 from ui_qt.common import Worker, QComboBox, QDoubleSpinBox, QSpinBox
@@ -40,20 +39,95 @@ def parse_regions(text):
     return tuple(regions)
 
 
-def _preview(folder, source, axis, settings, reference, generation, *, protected_regions=(), progress, log):
+def periodic_texture_status(reference):
+    """Describe what was applied, including validation failures and fallbacks."""
+    if not reference.settings.periodic_texture:
+        return ''
+    if not reference.settings.shared_texture:
+        return 'Periodic gaps: inactive while shared texture is off.'
+    report = reference.diagnostics.get('periodic_texture', {})
+    fraction = report.get('applied_fraction', report.get('prediction_fraction', report.get('corrected_fraction', 0))) or 0
+    additional = report.get('additional_corrected_fraction')
+    status = report.get('status', 'Not evaluated')
+    if fraction <= 0:
+        text = 'Periodic gaps: no validated prediction applied.'
+    elif additional is not None:
+        text = (f'Periodic gaps: {status}; additional corrected spectral points: {100*additional:.0f}%. '
+                f'Prediction applied at {100*fraction:.1f}% of spectral points.')
+    else:
+        text = f'Periodic gaps: {status}; prediction applied at {100*fraction:.0f}% of spectral points.'
+    windows = report.get('windows', ())
+    applied_windows = [window for window in windows
+                       if isinstance(window, dict) and window.get('status') == 'Applied']
+    if windows:
+        text += f' Validated windows: {len(applied_windows)}.'
+        counts = []
+        for window in applied_windows:
+            components = window.get('components', ())
+            count = window.get('component_count', len(components) if isinstance(components, (list, tuple)) else components)
+            if isinstance(count, (int, float)) and count > 0:
+                counts.append(count)
+        if counts:
+            text += f' Max. components per local fit: {max(counts):g}.'
+    elif report.get('components'):
+        components = report['components']
+        count = len(components) if isinstance(components, (list, tuple)) else components
+        text += f' Components: {count}.'
+    reason = report.get('reason') or report.get('rejection_reason')
+    if not reason and isinstance(report.get('validation'), dict):
+        reason = report['validation'].get('reason') or report['validation'].get('rejection_reason')
+    if reason:
+        text += f' {reason}'
+    elif fraction <= 0 and str(status).lower() not in {'applied', 'success', 'validated'}:
+        text += f' {status}.'
+    return text
+
+
+def reference_texture_status(reference):
+    """Selecting a reference is distinct from applying validated correction."""
+    if not reference.settings.texture_reference_source:
+        return ''
+    if not reference.settings.shared_texture:
+        return 'Fringe reference: inactive while shared texture is off.'
+    report = reference.diagnostics.get('reference_texture', {})
+    fraction = report.get('applied_fraction', 0) or 0
+    if fraction > 0:
+        text = f'Fringe reference: applied at {100*fraction:.1f}% of spectral points.'
+        additional = report.get('additional_corrected_fraction')
+        if additional is not None:
+            text += f' Additional corrected spectral points: {100*additional:.1f}%.'
+    else:
+        text = 'Fringe reference: no validated correction applied.'
+    windows = report.get('windows', ())
+    if windows:
+        count = sum(isinstance(window, dict) and window.get('status') == 'Applied' for window in windows)
+        text += f' Validated windows: {count}.'
+    reason = report.get('reason') or report.get('rejection_reason')
+    if not reason and isinstance(report.get('validation'), dict):
+        reason = report['validation'].get('reason') or report['validation'].get('rejection_reason')
+    if reason:
+        text += f' {reason}'
+        if not str(reason).endswith(('.', '!', '?')):
+            text += '.'
+    elif fraction <= 0:
+        status = report.get('status', 'Not evaluated')
+        if str(status).lower() not in {'applied', 'success', 'validated'}:
+            text += f' {status}.'
+    return text
+
+
+def _preview(folder, files, axis, settings, reference, generation, *, protected_regions=(), progress, log):
+    files = (files,) if isinstance(files, str) else tuple(files)
+    source = files[0]
     if reference is not None:
+        if not reference_matches_files(reference, files):
+            raise ValueError('The fitted background does not belong to this selected raw average. Refit the average.')
         raw = read_reference_raw(folder, reference, y_axis=axis)
     else:
-        path = resolve_source_path(folder, source)
-        signature = source_signature(path)
-        raw = load_intensity(folder, source, y_axis=axis)
-        order = np.argsort(raw.energy)
-        raw = replace(raw, energy=raw.energy[order].copy(), Z=raw.Z[:, order].copy())
+        prepared = prepare_fitted_group(folder, files, y_axis=axis, progress=progress.emit, log=log.emit)
+        raw = prepared.cube
         if settings is not None:
-            _, reference = fit_cached(raw, settings, source=source, signature=signature,
-                                      source_path=path, y_axis=axis)
-        if signature != source_signature(path):
-            raise ValueError('Source changed during preview; reload when acquisition is complete.')
+            _, reference = fit_prepared_group(prepared, settings, stage=log.emit)
     if reference is None:
         report = {**suggest_regions(raw, protected_regions), 'status': 'Needs fit',
                   'warnings': ['Review protection, then fit. Broad or weak features may be missed by screening.']}
@@ -65,14 +139,24 @@ class DrrBackgroundDialog(QDialog):
     applied = Signal(object)
 
     def __init__(self, folder, files, *, y_axis='auto', settings=None, references=(), pool,
-                 initial_gate=0., settings_store=None, comparison_window=21, comparison_poly=2, parent=None):
+                 initial_gate=0., settings_store=None, comparison_window=21, comparison_poly=2, parent=None,
+                 draft_mode=False):
         super().__init__(parent)
         self.setWindowTitle('DRR · Fit / view background')
+        self.draft_mode = bool(draft_mode)
         self.resize(1100, 900)
         self.folder, self.files, self.y_axis = str(folder), tuple(files), y_axis
+        self.grouped = len(self.files) > 1
+        self.fit_sources = self.files[:1]
+        self.input_label = f'Average ({len(self.files)} files)' if self.grouped else Path(self.files[0]).name
         self.resolved_axis = resolve_shared_y_axis_request(files, y_axis)
         self.pool = pool
-        self.references = {reference.source: reference for reference in references}
+        supplied_references = tuple(references)
+        self.references = self.compatible_references(supplied_references)
+        self.legacy_reference_notice = ('Previous per-file backgrounds cannot be reused for the raw average. Fit the average again.'
+                                        if supplied_references and not self.references else '')
+        self.recipe_migration_notice = self.group_recipe_error = ''
+        self.legacy_manual_regions = ()
         self.raw = self.reference = self.background = None
         self.worker = self.pending = None
         self.generation = 0
@@ -98,27 +182,35 @@ class DrrBackgroundDialog(QDialog):
         self.controls_scroll.setMaximumHeight(400)
         self.controls_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         outer.addWidget(self.controls_scroll)
-        self.info = QLabel('Fit outside protected resonances. The estimated denominator is shared in shape across gates, with per-gate gain and tilt. No BN reference.')
+        self.info = QLabel(('Average the selected raw intensities first, then fit one background and calculate DRR. '
+                           if self.grouped else '')
+                          + 'Fit outside protected resonances. The estimated denominator is shared in shape across gates, with per-gate gain and tilt. Sample envelope; optional reference supplies fine texture only.')
         self.info.setWordWrap(True)
         layout.addWidget(self.info)
         self.file_combo = QComboBox()
         self.file_combo.setMinimumContentsLength(28)
         self.file_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        for name in files:
-            self.file_combo.addItem(Path(name).name, name)
-            self.file_combo.setItemData(self.file_combo.count()-1, name, Qt.ToolTipRole)
-        self.file_combo.setAccessibleName('Measurement to inspect')
+        self.file_combo.addItem(self.input_label, self.files[0])
+        self.file_combo.setItemData(0, '\n'.join(self.files), Qt.ToolTipRole)
+        self.file_combo.setAccessibleName('Averaged measurements to inspect' if self.grouped else 'Measurement to inspect')
         layout.addWidget(self.file_combo)
-        if not settings and self.references:
-            first = next(iter(self.references.values()))
+        if not settings and supplied_references:
+            first = supplied_references[0]
             settings = asdict(first.settings)
-            overrides = {source: ref.settings.protected_regions for source, ref in self.references.items()
+            overrides = {ref.source: ref.settings.protected_regions for ref in supplied_references
                          if ref.settings.protected_regions != first.settings.protected_regions}
             if overrides:
                 settings['protected_regions_by_file'] = overrides
-        settings = settings or {}
+        settings = self.normalize_display_recipe(settings or {})
         self.base_regions_text = self.region_text(settings.get('protected_regions', ()))
-        self.override_texts = {key: self.region_text(value) for key, value in settings.get('protected_regions_by_file', {}).items() if key in self.files}
+        overrides = settings.get('protected_regions_by_file', {})
+        self.override_texts = ({key: self.region_text(value) for key, value in overrides.items() if key in self.files}
+                               if isinstance(overrides, dict) else {})
+        self.group_notice = QLabel()
+        self.group_notice.setWordWrap(True)
+        self.group_notice.setAccessibleName('Average fit migration notice')
+        layout.addWidget(self.group_notice)
+        self.update_group_notice()
         row = QHBoxLayout()
         self.template_combo = QComboBox()
         self.template_combo.setAccessibleName('Reusable background recipe template')
@@ -136,12 +228,53 @@ class DrrBackgroundDialog(QDialog):
         form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         self.auto_protect = QCheckBox('Automatically protect peaks at each gate')
         self.auto_protect.setChecked(settings.get('automatic_protection', not bool(settings.get('protected_regions'))))
-        self.auto_protect.setToolTip('Estimate protection separately at each gate of each file. The plot shows the current gate. Unchecking uses the union of all gate regions for manual protection.')
+        self.auto_protect.setToolTip(('Estimate protection at each gate of the averaged raw spectrum. '
+                                     if self.grouped else 'Estimate protection at each gate of the measurement. ')
+                                    + 'The plot shows the current gate. Unchecking uses the union of all gate regions for manual protection.')
         form.addRow('Peak protection', self.auto_protect)
         self.texture_check = QCheckBox('Correct shared fine texture (learned outside peaks)')
         self.texture_check.setChecked(settings.get('shared_texture', True))
         self.texture_check.setToolTip('At each energy, validates the unprotected gates in two separate groups, then applies their shared response to all gates. Grey bands protect the selected gate during estimation. Texture coverage shows where correction is applied. Disable to compare with the smooth envelope. Protect weak stationary sample features manually.')
         form.addRow('Shared texture', self.texture_check)
+        row = QHBoxLayout()
+        self.reference_source_edit = QLineEdit(settings.get('texture_reference_source', ''))
+        self.reference_source_edit.setReadOnly(True)
+        self.reference_source_edit.setPlaceholderText('Optional reference CSV; select explicitly with Browse')
+        self.reference_source_edit.setAccessibleName('Fringe reference CSV path')
+        self.reference_source_edit.setAccessibleDescription('Fine-texture reference from the same sample position and optical path. The sample envelope is fitted independently. Use Browse to select a file or Clear to disable the reference.')
+        self.reference_source_edit.setCursorPosition(0)
+        self.reference_browse_button = QPushButton('Browse…')
+        self.reference_browse_button.setAccessibleName('Browse for a fringe reference CSV')
+        self.reference_browse_button.setToolTip('Select a fine-texture reference from the same sample position and optical path. The sample envelope stays independently fitted.')
+        self.reference_clear_button = QPushButton('Clear')
+        self.reference_clear_button.setAccessibleName('Clear fringe reference')
+        self.reference_clear_button.setToolTip('Disable the external fringe reference.')
+        row.addWidget(self.reference_source_edit, 1)
+        row.addWidget(self.reference_browse_button)
+        row.addWidget(self.reference_clear_button)
+        reference_label = QLabel('Fringe reference')
+        reference_label.setBuddy(self.reference_source_edit)
+        form.addRow(reference_label, row)
+        self.update_reference_tooltip()
+        row = QHBoxLayout()
+        self.periodic_check = QCheckBox('Predict fringes across protected gaps (validated only)')
+        self.periodic_check.setChecked(settings.get('periodic_texture', False))
+        self.periodic_check.setAccessibleName('Predict periodic fringes across protected gaps')
+        self.periodic_check.setToolTip('Optional extension of shared texture. Learn periodic components outside protected peaks, then test prediction on held-out continuous bands. Only supported gaps receive a prediction; failed validation keeps the existing shared correction. Requires shared texture to be enabled.')
+        self.periodic_check.setAccessibleDescription(self.periodic_check.toolTip())
+        self.periodic_components_spin = QSpinBox()
+        self.periodic_components_spin.setRange(1, 5)
+        self.periodic_components_spin.setValue(settings.get('periodic_components', 3))
+        self.periodic_components_spin.setKeyboardTracking(False)
+        self.periodic_components_spin.setAccessibleName('Maximum periodic fringe components per local fit')
+        self.periodic_components_spin.setToolTip('Maximum number of periodic components per local spectral fit (1–5). Each window is validated separately and may select fewer components or reject prediction.')
+        self.periodic_components_spin.setAccessibleDescription(self.periodic_components_spin.toolTip())
+        row.addWidget(self.periodic_check, 1)
+        components_label = QLabel('Max. components')
+        components_label.setBuddy(self.periodic_components_spin)
+        row.addWidget(components_label)
+        row.addWidget(self.periodic_components_spin)
+        form.addRow('Periodic gaps', row)
         self.regions_edit = QLineEdit(self.base_regions_text)
         self.regions_edit.setPlaceholderText('Lower upper; lower upper (eV), or drag on the spectrum')
         self.regions_edit.setAccessibleName('Protected resonance intervals in electron volts')
@@ -149,6 +282,7 @@ class DrrBackgroundDialog(QDialog):
         row.addWidget(self.regions_edit, 1)
         self.file_only = QCheckBox('Only this file')
         self.file_only.setToolTip('Override protection for this measurement while keeping the group method unchanged.')
+        self.file_only.setVisible(not self.grouped)
         row.addWidget(self.file_only)
         form.addRow('Protected regions (eV)', row)
         row = QHBoxLayout()
@@ -190,11 +324,11 @@ class DrrBackgroundDialog(QDialog):
         form.addRow(row)
         layout.addLayout(form)
         row = QHBoxLayout()
-        self.check_button = QPushButton('Check all files')
+        self.check_button = QPushButton('Check average' if self.grouped else 'Check measurement')
         self.suggest_button = QPushButton('Add suggested regions')
         self.suggest_button.setEnabled(False)
-        self.suggest_button.setToolTip('Add suggestions only to this file, preserving all existing protected regions. Refit to apply.')
-        self.checks_visible = QCheckBox('Show file checks')
+        self.suggest_button.setToolTip('Add suggestions to the fitted input, preserving all existing protected regions. Refit to apply.')
+        self.checks_visible = QCheckBox('Show average check' if self.grouped else 'Show file checks')
         row.addWidget(self.check_button)
         row.addWidget(self.suggest_button)
         row.addWidget(self.checks_visible)
@@ -211,7 +345,7 @@ class DrrBackgroundDialog(QDialog):
         self.check_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
         self.check_table.setMaximumHeight(150)
         self.check_table.setMinimumHeight(110)
-        self.check_table.setAccessibleName('Per-file background quality checks')
+        self.check_table.setAccessibleName('Averaged-spectrum background quality check' if self.grouped else 'Measurement background quality check')
         self.check_table.hide()
         layout.addWidget(self.check_table)
         layout = outer
@@ -227,8 +361,8 @@ class DrrBackgroundDialog(QDialog):
         self.raw_check.setChecked(True)
         self.drag_check = QCheckBox('Drag to protect a region')
         self.view_combo = QComboBox()
-        self.view_combo.addItems(['Background', 'Second derivative comparison', 'Shared texture correction (%)', 'Texture coverage'])
-        self.view_combo.setToolTip('Texture coverage: 0% leaves the spectrum unchanged; 100% applies the full shared template. Intermediate weights taper at boundaries. This is not a confidence score.')
+        self.view_combo.addItems(['Background', 'Second derivative comparison', 'Applied texture correction (%)', 'Texture coverage'])
+        self.view_combo.setToolTip('Texture views include the final shared correction, validated reference correction, and periodic gap predictions. Coverage: 0% leaves the spectrum unchanged; 100% applies the full correction. Intermediate weights taper at boundaries. This is not a confidence score.')
         self.view_combo.setEnabled(False)
         for widget in (self.gate_label, self.gate_spin, self.raw_check, self.drag_check):
             row.addWidget(widget)
@@ -254,6 +388,11 @@ class DrrBackgroundDialog(QDialog):
         self.file_only.toggled.connect(self.scope_changed)
         self.auto_protect.toggled.connect(self.automatic_changed)
         self.texture_check.toggled.connect(self.invalidate_fit)
+        self.reference_source_edit.textChanged.connect(self.reference_source_changed)
+        self.reference_browse_button.clicked.connect(self.browse_reference)
+        self.reference_clear_button.clicked.connect(self.clear_reference)
+        self.periodic_check.toggled.connect(self.invalidate_fit)
+        self.periodic_components_spin.valueChanged.connect(self.invalidate_fit)
         self.template_save.clicked.connect(self.save_template)
         self.template_load.clicked.connect(self.load_template)
         self.method_combo.currentIndexChanged.connect(self.invalidate_fit)
@@ -293,15 +432,54 @@ class DrrBackgroundDialog(QDialog):
     def region_text(regions):
         return '; '.join(f'{a:.9g} {b:.9g}' for a, b in regions)
 
+    def compatible_references(self, references):
+        references = tuple(references)
+        if len(references) != 1 or not reference_matches_files(references[0], self.files):
+            return {}
+        return {self.files[0]: references[0]}
+
+    def normalize_display_recipe(self, settings):
+        self.group_recipe_error = self.recipe_migration_notice = ''
+        self.legacy_manual_regions = ()
+        if not self.grouped or not settings.get('protected_regions_by_file'):
+            return settings
+        try:
+            normalized = settings_for_group(settings, self.files)
+            if normalized.automatic_protection:
+                self.recipe_migration_notice = 'Automatic peak protection is recalculated on the averaged raw spectrum; previous per-file overrides are not used.'
+                try:
+                    self.legacy_manual_regions = settings_for_group(
+                        {**settings, 'automatic_protection': False}, self.files).protected_regions
+                except (TypeError, ValueError):
+                    pass
+            else:
+                self.recipe_migration_notice = 'Previous per-file protected regions were combined into one protection set for the averaged raw spectrum.'
+            return asdict(normalized)
+        except (TypeError, ValueError) as exc:
+            self.group_recipe_error = 'Review previous per-file protection before fitting the average: ' + str(exc)
+            self.recipe_migration_notice = self.group_recipe_error
+            return settings
+
+    def update_group_notice(self):
+        self.group_notice.setText(' '.join(text for text in (self.legacy_reference_notice, self.recipe_migration_notice) if text))
+        self.group_notice.setVisible(bool(self.group_notice.text()))
+
     def settings(self):
+        if self.group_recipe_error:
+            raise ValueError(self.group_recipe_error)
         return self.base_settings(() if self.auto_protect.isChecked() else parse_regions(self.regions_edit.text())).validate()
 
     def base_settings(self, regions):
         auto = self.auto_protect.isChecked()
         return BackgroundFitSettings(() if auto else regions, self.intervals_spin.value(), self.smoothing_spin.value(),
-                                     self.method_combo.currentData(), self.degree_spin.value(), auto, self.texture_check.isChecked())
+                                     self.method_combo.currentData(), self.degree_spin.value(), auto, self.texture_check.isChecked(),
+                                     periodic_texture=self.periodic_check.isChecked(),
+                                     periodic_components=self.periodic_components_spin.value(),
+                                     texture_reference_source=self.reference_source_edit.text())
 
     def recipe(self):
+        if self.group_recipe_error:
+            raise ValueError(self.group_recipe_error)
         recipe = asdict(self.base_settings(() if self.auto_protect.isChecked() else parse_regions(self.base_regions_text)))
         if self.override_texts and not self.auto_protect.isChecked():
             recipe['protected_regions_by_file'] = {key: parse_regions(value) for key, value in self.override_texts.items()}
@@ -323,6 +501,15 @@ class DrrBackgroundDialog(QDialog):
         self.regions_edit.setCursorPosition(0)
 
     def regions_changed(self, text):
+        if self.grouped:
+            self.group_recipe_error = ''
+            self.override_texts.clear()
+            self.base_regions_text = text
+            if self.recipe_migration_notice:
+                self.recipe_migration_notice = 'One protection set is used for the averaged raw spectrum.'
+                self.update_group_notice()
+            self.invalidate_fit()
+            return
         if self.file_only.isChecked():
             self.override_texts[self.file_combo.currentData()] = text
         else:
@@ -331,17 +518,27 @@ class DrrBackgroundDialog(QDialog):
 
     def automatic_changed(self, automatic):
         if not automatic:
-            # Seed manual editing with the actual protection used in each file.
+            # Seed manual editing with the protection on the fitted input.
             self.base_regions_text = (self.region_text(self.reference.settings.protected_regions)
-                                      if self.reference is not None else self.regions_edit.text())
+                                      if self.reference is not None else
+                                      self.region_text(self.legacy_manual_regions) if self.legacy_manual_regions else self.regions_edit.text())
             references = {**self.references, **self.preview_references}
-            self.override_texts = {source: self.region_text(ref.settings.protected_regions)
+            self.override_texts = {} if self.grouped else {source: self.region_text(ref.settings.protected_regions)
                 for source, ref in references.items()
                 if self.region_text(ref.settings.protected_regions) != self.base_regions_text}
+        if self.grouped:
+            self.group_recipe_error = ''
+            self.override_texts.clear()
+            if self.recipe_migration_notice:
+                self.recipe_migration_notice = ('Automatic peak protection is recalculated on the averaged raw spectrum.'
+                                                if automatic else 'One combined protection set is used for the averaged raw spectrum.')
+                self.update_group_notice()
         self.invalidate_fit()
         self.show_file_regions()
 
     def scope_changed(self, checked):
+        if self.grouped:
+            return
         source = self.file_combo.currentData()
         if checked:
             self.override_texts[source] = self.regions_edit.text()
@@ -351,9 +548,14 @@ class DrrBackgroundDialog(QDialog):
         self.invalidate_fit()
 
     def restore_recipe(self, settings):
+        settings = self.normalize_display_recipe(settings)
         self.base_regions_text = self.region_text(settings.get('protected_regions', ()))
-        self.override_texts = {key: self.region_text(value) for key, value in settings.get('protected_regions_by_file', {}).items() if key in self.files}
-        widgets = (self.method_combo, self.degree_spin, self.intervals_spin, self.smoothing_spin, self.auto_protect, self.texture_check)
+        overrides = settings.get('protected_regions_by_file', {})
+        self.override_texts = ({key: self.region_text(value) for key, value in overrides.items() if key in self.files}
+                               if isinstance(overrides, dict) else {})
+        widgets = (self.method_combo, self.degree_spin, self.intervals_spin, self.smoothing_spin,
+                   self.auto_protect, self.texture_check, self.periodic_check, self.periodic_components_spin,
+                   self.reference_source_edit)
         for widget in widgets:
             widget.blockSignals(True)
         self.method_combo.setCurrentIndex(max(0, self.method_combo.findData(settings.get('method', 'spline'))))
@@ -362,22 +564,57 @@ class DrrBackgroundDialog(QDialog):
         self.smoothing_spin.setValue(settings.get('smoothing', .001))
         self.auto_protect.setChecked(settings.get('automatic_protection', False))
         self.texture_check.setChecked(settings.get('shared_texture', True))
+        self.periodic_check.setChecked(settings.get('periodic_texture', False))
+        self.periodic_components_spin.setValue(settings.get('periodic_components', 3))
+        self.reference_source_edit.setText(settings.get('texture_reference_source', ''))
+        self.reference_source_edit.setCursorPosition(0)
+        self.update_reference_tooltip()
         for widget in widgets:
             widget.blockSignals(False)
         self.show_file_regions()
         self.update_method_controls()
+        self.update_group_notice()
 
     def update_method_controls(self):
+        idle = self.worker is None and self.pending is None
+        self.reference_browse_button.setEnabled(idle and self.texture_check.isChecked())
+        self.reference_clear_button.setEnabled(idle and self.texture_check.isChecked() and bool(self.reference_source_edit.text()))
+        self.periodic_check.setEnabled(idle and self.texture_check.isChecked())
+        self.periodic_components_spin.setEnabled(idle and self.texture_check.isChecked() and self.periodic_check.isChecked())
         spline = self.method_combo.currentData() == 'spline'
         self.intervals_spin.setEnabled(spline)
         self.smoothing_spin.setEnabled(spline)
         self.degree_spin.setEnabled(not spline)
         automatic = self.auto_protect.isChecked()
         self.regions_edit.setReadOnly(automatic)
-        self.file_only.setEnabled(not automatic)
+        self.file_only.setEnabled(not automatic and not self.grouped)
         self.drag_check.setEnabled(not automatic)
         if automatic:
             self.drag_check.setChecked(False)
+
+    def update_reference_tooltip(self):
+        text = 'Fine texture only; use the same sample position and optical path. The sample envelope is fitted independently.'
+        if self.reference_source_edit.text():
+            text += '\n' + self.reference_source_edit.text()
+        self.reference_source_edit.setToolTip(text)
+
+    def reference_source_changed(self, *_):
+        self.reference_source_edit.setCursorPosition(0)
+        self.update_reference_tooltip()
+        self.invalidate_fit()
+
+    def browse_reference(self, *_):
+        if not self.reference_browse_button.isEnabled():
+            return
+        selected = self.reference_source_edit.text()
+        start = str(Path(selected).parent) if selected and Path(selected).parent.is_dir() else self.folder
+        source, _ = QFileDialog.getOpenFileName(self, 'Select fringe reference CSV', start, 'CSV measurements (*.csv)')
+        if source:
+            self.reference_source_edit.setText(str(Path(source).resolve()))
+
+    def clear_reference(self, *_):
+        if self.reference_clear_button.isEnabled():
+            self.reference_source_edit.clear()
 
     def refresh_templates(self):
         self.templates = {}
@@ -413,7 +650,8 @@ class DrrBackgroundDialog(QDialog):
         self.settings_store.setValue('drr/background-templates-v1', json.dumps(self.templates))
         self.refresh_templates()
         self.template_combo.setCurrentText(name)
-        self.status.setText('Template saved. Check all files after loading it for a new measurement group.')
+        self.status.setText('Template saved. Review the averaged spectrum after loading it for a new measurement group.'
+                            if self.grouped else 'Template saved. Review the spectrum after loading it for a new measurement.')
 
     def load_template(self, *_):
         settings = self.templates.get(self.template_combo.currentText())
@@ -426,7 +664,8 @@ class DrrBackgroundDialog(QDialog):
             return
         self.restore_recipe(asdict(validated))
         self.invalidate_fit()
-        self.status.setText('Template loaded for this group. Check all files for new or shifted resonances before applying.')
+        self.status.setText('Template loaded. Check the averaged spectrum for new or shifted resonances before applying.'
+                            if self.grouped else 'Template loaded. Check the measurement for new or shifted resonances before applying.')
 
     def check_files(self):
         try:
@@ -445,24 +684,27 @@ class DrrBackgroundDialog(QDialog):
         self.request(settings, None, job='compare')
 
     def update_checks(self):
-        self.check_table.setRowCount(len(self.files))
-        for row, source in enumerate(self.files):
+        self.check_table.setRowCount(len(self.fit_sources))
+        for row, source in enumerate(self.fit_sources):
             item = self.reports.get(source, {})
             report, ref = item.get('report', {}), item.get('reference')
             rms = f'{ref.anchor_rms_percent:.3g}' if ref is not None else '—'
             notes = ' '.join(report.get('warnings', ())) or ('No heuristic alerts; inspect protected peaks.' if report else '')
+            if ref is not None:
+                notes += ' ' + reference_texture_status(ref) + ' ' + periodic_texture_status(ref)
             if report.get('suggested_regions'):
                 notes += ' Suggested protection (eV): ' + self.region_text(report['suggested_regions'])
-            values = [Path(source).name, report.get('status', 'Not checked'), rms,
+            values = [self.input_label, report.get('status', 'Not checked'), rms,
                       f"{report['worst_gate']:.6g}" if 'worst_gate' in report else '—',
                       notes]
             for column, value in enumerate(values):
                 cell = QTableWidgetItem(value)
-                cell.setToolTip(source if column == 0 else value)
+                cell.setToolTip('\n'.join(self.files) if column == 0 else value)
                 self.check_table.setItem(row, column, cell)
         report = self.reports.get(self.file_combo.currentData(), {}).get('report', {})
         self.suggest_button.setEnabled(bool(report.get('suggested_regions')) and self.worker is None and not self.auto_protect.isChecked())
-        self.suggest_button.setToolTip('Add suggestions only to this file, preserving existing protection. Refit to apply.'
+        self.suggest_button.setToolTip(('Add suggestions to the averaged spectrum, preserving existing protection. Refit to apply.'
+            if self.grouped else 'Add suggestions to this measurement, preserving existing protection. Refit to apply.')
             + ('\nSuggested protection (eV): ' + self.region_text(report['suggested_regions'])
                if report.get('suggested_regions') else ''))
 
@@ -474,7 +716,7 @@ class DrrBackgroundDialog(QDialog):
 
     def inspect_row(self, row, _column):
         self.file_combo.setCurrentIndex(row)
-        report = self.reports.get(self.files[row], {}).get('report', {})
+        report = self.reports.get(self.fit_sources[row], {}).get('report', {})
         if 'worst_gate' in report:
             self.preferred_gate = report['worst_gate']
             if self.raw is not None:
@@ -490,9 +732,11 @@ class DrrBackgroundDialog(QDialog):
         except (TypeError, ValueError) as exc:
             self.status.setText(str(exc))
             return
-        self.file_only.setChecked(True)
+        if not self.grouped:
+            self.file_only.setChecked(True)
         self.regions_edit.setText(self.region_text(combined))
-        self.status.setText('Suggestions added only for this file. Existing protected regions were preserved. Fit preview to review.')
+        self.status.setText('Suggestions added to the averaged spectrum. Existing protected regions were preserved. Fit preview to review.'
+                            if self.grouped else 'Suggestions added to this measurement. Existing protected regions were preserved. Fit preview to review.')
 
     def invalidate_fit(self, *_):
         self.awaiting_drr = False
@@ -553,7 +797,17 @@ class DrrBackgroundDialog(QDialog):
                 or tuple(loaded.selected_files) != self.files or loaded.y_axis_spec != self.y_axis):
             return
         was_loaded = any(self.reference is ref for ref in self.references.values())
-        self.references = {ref.source: ref for ref in loaded.drr_fitted_references}
+        self.references = self.compatible_references(loaded.drr_fitted_references)
+        if loaded.drr_fitted_references and not self.references:
+            self.legacy_reference_notice = 'Previous per-file backgrounds cannot be reused for the raw average. Fit the average again.'
+            self.update_group_notice()
+            self.preview_references.clear()
+            self.reports.clear()
+            self.load_source()
+            return
+        elif self.references:
+            self.legacy_reference_notice = ''
+            self.update_group_notice()
         refresh = self.references and (self.awaiting_drr or was_loaded or
             (self.reference is None and self.auto_protect.isChecked()))
         self.awaiting_drr = False
@@ -568,7 +822,7 @@ class DrrBackgroundDialog(QDialog):
 
     def update_apply_state(self):
         applied = self.reference is not None and self.reference is self.references.get(self.file_combo.currentData())
-        self.apply_button.setText('Applied to DRR' if applied else 'Use in DRR')
+        self.apply_button.setText('Use in settings' if self.draft_mode else ('Applied to DRR' if applied else 'Use in DRR'))
         self.apply_button.setEnabled(self.reference is not None and not applied)
 
     def request(self, settings, reference, *, job='preview'):
@@ -576,6 +830,7 @@ class DrrBackgroundDialog(QDialog):
             return
         self.generation += 1
         self.pending = (settings, reference, self.generation, self.file_combo.currentData(), job)
+        self.update_method_controls()
         self.apply_button.setEnabled(False)
         self.fit_button.setEnabled(False)
         self.check_button.setEnabled(False)
@@ -583,7 +838,7 @@ class DrrBackgroundDialog(QDialog):
         self.suggest_button.setEnabled(False)
         self.status.setText('Fitting sample background…' if settings else 'Loading spectrum and fitted background…')
         if job == 'checks':
-            self.status.setText(f'Checking {len(self.files)} files in background…')
+            self.status.setText('Checking the averaged raw spectrum…' if self.grouped else 'Checking the measurement…')
         elif job == 'compare':
             self.status.setText('Comparing spline and polynomial with identical protection and SG settings…')
         if self.worker:
@@ -600,14 +855,14 @@ class DrrBackgroundDialog(QDialog):
             self.worker = Worker(check_group, self.folder, self.files, self.resolved_axis, settings, generation,
                                  cancellation=LoadCancellation())
         elif job == 'compare':
-            self.worker = Worker(compare_methods, self.folder, source, self.resolved_axis, settings, generation,
+            self.worker = Worker(compare_methods, self.folder, self.files, self.resolved_axis, settings, generation,
                 self.comparison_window, self.comparison_poly, cancellation=LoadCancellation())
         else:
             try:
-                regions = parse_regions(self.regions_edit.text())
+                regions = () if self.group_recipe_error else parse_regions(self.regions_edit.text())
             except ValueError:
                 regions = ()
-            self.worker = Worker(_preview, self.folder, source, self.resolved_axis, settings, reference, generation,
+            self.worker = Worker(_preview, self.folder, self.files, self.resolved_axis, settings, reference, generation,
                                  protected_regions=regions, cancellation=LoadCancellation())
         self.worker.signals.result.connect(self.ready, Qt.QueuedConnection)
         self.worker.signals.error.connect(self.failed, Qt.QueuedConnection)
@@ -625,7 +880,7 @@ class DrrBackgroundDialog(QDialog):
                 self.update_checks()
                 self.checks_visible.setChecked(True)
                 alerts = sum(item['report']['status'] != 'Checked' for item in payload['results'])
-                self.status.setText(f'Checked {len(self.files)} files; {alerts} need review. Double-click a row to inspect it. Suggestions never change protection automatically.')
+                self.status.setText(f'{self.input_label} checked; {alerts} need review. Double-click to inspect the worst gate. Suggestions never change protection automatically.')
                 self.reference = self.background = None
                 self.comparison = None
                 self.view_combo.setEnabled(False)
@@ -651,6 +906,12 @@ class DrrBackgroundDialog(QDialog):
             self.view_combo.setCurrentIndex(0)
         if self.closed or generation != self.generation:
             return
+        if reference is not None and not reference_matches_files(reference, self.files):
+            self.reference = self.background = None
+            self.apply_button.setEnabled(False)
+            self.view_combo.setEnabled(False)
+            self.status.setText('The fitted background does not belong to this selected raw average. Fit the average again.')
+            return
         self.raw, self.reference = raw, reference
         self.background = reference.background() if reference is not None else None
         self.view_combo.setEnabled(reference is not None)
@@ -658,6 +919,8 @@ class DrrBackgroundDialog(QDialog):
         self.view_combo.model().item(2).setEnabled(reference is not None and reference.log_texture is not None)
         self.view_combo.model().item(3).setEnabled(reference is not None and reference.texture_coverage is not None)
         if reference is not None:
+            self.legacy_reference_notice = ''
+            self.update_group_notice()
             self.preview_references[reference.source] = reference
             self.reports[reference.source] = dict(reference=reference, report=reference.diagnostics)
             self.update_checks()
@@ -682,8 +945,10 @@ class DrrBackgroundDialog(QDialog):
             + ('Automatic peak protection · ' if reference.settings.automatic_protection else '')
             + f"Anchor coverage: {100*reference.anchor_masks().mean():.0f}% · "
             + f"Texture: {reference.diagnostics.get('shared_texture', {}).get('status', 'Disabled')} · "
-            + f"Corrected spectral points: {100*reference.diagnostics.get('shared_texture', {}).get('corrected_fraction', 0):.0f}% · "
+            + f"Corrected spectral points: {100*np.mean(reference.texture_coverage > .5) if reference.texture_coverage is not None else 0:.0f}% · "
             + f'Anchor RMS: {reference.anchor_rms_percent:.3g}%. '
+            + reference_texture_status(reference) + ' '
+            + periodic_texture_status(reference) + ' '
             + ' '.join(reference.diagnostics.get('warnings', ()))
             + ' Residual is not uncertainty under peaks.')
             if reference else 'All gates screened. Review suggested regions or draw protection, then Fit preview. Broad/weak peaks may be missed.')
@@ -701,8 +966,10 @@ class DrrBackgroundDialog(QDialog):
                 value = score['rms_percent']
                 scores.append(f"{ref.settings.method}: {value:.3g}% ({score['blocks']} bands)" if value is not None
                               else f'{ref.settings.method}: unavailable (insufficient support)')
-            self.status.setText(self.status.text() + ' Held-out anchor RMS — ' + '; '.join(scores)
-                                + '. This does not validate background under peaks.')
+            self.status.setText(self.status.text() + ' Envelope held-out RMS — ' + '; '.join(scores)
+                                + '. This does not validate background under peaks. '
+                                + reference_texture_status(reference) + ' '
+                                + periodic_texture_status(reference))
         self.draw()
 
     @Slot(str)
@@ -726,6 +993,7 @@ class DrrBackgroundDialog(QDialog):
             self.fit_button.setEnabled(True)
             self.check_button.setEnabled(True)
             self.compare_button.setEnabled(True)
+            self.update_method_controls()
             self.update_checks()
 
     def draw(self, *_):
@@ -768,7 +1036,7 @@ class DrrBackgroundDialog(QDialog):
             texture = self.reference.log_texture
             self.texture_line, = self.ax.plot(self.reference.energy,
                 100*np.expm1(texture) if texture is not None else np.zeros(len(self.reference.energy)),
-                color=alias('source_processed_foreground'), label='Applied shared texture (B / smooth envelope − 1)')
+                color=alias('source_processed_foreground'), label='Applied texture (B / smooth envelope − 1)')
             self.ax.axhline(0, color=alias('text_secondary'), linewidth=.7)
         elif derivative_view:
             for cube, reference, style, color in zip(self.comparison['derivatives'],
@@ -778,7 +1046,7 @@ class DrrBackgroundDialog(QDialog):
                              label=f'{reference.settings.method}: d²(I/B − 1)/dE²')
         elif self.raw_check.isChecked() or self.background is None:
             self.raw_line, = self.ax.plot(self.raw.energy, self.raw.Z[index], color=alias('source_new_foreground'),
-                                         linewidth=1, label='Raw sample spectrum')
+                                         linewidth=1, label='Averaged raw spectrum' if self.grouped else 'Raw sample spectrum')
         if self.background is not None and not derivative_view and not texture_view and not coverage_view:
             is_loaded = self.reference is self.references.get(self.file_combo.currentData())
             self.background_line, = self.ax.plot(self.raw.energy, self.background[index], linestyle='--',
@@ -802,9 +1070,9 @@ class DrrBackgroundDialog(QDialog):
             if np.isfinite([lo,hi]).all() and lo < hi:
                 self.ax.axvspan(lo, hi, color=alias('text_secondary'), alpha=.12,
                                label=('No texture correction' if coverage_view else 'Protected from fitting') if i == 0 else None)
-        self.ax.set(xlabel='Photon energy (eV)', ylabel=('Coverage (%)' if coverage_view else 'Shared correction (%)' if texture_view else
+        self.ax.set(xlabel='Photon energy (eV)', ylabel=('Coverage (%)' if coverage_view else 'Applied correction (%)' if texture_view else
                     'd²(I/B − 1)/dE² (eV⁻²)' if derivative_view else 'Intensity (counts)'),
-                    title='Shared texture coverage across gates' if coverage_view else f'{self.raw.gate_label} = {self.preferred_gate:.6g}')
+                    title='Applied texture coverage across gates' if coverage_view else f'{self.raw.gate_label} = {self.preferred_gate:.6g}')
         self.ax.legend(loc='best')
         # SpanSelector starts with a hidden rectangle at x=0. Explicit spectral
         # limits keep that artist out of the initial autoscaled energy range.
@@ -862,8 +1130,9 @@ def open_background_dialog(owner):
         references = getattr(loaded, 'drr_fitted_references', ())
     previous = getattr(owner, '_drr_background_dialog', None)
     if previous is not None:
+        reusable = (references if len(references) == 1 and reference_matches_files(references[0], files) else ())
         if (previous.files == files and previous.folder == folder and previous.y_axis == axis
-                and tuple(map(id, previous.references.values())) == tuple(map(id, references))):
+                and tuple(map(id, previous.references.values())) == tuple(map(id, reusable))):
             previous.show()
             previous.raise_()
             previous.activateWindow()

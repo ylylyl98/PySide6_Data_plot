@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 from core import processing_run as P
 from core.drr_sources import DrrMeasurementAssignment
-from core.loader import DataCube, load_pl, build_external_baseline, _interp_rows_no_extrapolation, _native_external_baseline
+from core.loader import DataCube, load_pl, build_external_baseline, _interp_rows_no_extrapolation, build_effective_background
 
 
 @dataclass(frozen=True)
@@ -19,7 +19,7 @@ class RawSnapshot:
     @property
     def backgrounds(self):
         return tuple(dict.fromkeys(source for item in self.assignments for source in
-            (item.baseline_files if item.baseline_mode == 'External' else (item.measurement_file,))))
+            (item.baseline_source_files if item.baseline_mode == 'External' else (item.measurement_file,))))
 
 
 @dataclass(frozen=True)
@@ -45,9 +45,9 @@ def snapshot_from_loaded(loaded):
     by_file = {item.measurement_file: item for item in assignments}
     if assignments and set(by_file) != set(files):
         raise ValueError('Loaded measurement/background mappings are incomplete.')
-    recipes = {(item.baseline_mode, item.baseline_files, item.baseline_which) for item in assignments}
+    recipes = {(item.baseline_mode, item.baseline_files, item.baseline_which, item.regions) for item in assignments}
     numerical_path = getattr(getattr(loaded, 'cube', None), 'drr_numerical_path',
-        'common' if len(recipes) <= 1 else 'heterogeneous')
+        'common' if len(recipes) <= 1 and not any(item.regions for item in assignments) else 'heterogeneous')
     return RawSnapshot(str(loaded.folder), files, tuple(by_file[name] for name in files) if assignments else (), str(loaded.y_axis_spec), numerical_path)
 
 
@@ -119,15 +119,20 @@ def load_preview(snapshot, role, scope, source=None):
         recipes = []
         for item in snapshot.assignments:
             if item.baseline_mode == 'External':
-                if snapshot.numerical_path == 'heterogeneous':
+                if snapshot.numerical_path == 'heterogeneous' or item.regions:
                     measurement = _raw_cube(snapshot, item.measurement_file)
                     energy = measurement.energy
                     axis = P.resolve_shared_y_axis_request(snapshot.measurements, snapshot.y_axis)
-                    vector = _native_external_baseline(snapshot.folder, item, energy, y_axis=axis)
+                    vector = build_effective_background(snapshot.folder, item, energy, y_axis=axis)
                 else:
                     baseline = build_external_baseline(snapshot.folder, item.baseline_files, which=item.baseline_which)
                     energy, vector = baseline['energy'], baseline['I0']
                 recipe = f'External: {item.baseline_which} frame(s), {len(item.baseline_files)} file(s)'
+                if item.regions:
+                    recipe += '; energy regions: ' + '; '.join(
+                        f'{region.xmin_ev:g}–{region.xmax_ev:g} eV: '
+                        f'{region.baseline_which}, {", ".join(region.baseline_files)}'
+                        for region in item.regions)
             else:
                 cube = _raw_cube(snapshot, item.measurement_file)
                 index = 0 if item.baseline_mode == 'Self (first frame)' else -1
@@ -154,6 +159,13 @@ def load_preview(snapshot, role, scope, source=None):
             raise ValueError('Select a source from the loaded DRR result.')
         cube = _raw_cube(snapshot, source, background=role == 'background')
         return RawPreview(cube, f'{source}\nOriginal intensity; no background subtraction, ratio or derivative.')
+    if role == 'measurement' and snapshot.numerical_path == 'fitted_raw_average':
+        from core.drr_fitted_background import prepare_fitted_group
+        prepared = prepare_fitted_group(snapshot.folder, snapshot.measurements, y_axis=snapshot.y_axis)
+        cube = replace(prepared.cube, cbar_label='Raw intensity (a.u.)')
+        return RawPreview(cube,
+            f'{len(sources)} raw files, equal weight on their common measured energy/gate overlap. '
+            'This is the raw intensity average used to fit one background, before normalization or derivatives.')
     cubes = [_raw_cube(snapshot, name, background=role == 'background') for name in sources]
     return RawPreview(average_raw_cubes(cubes),
         f'{len(sources)} raw files, equal weight. Aligned to the first file; no extrapolation; finite contributors only. '

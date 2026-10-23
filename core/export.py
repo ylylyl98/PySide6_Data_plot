@@ -975,6 +975,9 @@ def _save_drr_dat_atomic(
             name_suffix="",
             energy_label="Photon energy",
             energy_unit="eV",
+            # Preserve which side of an exact sample-energy seam each point
+            # belongs to when this DAT is reopened for derivative analysis.
+            data_precision=17 if cube.drr_background_boundaries else 10,
         )
     )
     try:
@@ -1040,6 +1043,12 @@ def export_drr_png_and_dat(
         "y_axis_unit": getattr(cube, "gate_unit", ""),
         "y_axis_semantic": getattr(cube, "y_axis_semantic", ""),
     }
+    if cube.drr_background_boundaries:
+        processing.update(
+            background_boundaries_ev=list(cube.drr_background_boundaries),
+            background_join="hard switch",
+            derivative_boundary_policy="independent intervals; half effective SG window masked beside each switch",
+        )
     sources = run_step('Checking source files', lambda: [
         _source_descriptor(folder, name, role=role)
         for role, name in input_files

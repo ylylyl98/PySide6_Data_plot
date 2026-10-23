@@ -367,7 +367,14 @@ def load_drr_external_cube(
     y_axis: str = "auto",
     derivative: int | None = None,
 ) -> DataCube:
+    from core.drr_bn_store import validate_bn_background_usage
+    validate_bn_background_usage(folder, files, baseline_files, y_axis=y_axis)
     _validate_drr_external_spectral_grids(folder, files, baseline_files)
+    from core.loader import has_composite_background
+    if has_composite_background(folder, baseline_files):
+        assignments = tuple(DrrMeasurementAssignment(str(name), "External", tuple(baseline_files), baseline_which)
+                            for name in files)
+        return load_drr_resolved_avg(folder, files, assignments=assignments, y_axis=y_axis, derivative=derivative)
     baseline = build_external_baseline(folder, baseline_files, which=baseline_which)
     return load_drr_avg(
         folder,
@@ -390,6 +397,9 @@ def load_drr_resolved_cube(
 ) -> DataCube:
     """Load DRR using validated per-measurement background assignments."""
     selected = tuple(str(item) for item in files)
+    from core.drr_bn_store import validate_bn_background_usage
+    validate_bn_background_usage(folder, selected, tuple(dict.fromkeys(
+        source for item in assignments for source in item.baseline_source_files)), y_axis=y_axis)
     by_measurement = {item.measurement_file: item for item in assignments}
     if (
         len(assignments) != len(selected)
@@ -397,12 +407,16 @@ def load_drr_resolved_cube(
         or set(by_measurement) != set(selected)
     ):
         raise ValueError("DRR assignments must contain exactly one entry per measurement file.")
-    for measurement in selected:
-        assignment = by_measurement[measurement]
-        if assignment.baseline_mode == "External":
-            _validate_drr_external_spectral_grids(
-                folder, [measurement], assignment.baseline_files
-            )
+    if any(item.regions for item in assignments):
+        _validate_drr_external_spectral_grids(folder, selected, tuple(dict.fromkeys(
+            source for item in assignments for source in item.baseline_source_files)))
+    else:
+        for measurement in selected:
+            assignment = by_measurement[measurement]
+            if assignment.baseline_mode == "External":
+                _validate_drr_external_spectral_grids(
+                    folder, [measurement], assignment.baseline_source_files
+                )
     return load_drr_resolved_avg(
         folder,
         files,
@@ -517,6 +531,33 @@ def get_power_series_sources(folder: str, files: Sequence[str], *,
             records=tuple(records),
         )
     return sources
+
+
+def refresh_power_series_sources(
+    folder: str,
+    files: Sequence[str],
+    catalog: Sequence[PowerSeriesSource] = (),
+    signatures: Sequence[tuple[str, int | None, int | None]] = (),
+) -> Dict[str, PowerSeriesSource]:
+    """Validate a UI catalog in the load worker and refresh changed tables.
+
+    Signatures use the folder-catalog ordering (name, size, mtime_ns). The
+    returned snapshot can be shared by every role in this load request.
+    """
+    previous = {name: (size, modified) for name, size, modified in signatures}
+    unchanged = set()
+    for name in files:
+        try:
+            stat = (Path(folder) / name).stat()
+        except OSError:
+            continue
+        if previous.get(str(name)) == (stat.st_size, stat.st_mtime_ns):
+            unchanged.add(str(name))
+    cached_tables = {
+        source.file_name: source for source in catalog
+        if source.source_format == "table" and source.file_name in unchanged
+    }
+    return get_power_series_sources(folder, files, cached_tables=cached_tables)
 
 
 def _power_sweep_signature(folder: str, file_name: str) -> tuple[int, int]:
@@ -687,8 +728,10 @@ def load_power_series_cube(
     *,
     group_key: str | None = None,
     y_axis: str = "auto",
+    sources: Dict[str, PowerSeriesSource] | None = None,
 ) -> PowerSeriesResult:
-    sources = get_power_series_sources(folder, files)
+    # Internal multi-role callers supply one freshly validated catalog.
+    sources = get_power_series_sources(folder, files) if sources is None else dict(sources)
     if not sources:
         raise ValueError(
             "No power-dependent data found. Use a CSV with a Power_uW column or filenames containing power such as 37.96uW."

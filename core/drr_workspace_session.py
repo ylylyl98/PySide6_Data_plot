@@ -22,7 +22,7 @@ def save_session(path,datasets,views=None,active_key=None,display=None,*,compres
         if result is not None:_valid_result(d)
         for field in ('energy','gate','Z'):arrays[f'{i}_{field}']=getattr(d.cube,field)
         records.append(dict(key=d.key,name=d.name,provenance=d.provenance,settings=asdict(d.settings),result=result,revision=d.revision,
-            cube={field:getattr(d.cube,field) for field in ('gate_label','title','cbar_label','gate_unit','y_axis_semantic')}))
+            cube={field:getattr(d.cube,field) for field in ('gate_label','title','cbar_label','gate_unit','y_axis_semantic','drr_background_boundaries')}))
     display=dict(display or {})
     if display.get('p2p'):
         state=dict(display['p2p']);packed=[]
@@ -56,6 +56,8 @@ def load_session(path,*,with_display=False):
             if meta['schema']!=1:raise ValueError('Unsupported workspace version.')
             datasets=[]
             for i,record in enumerate(meta['datasets']):
+                if 'drr_background_boundaries' in record['cube']:
+                    record['cube']['drr_background_boundaries'] = tuple(record['cube']['drr_background_boundaries'])
                 cube=DataCube(archive[f'{i}_energy'],archive[f'{i}_gate'],archive[f'{i}_Z'],**record['cube'])
                 d=create_dataset(cube,record['name'],record['provenance'],PeakAnalysisSettings(**record['settings']))
                 if d.key!=record['key']:raise ValueError('Workspace data identity mismatch.')
@@ -86,6 +88,13 @@ def snapshot_loaded(loaded):
     provenance={'measurement_files':list(loaded.selected_files),'background_files':list(loaded.baseline_files),
         'background_mode':loaded.drr_baseline_text,'background_frame':loaded.drr_baseline_which,'y_axis':loaded.y_axis_spec,
         'assignments':[a.to_dict() for a in getattr(loaded,'drr_assignments',())]}
+    if loaded.drr_baseline_text == 'Fitted (sample)':
+        from core.drr_fitted_background import reference_matches_files
+        references = tuple(getattr(loaded, 'drr_fitted_references', ()))
+        if len(references) != 1 or not reference_matches_files(references[0], loaded.selected_files):
+            raise ValueError('Reload DRR to fit one background to the selected raw intensity average before adding it to Analysis.')
+        provenance.update(average_method='Raw intensity average, one fitted background, then I/B_fit - 1',
+            fitted_background=[references[0].metadata()])
     name=Path(loaded.primary_file or (loaded.selected_files or ['Current DRR'])[0]).stem
     d=create_dataset(loaded.cube,name,provenance)
     path=session_directory()/'inbox'/f'{uuid4().hex}.npz'
