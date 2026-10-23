@@ -27,6 +27,9 @@ def main() -> int:
         _assert_exists(p)
 
     modules = [
+        # Match run_qt's native-library import order. Importing numerical and
+        # plotting libraries first can prevent QtGui DLL loading on Windows.
+        "PySide6.QtGui",
         "core.file_ops",
         "core.data_io",
         "core.loader",

@@ -30,6 +30,7 @@ from scipy.signal import find_peaks, peak_widths, savgol_filter
 
 from app_version import __version__
 from core.loader import DataCube
+from core.load_cancellation import check_load_cancelled
 from core.source_identity import match_source_identity
 
 EV_NM = 1239.841984
@@ -630,6 +631,7 @@ def _robust_log_ratio_coefficients(
     design = np.column_stack([x ** power for power in range(polynomial_order + 1)])
     coefficients = np.linalg.lstsq(design, values, rcond=None)[0]
     for _iteration in range(8):
+        check_load_cancelled()
         fit_residual = values - design @ coefficients
         centered = fit_residual - float(np.nanmedian(fit_residual))
         robust_sigma = 1.4826 * float(np.nanmedian(np.abs(centered)))
@@ -896,6 +898,7 @@ def _cross_validated_spectral_rms(
     center = float(np.nanmedian(np.asarray(energy_ev, float)))
     values: list[float] = []
     for pos_row, neg_row in zip(np.asarray(pos, float), np.asarray(neg, float)):
+        check_load_cancelled()
         coefficients = _robust_log_ratio_coefficients(energy_ev, pos_row, neg_row, train, order=order, center_ev=center)
         if coefficients is None:
             continue
@@ -925,6 +928,7 @@ def suggest_mcd_background_ranges(
     roughness, not the corrected MCD amplitude.  This avoids selecting bands
     merely because a correction could force their MCD to zero.
     """
+    check_load_cancelled()
     raw_energy = EV_NM / np.asarray(result.wavelength_nm, float)
     order = np.argsort(raw_energy)
     energy = raw_energy[order]
@@ -948,11 +952,14 @@ def suggest_mcd_background_ranges(
     # Local angle-ratio roughness flags detector spikes and unstable regions,
     # while preserving smooth B-dependent throughput that the correction can fit.
     ratio = np.log(np.where((pos > 1e-30) & (neg > 1e-30), pos / neg, np.nan))
-    row_smooth = np.vstack([
-        savgol_filter(row, smooth_window, min(3, smooth_window - 1), mode="interp")
-        if np.count_nonzero(np.isfinite(row)) >= smooth_window else row
-        for row in np.where(np.isfinite(ratio), ratio, np.nanmedian(ratio, axis=1, keepdims=True))
-    ])
+    smoothed_rows = []
+    for row in np.where(np.isfinite(ratio), ratio, np.nanmedian(ratio, axis=1, keepdims=True)):
+        check_load_cancelled()
+        smoothed_rows.append(
+            savgol_filter(row, smooth_window, min(3, smooth_window - 1), mode="interp")
+            if np.count_nonzero(np.isfinite(row)) >= smooth_window else row
+        )
+    row_smooth = np.vstack(smoothed_rows)
     roughness = np.nanmedian(np.abs(ratio - row_smooth), axis=0)
     curvature_scale = max(float(np.nanmedian(curvature[finite])), 1e-30)
     roughness_scale = max(float(np.nanmedian(roughness[finite])), 1e-30)

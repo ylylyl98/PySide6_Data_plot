@@ -61,6 +61,7 @@ from scipy.signal import find_peaks
 from app_version import __version__
 from core import data_io
 from core.drr_sources import (
+    DrrBackgroundResolution,
     DrrSource,
     DrrMeasurementAssignment,
     DrrSourceCache,
@@ -174,7 +175,7 @@ from ui_qt.common import (
     WorkerSignals,
     focused_numeric_input,
 )
-from ui_qt.drr_display_memory import guarded_auto, second_is_protected
+from ui_qt.drr_display_memory import background_folder_key, guarded_auto, second_is_protected
 from ui_qt.compact_spinbox import CompactDoubleSpinBox
 
 
@@ -728,6 +729,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.drr_baseline_files_found: List[str] = []
         self._drr_assignments: tuple[DrrMeasurementAssignment, ...] = ()
         self._drr_assignments_automatic = False
+        self._drr_background_regions = ()
         self._drr_fitted_settings = {}
         self._drr_baseline_user_selected = False
         self._drr_background_guess = None
@@ -2614,6 +2616,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return True
         try:
             window = self.drr_controller._enforce_drr_sg_constraints(show_status=False, use_mixed=derivative == 2)
+            self.drr_controller._require_current_bn_derivative_validation()
         except ValueError as exc:
             self.drr_mixed_recommendation.setText(str(exc))
             self._status(str(exc))
@@ -3434,6 +3437,18 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.drr_gate_toolbar_spin.valueChanged.connect(self._on_drr_toolbar_gate_changed)
         self.drr_gate_prev_btn.clicked.connect(lambda: self._step_drr_gate(-1))
         self.drr_gate_next_btn.clicked.connect(lambda: self._step_drr_gate(1))
+        # A BN comparison keeps the current processing windows until the user
+        # deliberately changes a processing control.
+        for signal in (
+            self.drr_derivative_combo.currentTextChanged,
+            self.drr_second_kind_combo.currentIndexChanged,
+            self.drr_sg_y_window_spin.valueChanged,
+            self.drr_sg_y_auto_chk.toggled,
+            self.drr_sg_window_spin.valueChanged,
+            self.drr_sg_auto_chk.toggled,
+            self.drr_sg_poly_spin.valueChanged,
+        ):
+            signal.connect(lambda *_: setattr(self, '_drr_bn_group_processing_hold', None))
         self.drr_derivative_combo.currentTextChanged.connect(self.drr_controller._on_drr_derivative_changed)
         from ui_qt.drr_mixed_controls import changed as mixed_changed
         self.drr_second_kind_combo.currentIndexChanged.connect(lambda _: mixed_changed(self))
@@ -3444,8 +3459,17 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.drr_sg_poly_spin.valueChanged.connect(self.drr_controller._on_drr_derivative_changed)
         self.drr_edit_measurements_btn.clicked.connect(self.drr_controller._edit_drr_measurements)
         self.drr_clear_measurements_btn.clicked.connect(self.drr_controller._clear_drr_measurements)
-        self.drr_edit_baselines_btn.clicked.connect(self.drr_controller._edit_drr_baselines_dialog)
+        self.drr_edit_baselines_btn.clicked.connect(self.drr_controller._edit_drr_background_settings)
+        from ui_qt.drr_bn_group_choice import request_group_choice
+        self.drr_bn_group_combo.activated.connect(
+            lambda index: request_group_choice(self, self.drr_bn_group_combo.itemData(index)))
+        self.drr_background_regions_btn.clicked.connect(self.drr_controller._edit_drr_background_regions)
+        self.drr_composite_background_btn.clicked.connect(self.drr_controller._edit_drr_composite_background)
+        self.drr_pn_background_btn.clicked.connect(self.drr_controller._edit_drr_pn_background)
+        self.drr_bn_calibration_btn.clicked.connect(self.drr_controller._edit_drr_bn_calibration)
+        self.drr_bn_auto_chk.toggled.connect(self.drr_controller._on_drr_bn_auto_toggled)
         self.drr_baseline_autofind_btn.clicked.connect(self.drr_controller._clear_drr_baselines)
+        self.drr_auto_match_btn.clicked.connect(self.drr_controller._auto_match_drr_backgrounds)
         self.drr_pin_baseline_chk.toggled.connect(self.drr_controller._on_drr_pin_baseline_toggled)
         self.drr_baseline_combine_combo.currentTextChanged.connect(self.drr_controller._on_drr_baseline_mode_changed)
         self.drr_auto_v_btn.clicked.connect(
@@ -5259,13 +5283,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self.current_folder, self.drr_available_sources, self.drr_selected_files,
             )
             if resolved.resolved:
-                self._drr_assignments = tuple(resolved.assignments)
-                self.drr_baseline_files_manual = list(dict.fromkeys(
-                    source for assignment in resolved.assignments
-                    for source in assignment.baseline_files
-                ))
+                self.drr_controller._restore_saved_drr_recipe(resolved)
             else:
                 self._drr_assignments = ()
+                self._drr_background_regions = ()
                 # Keep the automatic intent while the assignment set is
                 # unresolved.  The display union must never become a manual
                 # common-background recipe on the next load.
@@ -5384,6 +5405,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._power_pending_measurement_generation = None
         self.drr_controller._cancel_auto_external()
         self.drr_selected_files = []
+        self._drr_background_regions = ()
         self.drr_baseline_files_manual = []
         self.drr_baseline_files_found = []
         self._drr_assignments = ()
@@ -5746,6 +5768,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._pending_load_options = options
             self._invalidated_load_modes.add(mode)
             return
+        if options.drr_resolve_background:
+            self._clear_loaded_drr_view()
+            self._drr_background_regions = ()
+            self.drr_baseline_files_manual = []
+            self.drr_baseline_files_found = []
         trackers = getattr(self, "_load_requests", None)
         if trackers is None:
             trackers = {}
@@ -5774,7 +5801,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                      source_key=tuple(options.selected_files))
         worker = Worker(self._load_task, options, cancellation=self._active_load_cancel)
         worker.signals.log.connect(self._append_log)
-        if mode == 'DRR' and options.drr_baseline_text == 'Fitted (sample)':
+        if mode == 'DRR':
             worker.signals.progress.connect(
                 lambda value, token=token: self._on_fitted_load_progress(token, value=value))
             worker.signals.log.connect(
@@ -5801,6 +5828,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self.data_state_label.setText(f'Fitting backgrounds… {value}%')
         if message is not None and message.startswith('Fitting background '):
             self._status(message)
+        if message is not None and message.startswith('DRR load: '):
+            stage = message.removeprefix('DRR load: ')
+            self._status_progress.setRange(0, 0)
+            self.data_state_label.setText(stage.split(' · ', 1)[0] + '…')
+            self._status(stage)
 
     def _launch_pending_if_current(self, options: LoadOptions, generation: int,
                                    folder: str) -> None:
@@ -5820,6 +5852,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
     def _start_load(self, mode: str, *, drr_resolution=None) -> None:
         if self._is_closing:
             return
+        from ui_qt.drr_bn_group_choice import cancel_group_choice
+        cancel_group_choice(self)
         if mode == 'DRR' and self._drr_catalog_is_inventory_preview():
             self._status('Checking DRR measurement grids and backgrounds; please wait before loading.')
             return
@@ -5909,6 +5943,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self.mcd_controller._request_mcd_load()
             return
         self._invalidate_export_move_sources()
+        drr_resolve_background = False
         compare_sources: Dict[str, str] = {}
         power_group_key = ""
         shg_settings: ShgSettings | None = None
@@ -5928,6 +5963,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         elif mode == "DRR":
             selected = list(self.drr_selected_files)
             baselines = list(self.drr_baseline_files_manual)
+            from ui_qt.drr_background_settings_workflow import source_intent, background_ready_for_load
+            if not background_ready_for_load(self):
+                return
+            if (self.drr_baseline_combo.currentText() == 'External' and source_intent(self) is not None
+                    and not baselines and not self._drr_assignments):
+                self._invalidate_drr_for_background_selection(
+                    'Review this group in Background settings before applying its background.')
+                return
             pl_log = False
             cmp_log = False
             drr_baseline = self.drr_baseline_combo.currentText()
@@ -5961,8 +6004,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             ) else []
             if not self._drr_assignments_automatic:
                 required.extend(baselines)
+                required.extend(name for region in self._drr_background_regions for name in region.baseline_files)
             for assignment in getattr(self, "_drr_assignments", ()):
-                required.extend(getattr(assignment, "baseline_files", ()) or ())
+                required.extend(getattr(assignment, "baseline_source_files", getattr(assignment, "baseline_files", ())) or ())
             missing = self.drr_controller._drr_missing_sources(required)
             if missing:
                 self._invalidate_drr_for_background_selection(
@@ -5979,9 +6023,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     if drr_assignments:
                         resolved = None
                     else:
-                        resolved = resolve_drr_background_assignments(
-                            self.current_folder, self.drr_available_sources, selected,
-                        )
+                        resolved = None
+                        drr_resolve_background = True
                 elif not baselines and self._drr_baseline_user_selected and drr_baseline in {"Self (first frame)", "Self (last frame)"}:
                     resolved = resolve_drr_background_assignments(
                         self.current_folder, self.drr_available_sources, selected,
@@ -5996,6 +6039,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                         and all(a.baseline_mode == 'External'
                                 and tuple(a.baseline_files) == tuple(baselines)
                                 and a.baseline_which == drr_baseline_which
+                                and a.regions == tuple(self._drr_background_regions)
                                 for a in resolved.assignments)
                     ):
                         resolved = resolve_drr_background_assignments(
@@ -6003,16 +6047,15 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                             explicit_baseline_files=baselines,
                             explicit_baseline_mode="External",
                             explicit_baseline_which=drr_baseline_which,
+                            explicit_regions=tuple(self._drr_background_regions),
                         )
                 else:
-                    # Selection already inspected history, including the
-                    # unresolved/default-Self case. Reuse that exact result.
+                    # History and spectral matching belong to the cancellable
+                    # load request, never the file-picker callback.
                     resolved = drr_resolution
                     if resolved is None:
-                        resolved = resolve_drr_background_assignments(
-                            self.current_folder, self.drr_available_sources, selected,
-                        )
-                    if resolved.self_fallback_allowed and drr_baseline in {"Self (first frame)", "Self (last frame)"}:
+                        drr_resolve_background = True
+                    elif resolved.self_fallback_allowed and drr_baseline in {"Self (first frame)", "Self (last frame)"}:
                         # Keep saved/validated recipes when available. Otherwise
                         # the visible default Self is a usable recipe, even if
                         # no currentTextChanged signal has fired yet.
@@ -6047,7 +6090,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             resolved_required = list(selected)
             resolved_required.extend(baselines)
             for assignment in drr_assignments:
-                resolved_required.extend(getattr(assignment, "baseline_files", ()) or ())
+                resolved_required.extend(getattr(assignment, "baseline_source_files", getattr(assignment, "baseline_files", ())) or ())
             missing = self.drr_controller._drr_missing_sources(resolved_required)
             if missing:
                 self._invalidate_drr_for_background_selection(
@@ -6150,6 +6193,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
         drr_selection_metadata: dict[str, Any] = {}
         if mode == "DRR" and drr_assignments:
+            from ui_qt.drr_region_backgrounds import source_files
+            baselines = source_files(drr_assignments)
             drr_selection_metadata = {
                 "selection_method": "automatic_per_measurement" if self._drr_assignments_automatic else "explicit_per_measurement",
                 "numerical_path": "pending",
@@ -6171,9 +6216,21 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             compare_log_scale=cmp_log,
             drr_restore_files=self.drr_memory_files_chk.isChecked(),
             drr_restore_centers=self.drr_memory_centers_chk.isChecked(),
+            drr_resolve_background=drr_resolve_background,
+            drr_source_catalog=tuple(self.drr_available_sources) if drr_resolve_background else (),
             y_axis_spec=y_axis_spec,
             compare_sources=compare_sources,
             power_group_key=power_group_key,
+            power_source_catalog=(
+                tuple((self._power_sources_cache or {}).values())
+                if mode == "Power Dependent" and str(getattr(self, "_power_catalog_folder", "")).casefold() == str(self.current_folder).casefold()
+                else ()
+            ),
+            power_source_signatures=(
+                tuple(self._power_sources_cache_files)
+                if mode == "Power Dependent" and str(getattr(self, "_power_catalog_folder", "")).casefold() == str(self.current_folder).casefold()
+                else ()
+            ),
             power_role_group_keys=(
                 tuple(dict.fromkeys((
                     self.power_controller._power_role_group_key("KK"),
@@ -6250,9 +6307,26 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         pairs.extend(("background", name) for name in baselines)
         for role, name in pairs:
             check_load_cancelled()
-            records.append(
-                verify_initial_data_working_file(name, folder, workflow="DRR", role=role)
-            )
+            record = verify_initial_data_working_file(name, folder, workflow="DRR", role=role)
+            if role == 'background':
+                from core.drr_composite_background import is_composite_background
+                path = resolve_source_path(folder, name)
+                if is_composite_background(path):
+                    # A generated CSV and its recipe form one reference. It is
+                    # never a disposable root copy, even if a CSV-only duplicate exists.
+                    records.append(replace(record, canonical_source_path=str(path),
+                        canonical_sha256=record.working_sha256_at_creation,
+                        provenance_verified=False, temporary_working_copy=False,
+                        verification_method='direct_composite_background'))
+                    metadata = path.with_suffix('.metadata.json')
+                    recipe_record = verify_initial_data_working_file(
+                        metadata, folder, workflow='DRR', role='background_recipe')
+                    records.append(replace(recipe_record, canonical_source_path=str(metadata),
+                        canonical_sha256=recipe_record.working_sha256_at_creation,
+                        provenance_verified=False, temporary_working_copy=False,
+                        verification_method='direct_composite_background'))
+                    continue
+            records.append(record)
         return tuple(records)
 
     def _provenance_records_for_load(self, options: LoadOptions) -> tuple[WorkingCopyRecord, ...]:
@@ -6291,6 +6365,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             check_load_cancelled()
             with time_load_stage('display_memory'):
                 if loaded.mode == "DRR":
+                    log.emit('DRR load: Restoring display settings')
                     from core.drr_display_settings import find_candidates, source_names
                     if options.drr_restore_files or options.drr_restore_centers:
                         loaded.drr_display_candidates = find_candidates(loaded.folder, source_names(
@@ -6315,6 +6390,46 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         if not options.selected_files:
             raise ValueError("Select required files before loading.")
         log.emit(f"Loading {mode} ...")
+        if mode == 'DRR' and options.drr_resolve_background:
+            log.emit('DRR load: Matching background and saved recipes')
+            with time_load_stage('background_resolution'):
+                from core.drr_saved_background import resolve_saved_group_background
+                resolved = resolve_saved_group_background(
+                    folder, options.drr_source_catalog, options.selected_files,
+                    progress=progress, log=log)
+                restored_exact_group = resolved is not None
+                if resolved is None:
+                    resolved = resolve_drr_background_assignments(
+                        folder, options.drr_source_catalog, options.selected_files)
+                automatic = not (restored_exact_group and resolved.numerical_path == 'common')
+                check_load_cancelled()
+                if (not resolved.resolved and resolved.self_fallback_allowed
+                        and options.drr_baseline_text in {'Self (first frame)', 'Self (last frame)'}):
+                    resolved = resolve_drr_background_assignments(
+                        folder, options.drr_source_catalog, options.selected_files,
+                        explicit_baseline_mode=options.drr_baseline_text,
+                        explicit_baseline_which=options.drr_baseline_which)
+                    automatic = False
+                if not resolved.resolved:
+                    raise ValueError(resolved.reason or 'DRR background assignments are unresolved.')
+                assignments = tuple(resolved.assignments)
+                options = replace(options, drr_assignments=assignments,
+                    baseline_files=list(dict.fromkeys(
+                        name for assignment in assignments for name in assignment.baseline_source_files)),
+                    drr_baseline_text='Automatic' if automatic else assignments[0].baseline_mode,
+                    drr_baseline_which=assignments[0].baseline_which,
+                    drr_background_selection={
+                        'selection_method': 'automatic_per_measurement' if automatic else 'explicit_per_measurement',
+                        'drr_background_assignments': [item.to_dict() for item in assignments],
+                        'restored_exact_group_export': restored_exact_group,
+                    })
+                missing = [name for name in dict.fromkeys(options.selected_files + options.baseline_files)
+                           if not resolve_source_path(folder, name).is_file()]
+                if missing:
+                    raise ValueError('Missing DRR source(s): ' + ', '.join(missing))
+        check_load_cancelled()
+        if mode == 'DRR':
+            log.emit('DRR load: Checking source provenance')
         with time_load_stage('provenance'):
             provenance_records = self._provenance_records_for_load(options)
 
@@ -6386,13 +6501,23 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     raise ValueError(resolved.reason or "DRR background assignment is unresolved.")
                 assignments = tuple(resolved.assignments)
             if assignments:
+                log.emit('DRR load: Reading measurements and calculating contrast')
+                from ui_qt.drr_composite_workflow import background_dependencies
+                background_files = list(dict.fromkeys(
+                    source for assignment in assignments for source in assignment.baseline_source_files))
+                dependencies = background_dependencies(folder, background_files)
                 cube = data_io.load_drr_resolved_cube(
                     folder, options.selected_files, assignments,
                     y_axis=options.y_axis_spec, derivative=None,
                 )
                 numerical_path = getattr(cube, "drr_numerical_path", "common")
+                if dependencies != background_dependencies(folder, background_files):
+                    raise ValueError('Background files changed while loading. Load the measurement again.')
                 mode_label = (
-                    "DR/R Automatic" if numerical_path != "common"
+                    "DR/R External (X ranges)" if any(item.regions for item in assignments)
+                    else "DR/R External" if options.drr_baseline_text == 'External'
+                        and all(item.baseline_mode == 'External' for item in assignments)
+                    else "DR/R Automatic" if numerical_path != "common"
                     else "DR/R Self" if assignments[0].baseline_mode.startswith("Self")
                     else "DR/R External"
                 )
@@ -6401,10 +6526,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     folder=folder,
                     primary_file=options.selected_files[0],
                     selected_files=options.selected_files,
-                    baseline_files=list(dict.fromkeys(
-                        source for assignment in assignments
-                        for source in assignment.baseline_files
-                    )),
+                    baseline_files=background_files,
+                    drr_background_dependencies=dependencies,
                     cube=cube,
                     drr_mode_label=mode_label,
                     drr_derivative_label="None",
@@ -6419,6 +6542,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     provenance_records=provenance_records,
                 )
             baseline = options.drr_baseline_text
+            from ui_qt.drr_composite_workflow import background_dependencies
+            dependencies = background_dependencies(folder, options.baseline_files)
             if baseline == "External":
                 if not options.baseline_files:
                     raise ValueError("External DRR mode requires baseline files.")
@@ -6441,12 +6566,15 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 )
                 drr_mode_label = "DR/R Self"
 
+            if dependencies != background_dependencies(folder, options.baseline_files):
+                raise ValueError('Background files changed while loading. Load the measurement again.')
             return LoadedState(
                 mode="DRR",
                 folder=folder,
                 primary_file=options.selected_files[0],
                 selected_files=options.selected_files,
                 baseline_files=options.baseline_files,
+                drr_background_dependencies=dependencies,
                 cube=cube,
                 drr_mode_label=drr_mode_label,
                 drr_derivative_label="None",
@@ -6508,17 +6636,22 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             )
 
         if mode == "Power Dependent":
+            sources = data_io.refresh_power_series_sources(
+                folder, options.selected_files,
+                options.power_source_catalog, options.power_source_signatures,
+            )
             result = data_io.load_power_series_cube(
                 folder,
                 options.selected_files,
                 group_key=options.power_group_key,
                 y_axis="auto",
+                sources=sources,
             )
             power_results = {result.group_key: result}
             for role_key in options.power_role_group_keys:
                 if role_key and role_key not in power_results:
                     power_results[role_key] = data_io.load_power_series_cube(
-                        folder, options.selected_files, group_key=role_key, y_axis="auto"
+                        folder, options.selected_files, group_key=role_key, y_axis="auto", sources=sources
                     )
             return LoadedState(
                 mode="Power Dependent",
@@ -6619,7 +6752,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._show_error(message)
 
     def _on_loaded(self, loaded: LoadedState, load_generation: int | None = None,
-                   *, request_token: RequestToken | None = None) -> None:
+                   *, request_token: RequestToken | None = None,
+                   preserve_drr_display: bool = False, drr_derivatives=None,
+                   drr_display_snapshot=None) -> None:
         cancellation = getattr(self, '_active_load_cancel', None)
         if (getattr(self, '_is_closing', False)
                 or (request_token is not None and cancellation is not None and cancellation.cancelled)):
@@ -6645,18 +6780,37 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             and load_generation != self._mcd_source_generation
         ):
             return
+        previous = self.loaded
+        same_drr_folder = (previous is not None and previous.mode == 'DRR' and loaded.mode == 'DRR'
+                           and background_folder_key(previous.folder) == background_folder_key(loaded.folder))
+        display_snapshot = None
+        if preserve_drr_display:
+            if (loaded.mode != 'DRR' or previous is None or previous.mode != 'DRR'
+                    or not same_drr_folder
+                    or tuple(previous.selected_files) != tuple(loaded.selected_files)
+                    or previous.y_axis_spec != loaded.y_axis_spec):
+                raise ValueError('The BN comparison no longer belongs to the displayed measurement group.')
+            from ui_qt.drr_display_memory import prepare_background_switch
+            display_snapshot = (drr_display_snapshot if drr_display_snapshot is not None
+                                else prepare_background_switch(self))
         if loaded.mode == self._active_load_mode:
             self._active_load_succeeded = True
-        previous = self.loaded
         if loaded.mode == "DRR" and (
             previous is None or previous.mode != "DRR"
-            or previous.folder != loaded.folder
+            or not same_drr_folder
             or previous.selected_files != loaded.selected_files
             or previous.y_axis_spec != loaded.y_axis_spec
         ):
             self._drr_view_limits = None
             self._drr_limits_from_controls = True
         self.loaded = loaded
+        if not preserve_drr_display:
+            self._drr_bn_group_processing_hold = None
+        if display_snapshot is not None:
+            from ui_qt.drr_display_memory import restore_background_switch
+            if not restore_background_switch(self, loaded, display_snapshot):
+                self.loaded = previous
+                raise ValueError('The BN comparison changed the measurement grid; the previous result was kept.')
         background_dialog = getattr(self, '_drr_background_dialog', None)
         if background_dialog is not None:
             background_dialog.loaded_changed(loaded)
@@ -6672,11 +6826,32 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 str(getattr(loaded, "drr_background_selection", {}).get("selection_method", ""))
                 == "automatic_per_measurement"
             )
+            if self._drr_assignments and loaded.drr_background_selection.get('restored_exact_group_export'):
+                resolution = DrrBackgroundResolution(assignments=self._drr_assignments,
+                    numerical_path=loaded.drr_background_selection.get('numerical_path', 'common'))
+                from ui_qt.drr_saved_background import adopt_saved_background
+                adopt_saved_background(self, resolution)
+            elif self._drr_assignments_automatic and self._drr_assignments:
+                self.drr_controller._restore_saved_drr_recipe(DrrBackgroundResolution(
+                    assignments=self._drr_assignments))
+            elif self._drr_assignments:
+                self._drr_baseline_user_selected = True
+                from ui_qt.drr_region_backgrounds import restore_regions
+                restore_regions(self, self._drr_assignments)
         if hasattr(self, '_drr_display_compute'):
             self._drr_display_compute.clear()
         self._drr_derivative_cache.clear()
+        if preserve_drr_display and drr_derivatives:
+            self._drr_derivative_cache.update(drr_derivatives)
         self._drr_second_split_deferred = None
         self._drr_pending_raw_auto = None
+        if preserve_drr_display:
+            self._drr_pending_ranges = None
+            self._drr_pending_second_split = None
+            self._drr_pending_second_auto = None
+            self._drr_pending_split_sides = {}
+            self._drr_pending_auto_limits_cube = None
+            self._drr_color_plot_pending = False
         if hasattr(self, '_drr_color_compute'):
             self._drr_color_compute.clear()
         self.last_plotted_mode = None
@@ -6811,9 +6986,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self.shg_angle_cursor_spin.setValue(float(loaded.shg_result.measured_angle_deg[selected]))
                 self.shg_angle_cursor_spin.blockSignals(blocked)
             self.shg_controller._shg_update_summary()
-        from ui_qt.drr_display_memory import prepare_restore
-        prepare_restore(self, loaded)
-        self._apply_auto_limits_for_loaded()
+        if not preserve_drr_display:
+            from ui_qt.drr_display_memory import prepare_restore
+            prepare_restore(self, loaded)
+            self._apply_auto_limits_for_loaded()
         if loaded.mode == "MCD" and loaded.mcd_result is not None:
             # Candidate scoring was completed beside CSV processing in the
             # worker. Publishing its small result here avoids blocking the UI
@@ -6832,6 +7008,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._set_stage("Loaded")
         self._update_action_states()
         self._update_plot_view_bar_visibility()
+        if loaded.mode == 'DRR':
+            from ui_qt.drr_bn_group_choice import refresh_group_choices
+            refresh_group_choices(self)
         self._status(f"Loaded {loaded.mode}.")
         current_tab = self.tabs.tabText(self.tabs.currentIndex())
         plot_mode = "MCD Peak Shift" if loaded.mode == "MCD" and current_tab == "MCD Peak Shift" else loaded.mode
@@ -6843,7 +7022,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             if plot_mode == 'DRR' and getattr(self, '_drr_memory_pending', None) is not None:
                 self._schedule_plot_redraw('DRR')
             else:
-                self._plot_mode(plot_mode, auto=True)
+                self._plot_mode(plot_mode, auto=not preserve_drr_display)
         else:
             self._status(f"Loaded {loaded.mode}; switch to its page to display it.")
         if plot_mode == "MCD Peak Shift" and loaded.mcd_result is not None:
@@ -6878,6 +7057,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._active_load_options = None
         self._active_load_succeeded = False
         self._status_progress.setVisible(False)
+        from ui_qt.drr_bn_group_choice import refresh_group_choices
+        refresh_group_choices(self)
         if cancelled:
             self._data_state_error = None
             self._refresh_data_state_label()
@@ -6909,6 +7090,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     QTimer.singleShot(0, self, lambda mode=pending_mode: self._start_load(mode))
             elif pending_mode is None:
                 self._invalidated_load_modes.clear()
+        if finished_mode == 'DRR' and succeeded and not cancelled and self._pending_load_mode is None:
+            from ui_qt.drr_bn_workflow import maybe_auto_compare
+            maybe_auto_compare(self)
         if finished_mode == "PL" and self._pl_auto_next_active and not cancelled:
             if succeeded:
                 self._pl_auto_next_active = False
@@ -8392,7 +8576,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             source_choice = str(self.mcd_peak_source_combo.currentText())
             source_prefix = "pair_corrected" if source_choice.casefold().startswith("mcd-corrected") else "pair_raw"
             spectra = {
-                channel: np.asarray(getattr(source, f"{source_prefix}_{channel}"), float)[:, energy_order]
+                channel: np.asarray(getattr(source, f"{source_prefix}_{channel}"), float)
                 for channel in ("pos", "neg")
             }
             source_label = "MCD-corrected R" if source_prefix == "pair_corrected" else "Raw R"
@@ -8407,11 +8591,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 index = 0 if index is None else int(index)
                 index = max(0, min(index, int(np.asarray(source.pair_b).size) - 1))
                 for channel, color in (("pos", "#1769aa"), ("neg", "#d1495b")):
-                    raw_ax.plot(energy, spectra[channel][index], color=color, lw=0.9,
+                    selected_spectrum = spectra[channel][index][energy_order]
+                    raw_ax.plot(energy, selected_spectrum, color=color, lw=0.9,
                                 label=f"{format_mcd_angle(angles[channel])}° · B={fields[channel][index]:.4g} T")
                     if deriv_ax is not None:
                         grid, d2, _ = second_derivative_map(
-                            energy, spectra[channel][index][None, :], int(self.mcd_peak_deriv_window_spin.value())
+                            energy, selected_spectrum[None, :], int(self.mcd_peak_deriv_window_spin.value())
                         )
                         deriv_ax.plot(grid, -d2[0], color=color, lw=0.9)
                 raw_ax.set_title(f"Selected field · {source_label}")
@@ -8445,7 +8630,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         source_choice = str(self.mcd_peak_source_combo.currentText())
         source_prefix = "pair_corrected" if source_choice.casefold().startswith("mcd-corrected") else "pair_raw"
         spectra = {
-            channel: np.asarray(getattr(source, f"{source_prefix}_{channel}"), float)[:, energy_order]
+            channel: np.asarray(getattr(source, f"{source_prefix}_{channel}"), float)
             for channel in ("pos", "neg")
         }
         source_label = "MCD-corrected R" if source_prefix == "pair_corrected" else "Raw R"
@@ -8478,10 +8663,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 deriv_ax.set_title("−d²R/dE² · both channels", fontsize=9, pad=8)
             for channel, color in (("pos", "#1769aa"), ("neg", "#d1495b")):
                 idx = int(self.mcd_peak_field_combo.currentData() or 0)
-                raw_ax.plot(energy, spectra[channel][idx], color=color, lw=0.9, label=f"{format_mcd_angle(angles[channel])}° · B={fields[channel][idx]:.4g} T")
-                grid, d2, actual_window = second_derivative_map(energy, spectra[channel][idx][None, :], int(self.mcd_peak_deriv_window_spin.value()))
-                derivative_lines[channel] = (grid, -d2[0])
+                selected_spectrum = spectra[channel][idx][energy_order]
+                raw_ax.plot(energy, selected_spectrum, color=color, lw=0.9, label=f"{format_mcd_angle(angles[channel])}° · B={fields[channel][idx]:.4g} T")
                 if deriv_ax is not None:
+                    grid, d2, actual_window = second_derivative_map(energy, selected_spectrum[None, :], int(self.mcd_peak_deriv_window_spin.value()))
+                    derivative_lines[channel] = (grid, -d2[0])
                     deriv_ax.plot(grid, -d2[0], color=color, lw=0.9, label=f"{format_mcd_angle(angles[channel])}° · B={fields[channel][idx]:.4g} T")
             raw_ax.set_ylabel(f"{source_label} intensity (a.u.)"); raw_ax.set_xlabel("Energy (eV)")
             raw_ax.tick_params(labelbottom=False, bottom=False)
@@ -8513,7 +8699,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     continue
                 energy_point = float(point.energy_ev)
                 if raw_ax is not None:
-                    y_point = float(np.interp(energy_point, energy, spectra[channel][idx]))
+                    y_point = float(np.interp(energy_point, energy, spectra[channel][idx][energy_order]))
                     feature_line = raw_ax.axvline(energy_point, color=color, ls="--", lw=1.1)
                     feature_line._mcd_peak_drag_kind = "feature"
                     feature_line._mcd_peak_drag_channel = channel
@@ -8572,13 +8758,13 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 if self.mcd_peak_selected_field is not None:
                     axis.axhline(float(self.mcd_peak_selected_field), color="#f4a261", lw=1.1, ls="--")
                 if self.mcd_peak_map_mode_combo.currentText() == "Raw R":
-                    grid = energy; values = spectra[channel][mask][order]
+                    grid = energy; values = spectra[channel][mask][order][:, energy_order]
                     finite = np.abs(values[np.isfinite(values)]); limit = float(np.nanpercentile(finite, 98)) if finite.size else 1.0; limit = max(limit, np.finfo(float).eps)
                     axis.pcolormesh(grid, field[mask][order], values, shading="auto", cmap="viridis", vmin=float(np.nanmin(values)), vmax=float(np.nanmax(values)))
                     axis.set_title(f"{channel} · {source_label} · full E")
                     axis.set_xlabel("Energy (eV)"); axis.set_ylabel("B (T)")
                     continue
-                grid, values, actual_window = second_derivative_map(energy, spectra[channel][mask][order], int(self.mcd_peak_deriv_window_spin.value()))
+                grid, values, actual_window = second_derivative_map(energy, spectra[channel][mask][order][:, energy_order], int(self.mcd_peak_deriv_window_spin.value()))
                 finite = np.abs(values[np.isfinite(values)]); limit = float(np.nanpercentile(finite, 98)) if finite.size else 1.0; limit = max(limit, np.finfo(float).eps)
                 axis.pcolormesh(grid, field[mask][order], -values, shading="auto", cmap="RdBu_r", vmin=-limit, vmax=limit)
                 axis.set_title(f"{channel} · −d²R/dE² · full E"); axis.set_xlabel("Energy (eV)"); axis.set_ylabel("B (T)")
@@ -9752,7 +9938,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self._status("Plotted Compare (gate update).")
                 return
 
-            if mode == "DRR" and not self._drr_limits_from_controls:
+            if (mode == "DRR" and not self._drr_limits_from_controls
+                    and not getattr(self, '_drr_bn_group_publishing', False)):
                 self._capture_drr_view_limits()
             self._drr_limits_from_controls = False
             if mode == 'DRR':
@@ -10488,6 +10675,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             if not auto:
                 self._append_log(f"Plotted {mode}.")
         except Exception as exc:
+            if mode == 'DRR' and getattr(self, '_drr_bn_group_publishing', False):
+                raise RuntimeError('BN comparison could not be drawn: ' + str(exc)) from exc
             self._show_error(str(exc))
 
     def _current_plot_params_key(self, mode: str) -> tuple[Any, ...]:
@@ -10517,7 +10706,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self.power_axis_scale_combo.currentText(),
                 bool(self.power_controller._power_background_auto_enabled()),
                 float(self.power_controller._power_background_value(
-                    [self.loaded.cube] if self.loaded and self.loaded.mode == "Power Dependent" and self.loaded.cube is not None else None
+                    self.power_controller._power_background_source_cubes()
                 )),
                 self._resolved_cmap(self.power_cmap),
                 float(self.power_spins["vmin"].value()),
@@ -10595,6 +10784,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self.drr_right_yaxis_combo.currentText(),
             self.drr_second_kind_combo.currentData(), self.drr_sg_y_window_spin.value(),
             repr(p.get('fitted_settings', {})),
+            p.get('background_regions', ()),
         )
 
     def _ensure_loaded_matches_drr_params(self) -> bool:
@@ -10621,12 +10811,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             raise ValueError(f"Invalid DRR background assignment: {exc}") from exc
         if not assignments and selected and not data_io.is_xlsx_map_file(selected[0]):
             if baseline_text == "Automatic":
-                resolved = resolve_drr_background_assignments(
-                    self.current_folder, self.drr_available_sources, selected,
-                )
-                if not resolved.resolved:
-                    raise ValueError(resolved.reason or "DRR background assignment is unresolved.")
-                assignments = resolved.assignments
+                self._start_load('DRR')
+                return False
             else:
                 explicit_mode = baseline_text if baseline_text in {
                     "Self (first frame)", "Self (last frame)", "External",
@@ -10646,11 +10832,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                         baseline_files=tuple(baselines),
                         baseline_which=explicit_which,
                         selection_reason="explicit user baseline selection",
+                        regions=tuple(p.get('background_regions', ())) if explicit_mode == 'External' else (),
                     )
                 except ValueError as exc:
                     raise ValueError(str(exc)) from exc
                 missing = tuple(
-                    source for source in template.baseline_files
+                    source for source in template.baseline_source_files
                     if not resolve_source_path(self.current_folder, source).is_file()
                 )
                 if missing:
@@ -10664,6 +10851,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                         baseline_files=template.baseline_files,
                         baseline_which=template.baseline_which,
                         selection_reason=template.selection_reason,
+                        regions=template.regions,
                     )
                     for name in selected
                 )
@@ -10673,6 +10861,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             "Average all frames in each file, then average files": "all",
         }
         baseline_which = which_map.get(str(p["baseline_which"]), "last")
+        if assignments:
+            from ui_qt.drr_region_backgrounds import source_files
+            baselines = source_files(assignments)
+        from ui_qt.drr_composite_workflow import background_dependencies
+        dependencies = getattr(self.loaded, 'drr_background_dependencies', None)
         needs_reload = (
             selected != list(self.loaded.selected_files)
             or baseline_text != self.loaded.drr_baseline_text
@@ -10680,6 +10873,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             or baselines != list(self.loaded.baseline_files)
             or tuple(assignments) != tuple(getattr(self.loaded, "drr_assignments", ()))
             or y_axis_spec != getattr(self.loaded, "y_axis_spec", "auto")
+            or (dependencies is not None and dependencies != background_dependencies(self.loaded.folder, baselines))
         )
         if needs_reload:
             # A redraw must never turn a source or processing change into a
@@ -10705,7 +10899,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     else "DR/R External"
                 )
                 baselines = list(dict.fromkeys(
-                    source for assignment in assignments for source in assignment.baseline_files
+                    source for assignment in assignments for source in assignment.baseline_source_files
                 ))
             elif baseline_text == "External":
                 if not baselines:
@@ -11031,6 +11225,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             if mode == "DRR":
                 try:
                     drr_raw_cube, _raw_deriv, drr_raw_win, drr_raw_poly = self.drr_controller._drr_cube_with_metadata(None)
+                    self.drr_controller._require_current_bn_derivative_validation()
                     from ui_qt.drr_mixed_controls import derivative_key
                     second_key = derivative_key(self)
                 except ValueError as exc:
@@ -11349,7 +11544,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         } if mode in {"PL", "DRR", "Compare"} else None
         if mode == "PL" and loaded.primary_file and options.params_linear is not None and options.params_log is not None:
             linear_cube = data_io.load_pl_cube(folder, loaded.primary_file, log_scale=False, y_axis=loaded.y_axis_spec)
-            log_cube = data_io.load_pl_cube(folder, loaded.primary_file, log_scale=True, y_axis=loaded.y_axis_spec)
+            log_cube = (
+                linear_cube if Path(loaded.primary_file).suffix.lower() == ".dat"
+                else data_io.load_pl_cube(folder, loaded.primary_file, log_scale=True, y_axis=loaded.y_axis_spec)
+            )
             if Path(loaded.primary_file).suffix.lower() == ".dat" and loaded.cube is not None:
                 for cube in (linear_cube, log_cube):
                     cube.gate_label = loaded.cube.gate_label
@@ -11437,11 +11635,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     **current_selection,
                 })
             if is_fitted:
-                from core.drr_fitted_background import export_references
-                if not loaded.drr_fitted_references:
-                    raise ValueError('Fitted background is unavailable. Reload DRR before saving.')
+                from core.drr_fitted_background import export_references, reference_matches_files
+                if (len(loaded.drr_fitted_references) != 1
+                        or not reference_matches_files(loaded.drr_fitted_references[0], loaded.selected_files)):
+                    raise ValueError('Reload DRR to fit one background to the selected raw intensity average before saving.')
                 background_files = export_references(folder, loaded.drr_fitted_references)
-                drr_processing.update(selection_method='fitted_sample',
+                drr_processing.update(selection_method='fitted_sample', numerical_path='fitted_raw_average',
+                    average_method='Align raw intensities on the common measured overlap without extrapolation, '
+                                   'equal-weight file average, fit one background, then I/B_fit - 1',
                     fitted_background_files=background_files)
                 log.emit(f'Exported {len(background_files)} fitted background matrix/matrices with fit metadata.')
             pair_requested = options.drr_raw_cube is not None and options.drr_raw_params is not None

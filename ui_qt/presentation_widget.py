@@ -652,7 +652,9 @@ class PresentationBuilderWidget(QWidget):
         self.group_by_combo.currentIndexChanged.connect(self._plan_options_changed)
         self.caption_combo.currentIndexChanged.connect(self._update_preview)
         self.panel_labels_chk.toggled.connect(self._update_preview)
-        self.title_edit.textChanged.connect(self._plan_options_changed)
+        # A title changes labels, not image grouping. Commit the edit once
+        # without invalidating the existing slide plan on every keystroke.
+        self.title_edit.editingFinished.connect(self._rebuild_plan)
         self.slide_list.currentRowChanged.connect(self._update_preview)
         self.source_edit.editingFinished.connect(self._source_changed)
         self.build_copy_btn.clicked.connect(lambda: self._start_build("copy"))

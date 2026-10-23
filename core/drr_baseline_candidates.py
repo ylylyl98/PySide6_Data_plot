@@ -277,9 +277,14 @@ def _recommendation(
 
 
 def rank_baseline_candidates(
-    measurements: Sequence[DrrSource], candidates: Sequence[DrrSource]
+    measurements: Sequence[DrrSource], candidates: Sequence[DrrSource], *,
+    prefer_named_backgrounds: bool = True,
 ) -> tuple[DrrBaselineRecommendation, ...]:
-    """Prefer named constant backgrounds, then conditions, then newest timestamp."""
+    """Rank by conditions and newest timestamp, optionally preferring back names.
+
+    Generic baseline browsing favors named constant backgrounds. A role-scoped
+    P/N picker already established reference roles and can rank conditions first.
+    """
     if not measurements:
         return ()
     eligible = filter_baseline_candidates(measurements, candidates)
@@ -305,7 +310,7 @@ def rank_baseline_candidates(
             else 1
         )
         return (
-            0 if _named_constant_background(item.source) else 1,
+            0 if not prefer_named_backgrounds or _named_constant_background(item.source) else 1,
             (sample_position, *states[2:]),
             -item.source.modified_time
             if math.isfinite(item.source.modified_time) and item.source.modified_time > 0
@@ -318,6 +323,9 @@ def rank_baseline_candidates(
 
 
 def candidate_recommendation_map(
-    measurements: Sequence[DrrSource], candidates: Sequence[DrrSource]
+    measurements: Sequence[DrrSource], candidates: Sequence[DrrSource], *,
+    prefer_named_backgrounds: bool = True,
 ) -> dict[str, DrrBaselineRecommendation]:
-    return {item.source.source: item for item in rank_baseline_candidates(measurements, candidates)}
+    options = {} if prefer_named_backgrounds else {'prefer_named_backgrounds': False}
+    return {item.source.source: item for item in rank_baseline_candidates(
+        measurements, candidates, **options)}

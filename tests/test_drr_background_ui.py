@@ -101,7 +101,10 @@ class DrrBackgroundUiTests(unittest.TestCase):
         self.assertIn("BG2.csv", self.window.drr_baseline_summary.toolTip())
 
     def test_reload_of_legacy_self_state_materializes_assignments(self) -> None:
-        self.window.current_folder = str(Path.cwd())
+        fixture = tempfile.TemporaryDirectory()
+        self.addCleanup(fixture.cleanup)
+        self.window.current_folder = fixture.name
+        Path(fixture.name, 'measurement.csv').write_text('synthetic fixture')
         self.window.drr_selected_files = ["measurement.csv"]
         self.window.loaded = LoadedState(
             mode="DRR", folder=self.window.current_folder,
@@ -337,8 +340,11 @@ class DrrBackgroundUiTests(unittest.TestCase):
             captured = []
             with patch.object(w.thread_pool, "start", captured.append):
                 w._start_load("DRR")
-            self.assertFalse(captured)
-            self.assertIn("missing", w.statusBar().currentMessage().lower())
+            self.assertEqual(len(captured), 1)
+            with patch.object(w, '_show_error') as error:
+                captured[0].run()
+            self.assertIsNone(w.loaded)
+            self.assertIn('missing', error.call_args.args[0].lower())
 
     def test_returning_to_self_after_empty_external_selection_reloads(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -516,16 +522,15 @@ class DrrBackgroundUiTests(unittest.TestCase):
             with patch.object(self.window.thread_pool, "start", lambda worker: captured.setdefault("worker", worker)):
                 self.window._start_load("DRR")
             options = captured["worker"].args[0]
-            self.assertEqual(
-                [item.baseline_files for item in options.drr_assignments],
-                [(bg1_name,), (bg2_name,)],
-            )
+            self.assertTrue(options.drr_resolve_background)
             loaded = self.window._load_task(
                 options,
                 progress=SimpleNamespace(emit=lambda *_args: None),
                 log=SimpleNamespace(emit=lambda *_args: None),
             )
             self.assertEqual(loaded.cube.drr_numerical_path, "heterogeneous")
+            self.assertEqual([item.baseline_files for item in loaded.drr_assignments],
+                             [(bg1_name,), (bg2_name,)])
             self.assertTrue(np.allclose(loaded.cube.Z, 0.5))
             self.window._on_loaded(loaded)
             self.window._on_load_finished(request_token=self.window._active_load_token)
@@ -653,11 +658,15 @@ class DrrBackgroundUiTests(unittest.TestCase):
         with (
             patch("ui_qt.main_window.resolve_drr_background_assignments", return_value=unresolved) as resolve,
             patch.object(self.window.thread_pool, "start") as start,
+            patch('ui_qt.controllers_drr.DrrController._drr_missing_sources', return_value=[]),
+            patch.object(self.window, '_show_error') as error,
         ):
             self.window._start_load("DRR")
+            resolve.assert_not_called()
+            start.call_args.args[0].run()
 
         resolve.assert_called_once()
-        start.assert_not_called()
+        self.assertIn('recorded baseline missing', error.call_args.args[0])
         self.assertIsNone(self.window.loaded)
         self.assertTrue(self.window._drr_assignments_automatic)
         self.assertEqual(self.window.drr_baseline_files_manual, [])

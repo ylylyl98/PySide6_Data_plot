@@ -24,8 +24,10 @@ from ui_qt.peak_cursor_readout import PeakCursorReadout
 from ui_qt.peak_analysis_ipc import send_message
 
 
-def snapshot(dataset):
-    return {k: v if k=='cube' else deepcopy(v) for k,v in dataset.items()}
+def snapshot(dataset, *, share_candidates=False):
+    """Copy editable state, optionally retaining the read-only filter pool."""
+    shared = {'cube', 'candidates'} if share_candidates else {'cube'}
+    return {k: v if k in shared else deepcopy(v) for k,v in dataset.items()}
 
 
 class AnalysisToolbar(NavigationToolbar2QT):
@@ -293,7 +295,7 @@ class PeakAnalysisWindow(QMainWindow):
 
     def refilter(self):
         if self.busy or not self.dataset.get('candidates'):return
-        d=self.dataset;copy=snapshot(d);copy['candidates']=d['candidates']
+        d=self.dataset;copy=snapshot(d,share_candidates=True)
         def work(cancel,progress):
             pool=prepare_quality_cache(copy,copy['candidates'],cancel,lambda n:progress(n//3))
             copy['candidates']=pool

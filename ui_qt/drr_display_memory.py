@@ -1,7 +1,7 @@
 """Apply remembered DRR displays without triggering intermediate plots."""
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import wraps
 import json
 import math
@@ -107,6 +107,113 @@ def _set(widget, value):
     else:
         widget.setChecked(value)
     del blocker
+
+
+@dataclass(frozen=True)
+class _BackgroundSwitchDisplay:
+    folder: str
+    selected: tuple
+    y_axis_spec: str
+    energy: object
+    gate: object
+    values: tuple
+    viewport: object
+    limits_from_controls: bool
+    second_auto_scale: bool
+    borrowed: dict
+    origins: dict
+    protected: frozenset
+
+
+def _background_switch_controls(owner):
+    controls = _controls(owner)
+    for name in ('drr_sg_window_spin', 'drr_sg_poly_spin', 'drr_sg_auto_chk',
+                 'drr_sg_mode_combo', 'drr_derivative_combo', 'drr_second_kind_combo',
+                 'drr_sg_y_window_spin', 'drr_sg_y_auto_chk'):
+        widget = getattr(owner, name, None)
+        if widget is not None:
+            controls['processing.' + name] = widget
+    return controls
+
+
+def background_folder_key(folder):
+    """Compare directory identity across Windows short names and path aliases."""
+    return Path(folder).resolve()
+
+
+def prepare_background_switch(owner):
+    """Capture the current view immediately before accepting a BN-only result.
+
+    This snapshot is local to the accepted load; it does not save a display or
+    change processing controls. Capture at publication, so edits made while the
+    reference was loading remain the current view.
+    """
+    loaded = getattr(owner, 'loaded', None)
+    if loaded is None or loaded.mode != 'DRR' or loaded.cube is None:
+        return None
+    viewport = deepcopy(getattr(owner, '_drr_view_limits', None))
+    figure_axes = set(getattr(getattr(owner, 'figure', None), 'axes', ()))
+    axes = getattr(owner, '_drr_heatmap_axes', {}) or {}
+    axis = getattr(owner, '_drr_heatmap_ax', None)
+    if axis not in figure_axes:
+        axis = next((item for item in axes.values() if item in figure_axes), None)
+    if axis is not None:
+        viewport = (tuple(float(value) for value in axis.get_xlim()),
+                    tuple(float(value) for value in axis.get_ylim()))
+    return _BackgroundSwitchDisplay(
+        str(background_folder_key(loaded.folder)), tuple(loaded.selected_files), loaded.y_axis_spec,
+        np.asarray(loaded.cube.energy).copy(), np.asarray(loaded.cube.gate).copy(),
+        tuple((name, _value(widget)) for name, widget in _background_switch_controls(owner).items()),
+        viewport, bool(getattr(owner, '_drr_limits_from_controls', False)),
+        bool(owner.drr_second_auto_scale),
+        deepcopy(getattr(owner, '_drr_memory_borrowed', {})),
+        dict(getattr(owner, '_drr_fix_origins', {})),
+        frozenset(getattr(owner, '_drr_memory_protected', ())))
+
+
+def restore_background_switch(owner, loaded, snapshot):
+    """Preserve all bounds for an accepted BN-only load of the exact same grid.
+
+    Call after publishing ``loaded`` and clearing obsolete compute jobs, in
+    place of normal history restoration and automatic load limits. Fix states
+    stay unchanged. Explicit Auto actions release the temporary protections
+    through the existing display-memory handlers.
+    """
+    if (not isinstance(snapshot, _BackgroundSwitchDisplay)
+            or getattr(owner, 'loaded', None) is not loaded
+            or loaded.mode != 'DRR' or loaded.cube is None
+            or background_folder_key(loaded.folder) != Path(snapshot.folder)
+            or tuple(loaded.selected_files) != snapshot.selected
+            or background_folder_key(getattr(owner, 'current_folder', loaded.folder)) != Path(snapshot.folder)
+            or tuple(getattr(owner, 'drr_selected_files', loaded.selected_files)) != snapshot.selected
+            or loaded.y_axis_spec != snapshot.y_axis_spec
+            or not np.array_equal(loaded.cube.energy, snapshot.energy, equal_nan=True)
+            or not np.array_equal(loaded.cube.gate, snapshot.gate, equal_nan=True)):
+        return False
+    controls = _background_switch_controls(owner)
+    if any(name not in controls for name, _ in snapshot.values):
+        return False
+    for name, value in snapshot.values:
+        _set(controls[name], value)
+    owner.drr_second_auto_scale = snapshot.second_auto_scale
+    owner._drr_memory_borrowed = deepcopy(snapshot.borrowed)
+    owner._drr_fix_origins = dict(snapshot.origins)
+    owner._drr_memory_protected = set(snapshot.protected) | {
+        name for name, _ in snapshot.values
+        if name.startswith(('axis.', 'drr.', 'drr_second.'))
+        or name in ('second_min', 'second_max')}
+    owner._drr_memory_cube = loaded.cube
+    owner._drr_memory_pending = None
+    owner._drr_memory_pending_overrides = {}
+    owner._drr_bn_group_processing_hold = (
+        loaded.cube, int(owner.drr_sg_window_spin.value()), int(owner.drr_sg_poly_spin.value()),
+        int(owner.drr_sg_y_window_spin.value()), bool(owner.drr_sg_auto_chk.isChecked()),
+        bool(owner.drr_sg_y_auto_chk.isChecked()))
+    owner._drr_view_limits = deepcopy(snapshot.viewport)
+    owner._drr_limits_from_controls = snapshot.limits_from_controls if snapshot.viewport is None else False
+    sync_controls(owner)
+    refresh_fix_sources(owner)
+    return True
 
 
 def _fixed_value_key(name):

@@ -60,6 +60,14 @@ class DrrBaselineCandidateTests(unittest.TestCase):
                 candidate = replace(_source(name), gate_varies=varies)
                 self.assertEqual(rank_baseline_candidates((measurement,), (candidate, match))[0].source, match)
 
+    def test_role_scoped_ranking_can_prioritize_conditions_without_changing_default(self) -> None:
+        measurement = _source('YZ383_p2n1_1.67KREF_RotIn49deg_TG.csv', background=False)
+        inferred = replace(_source('YZ383_p2n1_1.67KREF_RotIn49deg_bg.csv', mtime=100), gate_varies=False)
+        named = replace(_source('YZ383_p2n1_1.67KREF_RotIn94deg_Pbackground.csv', mtime=900), gate_varies=False)
+        self.assertEqual(rank_baseline_candidates((measurement,), (inferred, named))[0].source, named)
+        scoped = rank_baseline_candidates((measurement,), (inferred, named), prefer_named_backgrounds=False)
+        self.assertEqual([item.source for item in scoped], [inferred, named])
+
     def test_named_constant_background_still_requires_matching_spectral_grid(self) -> None:
         measurement = _source("measurement.csv", background=False)
         background = replace(_source("other_background.csv", grid=(740., 760., 781.)), gate_varies=False)

@@ -207,6 +207,7 @@ class SidebarLayoutRegressionTests(unittest.TestCase):
                     window.drr_edit_measurements_btn,
                     window.drr_clear_measurements_btn,
                     window.drr_edit_baselines_btn,
+                    window.drr_pn_background_btn,
                     window.drr_baseline_autofind_btn,
                 ):
                     # Data commands stay above both parameter pages; lay out

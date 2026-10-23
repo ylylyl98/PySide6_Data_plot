@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime
+import os
 from pathlib import Path
 import re
 from threading import Event
@@ -559,27 +560,32 @@ class DrrController:
             self._drr_assignments_automatic = True
             baseline_files = list(dict.fromkeys(
                 source for assignment in resolved.assignments
-                for source in assignment.baseline_files
+                for source in assignment.baseline_source_files
             ))
             self.drr_baseline_files_manual = baseline_files
             self.drr_baseline_files_found = list(baseline_files)
+            from ui_qt.drr_region_backgrounds import restore_regions
+            restore_regions(self._owner, resolved.assignments)
             if baseline_files:
                 blocked = self.drr_baseline_combo.blockSignals(True)
                 self.drr_baseline_combo.setCurrentText("External")
                 self.drr_baseline_combo.blockSignals(blocked)
-                combine_text = {
-                    "first": "First frame from each file, then average",
-                    "last": "Last frame from each file, then average",
-                    "all": "Average all frames in each file, then average files",
-                }.get(resolved.assignments[0].baseline_which)
-                if combine_text:
-                    blocked = self.drr_baseline_combine_combo.blockSignals(True)
-                    self.drr_baseline_combine_combo.setCurrentText(combine_text)
-                    self.drr_baseline_combine_combo.blockSignals(blocked)
             else:
                 blocked = self.drr_baseline_combo.blockSignals(True)
                 self.drr_baseline_combo.setCurrentText(resolved.assignments[0].baseline_mode)
                 self.drr_baseline_combo.blockSignals(blocked)
+            # Self recipes also carry this value into the load options. Keep
+            # the disabled selector consistent so the first redraw does not
+            # mistake a restored recipe for a user change and reload it.
+            combine_text = {
+                "first": "First frame from each file, then average",
+                "last": "Last frame from each file, then average",
+                "all": "Average all frames in each file, then average files",
+            }.get(resolved.assignments[0].baseline_which)
+            if combine_text:
+                blocked = self.drr_baseline_combine_combo.blockSignals(True)
+                self.drr_baseline_combine_combo.setCurrentText(combine_text)
+                self.drr_baseline_combine_combo.blockSignals(blocked)
             self.drr_baseline_combine_combo.setEnabled(False)
             self.drr_pin_baseline_chk.setEnabled(False)
             self._update_drr_selection_labels()
@@ -589,13 +595,14 @@ class DrrController:
         self._status(resolved.reason or "Saved DRR background assignment is unavailable.")
         return False
 
-    def _apply_drr_background_gate_default(self) -> bool:
+    def _apply_drr_background_gate_default(self, assessment=None) -> bool:
         if not self.drr_baseline_files_manual:
             return True
-        assessment = assess_background_gate_files(
-            self.current_folder,
-            self.drr_baseline_files_manual,
-        )
+        if assessment is None:
+            assessment = assess_background_gate_files(
+                self.current_folder,
+                self.drr_baseline_files_manual,
+            )
         if not assessment.all_constant:
             return True
         if len(assessment.profiles) > 1 and not assessment.same_constant_values:
@@ -624,10 +631,12 @@ class DrrController:
             self._drr_assignments_automatic = True
             baseline_files = list(dict.fromkeys(
                 source for assignment in resolved.assignments
-                for source in assignment.baseline_files
+                for source in assignment.baseline_source_files
             ))
             self.drr_baseline_files_manual = baseline_files
             self.drr_baseline_files_found = list(baseline_files)
+            from ui_qt.drr_region_backgrounds import restore_regions
+            restore_regions(self._owner, resolved.assignments)
             blocked = self.drr_baseline_combo.blockSignals(True)
             self.drr_baseline_combo.setCurrentText("External")
             self.drr_baseline_combo.blockSignals(blocked)
@@ -641,6 +650,14 @@ class DrrController:
         return False
 
     def _cancel_auto_external(self) -> None:
+        from ui_qt.drr_bn_group_choice import cancel_group_choice
+        cancel_group_choice(self._owner)
+        from ui_qt.drr_background_settings_workflow import cancel_settings_apply
+        cancel_settings_apply(self._owner)
+        from ui_qt.drr_pn_workflow import cancel_pn_apply
+        from ui_qt.drr_bn_workflow import cancel_bn_requests
+        cancel_pn_apply(self._owner)
+        cancel_bn_requests(self._owner)
         request = getattr(self, '_drr_external_request', None)
         if request is not None:
             request.cancelled.set()
@@ -649,6 +666,9 @@ class DrrController:
 
     def _refresh_auto_external(self, selection_changed=False) -> bool:
         """Keep accepted recommendations; rematch changed unpinned selections."""
+        from ui_qt.drr_background_settings_workflow import follow_source_type
+        if follow_source_type(self._owner, selection_changed=selection_changed):
+            return True
         request = getattr(self, '_drr_external_request', None)
         automatic = getattr(self, '_drr_external_auto_selected', False)
         if self.drr_baseline_combo.currentText() != 'External' or self.drr_pin_baseline_chk.isChecked():
@@ -660,13 +680,14 @@ class DrrController:
         from core.drr_baseline_candidates import spectral_grids_match
         catalog = {item.source: item for item in self.drr_available_sources}
         valid = bool(self._drr_assignments) and not selection_changed and all(
-            not self._drr_missing_sources((assignment.measurement_file, *assignment.baseline_files))
+            not self._drr_missing_sources((assignment.measurement_file, *assignment.baseline_source_files))
             and all(
                 (assignment.measurement_file not in catalog or path not in catalog
                  or spectral_grids_match(catalog[assignment.measurement_file], catalog[path]))
-                for path in assignment.baseline_files)
+                for path in assignment.baseline_source_files)
             for assignment in self._drr_assignments)
         if not valid:
+            self._drr_background_regions = ()
             self._drr_assignments = ()
             self._drr_assignments_automatic = False
             self.drr_baseline_files_manual = []
@@ -674,21 +695,31 @@ class DrrController:
             self._start_auto_external()
         return True
 
-    def _start_auto_external(self) -> None:
+    def _start_auto_external(self, *, measured_bn_only=False) -> None:
+        from ui_qt.drr_background_settings_workflow import follow_source_type
+        if follow_source_type(self._owner, selection_changed=True, restore_saved=not measured_bn_only):
+            return
         from ui_qt.drr_auto_external import ExternalMatchRequest
         self._cancel_auto_external()
         if not self.current_folder or not self.drr_selected_files or self._suspend_drr_autoplot:
             return
-        request = ExternalMatchRequest(self._owner, self)
+        request = ExternalMatchRequest(self._owner, self, measured_bn_only=measured_bn_only)
         self._drr_external_request = request
-        self._invalidate_drr_for_background_selection('Matching external background…')
+        self._invalidate_drr_for_background_selection(
+            'Matching measured BN references…' if measured_bn_only else 'Matching external background…')
         self._update_drr_baseline_controls()
         self.thread_pool.start(request.worker)
 
     def _finish_auto_external(self, resolved) -> None:
+        measured_bn_only = bool(getattr(getattr(self, '_drr_external_request', None), 'measured_bn_only', False))
         self._drr_external_request = None
         if not resolved.resolved:
             self._invalidate_drr_for_background_selection(resolved.reason)
+            if measured_bn_only:
+                self._update_drr_selection_labels()
+                self.drr_baseline_summary.setText('No matching measured BN.\nReview BN inputs or choose a background.')
+                self.drr_baseline_summary.setToolTip(resolved.reason)
+                return
             self._edit_drr_baselines_dialog()
             return
         self._restore_saved_drr_recipe(resolved)
@@ -760,6 +791,13 @@ class DrrController:
                 self._status(f"State: SG window = {used_win} ({n_energy} energy points, order={poly}).")
         return used_win
 
+    def _require_current_bn_derivative_validation(self) -> None:
+        from ui_qt.drr_bn_workflow import managed_joint_validation_current, ensure_managed_bn_validation
+        if not managed_joint_validation_current(self._owner):
+            ensure_managed_bn_validation(self._owner)
+            raise ValueError('BN joint DR/R and D2E validation is required at the current SG settings. '
+                             'Compare this group or use the original BN before derivative output.')
+
     def _drr_cube_with_metadata(
         self, derivative=_CURRENT_DRR_DERIVATIVE,
     ) -> tuple[DataCube, int | None, int, int]:
@@ -775,6 +813,8 @@ class DrrController:
             raise ValueError("DRR derivative must be None, 1, or 2.")
         poly = int(self.drr_sg_poly_spin.value())
         req_win = self._enforce_drr_sg_constraints(show_status=True, use_mixed=deriv == 2)
+        if deriv is not None:
+            self._require_current_bn_derivative_validation()
         if deriv == 2:
             from ui_qt.drr_mixed_controls import derivative_key
             deriv = derivative_key(self._owner)
@@ -846,6 +886,7 @@ class DrrController:
             "center_zero": bool(self.drr_center_zero_chk.isChecked()),
             "drr_assignments": assignments,
             "fitted_settings": getattr(self, '_drr_fitted_settings', {}),
+            "background_regions": tuple(item.to_dict() for item in getattr(self, '_drr_background_regions', ())),
         }
 
     def _is_drr_gate_only_change(self, new_key: tuple) -> bool:
@@ -911,6 +952,8 @@ class DrrController:
             return
         # Auto recommendations/clamps update spins with signals blocked.
         self._invalidate_drr_display_derivative_parameters()
+        from ui_qt.drr_bn_workflow import derivative_settings_changed
+        derivative_settings_changed(self._owner)
         if self.loaded and self.loaded.mode == "DRR" and not self._suspend_drr_autoplot:
             self._refresh_automatic_ranges("DRR", refresh_split=True)
             self._schedule_plot_redraw("DRR")
@@ -942,6 +985,8 @@ class DrrController:
             self._drr_limits_from_controls = True
         if source is getattr(self, "drr_baseline_combo", None):
             self._cancel_auto_external()
+            from ui_qt.drr_bn_workflow import forget_bn_choice
+            forget_bn_choice(self._owner)
             self._drr_baseline_user_selected = True
             # A baseline-mode change is an explicit recipe change.  Clear
             # every previous per-measurement assignment, including explicit
@@ -952,6 +997,7 @@ class DrrController:
             self.drr_baseline_combine_combo.setEnabled(True)
             self.drr_pin_baseline_chk.setEnabled(True)
             if self.drr_baseline_combo.currentText().startswith("Self") or self.drr_baseline_combo.currentText() == 'Fitted (sample)':
+                self._drr_background_regions = ()
                 self.drr_baseline_files_manual = []
                 self.drr_baseline_files_found = []
                 blocked = self.drr_pin_baseline_chk.blockSignals(True)
@@ -997,6 +1043,8 @@ class DrrController:
 
     def _on_drr_baseline_mode_changed(self) -> None:
         self._cancel_auto_external()
+        from ui_qt.drr_bn_workflow import forget_bn_choice
+        forget_bn_choice(self._owner)
         if self._drr_assignments:
             # The visible frame selector is only a summary for automatic
             # assignments.  A user change must opt into one common recipe;
@@ -1057,6 +1105,61 @@ class DrrController:
         self._status("State: Auto Y range refreshed from gate axis; fixed limits kept.")
         self._schedule_plot_redraw("DRR")
     def _update_drr_selection_labels(self) -> None:
+        from ui_qt.drr_background_settings_workflow import source_intent, KIND_LABELS
+        from ui_qt.drr_pn_labels import SAVED_COMPOSITE_LABEL, SAVED_COMPOSITE_TOOLTIP, source_frame_summary
+        intent = source_intent(self._owner)
+
+        def _saved_composite(names) -> bool:
+            names = tuple(names)
+            if not names:
+                return False
+            # Saved exports can restore a composite without a live version
+            # object. Recognize its managed path without opening any files.
+            if all('pn backgrounds' in str(name).replace('\\', '/').casefold().split('/') for name in names):
+                return True
+            return bool(intent is not None and intent.kind == 'pn'
+                        and names == tuple(intent.files))
+
+        def _source_frames(names) -> str:
+            version = (intent.version if intent is not None and intent.kind == 'pn'
+                       and tuple(names) == tuple(intent.files) else None)
+            return source_frame_summary(version)
+
+        def _frame_description(names, which) -> str:
+            return SAVED_COMPOSITE_LABEL if _saved_composite(names) else which
+
+        def _background_kind(names, reasons=()) -> str:
+            names = tuple(names)
+            if _saved_composite(names):
+                return KIND_LABELS['pn']
+            if intent is not None and self.drr_baseline_combo.currentText() == 'External':
+                if intent.calibration is not None and not intent.calibration.get('original', False):
+                    return 'Calibrated BN'
+                return KIND_LABELS[intent.kind]
+            # Display-only classification: never read a file or a managed store
+            # on the GUI thread. Unknown names remain explicitly unclassified.
+            reasons = tuple(reasons)
+            kinds = []
+            for name in names:
+                parts = str(name).replace('\\', '/').casefold().split('/')
+                filename = parts[-1]
+                if '.drr_bn_calibration' in parts:
+                    kind = 'Calibrated BN'
+                elif 'pn backgrounds' in parts or re.search(r'(?<![a-z0-9])pn[ _-]*back(?:ground)?(?=$|[^a-z])', filename):
+                    kind = 'P/N'
+                elif re.search(r'(?<![a-z0-9])bn[ _-]*back(?:ground)?(?=$|[^a-z])', filename):
+                    kind = 'BN'
+                else:
+                    kind = 'Other external'
+                if kind not in kinds:
+                    kinds.append(kind)
+            if kinds == ['Other external']:
+                if any(reason.startswith(('Validated exact-group BN calibration', 'Validated group BN calibration')) for reason in reasons):
+                    kinds = ['Calibrated BN']
+                elif any(reason.startswith('Explicitly applied P/N version') for reason in reasons):
+                    kinds = ['P/N']
+            return ' + '.join(kinds) if kinds else 'External'
+
         def _brief(names: List[str]) -> str:
             if not names:
                 return "none"
@@ -1087,9 +1190,10 @@ class DrrController:
                 and list(loaded.selected_files) == self.drr_selected_files else ())
             warnings = [f'{ref.source}: {message}' for ref in references for message in ref.diagnostics.get('warnings', ())]
             count = sum(bool(ref.diagnostics.get('warnings')) for ref in references)
-            self.drr_baseline_summary.setText('Background fitted from sample spectra' + (f' · {count} need review' if count else ''))
+            self.drr_baseline_summary.setText(f'One background fitted to average ({len(self.drr_selected_files)} files)'
+                + (f' · {count} need review' if count else ''))
             self.drr_baseline_summary.setToolTip('\n'.join(warnings) if warnings else
-                'No external reference. Use Fit / view background to protect resonances and inspect the fitted denominator.')
+                'Raw intensities are averaged before fitting one background. Use Fit / view background to protect resonances and inspect the denominator.')
         elif self.drr_baseline_combo.currentText().startswith("Self"):
             frame = "first" if "first" in self.drr_baseline_combo.currentText() else "last"
             self.drr_baseline_summary.setText(f"Using {frame} frame")
@@ -1097,17 +1201,27 @@ class DrrController:
                 f"Using the {frame} frame from each selected measurement as its own background."
             )
         elif self._drr_assignments_automatic and self._drr_assignments:
+            kind = _background_kind(
+                (name for item in self._drr_assignments for name in item.baseline_source_files),
+                (item.selection_reason for item in self._drr_assignments))
+            groups = {}
+            for item in self._drr_assignments:
+                key = (item.baseline_files, item.baseline_which, item.regions)
+                groups[key] = groups.get(key, 0) + 1
+            counts = " + ".join(str(count) for count in groups.values())
             mapping = "\n".join(
                 f"{Path(item.measurement_file).name} ← "
                 + (", ".join(item.baseline_files) if item.baseline_files else item.baseline_mode)
-                + f" [{item.baseline_which}]"
+                + f" [{_frame_description(item.baseline_files, item.baseline_which)}]"
                 + f" — {item.selection_reason}"
                 for item in self._drr_assignments
             )
             self.drr_baseline_summary.setText(
-                f"Backgrounds: automatic per measurement ({len(self._drr_assignments)} mappings)"
+                f"{kind}: all {len(self._drr_assignments)} measurements → one average\n"
+                f"{len(groups)} backgrounds ({counts} measurements)"
             )
             self.drr_baseline_summary.setToolTip(
+                "Each measurement contributes equally after its own background correction.\n"
                 "Automatic per-measurement background mapping:\n" + mapping
             )
         else:
@@ -1116,21 +1230,57 @@ class DrrController:
                 "\nMissing: " + ", ".join(Path(name).name for name in missing_baselines)
                 if missing_baselines else ""
             )
+            kind = _background_kind(self.drr_baseline_files_manual,
+                                    tuple(item.selection_reason for item in self._drr_assignments))
+            composite = _saved_composite(self.drr_baseline_files_manual)
+            frame_summary = (SAVED_COMPOSITE_LABEL if composite else
+                             f'{len(self.drr_baseline_files_manual)} files (mode: {mode_short})')
             self.drr_baseline_summary.setText(
-                f"Baselines: {len(self.drr_baseline_files_manual)} files (mode: {mode_short}){baseline_label}"
-            )
-            if getattr(self, '_drr_external_auto_selected', False):
+                f"{kind}: {frame_summary}{baseline_label}")
+            if getattr(self, '_drr_external_auto_selected', False) and self._drr_assignments:
+                frame_summary = (SAVED_COMPOSITE_LABEL if composite else
+                                 f'{len(self.drr_baseline_files_manual)} background files ({mode_short})')
                 self.drr_baseline_summary.setText(
-                    self.drr_baseline_summary.text() + f' · {_brief(self.drr_baseline_files_manual)}')
+                    f'{kind}: all {len(self._drr_assignments)} measurements → one average\n'
+                    f'{frame_summary}{baseline_label}')
             self.drr_baseline_summary.setToolTip(
                 "Selected baseline files:\n" + "\n".join(self.drr_baseline_files_manual)
                 if self.drr_baseline_files_manual
                 else "No external baseline files selected."
             )
+            if composite:
+                self.drr_baseline_summary.setText(
+                    self.drr_baseline_summary.text() + '\n' + _source_frames(self.drr_baseline_files_manual))
+                self.drr_baseline_summary.setToolTip(
+                    SAVED_COMPOSITE_TOOLTIP + '\n' + self.drr_baseline_summary.toolTip())
             if self._drr_assignments:
                 self.drr_baseline_summary.setToolTip(
                     self.drr_baseline_summary.toolTip() + '\n' + '\n'.join(
                         item.selection_reason for item in self._drr_assignments))
+        regions = tuple(getattr(self, '_drr_background_regions', ()))
+        if self.drr_baseline_combo.currentText() == 'External' and regions:
+            self.drr_baseline_summary.setText(
+                self.drr_baseline_summary.text() + f' · {len(regions)} X range override(s)')
+            details = '\n'.join(
+                f'{item.xmin_ev:g} ≤ E < {item.xmax_ev:g} eV: '
+                + ', '.join(Path(name).name for name in item.baseline_files)
+                + f' [{_frame_description(item.baseline_files, item.baseline_which)}]' for item in regions)
+            missing = self._drr_missing_sources(name for item in regions for name in item.baseline_files)
+            self.drr_baseline_summary.setToolTip(
+                self.drr_baseline_summary.toolTip() + '\nX range overrides:\n' + details
+                + '\nUnspecified energies use the default background. '
+                  'Derivatives leave half-window gaps at background changes.')
+            if missing:
+                self.drr_baseline_summary.setText(self.drr_baseline_summary.text()
+                    + '\nMissing region background: ' + ', '.join(Path(name).name for name in missing))
+        from ui_qt.drr_background_settings_workflow import source_intent, KIND_LABELS
+        intent = source_intent(self._owner)
+        pending_plan = getattr(self, '_drr_pending_bn_plan', None)
+        if (self.drr_baseline_combo.currentText() == 'External' and not self.drr_baseline_files_manual
+                and intent is not None):
+            self.drr_baseline_summary.setText(
+                'BN: suggestions available — review in Background settings' if pending_plan is not None
+                else f'{KIND_LABELS[intent.kind]}: choose a background for this group')
         self._update_drr_baseline_controls()
         self._repopulate_drr_yaxis()
 
@@ -1139,13 +1289,29 @@ class DrrController:
         external = self.drr_baseline_combo.currentText() == "External"
         automatic = bool(external and self._drr_assignments_automatic and self._drr_assignments)
         pending = getattr(self, '_drr_external_request', None) is not None
-        self.drr_external_baseline_row.setVisible(external)
-        self.drr_background_fit_btn.setVisible(
-            self.drr_baseline_combo.currentText() == 'Fitted (sample)')
-        self.drr_edit_baselines_btn.setEnabled(external)
+        self.drr_external_baseline_row.setVisible(True)
+        self.drr_background_fit_btn.hide()
+        self.drr_edit_baselines_btn.setEnabled(bool(self.current_folder)
+            and getattr(self, '_drr_settings_apply_request', None) is None)
+        if hasattr(self, 'drr_composite_background_btn'):
+            self.drr_composite_background_btn.setEnabled(external and bool(self.current_folder))
+        if hasattr(self, 'drr_pn_background_btn'):
+            self.drr_pn_background_btn.setEnabled(external and bool(self.current_folder))
+        if hasattr(self, 'drr_background_regions_btn'):
+            self.drr_background_regions_btn.setEnabled(
+                external and not pending and bool(self.drr_selected_files)
+                and bool(self.drr_baseline_files_manual)
+                and not any(data_io.is_xlsx_map_file(name) for name in self.drr_selected_files))
         self.drr_baseline_autofind_btn.setEnabled(external)
+        self.drr_auto_match_btn.setEnabled(
+            external and not pending and bool(self.current_folder) and bool(self.drr_selected_files)
+            and not any(data_io.is_xlsx_map_file(name) for name in self.drr_selected_files))
         self.drr_baseline_combine_combo.setEnabled(external and not automatic and not pending)
         self.drr_pin_baseline_chk.setEnabled(external and not automatic and not pending)
+        from ui_qt.drr_bn_workflow import update_bn_controls
+        update_bn_controls(self._owner)
+        from ui_qt.drr_bn_group_choice import refresh_group_choices
+        refresh_group_choices(self._owner)
     def _edit_drr_measurements(self) -> None:
         previous = list(self.drr_selected_files)
         selected = self._open_drr_source_dialog(
@@ -1159,8 +1325,8 @@ class DrrController:
         if measurement_changed:
             self._cancel_auto_external()
         external_requested = self.drr_baseline_combo.currentText() == 'External'
-        resolution = None
         if measurement_changed and not self.drr_pin_baseline_chk.isChecked():
+            self._drr_background_regions = ()
             self._drr_assignments = ()
             self._drr_assignments_automatic = False
             self._drr_baseline_user_selected = False
@@ -1172,11 +1338,6 @@ class DrrController:
                 self._clear_loaded_drr_view()
                 self._start_auto_external()
                 return
-            if self.drr_baseline_combo.currentText() != 'Fitted (sample)':
-                resolution = resolve_drr_background_assignments(
-                    self.current_folder, self.drr_available_sources, selected,
-                )
-                self._restore_saved_drr_recipe(resolution)
         self._update_drr_selection_labels()
         if measurement_changed:
             self._clear_loaded_drr_view()
@@ -1190,7 +1351,7 @@ class DrrController:
             )
             return
         if self.drr_selected_files:
-            self._start_load("DRR", drr_resolution=resolution)
+            self._start_load("DRR")
     def _clear_drr_measurements(self) -> None:
         self._cancel_auto_external()
         self.drr_selected_files = []
@@ -1200,34 +1361,96 @@ class DrrController:
         self.drr_baseline_combine_combo.setEnabled(True)
         self.drr_pin_baseline_chk.setEnabled(True)
         if not self.drr_pin_baseline_chk.isChecked():
+            self._drr_background_regions = ()
             self.drr_baseline_files_manual = []
         self._update_drr_selection_labels()
         self._clear_loaded_drr_view()
         self._set_stage("No DRR measurement")
         self._update_action_states()
     def _edit_drr_baselines_dialog(self) -> None:
+        from ui_qt.drr_pn_workflow import _context
+        if not self.current_folder:
+            self._show_error("Open an experiment folder before selecting a background.")
+            return
         self._cancel_auto_external()
-        self.drr_baseline_files_manual = self._open_drr_source_dialog(
-            title="Choose Historical or External Baseline",
-            selected=self.drr_baseline_files_manual,
-            baseline_mode=True,
-        )
-        self._drr_background_guess = None
-        self._drr_assignments = ()
-        self._drr_assignments_automatic = False
-        self.drr_baseline_combine_combo.setEnabled(True)
-        self.drr_pin_baseline_chk.setEnabled(True)
-        if self.drr_baseline_files_manual:
+        context = _context(self._owner)
+        self._owner._drr_source_dialog_accepted = None
+        try:
+            selected = self._open_drr_source_dialog(
+                title="Choose Background Files",
+                selected=list(self.drr_baseline_files_manual),
+                baseline_mode=True,
+            )
+            if self._owner._drr_source_dialog_accepted is False:
+                return
+            if getattr(self._owner, "_is_closing", False) or _context(self._owner) != context:
+                self._status("Background was not applied because the current selection changed.")
+                return
+            if not selected:
+                self._clear_drr_baselines()
+                return
+            # Validate before replacing an existing recipe. Constant-gate
+            # repeats must agree; P/N generation has its own entry.
+            assessment = assess_background_gate_files(self.current_folder, selected)
+            if (assessment.all_constant and len(assessment.profiles) > 1
+                    and not assessment.same_constant_values):
+                self._show_error("Selected backgrounds have different constant gate values. "
+                                 "Choose files from one gate condition.")
+                return
+            from ui_qt.drr_bn_workflow import forget_bn_choice
+            forget_bn_choice(self._owner)
+            self.drr_baseline_files_manual = list(selected)
+            self.drr_baseline_files_found = []
+            self._drr_background_regions = ()
+            self._drr_assignments = ()
+            self._drr_assignments_automatic = False
+            self._drr_baseline_user_selected = True
+            self._drr_background_guess = None
             blocked = self.drr_baseline_combo.blockSignals(True)
             self.drr_baseline_combo.setCurrentText("External")
             self.drr_baseline_combo.blockSignals(blocked)
-        self._update_drr_selection_labels()
-        if not self._apply_drr_background_gate_default():
-            return
-        if self.drr_selected_files and self.drr_baseline_files_manual:
-            self._start_load("DRR")
+            self._apply_drr_background_gate_default(assessment)
+            self._update_drr_selection_labels()
+            if self.drr_selected_files:
+                self._start_load("DRR")
+        finally:
+            self._update_drr_baseline_controls()
+            self.drr_edit_baselines_btn.setFocus()
+
+    def _edit_drr_background_settings(self, *, initial_kind=None) -> None:
+        from ui_qt.drr_background_settings_workflow import edit_settings
+        edit_settings(self._owner, initial_kind=initial_kind)
+
+    def _edit_drr_background_regions(self) -> None:
+        from ui_qt.drr_background_workspace_workflow import edit_background_workspace
+        edit_background_workspace(self._owner, initial_page="edit")
+
+    def _edit_drr_composite_background(self) -> None:
+        from ui_qt.drr_background_workspace_workflow import edit_background_workspace
+        edit_background_workspace(self._owner, initial_page="edit")
+
+    def _edit_drr_pn_background(self) -> None:
+        from ui_qt.drr_background_workspace_workflow import edit_background_workspace
+        edit_background_workspace(self._owner)
+
+    def _edit_drr_bn_calibration(self) -> None:
+        from ui_qt.drr_bn_workflow import edit_bn_calibration
+        edit_bn_calibration(self._owner)
+
+    def _on_drr_bn_auto_toggled(self, enabled) -> None:
+        from ui_qt.drr_bn_workflow import auto_toggled
+        self.settings.setValue('drr/bn_auto_compare', bool(enabled))
+        auto_toggled(self._owner, enabled)
+
+    def _auto_match_drr_backgrounds(self) -> None:
+        """Compatibility entry: matching is now a reviewable settings draft."""
+        self._edit_drr_background_settings(initial_kind='bn')
+
     def _clear_drr_baselines(self) -> None:
         self._cancel_auto_external()
+        from ui_qt.drr_bn_workflow import forget_bn_choice
+        forget_bn_choice(self._owner)
+        self._drr_background_regions = ()
         self.drr_baseline_files_manual = []
         self.drr_baseline_files_found = []
         self._drr_assignments = ()
@@ -1242,6 +1465,13 @@ class DrrController:
                 "External background cleared. Select a background before processing."
             )
     def _on_drr_pin_baseline_toggled(self, checked: bool) -> None:
+        from ui_qt.drr_bn_workflow import managed_background
+        if checked and managed_background(self._owner):
+            blocked = self.drr_pin_baseline_chk.blockSignals(True)
+            self.drr_pin_baseline_chk.setChecked(False)
+            self.drr_pin_baseline_chk.blockSignals(blocked)
+            self._status('A calibrated BN belongs to one exact group and cannot be pinned to another group.')
+            return
         if checked and self._drr_assignments_automatic:
             blocked = self.drr_pin_baseline_chk.blockSignals(True)
             self.drr_pin_baseline_chk.setChecked(False)
@@ -1263,8 +1493,12 @@ class DrrController:
         title: str,
         selected: List[str],
         baseline_mode: bool,
+        independent_background: bool = False,
+        background_role: str | None = None,
     ) -> List[str]:
         """Browse all DRR history while keeping files organized by group."""
+        if background_role not in (None, 'P', 'N', 'BN'):
+            raise ValueError('Background role must be P, N or BN.')
         dlg = QDialog(self._owner)
         dlg.setWindowTitle(title)
         if not self.windowIcon().isNull():
@@ -1274,6 +1508,11 @@ class DrrController:
         layout = QVBoxLayout(dlg)
 
         hint_text = (
+            "BN references only; same angle first, then other known conditions and newest modification time. "
+            "Unknown angles follow; different angles remain available for manual selection."
+            if background_role == 'BN' else
+            f"{background_role} references only; closest known measurement conditions first, then newest file modification time."
+            if background_role else
             "Background history includes earlier measurement groups; select any compatible file or group."
             if baseline_mode
             else "All matching measurement groups are shown, newest first. Search to find a session or file."
@@ -1318,6 +1557,11 @@ class DrrController:
         filters_btn.setToolTip(hint_text)
         filter_row.addWidget(filters_btn)
         layout.addLayout(filter_row)
+        if background_role == 'BN':
+            bn_hint = QLabel(hint_text)
+            bn_hint.setObjectName('drr_bn_picker_order_hint')
+            bn_hint.setWordWrap(True)
+            layout.addWidget(bn_hint)
 
         type_row = QHBoxLayout()
         type_row.addWidget(QLabel("Data type"))
@@ -1325,7 +1569,7 @@ class DrrController:
         type_combo.setObjectName("drr_source_type_combo")
         type_combo.addItem("REF", "REF")
         type_combo.addItem("All data", "All")
-        type_combo.setCurrentIndex(1 if getattr(self._owner, "_drr_include_all_sources", False) else 0)
+        type_combo.setCurrentIndex(1 if independent_background or getattr(self._owner, "_drr_include_all_sources", False) else 0)
         type_combo.setToolTip("Filter files by PL source marker. All data includes PL, REF, and Unknown.")
         type_row.addWidget(type_combo)
         type_container = QWidget()
@@ -1450,7 +1694,9 @@ class DrrController:
         def _source_kind(source) -> str:
             source_path = source.source if hasattr(source, "source") else str(source)
             if source_path not in source_kind_cache:
-                source_kind_cache[source_path] = data_io.classify_pl_source(source_path)
+                source_kind_cache[source_path] = (
+                    'REF' if getattr(source, 'classification_reason', '') == 'saved composite background'
+                    else data_io.classify_pl_source(source_path))
             return source_kind_cache[source_path]
 
         def _source_label(source) -> str:
@@ -1490,13 +1736,46 @@ class DrrController:
 
         baseline_recommendations = {}
         catalog_by_path = {}
+        catalog_by_absolute_path = {}
         catalog_peers = {}
         file_rows_cache = {}
         group_rows_cache = {}
         session_summaries = {}
         chosen_paths = set()
+        source_root = str(Path(self.current_folder or '.').resolve()) if background_role else ''
+        absolute_source_keys = {}
+
+        def _absolute_source_key(source):
+            # Resolve the experiment directory once, so Windows short names
+            # and Browse's long paths share the same cached grid evidence.
+            # Relative catalog entries remain lexical; absolute selections
+            # are resolved once per dialog, never on every row refresh.
+            source = str(source)
+            if source not in absolute_source_keys:
+                path = Path(source)
+                absolute = path.resolve() if path.is_absolute() else Path(source_root) / path
+                absolute_source_keys[source] = os.path.normcase(os.path.abspath(absolute))
+            return absolute_source_keys[source]
 
         def _baseline_measurements():
+            if independent_background and not background_role:
+                return ()
+            if background_role == 'BN':
+                # A failed match or an inventory preview can lack grid metadata.
+                # Preserve every selected filename's angle until the catalog
+                # worker supplies the rest; never read CSV headers here.
+                measurements = []
+                missing = []
+                for name in self.drr_selected_files:
+                    source = catalog_by_absolute_path.get(_absolute_source_key(name))
+                    if source is None:
+                        missing.append(name)
+                        source = DrrSource(name, Path(name).name, '', '', 0., False)
+                    measurements.append(source)
+                if missing:
+                    self._queue_drr_catalog_refresh(auto=True, old_source_files=set(missing),
+                                                   selected_sources=tuple(self.drr_selected_files))
+                return tuple(measurements)
             selected_paths = {str(path) for path in self.drr_selected_files}
             catalog_measurements = tuple(
                 source for source in self.drr_available_sources
@@ -1526,7 +1805,8 @@ class DrrController:
         self._owner._drr_picker_presentations = presentations
 
         def _catalog_signature():
-            return (str(self.current_folder).casefold(), baseline_mode,
+            return (str(self.current_folder).casefold(), baseline_mode, independent_background,
+                    background_role,
                     tuple(self.drr_available_sources), type_combo.currentData(),
                     tuple(self.drr_selected_files) if baseline_mode else (),
                     # Equal styled palettes may have distinct Qt cache keys.
@@ -1536,12 +1816,13 @@ class DrrController:
 
         def _catalog_groups():
             nonlocal baseline_recommendations, catalog_signature
-            nonlocal catalog_by_path, catalog_peers, file_rows_cache, group_rows_cache, source_kind_cache, session_summaries
+            nonlocal catalog_by_path, catalog_by_absolute_path, catalog_peers, file_rows_cache, group_rows_cache, source_kind_cache, session_summaries
             catalog_signature = _catalog_signature()
             for index, cached in enumerate(presentations):
                 if cached['signature'] == catalog_signature:
                     presentations.append(presentations.pop(index))
                     catalog_by_path, catalog_peers = cached['paths'], cached['peers']
+                    catalog_by_absolute_path = cached['absolute_paths']
                     file_rows_cache, group_rows_cache = cached['files'], cached['rows']
                     source_kind_cache = cached['kinds']
                     session_summaries = cached['summaries']
@@ -1549,11 +1830,13 @@ class DrrController:
                     return cached['groups']
             # One index per publication/filter rebuild; selecting a group or
             # adding its members must not rescan the complete catalog.
-            catalog_by_path, catalog_peers = {}, {}
+            catalog_by_path, catalog_by_absolute_path, catalog_peers = {}, {}, {}
             file_rows_cache, group_rows_cache = {}, {}
             source_kind_cache = {}
             for source in self.drr_available_sources:
                 catalog_by_path[source.source] = source
+                if background_role:
+                    catalog_by_absolute_path[_absolute_source_key(source.source)] = source
                 catalog_peers.setdefault(source.group_key, []).append(source)
             catalog_sources = (
                 [
@@ -1564,15 +1847,33 @@ class DrrController:
                 if baseline_mode
                 else self.drr_available_sources
             )
-            if baseline_mode:
+            baseline_recommendations = {}
+            if background_role == 'BN':
+                from core.drr_measured_bn import is_measured_bn_name
+                catalog_sources = [source for source in catalog_sources
+                                   if is_measured_bn_name(source.filename)]
+            elif background_role:
+                from core.drr_pn_selection import build_pn_source_catalog
+                # Reuse catalog role evidence without imposing the composite
+                # reconstruction's frame-count requirements on direct averaging.
+                catalog_sources = [entry.source for entry in build_pn_source_catalog(
+                    catalog_sources, _baseline_measurements()) if entry.role == background_role]
+            if baseline_mode and (not independent_background or background_role):
                 all_csv = tuple(catalog_sources)
-                baseline_recommendations = candidate_recommendation_map(
-                    _baseline_measurements(), all_csv
-                )
-                catalog_sources = [
-                    source for source in all_csv
-                    if source.source in baseline_recommendations
-                ]
+                if background_role == 'BN':
+                    from core.drr_bn_candidates import rank_bn_candidates
+                    baseline_recommendations = {item.source.source: item for item in
+                        rank_bn_candidates(_baseline_measurements(), all_csv)}
+                else:
+                    rank_options = {'prefer_named_backgrounds': False} if background_role else {}
+                    baseline_recommendations = candidate_recommendation_map(
+                        _baseline_measurements(), all_csv, **rank_options
+                    )
+                if not background_role:
+                    catalog_sources = [
+                        source for source in all_csv
+                        if source.source in baseline_recommendations
+                    ]
             selected_type = str(type_combo.currentData() or "REF")
             if selected_type != "All":
                 catalog_sources = [
@@ -1588,6 +1889,8 @@ class DrrController:
                             group.files,
                             key=lambda source: (
                                 order.get(source.source, 10**9),
+                                (-source.modified_time if np.isfinite(source.modified_time)
+                                 and source.modified_time > 0 else float('inf')) if background_role else 0,
                                 source.filename.casefold(),
                             ),
                         )),
@@ -1602,6 +1905,7 @@ class DrrController:
             session_summaries = format_drr_session_summaries(result)
             if len(result) <= 2000:
                 presentations.append(dict(signature=catalog_signature, paths=catalog_by_path,
+                    absolute_paths=catalog_by_absolute_path,
                     peers=catalog_peers, files=file_rows_cache, rows=group_rows_cache,
                     kinds=source_kind_cache, recommendations=baseline_recommendations, groups=result,
                     summaries=session_summaries))
@@ -1620,7 +1924,23 @@ class DrrController:
 
         group_search_text = {group.key: _group_search_text(group) for group in groups}
 
+        def _path_matches_background_role(source: str) -> bool:
+            if not background_role:
+                return True
+            if background_role == 'BN':
+                from core.drr_measured_bn import is_measured_bn_name
+                return is_measured_bn_name(source)
+            from core.drr_pn_selection import pn_source_matches_role
+            cached_source = catalog_by_absolute_path.get(_absolute_source_key(source))
+            return pn_source_matches_role(cached_source or source, background_role)
+
         def _path_matches_selected_measurements(source: str) -> bool:
+            if background_role == 'BN':
+                from core.drr_bn_candidates import bn_grid_state
+                candidate = catalog_by_absolute_path.get(_absolute_source_key(source))
+                return bn_grid_state(_baseline_measurements(), candidate) != 2
+            if independent_background:
+                return True  # The composite editor checks the sources against each other.
             if source in baseline_recommendations:
                 return True
             measurements = _baseline_measurements()
@@ -1645,6 +1965,9 @@ class DrrController:
         def _add_chosen(source: str, *, allow_existing: bool = False) -> bool:
             if source in chosen_paths:
                 return True
+            if not _path_matches_background_role(source):
+                self._status(f"Not added: {Path(source).name} is not a {background_role} reference.")
+                return False
             incompatible = baseline_mode and not _path_matches_selected_measurements(source)
             if incompatible and not allow_existing:
                 self._status(
@@ -1795,7 +2118,10 @@ class DrrController:
                         source, group.files, peer_condition_values=peer_condition_values,
                     ).splitlines()
                     item = QListWidgetItem('\n'.join((
-                        source.filename, *file_summary[1:], _drr_source_aux(source))))
+                        source.filename,
+                        *(("; ".join(recommendation.reason.split('; ')[:2]),)
+                          if background_role == 'BN' and recommendation is not None else ()),
+                        *file_summary[1:], _drr_source_aux(source))))
                     item.setData(Qt.UserRole, source.source)
                     item.setData(Qt.UserRole + 4, source.source)
                     item.setData(Qt.UserRole + 5, True)
@@ -2171,6 +2497,12 @@ class DrrController:
                 group_detail.setText("Missing DRR source(s): " + ", ".join(missing))
                 details_btn.setChecked(True)
                 return
+            wrong_role = [path for path in paths if not _path_matches_background_role(path)]
+            if wrong_role:
+                group_detail.setText(f"Choose {background_role} references only: " + ", ".join(
+                    Path(path).name for path in wrong_role))
+                details_btn.setChecked(True)
+                return
             incompatible = [
                 path for path in paths
                 if baseline_mode and not _path_matches_selected_measurements(path)
@@ -2230,11 +2562,14 @@ class DrrController:
         validation_timer.start()
         try:
             if dlg.exec() != QDialog.Accepted:
+                self._owner._drr_source_dialog_accepted = False
                 return selected
-            return [
+            self._owner._drr_source_dialog_accepted = True
+            chosen = [
                 str(selected_list.item(index).data(Qt.UserRole) or selected_list.item(index).text())
                 for index in range(selected_list.count())
             ]
+            return chosen
         finally:
             # ``finished`` is not guaranteed by test doubles or unusual
             # dialog exits; always detach before widgets become unreachable.

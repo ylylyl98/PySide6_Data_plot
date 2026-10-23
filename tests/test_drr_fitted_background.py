@@ -69,7 +69,7 @@ class FittedBackgroundTests(unittest.TestCase):
             cancellation.cancel()
             estimate_background(synthetic()[0], SETTINGS)
 
-    def test_group_normalizes_each_file_before_average_and_exports_actual_denominators(self):
+    def test_group_fits_mean_raw_once_and_exports_its_actual_denominator(self):
         raw, _, _ = synthetic()
         altered = replace(raw, Z=3*raw.Z*(1+.04*np.exp(-.5*((raw.energy-1.6)/.005)**2)))
         with tempfile.TemporaryDirectory() as folder:
@@ -77,10 +77,16 @@ class FittedBackgroundTests(unittest.TestCase):
             write_csv(root/'a.csv', raw)
             write_csv(root/'b.csv', altered)
             result, references = load_fitted_group(folder, ['a.csv', 'b.csv'], asdict(SETTINGS), y_axis='bg')
-            expected = [estimate_background(cube, SETTINGS)[0].Z for cube in (raw, altered)]
-            np.testing.assert_allclose(result.Z, np.mean(expected, axis=0), atol=1e-10)
+            mean_raw = replace(raw, Z=(raw.Z+altered.Z)/2)
+            expected = estimate_background(mean_raw, SETTINGS)[0].Z
+            old_per_file_average = np.mean([estimate_background(cube, SETTINGS)[0].Z
+                                           for cube in (raw, altered)], axis=0)
+            np.testing.assert_allclose(result.Z, expected, atol=1e-10)
+            self.assertGreater(float(np.max(abs(result.Z-old_per_file_average))), .01)
+            self.assertEqual(len(references), 1)
             self.assertIn('BG', result.gate_coordinates)
             files = export_references(folder, references)
+            self.assertEqual(len(files), 1)
             for name, reference in zip(files, references):
                 exported = load_dat(root/name)
                 np.testing.assert_allclose(exported.Z, reference.background(), rtol=1e-11)
@@ -89,6 +95,7 @@ class FittedBackgroundTests(unittest.TestCase):
                 self.assertEqual(metadata['processing']['settings']['spline_intervals'], 8)
                 original = read_reference_raw(folder, reference, y_axis='bg')
                 self.assertEqual(original.Z.shape, exported.Z.shape)
+                np.testing.assert_allclose(original.Z, mean_raw.Z, rtol=1e-12)
             self.assertEqual(files, export_references(folder, references))
             (root/'a.csv').write_text('changed source', encoding='utf-8')
             with self.assertRaisesRegex(ValueError, 'changed after fitting'):
@@ -101,12 +108,12 @@ class FittedBackgroundTests(unittest.TestCase):
             write_csv(Path(folder)/'a.csv', raw)
             write_csv(Path(folder)/'b.csv', second)
             combined, _ = load_fitted_group(folder, ['a.csv', 'b.csv'], SETTINGS, y_axis='bg')
-            first_result = estimate_background(raw, SETTINGS)[0]
-            second_result = estimate_background(second, SETTINGS)[0]
-            np.testing.assert_allclose(combined.Z[0], first_result.Z[0], atol=1e-10)
-            np.testing.assert_allclose(combined.Z[1:], (first_result.Z[1:]+second_result.Z[:2])/2, atol=1e-10)
+            mean_raw = replace(raw, gate=np.array([0., 1.]), Z=(raw.Z[1:]+second.Z[:2])/2)
+            expected = estimate_background(mean_raw, SETTINGS)[0]
+            np.testing.assert_array_equal(combined.gate, [0., 1.])
+            np.testing.assert_allclose(combined.Z, expected.Z, atol=1e-10)
 
-    def test_group_reports_current_file_before_fitting_and_cache_reuse_afterwards(self):
+    def test_group_reports_raw_averaging_before_one_fit_and_cache_reuse_afterwards(self):
         raw, _, _ = synthetic()
         with tempfile.TemporaryDirectory() as folder, patch.dict(
                 'os.environ', DPTK_FITTED_CACHE_DIR=folder+'/cache'):
@@ -119,12 +126,42 @@ class FittedBackgroundTests(unittest.TestCase):
                 _, references = load_fitted_group(folder, ['a.csv', 'b.csv'], SETTINGS,
                     y_axis='bg', progress=progress, log=log)
                 self.assertEqual(events[0], ('progress', 0))
-                self.assertEqual(events[1], ('log', 'Fitting background 1/2: a.csv'))
-                self.assertEqual(events[3], ('progress', 45))
-                self.assertEqual(events[4], ('log', 'Fitting background 2/2: b.csv'))
+                averaging = [i for i, (kind, message) in enumerate(events)
+                             if kind == 'log' and message.startswith('Averaging raw intensity ')]
+                fitting = [i for i, (kind, message) in enumerate(events)
+                           if kind == 'log' and message.startswith('Fitting one background to average of 2 files')]
+                self.assertEqual(len(averaging), 2)
+                self.assertEqual(len(fitting), 1)
+                self.assertLess(max(averaging), fitting[0])
                 self.assertEqual(events[-1], ('progress', 90))
-                self.assertIn('cache reused' if cached else 'calculated', events[2][1])
-                self.assertEqual([ref.cache_hit for ref in references], [cached, cached])
+                completed = [message for kind, message in events
+                             if kind == 'log' and ('cache reused' if cached else 'calculated') in message]
+                self.assertTrue(completed)
+                self.assertEqual([ref.cache_hit for ref in references], [cached])
+
+    def test_single_file_reports_stages_before_expensive_fit_operations(self):
+        raw, _, _ = synthetic()
+        with tempfile.TemporaryDirectory() as folder, patch.dict(
+                'os.environ', DPTK_FITTED_CACHE_DIR=folder+'/cache'):
+            write_csv(Path(folder)/'a.csv', raw)
+            from core import drr_background_structure as structure
+            from core import drr_background_quality as quality
+            messages = []
+            def guarded_stage(function, expected):
+                def call(*args, **kwargs):
+                    self.assertIn(expected, messages[-1])
+                    return function(*args, **kwargs)
+                return call
+            with patch.object(structure, 'gate_anchor_masks', guarded_stage(
+                    structure.gate_anchor_masks, 'Identifying protected peaks')), patch.object(
+                    quality, 'inspect_background', guarded_stage(
+                        quality.inspect_background, 'Checking background quality')):
+                _, references = load_fitted_group(folder, ['a.csv'],
+                    replace(SETTINGS, automatic_protection=True), y_axis='bg', log=messages.append)
+            self.assertFalse(references[0].cache_hit)
+            stages = [message for message in messages if message.startswith('DRR load: ')]
+            self.assertGreaterEqual(len(stages), 6)
+            self.assertTrue(any('Checking fitted background cache' in message for message in stages))
 
     def test_cancelled_fitted_group_does_not_start_next_file_or_publish_completion(self):
         raw, _, _ = synthetic()
@@ -132,7 +169,7 @@ class FittedBackgroundTests(unittest.TestCase):
         events = []
         def log(message):
             events.append(message)
-            if message.startswith('Fitted background 1/2:'):
+            if message.startswith('Averaging raw intensity 1/2'):
                 cancellation.cancel()
         with tempfile.TemporaryDirectory() as folder, patch.dict(
                 'os.environ', DPTK_FITTED_CACHE_DIR=folder+'/cache'):
@@ -140,7 +177,8 @@ class FittedBackgroundTests(unittest.TestCase):
             write_csv(Path(folder)/'b.csv', raw)
             with load_scope(cancellation), self.assertRaises(LoadCancelled):
                 load_fitted_group(folder, ['a.csv', 'b.csv'], SETTINGS, y_axis='bg', log=log)
-        self.assertFalse(any('2/2' in message for message in events))
+        self.assertFalse(any(message.startswith('Averaging raw intensity 2/2') for message in events))
+        self.assertFalse(any(message.startswith('Fitting one background') for message in events))
 
 
 if __name__ == '__main__':

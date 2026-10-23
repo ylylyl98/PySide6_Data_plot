@@ -68,6 +68,39 @@ class RawPreviewTests(unittest.TestCase):
         np.testing.assert_allclose(result.Z, [[1,11,16.5],[4,27.5,33]])
         np.testing.assert_allclose(a.Z, [[1,2,3],[4,5,6]])
 
+    def test_fitted_average_matches_common_support_and_keeps_single_source_view(self):
+        from core.loader import DataCube
+        from core.drr_fitted_background import load_intensity
+        from tests.test_drr_fitted_background import write_csv
+        api = self.api()
+        for name, energy, gate, gain in (
+                ('a.csv', np.linspace(1.4, 2., 101), np.array([-2., -1., 0., 1., 2.]), 1.),
+                ('b.csv', np.linspace(1.45, 1.95, 81), np.array([-1.5, -.5, .5, 1.5]), 3.)):
+            values = gain*(10000+2000*energy+gate[:, None]*(100+30*energy))
+            write_csv(self.root/name, DataCube(energy, gate, values, 'BG (V)', name, 'counts'))
+        first = load_intensity(self.root, 'a.csv', y_axis='bg')
+        second = load_intensity(self.root, 'b.csv', y_axis='bg')
+        self.loaded.drr_baseline_text = 'Fitted (sample)'
+        self.loaded.cube = SimpleNamespace(drr_numerical_path='fitted_raw_average')
+        snapshot = api.snapshot_from_loaded(self.loaded)
+        mean = api.load_preview(snapshot, 'measurement', 'average')
+        e_mask = (first.energy >= second.energy.min()) & (first.energy <= second.energy.max())
+        g_mask = (first.gate >= second.gate.min()) & (first.gate <= second.gate.max())
+        energy, gate = first.energy[e_mask], first.gate[g_mask]
+        aligned = np.array([np.interp(energy, second.energy, row) for row in second.Z])
+        aligned = np.array([np.interp(gate, second.gate, row) for row in aligned.T]).T
+        np.testing.assert_array_equal(mean.cube.energy, energy)
+        np.testing.assert_array_equal(mean.cube.gate, gate)
+        np.testing.assert_allclose(mean.cube.Z, (first.Z[np.ix_(g_mask, e_mask)]+aligned)/2, atol=1e-10)
+        self.assertIn('used to fit one background', mean.description)
+        single = api.load_preview(snapshot, 'measurement', 'single', 'a.csv')
+        np.testing.assert_array_equal(single.cube.energy, first.energy)
+        np.testing.assert_array_equal(single.cube.gate, first.gate)
+        np.testing.assert_array_equal(single.cube.Z, first.Z)
+        (self.root/'b.csv').unlink()
+        with self.assertRaises(OSError):
+            api.load_preview(snapshot, 'measurement', 'average')
+
     def test_common_self_reference_selects_frame_after_gate_alignment(self):
         api = self.api()
         (self.root / 'b.csv').write_text('Vbg_set,Vtg_set,Vbias_set,620,1000,1240\n'

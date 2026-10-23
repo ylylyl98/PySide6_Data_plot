@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from functools import lru_cache
+from dataclasses import dataclass, field, replace
+from collections import OrderedDict
+from contextvars import ContextVar
+from functools import lru_cache, wraps
 import json
 from pathlib import Path
 from typing import Any, Optional, Sequence, Tuple
@@ -46,6 +48,7 @@ class DataCube:
     gate_unit: str = ""
     y_axis_semantic: str = ""
     gate_coordinates: dict[str, np.ndarray] = field(default_factory=dict)
+    drr_background_boundaries: tuple[float, ...] = ()
 
 
 def _dat_sidecar_candidates(path: Path) -> tuple[Path, ...]:
@@ -65,6 +68,25 @@ def _load_dat_sidecar(path: Path) -> dict:
             return {}
         return value if isinstance(value, dict) else {}
     return {}
+
+
+def _dat_background_boundaries(processing: dict, energy: np.ndarray) -> tuple[float, ...]:
+    """Restore explicit seams without silently discarding invalid metadata."""
+    if "background_boundaries_ev" not in processing:
+        return ()
+    values = processing["background_boundaries_ev"]
+    if (not isinstance(values, list)
+            or any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values)):
+        raise ValueError("DAT background boundaries must be a list of numeric energies.")
+    boundaries = np.asarray(values, dtype=float)
+    if not np.isfinite(boundaries).all() or np.any(np.diff(boundaries) <= 0):
+        raise ValueError("DAT background boundaries must be finite and strictly increasing.")
+    if boundaries.size:
+        if not np.isfinite(energy).all() or np.unique(energy).size != energy.size:
+            raise ValueError("DAT background boundaries require finite, distinct energy coordinates.")
+        if np.any(boundaries <= np.min(energy)) or np.any(boundaries >= np.max(energy)):
+            raise ValueError("DAT background boundaries must lie strictly inside the energy range.")
+    return tuple(float(value) for value in boundaries)
 
 
 def resolve_dat_y_axis(choice: str, *, custom_label: str = "", custom_unit: str = "") -> tuple[str, str, str]:
@@ -141,6 +163,7 @@ def load_dat(path: str | Path) -> DataCube:
         cbar_label=str(plot.get("cbar_label", mode or "Imported DAT")),
         gate_unit=str(sidecar_unit or ""),
         y_axis_semantic=str(sidecar_semantic or ""),
+        drr_background_boundaries=_dat_background_boundaries(processing, energy),
     )
     cube.plot_metadata = plot
     cube.import_metadata = metadata
@@ -372,6 +395,98 @@ def load_xlsx_map(
     )
 
 
+_DRR_BASELINE_REUSE: ContextVar[OrderedDict | None] = ContextVar('drr_baseline_reuse', default=None)
+_DRR_BASELINE_BUDGET = 16 * 1024 * 1024
+
+
+def _baseline_signatures(user_folder, files):
+    from core.drr_composite_background import composite_metadata_signature
+    signatures = []
+    try:
+        for name in files:
+            path = _source_path(user_folder, name)
+            signature = composite_metadata_signature(path)
+            if (not _reliable_background_signature(signature[:3])
+                    or (signature[2] and not _reliable_background_signature(signature[3]))):
+                return None
+            signatures.append((path, signature))
+    except OSError:
+        return None  # Let the normal loader report missing/unreadable sources.
+    return tuple(signatures)
+
+
+def _reliable_background_signature(value):
+    if value is None:
+        return False
+    return all(_reliable_background_signature(item) for item in value) if isinstance(value, (tuple, list)) else True
+
+
+def _background_source_boundaries(user_folder, file_name):
+    """Read frozen composite seams; never resolve the original component files."""
+    from core.drr_composite_background import composite_background_boundaries
+    check_load_cancelled()
+    path = _source_path(user_folder, file_name)
+    cache = _DRR_BASELINE_REUSE.get()
+    signature = _baseline_signatures(user_folder, (file_name,)) if cache is not None else None
+    key = ('composite_boundaries', path, signature)
+    if cache is not None and signature is not None and key in cache:
+        cache.move_to_end(key)
+        return cache[key][0]
+    boundaries = tuple(composite_background_boundaries(path))
+    check_load_cancelled()
+    if cache is not None and signature is not None and signature == _baseline_signatures(user_folder, (file_name,)):
+        _remember_baseline(cache, key, boundaries, max(64, len(boundaries) * 24))
+    return boundaries
+
+
+def has_composite_background(user_folder, files):
+    from core.drr_composite_background import is_composite_background
+    return any(is_composite_background(_source_path(user_folder, name)) for name in files)
+
+
+def effective_background_boundaries(user_folder, assignment, energy):
+    """Combine recipe switches with source seams only where that source is used."""
+    if assignment.baseline_mode != "External":
+        return ()
+    from core.drr_background_regions import background_boundaries
+    result = set(background_boundaries(assignment, energy))
+    minimum, maximum = float(np.min(energy)), float(np.max(energy))
+    for source in assignment.baseline_source_files:
+        for boundary in _background_source_boundaries(user_folder, source):
+            if not minimum < boundary < maximum:
+                continue
+            # At a recipe endpoint the explicit switch is already accounted
+            # for above. An inherited seam matters only if this source still
+            # contributes immediately on both sides (including equal recipes).
+            left = next((r.baseline_files for r in assignment.regions
+                         if r.xmin_ev < boundary <= r.xmax_ev), assignment.baseline_files)
+            right = next((r.baseline_files for r in assignment.regions
+                          if r.xmin_ev <= boundary < r.xmax_ev), assignment.baseline_files)
+            if source in left and source in right:
+                result.add(float(boundary))
+    return tuple(sorted(result))
+
+
+def _remember_baseline(cache, key, value, size):
+    if cache is None or size > _DRR_BASELINE_BUDGET:
+        return
+    while cache and (len(cache) >= 64 or size + sum(entry[1] for entry in cache.values())
+                     > _DRR_BASELINE_BUDGET):
+        cache.popitem(last=False)
+    cache[key] = (value, size)
+
+
+def _reuse_drr_baselines(function):
+    @wraps(function)
+    def load(*args, **kwargs):
+        token = _DRR_BASELINE_REUSE.set(OrderedDict())
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _DRR_BASELINE_REUSE.reset(token)
+    return load
+
+
 def build_external_baseline(user_folder: str, files: Sequence[str], *, which: str = "last") -> dict:
     """
     Returns dict with keys: energy, I0
@@ -402,13 +517,27 @@ def build_external_baseline(user_folder: str, files: Sequence[str], *, which: st
     if w not in ("first", "last", "all"):
         raise ValueError(f"Unknown which='{which}'. Use 'first', 'last', or 'all'.")
 
+    check_load_cancelled()
+    for name in files:
+        _background_source_boundaries(user_folder, name)
+    cache = _DRR_BASELINE_REUSE.get()
+    signature = _baseline_signatures(user_folder, files) if cache is not None else None
+    key = ('aggregate', signature, w)
+    if cache is not None and signature is not None and key in cache:
+        cache.move_to_end(key)
+        return {name: array.copy() for name, array in cache[key][0].items()}
     energy, I0 = P.build_external_baseline_avg(
         user_folder=user_folder,
         files_zero=list(files),
         which=w,
         save_npz=None,
     )
-    return {"energy": np.asarray(energy, dtype=float).copy(), "I0": np.asarray(I0, dtype=float).copy()}
+    result = {"energy": np.asarray(energy, dtype=float).copy(), "I0": np.asarray(I0, dtype=float).copy()}
+    check_load_cancelled()
+    if cache is not None and signature is not None and signature == _baseline_signatures(user_folder, files):
+        _remember_baseline(cache, key, {name: array.copy() for name, array in result.items()},
+                           sum(array.nbytes for array in result.values()))
+    return result
 
 
 def load_drr_avg(
@@ -524,6 +653,24 @@ def _wavelength_center_nm(energy: np.ndarray) -> float:
 def _native_external_baseline(
     user_folder: str, assignment: DrrMeasurementAssignment, measurement_energy: np.ndarray, *, y_axis: str
 ) -> np.ndarray:
+    check_load_cancelled()
+    cache = _DRR_BASELINE_REUSE.get()
+    signature = _baseline_signatures(user_folder, assignment.baseline_files) if cache is not None else None
+    axis = np.asarray(measurement_energy, dtype=float).ravel()
+    key = ('native', signature, assignment.baseline_which, y_axis, axis.tobytes())
+    if cache is not None and signature is not None and key in cache:
+        cache.move_to_end(key)
+        return cache[key][0].copy()
+    result = _native_external_baseline_uncached(user_folder, assignment, measurement_energy, y_axis=y_axis)
+    check_load_cancelled()
+    if cache is not None and signature is not None and signature == _baseline_signatures(user_folder, assignment.baseline_files):
+        _remember_baseline(cache, key, result.copy(), result.nbytes + axis.nbytes)
+    return result
+
+
+def _native_external_baseline_uncached(
+    user_folder: str, assignment: DrrMeasurementAssignment, measurement_energy: np.ndarray, *, y_axis: str
+) -> np.ndarray:
     # Preserve the established recipe order: each source contributes one
     # frame vector, sources are aligned to the first baseline grid and then
     # averaged.  Only the resulting baseline is aligned to the measurement.
@@ -537,6 +684,19 @@ def _native_external_baseline(
     baseline = build_external_baseline(
         user_folder, assignment.baseline_files, which=assignment.baseline_which
     )
+    if has_composite_background(user_folder, assignment.baseline_files):
+        target = np.asarray(measurement_energy, float)
+        source = np.asarray(baseline['energy'], float)
+        order, target_order = np.argsort(source, kind='stable'), np.argsort(target, kind='stable')
+        if (source.shape != target.shape or not np.allclose(source[order], target[target_order],
+                                                          rtol=1e-9, atol=1e-10)):
+            raise ValueError('Composite background requires the exact measurement energy grid.')
+        # A frozen reference may deliberately contain missing samples. On its
+        # validated grid preserve them; interpolation/coverage thresholds would
+        # change the saved background when it is selected again.
+        aligned = np.empty_like(np.asarray(baseline['I0'], float))
+        aligned[target_order] = np.asarray(baseline['I0'], float)[order]
+        return aligned
     measurement_center = _wavelength_center_nm(measurement_energy)
     baseline_center = _wavelength_center_nm(np.asarray(baseline["energy"], dtype=float))
     if (
@@ -560,6 +720,55 @@ def _native_external_baseline(
     return aligned
 
 
+def build_effective_background(
+    user_folder: str, assignment: DrrMeasurementAssignment, measurement_energy: np.ndarray,
+    *, y_axis: str = "auto",
+) -> np.ndarray:
+    """Build the actual external denominator, with optional energy overrides.
+
+    Every source must match the original acquisition grid. Region composition
+    happens before normalization, and never averages unrelated region recipes.
+    """
+    if assignment.baseline_mode != "External":
+        raise ValueError("An effective external background requires External DRR mode.")
+    if not assignment.regions:
+        return _native_external_baseline(user_folder, assignment, measurement_energy, y_axis=y_axis)
+    from core.data_io import _validate_drr_external_spectral_grids
+    from core.drr_background_regions import region_masks
+    masks = region_masks(measurement_energy, assignment.regions)
+    _validate_drr_external_spectral_grids(
+        user_folder, (assignment.measurement_file,), assignment.baseline_source_files)
+    vectors = {}
+    target_energy = np.asarray(measurement_energy, dtype=float)
+    target_order = np.argsort(target_energy, kind="stable")
+
+    def reference(files, which):
+        check_load_cancelled()
+        key = (files, which)
+        if key not in vectors:
+            baseline = build_external_baseline(user_folder, files, which=which)
+            source_energy = _validated_interp_axis(baseline["energy"], context="Regional background")
+            values = np.asarray(baseline["I0"], dtype=float)
+            source_order = np.argsort(source_energy, kind="stable")
+            if (source_energy.shape != target_energy.shape or values.shape != source_energy.shape
+                    or not np.allclose(source_energy[source_order], target_energy[target_order],
+                                       rtol=1e-9, atol=1e-10)):
+                raise ValueError("Regional background must use the measurement's exact energy grid.")
+            # Original acquisition grids were checked above. Reorder samples
+            # only: NaNs outside a region need no coverage and NaNs inside it
+            # must remain missing rather than being interpolated away.
+            aligned = np.empty_like(values)
+            aligned[target_order] = values[source_order]
+            vectors[key] = aligned
+        return vectors[key]
+
+    background = reference(assignment.baseline_files, assignment.baseline_which).copy()
+    for region, mask in zip(assignment.regions, masks):
+        background[mask] = reference(region.baseline_files, region.baseline_which)[mask]
+    return background
+
+
+@_reuse_drr_baselines
 def load_drr_resolved_avg(
     user_folder: str,
     files: Sequence[str],
@@ -581,6 +790,9 @@ def load_drr_resolved_avg(
     correction, with NaN outside coverage.
     """
     selected = tuple(str(item) for item in files)
+    from core.drr_bn_store import validate_bn_background_usage
+    validate_bn_background_usage(user_folder, selected, tuple(dict.fromkeys(
+        source for item in assignments for source in item.baseline_source_files)), y_axis=y_axis)
     by_measurement = {item.measurement_file: item for item in assignments}
     if (
         not selected
@@ -590,7 +802,14 @@ def load_drr_resolved_avg(
     ):
         raise ValueError("DRR assignments must contain exactly one entry per measurement file.")
     ordered = tuple(by_measurement[item] for item in selected)
-    common = all(item.baseline_mode == ordered[0].baseline_mode for item in ordered)
+    has_regions = any(item.regions for item in ordered)
+    has_composite = any(has_composite_background(user_folder, item.baseline_source_files)
+                        for item in ordered if item.baseline_mode == 'External')
+    if has_regions:
+        from core.data_io import _validate_drr_external_spectral_grids
+        _validate_drr_external_spectral_grids(user_folder, selected, tuple(dict.fromkeys(
+            source for item in ordered for source in item.baseline_source_files)))
+    common = not (has_regions or has_composite) and all(item.baseline_mode == ordered[0].baseline_mode for item in ordered)
     external_descriptors_same = all(
         item.baseline_files == ordered[0].baseline_files
         and item.baseline_which == ordered[0].baseline_which
@@ -640,6 +859,7 @@ def load_drr_resolved_avg(
         return cube
 
     effective_y_axis = P.resolve_shared_y_axis_request(selected, y_axis)
+    boundaries = set()
     for index, (name, assignment) in enumerate(zip(selected, ordered)):
         check_load_cancelled()
         data = P._load_canonical(user_folder, name, y_axis=effective_y_axis)
@@ -661,9 +881,10 @@ def load_drr_resolved_avg(
             raise ValueError(f"Measurement {name} data does not match its grid.")
         coordinates.add(gate, data.get('gate_coordinates', {}))
         if assignment.baseline_mode == "External":
-            baseline = _native_external_baseline(
+            baseline = build_effective_background(
                 user_folder, assignment, energy, y_axis=effective_y_axis
             )
+            boundaries.update(effective_background_boundaries(user_folder, assignment, energy))
             native = P._drr_from_Z(z, "external", baseline)
         else:
             native = P._drr_from_Z(
@@ -671,7 +892,8 @@ def load_drr_resolved_avg(
                 "first" if assignment.baseline_mode == "Self (first frame)" else "last",
                 None,
             )
-        if name != selected[0] or energy.shape != first_energy.shape or not np.array_equal(energy, first_energy):
+        energy_changed = energy.shape != first_energy.shape or not np.array_equal(energy, first_energy)
+        if energy_changed or (name != selected[0] and not (has_regions or has_composite)):
             native = _interp_rows_no_extrapolation(native, energy, first_energy, context=f"Measurement {name}")
         if gate.shape != first_gate.shape or not np.array_equal(gate, first_gate):
             native = _interp_rows_no_extrapolation(native.T, gate, first_gate, context=f"Measurement {name} gate").T
@@ -681,7 +903,7 @@ def load_drr_resolved_avg(
     check_load_cancelled()
     result = corrected_average.mean()
     del corrected_average
-    if derivative in (1, 2):
+    if derivative in (1, 2) and not (has_regions or boundaries):
         result = P.sg_derivative_origin_rows(
             result, first_energy, deriv=derivative,
             window_pts=dE_window_pts, polyorder=dE_polyorder,
@@ -694,7 +916,13 @@ def load_drr_resolved_avg(
         gate_label=gate_label, title=title,
         cbar_label="DR/R" if derivative is None else ("d(DR/R)/dE" if derivative == 1 else "d2(DR/R)/dE2"),
         gate_coordinates=coordinates.result(),
+        drr_background_boundaries=tuple(sorted(point for point in boundaries
+            if float(np.min(first_energy)) < point < float(np.max(first_energy)))),
     )
+    if derivative in (1, 2) and (has_regions or boundaries):
+        from core.processing import apply_sg_derivative_energy
+        cube, _ = apply_sg_derivative_energy(cube, derivative=derivative,
+                                           window_length=dE_window_pts, polyorder=dE_polyorder)
     cube.drr_numerical_path = "heterogeneous"
     cube.drr_assignments = tuple(item.to_dict() for item in ordered)
     return cube

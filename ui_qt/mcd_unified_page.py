@@ -949,25 +949,29 @@ class McdUnifiedView(QWidget):
             metric_key = "mean"
         key = (id(result), id(getattr(result, 'pair_mcd_corrected', None)),
                self.state.window_center_ev, self.state.window_width_mev, metric_key)
-        # Results may be revised in place; identity alone cannot validate a
-        # cached trace (nor slopes derived from that trace).
-        inputs = tuple(np.asarray(getattr(result, name)) for name in
-                       ('wavelength_nm', 'pair_mcd_corrected', 'pair_b', 'pair_labels')
-                       if hasattr(result, name))
+        from core.mcd import _pair_window_energy, pair_window_trace_by_branch
+        source = result
         if not hasattr(result, 'wavelength_nm'):
-            inputs += (np.asarray(result.energy_ev),)
+            import copy
+            source = copy.copy(result)
+            source.wavelength_nm = 1239.841984 / np.asarray(result.energy_ev, float)
+        order, energy = _pair_window_energy(source)
+        mask = np.abs(energy - key[2]) <= key[3] * 5e-4
+        if not np.any(mask):
+            mask[int(np.argmin(np.abs(energy - key[2])))] = True
+        # Detect in-place changes to every input that affects this trace, while
+        # avoiding a scan/copy of spectral columns outside the selected window.
+        inputs = (
+            np.asarray(source.wavelength_nm),
+            np.asarray(source.pair_mcd_corrected)[:, order[mask]],
+            np.asarray(source.pair_b), np.asarray(source.pair_labels),
+        )
         cached = self._window_trace_cache
         unchanged = (cached is not None and cached[0] == key and len(cached) == 3
                      and len(cached[2]) == len(inputs)
                      and all(np.array_equal(old, new, equal_nan=old.dtype.kind in 'fc')
                              for old, new in zip(cached[2], inputs)))
         if not unchanged:
-            from core.mcd import pair_window_trace_by_branch
-            source = result
-            if not hasattr(result, 'wavelength_nm'):
-                import copy
-                source = copy.copy(result)
-                source.wavelength_nm = 1239.841984 / np.asarray(result.energy_ev, float)
             traces = pair_window_trace_by_branch(source, key[2], key[3], metrics=(metric_key,), include_raw=False)
             self._window_trace_cache = (key, traces, tuple(array.copy() for array in inputs))
         return metric_key, self._window_trace_cache[1]

@@ -128,6 +128,14 @@ def inspect_background(cube, reference):
         warnings.append('Less than 35% of the spectrum supports the background.')
     if reference.diagnostics.get('shared_texture', {}).get('status') == 'Applied':
         warnings.append('Shared fine texture corrected outside protected peaks; inspect stationary weak features with correction off.')
+    periodic = reference.diagnostics.get('periodic_texture', {})
+    if reference.settings.periodic_texture and reference.settings.shared_texture:
+        if periodic.get('applied_fraction', 0) > 0:
+            warnings.append('Periodic predictions supplement shared texture only within validated coverage; '
+                            'compare protected peaks with prediction disabled.')
+        else:
+            warnings.append('Periodic prediction added no correction: '
+                            + str(periodic.get('reason') or periodic.get('status') or 'validation unavailable'))
     if float(np.max(rms)) > max(3., 6*report['noise_percent']):
         warnings.append('Large residual outside protection; inspect missing peaks or background shape.')
     if float(np.max(rms)) > max(1., 3*float(np.median(rms))):

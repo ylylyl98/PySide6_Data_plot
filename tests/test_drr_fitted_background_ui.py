@@ -107,31 +107,35 @@ class FittedBackgroundUiTests(unittest.TestCase):
 
     def test_restored_background_is_exact_and_never_refitted(self):
         _, references = load_fitted_group(self.root, ['sample.csv'], SETTINGS, y_axis='bg')
-        with patch('ui_qt.drr_background_dialog.fit_cached', side_effect=AssertionError('must not refit')):
+        with patch('ui_qt.drr_background_dialog.fit_prepared_group', side_effect=AssertionError('must not refit')):
             dialog = self.dialog(references=references, settings=None)
         self.assertIs(dialog.reference, references[0])
         np.testing.assert_array_equal(dialog.background, references[0].background())
 
-    def test_group_checks_file_only_suggestions_and_reusable_template(self):
+    def test_group_checks_average_suggestions_and_reusable_template(self):
         extra = self.raw.Z*(1+.25*np.exp(-.5*((self.raw.energy-1.70)/.004)**2))
         write_csv(self.root/'shifted.csv', replace(self.raw, Z=extra))
         store = QSettings(str(self.root/'templates.ini'), QSettings.IniFormat)
         dialog = self.dialog(files=['sample.csv', 'shifted.csv'], settings_store=store)
         self.assertIn('sample.csv', dialog.reports)  # Automatic raw screening on opening.
+        self.assertEqual(dialog.file_combo.count(), 1)
+        self.assertEqual(dialog.file_combo.currentText(), 'Average (2 files)')
+        self.assertFalse(dialog.file_only.isVisible())
+        np.testing.assert_allclose(dialog.raw.Z, (self.raw.Z+extra)/2)
         dialog.check_files()
-        self.wait(lambda: len(dialog.reports) == 2 and dialog.reference is not None and dialog.worker is None)
-        self.assertEqual(dialog.check_table.rowCount(), 2)
-        self.assertEqual(dialog.reports['shifted.csv']['report']['status'], 'Review')
-        dialog.file_combo.setCurrentIndex(1)
-        self.wait(lambda: dialog.reference is not None and dialog.worker is None)
+        self.wait(lambda: len(dialog.reports) == 1 and dialog.reference is not None and dialog.worker is None)
+        self.assertEqual(dialog.check_table.rowCount(), 1)
+        self.assertEqual(dialog.check_table.item(0, 0).text(), 'Average (2 files)')
+        self.assertEqual(dialog.reports['sample.csv']['report']['status'], 'Review')
+        self.assertEqual([item['source'] for item in dialog.reference.input_sources], ['sample.csv', 'shifted.csv'])
         self.assertTrue(dialog.suggest_button.isEnabled())
         original = dialog.base_regions_text
         dialog.add_suggestions()
-        self.assertTrue(dialog.file_only.isChecked())
-        self.assertEqual(dialog.base_regions_text, original)
+        self.assertFalse(dialog.file_only.isChecked())
+        self.assertNotEqual(dialog.base_regions_text, original)
         recipe = dialog.recipe()
-        self.assertEqual(set(recipe['protected_regions_by_file']), {'shifted.csv'})
-        self.assertTrue(any(lo <= 1.7 <= hi for lo, hi in recipe['protected_regions_by_file']['shifted.csv']))
+        self.assertNotIn('protected_regions_by_file', recipe)
+        self.assertTrue(any(lo <= 1.7 <= hi for lo, hi in recipe['protected_regions']))
         dialog.fit_preview()
         self.wait(lambda: dialog.reference is not None and dialog.worker is None)
         applied = []
@@ -153,7 +157,7 @@ class FittedBackgroundUiTests(unittest.TestCase):
         self.wait(lambda: dialog.comparison is not None and dialog.worker is None)
         self.assertEqual(dialog.method_combo.currentData(), 'spline')
         self.assertIsNotNone(dialog.alternate_line)
-        self.assertIn('Held-out anchor RMS', dialog.status.text())
+        self.assertIn('Envelope held-out RMS', dialog.status.text())
         dialog.view_combo.setCurrentIndex(1)
         self.assertEqual(len(dialog.ax.lines), 2)
         dialog.gate_spin.setValue(1)
@@ -165,7 +169,84 @@ class FittedBackgroundUiTests(unittest.TestCase):
         self.assertTrue(dialog.degree_spin.isEnabled())
         self.assertFalse(dialog.smoothing_spin.isEnabled())
 
-    def test_pending_group_check_cannot_overwrite_new_file_selection(self):
+    def test_average_preview_restores_one_exact_background_and_mean_raw(self):
+        second = replace(self.raw, Z=self.raw.Z*1.7 + 250)
+        write_csv(self.root/'second.csv', second)
+        expected, references = load_fitted_group(self.root, ['sample.csv', 'second.csv'], SETTINGS, y_axis='bg')
+        self.assertEqual(len(references), 1)
+        with patch('ui_qt.drr_background_dialog.fit_prepared_group', side_effect=AssertionError('Viewing must not refit')):
+            dialog = self.dialog(files=['sample.csv', 'second.csv'], references=references, settings=None)
+        self.assertIs(dialog.reference, references[0])
+        self.assertEqual(len(dialog.references), 1)
+        np.testing.assert_allclose(dialog.raw.Z, (self.raw.Z+second.Z)/2)
+        np.testing.assert_array_equal(dialog.background, references[0].background())
+        np.testing.assert_allclose(dialog.raw.Z/dialog.background-1, expected.Z, rtol=0, atol=1e-14)
+        np.testing.assert_array_equal(dialog.raw_line.get_ydata(), dialog.raw.Z[1])
+        self.assertEqual(dialog.apply_button.text(), 'Applied to DRR')
+        self.assertEqual(dialog.check_table.rowCount(), 1)
+
+    def test_average_comparison_uses_the_same_mean_raw_for_both_methods(self):
+        second = replace(self.raw, Z=self.raw.Z*(1+.15*np.sin(self.raw.energy*40)) + 200)
+        write_csv(self.root/'second.csv', second)
+        dialog = self.dialog(files=['sample.csv', 'second.csv'])
+        dialog.compare()
+        self.wait(lambda: dialog.comparison is not None and dialog.worker is None)
+        np.testing.assert_allclose(dialog.comparison['raw'].Z, (self.raw.Z+second.Z)/2)
+        for reference in (dialog.reference, dialog.comparison['alternate']):
+            self.assertEqual([item['source'] for item in reference.input_sources], ['sample.csv', 'second.csv'])
+        self.assertEqual(dialog.method_combo.currentData(), 'spline')
+        self.assertEqual(len(dialog.reports), 1)
+
+    def test_average_legacy_protection_union_is_visible_and_kept_in_template(self):
+        write_csv(self.root/'second.csv', self.raw)
+        recipe = {**asdict(SETTINGS), 'protected_regions_by_file': {'second.csv': ((1.68, 1.72),)}}
+        store = QSettings(str(self.root/'legacy.ini'), QSettings.IniFormat)
+        dialog = self.dialog(files=['sample.csv', 'second.csv'], settings=recipe, settings_store=store)
+        self.assertTrue(dialog.group_notice.isVisible())
+        self.assertIn('per-file protected regions were combined', dialog.group_notice.text())
+        self.assertEqual(dialog.settings().protected_regions, ((1.56, 1.64), (1.68, 1.72), (1.76, 1.84)))
+        self.assertFalse(dialog.override_texts)
+        self.assertNotIn('protected_regions_by_file', dialog.recipe())
+        dialog.save_template('Combined average protection')
+        saved = json.loads(store.value('drr/background-templates-v1'))['Combined average protection']
+        self.assertEqual(saved['protected_regions'], [[1.56, 1.64], [1.68, 1.72], [1.76, 1.84]])
+        automatic = {**recipe, 'automatic_protection': True}
+        dialog.restore_recipe(automatic)
+        self.assertIn('previous per-file overrides are not used', dialog.group_notice.text())
+        dialog.auto_protect.setChecked(False)
+        self.assertEqual(dialog.settings().protected_regions, ((1.56, 1.64), (1.68, 1.72), (1.76, 1.84)))
+
+    def test_legacy_individual_references_are_never_labeled_as_average_background(self):
+        write_csv(self.root/'second.csv', replace(self.raw, Z=self.raw.Z*2))
+        _, first = load_fitted_group(self.root, ['sample.csv'], SETTINGS, y_axis='bg')
+        _, second = load_fitted_group(self.root, ['second.csv'], SETTINGS, y_axis='bg')
+        for old_references in (first+second, first):
+            with patch('ui_qt.drr_background_dialog.fit_prepared_group', side_effect=AssertionError('Opening must not refit')):
+                dialog = self.dialog(files=['sample.csv', 'second.csv'], references=old_references, settings=None)
+            self.assertEqual(dialog.file_combo.currentText(), 'Average (2 files)')
+            self.assertIsNone(dialog.reference)
+            self.assertIsNone(dialog.background)
+            self.assertFalse(dialog.references)
+            self.assertFalse(dialog.apply_button.isEnabled())
+            self.assertIn('cannot be reused for the raw average', dialog.group_notice.text())
+            np.testing.assert_allclose(dialog.raw.Z, 1.5*self.raw.Z)
+
+    def test_invalid_legacy_group_protection_requires_explicit_edit_before_fit(self):
+        write_csv(self.root/'second.csv', self.raw)
+        recipe = {**asdict(SETTINGS), 'protected_regions_by_file': {'sample.csv': ((1.72, 1.68),)}}
+        dialog = self.dialog(files=['sample.csv', 'second.csv'], settings=recipe)
+        self.assertIn('Review previous per-file protection', dialog.group_notice.text())
+        dialog.fit_preview()
+        self.assertIsNone(dialog.worker)
+        self.assertIsNone(dialog.reference)
+        self.assertFalse(dialog.apply_button.isEnabled())
+        dialog.regions_edit.setText('1.56 1.64; 1.76 1.84')
+        self.assertFalse(dialog.group_recipe_error)
+        self.assertNotIn('protected_regions_by_file', dialog.recipe())
+        dialog.fit_preview()
+        self.wait(lambda: dialog.reference is not None and dialog.worker is None)
+
+    def test_pending_group_check_cannot_restore_invalidated_average_settings(self):
         write_csv(self.root/'second.csv', self.raw)
         dialog = self.dialog(files=['sample.csv', 'second.csv'])
         entered, release = Event(), Event()
@@ -177,12 +258,13 @@ class FittedBackgroundUiTests(unittest.TestCase):
         with patch('ui_qt.drr_background_dialog.check_group', side_effect=slow):
             dialog.check_files()
             self.wait(entered.is_set)
-            dialog.file_combo.setCurrentIndex(1)
+            dialog.smoothing_spin.setValue(.01)
             release.set()
             self.wait(lambda: dialog.worker is None and dialog.raw is not None)
-        self.assertEqual(dialog.file_combo.currentData(), 'second.csv')
+        self.assertEqual(dialog.file_combo.currentText(), 'Average (2 files)')
+        self.assertEqual(dialog.settings().smoothing, .01)
         self.assertIsNone(dialog.reference)
-        self.assertIn('second.csv', dialog.reports)
+        self.assertFalse(dialog.reports)
 
     def test_late_preview_cannot_restore_invalidated_or_closed_state(self):
         dialog = self.dialog()
@@ -268,7 +350,7 @@ class FittedBackgroundUiTests(unittest.TestCase):
             reference = loaded.drr_fitted_references[0]
             self.assertTrue(reference.settings.automatic_protection)
             self.assertTrue(reference.settings.protected_regions)
-            with patch('ui_qt.drr_background_dialog.fit_cached', side_effect=AssertionError('Viewing must not refit')):
+            with patch('ui_qt.drr_background_dialog.fit_prepared_group', side_effect=AssertionError('Viewing must not refit')):
                 window.drr_background_fit_btn.click()
                 dialog = window._drr_background_dialog
                 self.wait(lambda: dialog.reference is reference and dialog.worker is None)
@@ -304,13 +386,21 @@ class FittedBackgroundUiTests(unittest.TestCase):
             self.assertEqual(window._status_progress.value(), 45)
             self.assertEqual(window.data_state_label.text(), 'Fitting backgrounds… 45%')
             self.assertEqual(window.status_bar_view.currentMessage(), 'Fitting background 2/4: sample.csv')
+            worker.signals.log.emit('DRR load: Checking background quality · 2/4 · sample.csv')
+            self.assertEqual(window._status_progress.maximum(), 0)
+            self.assertEqual(window.data_state_label.text(), 'Checking background quality…')
+            self.assertEqual(window.status_bar_view.currentMessage(),
+                             'Checking background quality · 2/4 · sample.csv')
+            worker.signals.progress.emit(45)
             window._on_fitted_load_progress(replace(token, generation=token.generation+1), value=80)
             self.assertEqual(window._status_progress.value(), 45)
             window._active_load_cancel.cancel()
             worker.signals.progress.emit(80)
             worker.signals.log.emit('Fitting background 3/4: obsolete.csv')
+            worker.signals.log.emit('DRR load: Obsolete matching')
             self.assertEqual(window._status_progress.value(), 45)
-            self.assertEqual(window.status_bar_view.currentMessage(), 'Fitting background 2/4: sample.csv')
+            self.assertEqual(window.status_bar_view.currentMessage(),
+                             'Checking background quality · 2/4 · sample.csv')
             window._on_load_finished(request_token=token)
             worker.signals.progress.emit(90)
             self.assertEqual(window._status_progress.value(), 45)

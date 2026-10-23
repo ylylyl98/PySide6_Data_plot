@@ -39,6 +39,8 @@ def create_dataset(cube, name, provenance, settings=None):
         digest.update(array.tobytes())
         array.setflags(write=False)
     digest.update(str((cube.gate_label, cube.gate_unit, cube.y_axis_semantic)).encode('utf-8'))
+    if cube.drr_background_boundaries:
+        digest.update(str(tuple(cube.drr_background_boundaries)).encode('utf-8'))
     snapshot = replace(cube, energy=x, gate=y, Z=z)
     settings = settings or PeakAnalysisSettings(float(x.min()), float(x.max()), float(y.min()), float(y.max()))
     return AnalysisDataset(digest.hexdigest(), str(name), snapshot, provenance, replace(settings))

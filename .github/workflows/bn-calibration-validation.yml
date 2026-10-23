@@ -1,0 +1,44 @@
+name: BN calibration validation
+
+# Optional fitted-BN numerical qualification. Ordinary measured-BN matching,
+# assignment, persistence, and application remain in the required PR checks.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bn-calibration-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  numerical-validation:
+    name: BN calibration / ${{ matrix.module }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        module:
+          - test_drr_bn_calibration
+          - test_drr_bn_joint
+          - test_drr_bn_joint_independent
+          - test_drr_bn_d2_objective
+          - test_drr_bn_d2_priority_independent
+          - test_drr_bn_shrinkage
+          - test_drr_bn_shrinkage_independent
+          - test_drr_bn_derivative_protection
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install runtime dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+      - name: Run numerical qualification
+        run: python -m unittest -v tests.${{ matrix.module }}

@@ -529,7 +529,7 @@ def process_shg_sweep(
         raise ValueError("SHG peak gate needs at least two wavelength points.")
 
     background_reference: np.ndarray | None = None
-    if background is not None:
+    if background is not None and settings.background_method == "external":
         background_spectra = np.asarray(background.spectra, float)
         background_angles = np.asarray(background.measured_angle_deg, float)
         cleaned_background, _background_cosmic_mask = _remove_cosmic_ray_spikes(

@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -1324,8 +1325,16 @@ class SplitScaleControlTests(unittest.TestCase):
                 type(self.window.drr_controller),
                 "_open_drr_source_dialog",
                 return_value=[selected],
-            ), patch.object(self.window, "_start_load") as start_load:
+            ), patch.object(self.window.thread_pool, "start") as start_load:
                 self.window.drr_controller._edit_drr_measurements()
+                options = start_load.call_args.args[0].args[0]
+                self.assertTrue(options.drr_resolve_background)
+                self.assertEqual(self.window.drr_baseline_files_manual, [])
+                signals = SimpleNamespace(emit=lambda *_: None)
+                loaded = self.window._load_task(options, progress=signals, log=signals)
+                with patch.object(self.window, '_plot_mode'):
+                    self.window._on_loaded(loaded, request_token=self.window._active_load_token)
+                self.window._on_load_finished(request_token=self.window._active_load_token)
 
             self.assertEqual(self.window.drr_selected_files, [selected])
             self.assertEqual(
@@ -1338,10 +1347,8 @@ class SplitScaleControlTests(unittest.TestCase):
                 "Average all frames in each file, then average files",
             )
             start_load.assert_called_once()
-            self.assertEqual(start_load.call_args.args, ("DRR",))
-            resolution = start_load.call_args.kwargs["drr_resolution"]
-            self.assertEqual(resolution.assignments[0].baseline_files, ("Initial Data/sample_760nmc_back.csv",))
-            self.assertEqual(resolution.assignments[0].baseline_which, "all")
+            self.assertEqual(loaded.drr_assignments[0].baseline_files, ("Initial Data/sample_760nmc_back.csv",))
+            self.assertEqual(loaded.drr_assignments[0].baseline_which, "all")
 
     def test_constant_gate_background_selection_defaults_to_all_frames(self) -> None:
         with profile_phase("drr_filesystem_setup"), tempfile.TemporaryDirectory() as tmp:
@@ -1388,7 +1395,7 @@ class SplitScaleControlTests(unittest.TestCase):
         self.assertEqual(
             self.window.drr_baseline_files_manual, ["old_760nmc_back.csv"]
         )
-        start_load.assert_called_once_with("DRR", drr_resolution=None)
+        start_load.assert_called_once_with("DRR")
 
 
 class WindowLifecycleTests(unittest.TestCase):
