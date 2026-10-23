@@ -9,12 +9,17 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: fast-pr-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   quick-checks:
     name: quick-checks
     runs-on: windows-latest
-    # BN qualification reruns the full selector on injected weak features.
-    timeout-minutes: 60
+    timeout-minutes: 10
+    env:
+      QT_QPA_PLATFORM: offscreen
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -31,16 +36,8 @@ jobs:
           tests.test_dat_loader
           tests.test_loader
           tests.test_processing_derivative
-          tests.test_drr_bn_calibration
           tests.test_drr_bn_settings_compatibility
-          tests.test_drr_bn_joint
-          tests.test_drr_bn_joint_independent
-          tests.test_drr_bn_d2_objective
-          tests.test_drr_bn_d2_priority_independent
-          tests.test_drr_bn_shrinkage
-          tests.test_drr_bn_shrinkage_independent
           tests.test_drr_bn_fingerprint
-          tests.test_drr_bn_derivative_protection
           tests.test_drr_bn_store
           tests.test_drr_bn_integration
           tests.test_shg_fit
@@ -48,5 +45,23 @@ jobs:
           tests.test_compare_vp
           tests.test_colormaps
           tests.test_release_version
+      - name: Run BN background assignment regressions
+        run: >-
+          python -m unittest -v
+          tests.test_drr_measured_bn
+          tests.test_drr_bn_candidates
+          tests.test_drr_bn_matching
+          tests.test_drr_bn_batches
+          tests.test_drr_bn_match_request
+          tests.test_drr_bn_prepared_cache
+          tests.test_drr_bn_group_choice
+          tests.test_drr_bn_group_display
+          tests.test_drr_bn_group_selector_ui
+          tests.test_drr_bn_manual_entry
+          tests.test_drr_bn_manual_picker
+          tests.test_drr_background_settings
+          tests.test_drr_background_settings_workflow
+          tests.test_drr_background_entrypoints
+          tests.test_drr_auto_external
       - name: Run smoke check
         run: python scripts/smoke_check.py

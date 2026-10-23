@@ -1710,6 +1710,20 @@ calling those helpers directly is separate from the normal GUI workflow.
   `<file>.plotmeta.json`). Without a sidecar, safe generic labels are used.
 
 ## Smoke Check (No Test Framework Required)
+
+Pull requests to `main` run the required **quick-checks** workflow, with a
+10-minute time limit. It covers representative core behavior and the ordinary
+measured-BN workflow: candidate matching, batch assignments, manual selection,
+group overrides, background settings, saved recipes, and application guards.
+These checks do not run the expensive fitted-BN numerical qualification.
+
+When changing or using fitted-BN calibration, run **Actions → BN calibration
+validation → Run workflow** on the relevant branch. Its eight numerical test
+modules run in separate jobs, with up to four jobs in parallel. All existing
+numerical assertions and feature-protection thresholds are retained. This
+manual workflow is separate from the ordinary BN assignment PR gate; the
+Windows release workflow still runs the full test suite before packaging.
+
 Run:
 ```bash
 python scripts/smoke_check.py

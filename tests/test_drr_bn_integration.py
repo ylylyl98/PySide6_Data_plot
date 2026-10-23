@@ -239,19 +239,33 @@ class BnIntegrationTests(unittest.TestCase):
             resolve_auto_external(self.root,catalog,self.names[:1])
         self.assertFalse(any('.drr_bn_calibration' in item.source for item in seen))
 
-    def test_original_tombstone_beats_exported_member_recipe(self):
-        _,version=self.saved();derived=portable_source_name(self.root,version.csv_path)
+    def export_member_recipe(self, background, which='last'):
         output=self.root/'Processed Data'/'DRR';output.mkdir(parents=True)
         (output/'old.metadata.json').write_text(json.dumps({
             'operation':'DR/R','sources':[
                 *[{'role':'measurement','source_path':str(self.root/n)} for n in self.names],
-                {'role':'background','source_path':str(version.csv_path)}],
-            'processing':{'baseline_selection':'External','baseline_which':'last',
-                          'drr_assignments':[a.to_dict() for a in self.assignments(self.names,derived)]}}),encoding='utf-8')
+                {'role':'background','source_path':str(self.root/background)}],
+            'processing':{'baseline_selection':'External','baseline_which':which,
+                          'drr_assignments':[DrrMeasurementAssignment(
+                              name,'External',(background,),which).to_dict() for name in self.names]}}),encoding='utf-8')
+
+    def test_original_tombstone_beats_exported_member_recipe(self):
+        _,version=self.saved();derived=portable_source_name(self.root,version.csv_path)
+        self.export_member_recipe(derived)
         self.store.deactivate(self.names,[self.bg],'all')
         result=resolve_auto_external(self.root,discover_drr_sources(self.root,include_all=True),self.names)
         self.assertTrue(result.resolved,result.reason)
         self.assertTrue(all(a.baseline_files==(self.bg,) and a.baseline_which=='all' for a in result.assignments))
+
+    def test_original_tombstone_preserves_exported_measured_background(self):
+        self.saved()
+        other=self.bg.replace('BNbackground','BNbackground_other')
+        (self.root/other).write_bytes((self.root/self.bg).read_bytes())
+        self.export_member_recipe(other, 'first')
+        self.store.deactivate(self.names,[self.bg],'all')
+        result=resolve_auto_external(self.root,discover_drr_sources(self.root,include_all=True),self.names)
+        self.assertTrue(result.resolved,result.reason)
+        self.assertTrue(all(a.baseline_files==(other,) and a.baseline_which=='first' for a in result.assignments))
 
     def test_explicit_original_restore_survives_missing_candidate_and_precedes_pn(self):
         _,version=self.saved()

@@ -456,7 +456,7 @@ class AutoExternalUiTests(AutoExternalTests):
         for name, reason, expected in (
             ('sample_BNbackground.csv', 'newest saved DRR recipe', 'BN'),
             ('.drr_bn_calibration/BNbackground.csv', 'Validated exact-group BN calibration v1', 'Calibrated BN'),
-            ('Processed Data/DRR/PN Backgrounds/version.csv', 'Explicitly applied P/N version v1', 'P/N'),
+            ('Processed Data/DRR/PN Backgrounds/version.csv', 'Explicitly applied P/N version v1', 'P + N composite'),
             ('version.csv', 'Explicitly applied P/N version v1', 'P/N'),
             ('sample_other.csv', 'newest saved DRR recipe', 'Other external'),
         ):

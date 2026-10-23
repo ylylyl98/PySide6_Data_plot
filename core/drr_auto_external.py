@@ -35,11 +35,18 @@ def resolve_auto_external(root, catalog, selected, *, measured_bn_only=False,
     # result, ahead of a later applied-but-unsaved P/N or BN choice. Keep this
     # generic External request external; typed group restoration also handles
     # explicitly saved self-reference recipes in its separate workflow.
-    if exported is not None and (not exported.resolved or all(
-            item.baseline_mode == 'External' for item in exported.assignments)):
-        return exported
     bn_store = DrrBnStore(root)
     try:
+        if exported is not None and (not exported.resolved or all(
+                item.baseline_mode == 'External' for item in exported.assignments)):
+            calibrated_export = exported.resolved and any(
+                is_bn_calibration_source(root, name)
+                for item in exported.assignments for name in item.baseline_source_files)
+            # An original-BN choice also revokes calibrated member recipes in
+            # an exact-group export. Let the restoration checks below recover
+            # its measured reference; ordinary saved backgrounds keep priority.
+            if not calibrated_export or bn_store.selection_state(selected) != 'original':
+                return exported
         applied_bn = bn_store.find_applied(selected)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         return DrrBackgroundResolution(reason=f'Saved group BN calibration needs review: {exc}',
