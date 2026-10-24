@@ -1,8 +1,9 @@
+import unittest
 import numpy as np
-from tests.test_drr_dual_view_regressions import DrrDualViewRegressionTests
+from tests.test_drr_dual_view_regressions import DrrDualViewFixture
 
 
-class DrrPlotReuseTests(DrrDualViewRegressionTests):
+class DrrPlotReuseTests(DrrDualViewFixture, unittest.TestCase):
     def test_split_color_partial_draw_matches_rebuild_for_both_products(self):
         from unittest.mock import patch
         w = self.window

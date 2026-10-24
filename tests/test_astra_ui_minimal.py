@@ -1,4 +1,6 @@
 import os
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -6,7 +8,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, QSettings
 from PySide6.QtWidgets import QApplication, QToolButton
+from shiboken6 import isValid
 
+from tests.ui_test_helpers import dispose_owned_window
 from ui_qt.main_window import MainWindow
 from ui_qt.theme import install_theme
 
@@ -18,24 +22,21 @@ class AstraUiMinimalTests(unittest.TestCase):
         install_theme(cls.app, mode="light")
 
     def setUp(self):
-        settings = QSettings("DPTK", "PySide6_Data_Plot")
-        for prefix, titles in {
-            "pl": ("Manual plot ranges",),
-            "cmp": ("Display", "Manual channel assignments", "Angle Rules"),
-            "mcd": ("Analysis", "Correction", "Diagnostics", "Plot"),
-        }.items():
-            for title in titles:
-                settings.remove(f"ui/expanders/{prefix}/{title.replace(' ', '_')}")
-        with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
+        directory = tempfile.TemporaryDirectory(prefix="astra-ui-settings-")
+        self.addCleanup(directory.cleanup)
+        settings = QSettings(str(Path(directory.name) / "ui.ini"), QSettings.IniFormat)
+        settings.setValue(MainWindow.SETTINGS_AUTO_UPDATE_CHECK, False)
+        with patch.object(MainWindow, "_restore_last_folder", lambda _self: None), patch(
+                "ui_qt.main_window.QSettings", return_value=settings), patch(
+                "ui_qt.presentation_widget.QSettings", return_value=settings):
             self.window = MainWindow()
         self.window.resize(1180, 820)
         self.window.show()
         self.app.processEvents()
 
     def tearDown(self):
-        self.window.close()
-        self.window.deleteLater()
-        self.app.processEvents()
+        dispose_owned_window(self.window)
+        self.assertFalse(isValid(self.window))
 
     @staticmethod
     def _expander(page, title):

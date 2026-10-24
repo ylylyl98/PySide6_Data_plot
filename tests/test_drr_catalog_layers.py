@@ -28,7 +28,7 @@ class DrrCatalogLayerTests(unittest.TestCase):
             ref.mkdir(parents=True)
             old=initial/'old_REF.csv';new=ref/'new_REF.csv'
             for path in (old,new):path.write_text('Vbg,700,701\n0,1,2\n1,2,3\n')
-            self.assertEqual(set(drr_source_paths(root)),{old,new})
+            self.assertEqual(set(drr_source_paths(root)), {old.resolve(), new.resolve()})
             self.assertEqual(len(discover_drr_sources(root,include_history=False)),2)
 
     def test_ref_partition_and_legacy_fallback(self):
@@ -43,8 +43,9 @@ class DrrCatalogLayerTests(unittest.TestCase):
             ref = pl.parent / "ref"
             ref.mkdir()
             (ref / "sample.csv").write_text("Vbg,700,701\n0,1,2\n")
-            self.assertEqual(set(drr_source_paths(root)), {legacy, ref / "sample.csv"})
-            self.assertEqual(set(drr_source_paths(root, include_all=True)), {legacy, ref / "sample.csv", pl / "sample.csv"})
+            self.assertEqual(set(drr_source_paths(root)), {legacy.resolve(), (ref / "sample.csv").resolve()})
+            self.assertEqual(set(drr_source_paths(root, include_all=True)),
+                             {legacy.resolve(), (ref / "sample.csv").resolve(), (pl / "sample.csv").resolve()})
             self.assertEqual(len(discover_drr_sources(root, include_all=True)), 3)
 
     def test_history_add_change_remove_without_source_inspection(self):

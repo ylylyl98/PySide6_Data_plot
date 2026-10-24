@@ -3,6 +3,7 @@ from dataclasses import replace
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import time
 import unittest
 from unittest.mock import patch
 
@@ -48,11 +49,24 @@ class BnProfileCacheTests(unittest.TestCase):
         with patch.object(matching, 'inspect_csv_gate_profile', wraps=inspect_csv_gate_profile) as inspect:
             first = self.cache.load(path, inspect)
             original_stat, original_signature = path.stat(), _digest_signature(path)
+            # Arrange distinct filesystem change times before the tested
+            # rewrite. Rapid writes can share one clock tick on Windows.
+            probe = self.root / 'filesystem-clock-probe'
+            deadline = time.monotonic() + 2.0
+            while True:
+                probe.touch()
+                probe_signature = _digest_signature(probe)
+                if probe_signature is not None and probe_signature[-1] > original_signature[-1]:
+                    break
+                self.assertLess(time.monotonic(), deadline, 'Filesystem change clock did not advance')
+                time.sleep(0.001)
             text = path.read_text(encoding='utf-8').replace('1,0,10', '9,0,10')
             path.write_text(text, encoding='utf-8')
             os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
             self.assertEqual(path.stat().st_size, original_stat.st_size)
-            self.assertNotEqual(_digest_signature(path), original_signature)
+            rewrite_signature = _digest_signature(path)
+            self.assertEqual(rewrite_signature[:4], original_signature[:4])
+            self.assertNotEqual(rewrite_signature, original_signature)
             second = self.cache.load(path, inspect)
         self.assertEqual(inspect.call_count, 2)
         self.assertEqual(first.gate_grid[-1][0], 1.)

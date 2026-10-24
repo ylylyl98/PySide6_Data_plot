@@ -152,8 +152,15 @@ class SourceCatalogCache:
             if record['schema'] == 1:
                 self._write(record['inventory'], payload)
                 return record['inventory'], payload
-            from core.drr_sources import DrrSource
-            if isinstance(payload, list) and len(payload) <= 10000 and all(isinstance(item, DrrSource) for item in payload):
+            cache_snapshot = isinstance(payload, list) and len(payload) <= 10000
+            if cache_snapshot and payload:
+                # Plain catalogs (for example Slides dictionaries) do not need
+                # the numerical stack just to rule out a DRR memory snapshot.
+                cache_snapshot = is_dataclass(payload[0])
+                if cache_snapshot:
+                    from core.drr_sources import DrrSource
+                    cache_snapshot = all(isinstance(item, DrrSource) for item in payload)
+            if cache_snapshot:
                 with _SNAPSHOT_LOCK:
                     _DRR_SNAPSHOTS[key] = (signature, [row[:] for row in record['inventory']], tuple(payload))
                     _DRR_SNAPSHOTS.move_to_end(key)

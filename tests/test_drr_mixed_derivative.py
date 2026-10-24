@@ -62,10 +62,10 @@ class MixedDerivativeTests(unittest.TestCase):
             self.assertIn('Bias', metadata['plot']['cbar_label'])
 
 
-from tests.test_drr_dual_view_regressions import DrrDualViewRegressionTests
+from tests.test_drr_dual_view_regressions import DrrDualViewFixture
 
 
-class MixedUiTests(DrrDualViewRegressionTests):
+class MixedUiTests(DrrDualViewFixture, unittest.TestCase):
     def test_mixed_mode_invalidates_peak_results_and_blocks_wrong_derivative_tracking(self):
         w = self.window
         tracker = w.drr_peak_analysis

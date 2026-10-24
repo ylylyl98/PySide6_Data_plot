@@ -245,7 +245,7 @@ class CompositeBackgroundDialogTests(unittest.TestCase):
         self.assertFalse(dialog._closed)
         self.assertIsNone(dialog.applied_background)
         self.assertTrue(dialog.apply_button.isEnabled())
-        self.assertEqual(Path(dialog.saved_path), path)
+        self.assertEqual(Path(dialog.saved_path), path.resolve())
         (self.root / "p.csv").unlink()
         (self.root / "n.csv").unlink()
         reopened = self.dialog(initial_files=(str(path),))

@@ -65,10 +65,11 @@ assert not multiprocessing.active_children()
             original_stat = Path.stat
             class Stat:
                 def __init__(self, value):
+                    self._value = value
                     self.st_size = value.st_size + 2*1024**2
-                    self.st_mtime_ns = value.st_mtime_ns
-                    self.st_mtime = value.st_mtime
-                    self.st_mode = value.st_mode
+
+                def __getattr__(self, name):
+                    return getattr(self._value, name)
             def stat(path, *args, **kwargs):
                 result = original_stat(path, *args, **kwargs)
                 return Stat(result) if path.suffix == '.csv' else result
