@@ -24,7 +24,9 @@ from ui_qt.common import LoadedState
 from ui_qt.main_window import MainWindow
 
 
-class DrrDualViewRegressionTests(unittest.TestCase):
+class DrrDualViewFixture:
+    """Share DRR UI setup and helpers without inheriting test methods."""
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
@@ -102,6 +104,8 @@ class DrrDualViewRegressionTests(unittest.TestCase):
             time.sleep(.005)
         self.fail('Derivative did not finish')
 
+
+class DrrDualViewRegressionTests(DrrDualViewFixture, unittest.TestCase):
     def test_layout_and_product_switches_retain_shared_zoom(self):
         w = self.window
         w.drr_view_side_btn.setChecked(True)

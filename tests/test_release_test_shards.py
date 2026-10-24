@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -71,6 +72,123 @@ class ReleaseTestShardTests(unittest.TestCase):
         self.make_plan()
         self.run_shard()
         self.verify()
+
+    def timing_hints(self, seconds_by_key):
+        plan = release.read_json(self.plan)
+        modules = {test["id"]: test["module"] for test in plan["tests"]}
+        units = {}
+        for unit in plan["units"]:
+            key = unit["timing_key"]
+            if key not in seconds_by_key:
+                continue
+            source = self.repo / (modules[unit["test_ids"][0]].replace(".", "/") + ".py")
+            units[key] = {
+                "duration_seconds": seconds_by_key[key],
+                "source_sha256_lf": hashlib.sha256(source.read_text(encoding="utf-8").encode()).hexdigest(),
+                "test_ids_sha256": release.digest(sorted(unit["test_ids"])),
+            }
+        data = {"schema_version": 1,
+                "source": {"workflow_run_id": 1, "commit": "a" * 40, "plan_id": "b" * 64,
+                           "recorded_at_utc": "2026-10-24T01:36:13Z",
+                           "measurement": "unit_wall_seconds_including_startup"},
+                "units": units}
+        path = self.repo / release.TIMING_HINTS_PATH
+        release.write_json(path, data)
+        return path, data
+
+    def test_measured_weights_balance_modules_and_survive_id_and_checkout_changes(self):
+        for name in ("a", "b", "c", "d"):
+            self.source(f"test_{name}.py", PASSING)
+        self.make_plan(shards=2)
+        original = release.read_json(self.plan)
+        self.timing_hints({"suite.test_a": 2, "suite.test_b": 100,
+                           "suite.test_c": 20, "suite.test_d": 80})
+        self.make_plan(shards=2)
+        measured = release.read_json(self.plan)
+        self.assertCountEqual([s["weight_seconds"] for s in measured["shards"]], [102, 100])
+        self.assertTrue(all(u["weight_basis"] == "measured_unit_wall" for u in measured["units"]))
+        self.assertCountEqual([t["id"] for t in measured["tests"]], [t["id"] for t in original["tests"]])
+        for shard in range(2):
+            self.run_shard(shard)
+        self.verify()
+
+        # Ordinal unit IDs shift; an LF -> CRLF checkout must not lose the hint.
+        old_id = next(u["id"] for u in measured["units"] if u["timing_key"] == "suite.test_b")
+        self.source("test_0new.py", PASSING)
+        path = self.repo / "suite" / "test_b.py"
+        path.write_bytes(path.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+        self.make_plan(shards=2)
+        changed = release.read_json(self.plan)
+        by_key = {u["timing_key"]: u for u in changed["units"]}
+        self.assertNotEqual(by_key["suite.test_b"]["id"], old_id)
+        self.assertEqual(by_key["suite.test_b"]["weight_seconds"], 100)
+        self.assertEqual(by_key["suite.test_0new"]["weight_basis"], "estimated_tests_plus_startup")
+        self.assertEqual(len(changed["tests"]), 5)
+
+    def test_changed_source_and_inherited_membership_fall_back_without_hiding_failures(self):
+        base = PASSING.replace("Passing", "Base")
+        self.source("fixture_base.py", base)
+        self.source("test_child.py", "from suite.fixture_base import Base\nclass Derived(Base): pass\n")
+        self.source("test_control.py", PASSING)
+        self.make_plan()
+        self.timing_hints({"suite.fixture_base": 10, "suite.test_child": 20, "suite.test_control": 30})
+        self.source("fixture_base.py", base + "\n    def test_added(self):\n        self.fail('new regression')\n")
+        self.make_plan()
+        plan = release.read_json(self.plan)
+        by_key = {u["timing_key"]: u for u in plan["units"]}
+        for key in ("suite.fixture_base", "suite.test_child"):
+            self.assertEqual(by_key[key]["weight_basis"], "estimated_tests_plus_startup")
+            self.assertEqual(by_key[key]["weight_seconds"], 4)
+        self.assertEqual(by_key["suite.test_control"]["weight_seconds"], 30)
+        self.assertEqual(len(plan["tests"]), 5)
+        self.run_shard(expected=1)
+        self.verify(expected=1)
+
+    def test_split_test_timings_preserve_per_case_process_isolation(self):
+        self.source("test_drr_bn_joint.py", """
+            import os
+            import unittest
+            class Split(unittest.TestCase):
+                def test_a_set_environment(self):
+                    os.environ['RELEASE_SPLIT_TIMING_STATE'] = 'changed'
+                def test_b_environment_is_isolated(self):
+                    self.assertNotIn('RELEASE_SPLIT_TIMING_STATE', os.environ)
+        """)
+        self.make_plan()
+        first = release.read_json(self.plan)
+        ids = sorted(t["id"] for t in first["tests"])
+        self.timing_hints({ids[0]: 30, ids[1]: 5})
+        self.make_plan()
+        plan = release.read_json(self.plan)
+        self.assertEqual(len(plan["units"]), 2)
+        self.assertCountEqual([u["timing_key"] for u in plan["units"]], ids)
+        self.assertCountEqual([u["weight_seconds"] for u in plan["units"]], [30, 5])
+        self.run_shard()
+        self.verify()
+
+    def test_invalid_timing_hints_fail_closed_instead_of_silently_changing_scheduling(self):
+        self.source("test_ok.py", PASSING)
+        self.make_plan()
+        path, valid = self.timing_hints({"suite.test_ok": 1})
+        for field, invalid in (("duration_seconds", 0), ("duration_seconds", -1),
+                               ("duration_seconds", True), ("duration_seconds", float("nan")),
+                               ("duration_seconds", float("inf")), ("duration_seconds", "10"),
+                               ("source_sha256_lf", "wrong"), ("test_ids_sha256", "wrong")):
+            with self.subTest(field=field, value=invalid):
+                data = json.loads(json.dumps(valid))
+                data["units"]["suite.test_ok"][field] = invalid
+                release.write_json(path, data)
+                with self.assertRaises(ValueError):
+                    release.read_timing_hints(self.repo)
+        for text in ('{"schema_version": 1, "schema_version": 1}', '[1]',
+                     json.dumps({**valid, "schema_version": 2}), json.dumps({**valid, "units": []})):
+            with self.subTest(text=text):
+                path.write_text(text, encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    release.read_timing_hints(self.repo)
+        self.plan.unlink()
+        self.assertIn("Invalid timing hints", self.make_plan(expected=1).stdout)
+        self.assertFalse(self.plan.exists())
 
     def test_plan_discovers_new_tests_and_assigns_every_unique_id_once(self):
         self.source("test_first.py", PASSING)

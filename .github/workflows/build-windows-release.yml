@@ -2,6 +2,15 @@ name: Windows Build
 
 on:
   workflow_dispatch:
+    inputs:
+      test_scope:
+        description: Test scope (tags always use full regression)
+        type: choice
+        required: true
+        default: quick
+        options:
+          - quick
+          - full
   push:
     tags:
       - "v*"
@@ -14,6 +23,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 5
     outputs:
+      test-scope: ${{ github.event_name == 'workflow_dispatch' && github.ref_type == 'branch' && inputs.test_scope == 'quick' && 'quick' || 'full' }}
       app-version: ${{ steps.version.outputs.app-version }}
       zip-name: ${{ steps.version.outputs.zip-name }}
       setup-name: ${{ steps.version.outputs.setup-name }}
@@ -55,8 +65,14 @@ jobs:
             throw "Release tag $env:GITHUB_REF_NAME is not contained in main. Merge the release commit into main before publishing the tag."
           }
 
+  quick-tests:
+    needs: preflight
+    if: needs.preflight.outputs.test-scope == 'quick'
+    uses: ./.github/workflows/fast-checks.yml
+
   test-plan:
     needs: preflight
+    if: needs.preflight.outputs.test-scope == 'full'
     runs-on: windows-latest
     timeout-minutes: 10
     env:

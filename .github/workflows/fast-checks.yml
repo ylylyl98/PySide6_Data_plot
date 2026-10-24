@@ -2,6 +2,7 @@ name: Fast PR checks
 
 on:
   workflow_dispatch:
+  workflow_call:
   pull_request:
     branches:
       - main
@@ -10,7 +11,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: fast-pr-checks-${{ github.event.pull_request.number || github.ref }}
+  # Supersede older PR checks; keep manual/reusable calls within their own run.
+  group: fast-pr-checks-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 jobs:
