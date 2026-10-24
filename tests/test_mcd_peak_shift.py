@@ -13,6 +13,9 @@ import numpy as np
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
 from PySide6.QtTest import QTest
+from shiboken6 import isValid
+
+from tests.ui_test_helpers import dispose_owned_window
 
 from core.mcd_peak_shift import analyze_peak_shift, detect_reflection_peaks, format_mcd_angle, source_spectra, valley_quantities
 
@@ -234,25 +237,24 @@ class MCDPeakShiftUITests(unittest.TestCase):
         from PySide6.QtCore import QSettings
         import ui_qt.main_window as main_window
         self._settings_dir = TemporaryDirectory()
-        self._settings_patch = patch.object(
-            main_window, "QSettings",
-            lambda *args, **kwargs: QSettings(
-                str(Path(self._settings_dir.name) / "settings.ini"), QSettings.IniFormat
-            ),
-        )
-        self._settings_patch.start()
+        self.addCleanup(self._settings_dir.cleanup)
+        settings = QSettings(str(Path(self._settings_dir.name) / "settings.ini"), QSettings.IniFormat)
+        settings.setValue(main_window.MainWindow.SETTINGS_AUTO_UPDATE_CHECK, False)
+        for target in ("ui_qt.main_window.QSettings", "ui_qt.presentation_widget.QSettings"):
+            settings_patch = patch(target, return_value=settings)
+            settings_patch.start()
+            self.addCleanup(settings_patch.stop)
         self._restore_patch = patch.object(
             main_window.MainWindow, "_restore_last_folder", lambda _window: None
         )
         self._restore_patch.start()
-        self._update_patch = patch.object(
-            main_window.MainWindow, "_schedule_automatic_update_check", lambda _window: None
-        )
-        self._update_patch.start()
-        self.addCleanup(self._update_patch.stop)
         self.addCleanup(self._restore_patch.stop)
-        self.addCleanup(self._settings_patch.stop)
-        self.addCleanup(self._settings_dir.cleanup)
+
+    def _dispose_window(self, window):
+        # close() leaves MainWindow alive; destroy each test-owned Qt tree before
+        # another test constructs one, rather than relying on Python GC timing.
+        dispose_owned_window(window)
+        self.assertFalse(isValid(window))
 
     def _wait_for_peak_analysis(self, window):
         # Plot interaction tests must give this workflow ownership of the shared
@@ -294,7 +296,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             methods = {getattr(line, "_mcd_peak_method", None) for line in window.mcd_peak_shift_ax.lines}
             self.assertTrue({"Raw spectrum", "Second derivative"}.issubset(methods))
         finally:
-            window.close()
+            self._dispose_window(window)
 
     def test_page_exists_and_empty_state_is_safe(self):
         from ui_qt.main_window import MainWindow
@@ -305,7 +307,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             self.assertFalse(window.mcd_peak_analyze_btn.isEnabled())
             self.assertIn("No MCD result", window.mcd_peak_source_summary.text())
         finally:
-            window.close()
+            self._dispose_window(window)
 
     def test_raw_r_source_and_local_fit_route_each_physical_channel(self):
         from ui_qt.feature_pages import _mcd_fit_source_for_channel, _mcd_local_fit_worker
@@ -322,7 +324,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             self.assertFalse(window.mcd_peak_source_combo.isHidden())
         finally:
             if window is not None:
-                window.close()
+                self._dispose_window(window)
 
         energy = np.linspace(1.62, 1.66, 20)
         values = np.tile(np.linspace(0.0, 1.0, 20), (2, 1))
@@ -364,7 +366,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             self.assertGreater(window._mcd_peak_fit_generation, generation)
             analyze.assert_called_once_with()
         finally:
-            window.close()
+            self._dispose_window(window)
 
     def test_local_export_contains_both_channel_centers_and_valley_splitting(self):
         from core.mcd_peak_shift import PeakPoint, PeakShiftResult, PeakTrack
@@ -413,7 +415,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             self.assertTrue(all(row["fit_window_low_eV"] == "1.63" for row in rows))
             self.assertTrue(all(row["background_model"] == "linear" for row in rows))
         finally:
-            window.close()
+            self._dispose_window(window)
 
     def test_stale_local_completion_is_ignored_and_cached_fit_reenables_analyze(self):
         from core.mcd_local_fit import local_fit_cache_key
@@ -450,7 +452,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             self.assertIs(window.mcd_peak_result, analysis)
             self.assertTrue(window.mcd_peak_analyze_btn.isEnabled())
         finally:
-            window.close()
+            self._dispose_window(window)
 
     def test_local_cache_miss_keeps_requested_candidate_during_async_fit(self):
         from core.mcd_peak_shift import analyze_peak_shift
@@ -483,7 +485,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             self.assertFalse(window.mcd_peak_analyze_btn.isEnabled())
             worker.signals.result.assert_not_called()
         finally:
-            window.close()
+            self._dispose_window(window)
 
     def test_legacy_tracker_uses_the_selected_reflection_source(self):
         from core.mcd_peak_shift import analyze_peak_shift
@@ -506,7 +508,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
                 {"corrected pos", "corrected neg"},
             )
         finally:
-            window.close()
+            self._dispose_window(window)
 
     def test_repeat_analysis_clears_rows_and_display_uses_shared_canvas(self):
         from ui_qt.main_window import LoadedState, MainWindow
@@ -533,7 +535,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             window.tabs.setCurrentIndex(peak_tab)
             self.assertIn("R intensity", window.figure.axes[0].get_ylabel())
         finally:
-            window.close()
+            self._dispose_window(window)
 
     def test_map_first_preview_has_two_maps_spectrum_and_branch_controls(self):
         from ui_qt.main_window import LoadedState, MainWindow
@@ -560,7 +562,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             self.assertIsNone(window.mcd_peak_spectrum_ax)
             self.assertTrue(all(axis.get_visible() for axis in window.mcd_peak_map_axes))
         finally:
-            window.close()
+            self._dispose_window(window)
 
     def test_tracker_method_switch_keeps_nearest_peak_energy(self):
         from ui_qt.main_window import LoadedState, MainWindow
@@ -591,7 +593,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             self._wait_for_peak_analysis(window)
             self.assertIsNot(d2_before, window.mcd_peak_method_results["Second derivative"]["pos"])
         finally:
-            window.close()
+            self._dispose_window(window)
 
     def test_map_branch_filter_and_click_update_selected_field(self):
         from ui_qt.main_window import LoadedState, MainWindow
@@ -613,7 +615,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             self.assertAlmostEqual(window.mcd_peak_selected_field, -0.5)
             self.assertIn("-0.49", window.mcd_peak_field_combo.currentText())
         finally:
-            window.close()
+            self._dispose_window(window)
 
     def test_inspection_axes_are_real_and_toggle_without_hidden_overlays(self):
         from ui_qt.main_window import LoadedState, MainWindow
@@ -634,7 +636,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             self.assertEqual(len(window.mcd_peak_map_axes), 2)
             self.assertTrue(all(axis.get_visible() for axis in window.mcd_peak_map_axes))
         finally:
-            window.close()
+            self._dispose_window(window)
 
     def test_branch_switch_matches_unique_true_e0_and_keeps_feature_kind(self):
         from ui_qt.main_window import LoadedState, MainWindow
@@ -667,7 +669,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             self.assertEqual(switched[3], selected[3])
             self.assertLess(abs(float(switched_track.reference_energy_ev) - float(selected_track.reference_energy_ev)), 0.005)
         finally:
-            window.close()
+            self._dispose_window(window)
 
     def test_result_click_uses_nearby_curve_metadata_and_keeps_both_branches(self):
         from types import SimpleNamespace
@@ -693,7 +695,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             self.assertIn("B increasing", plotted_branches)
             self.assertIn("B decreasing", plotted_branches)
         finally:
-            window.close()
+            self._dispose_window(window)
 
     @staticmethod
     def _plot_event(axis, xdata, ydata, *, button=1, inaxes=None):
@@ -741,7 +743,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             window._on_canvas_release(SimpleNamespace(button=1, x=None, y=None, xdata=None, ydata=None, inaxes=None, key=None))
             self.assertIsNone(window._mcd_peak_drag)
         finally:
-            window.close()
+            self._dispose_window(window)
 
     def test_peak_feature_drag_moves_continuous_center_without_mutating_data(self):
         from ui_qt.main_window import LoadedState, MainWindow
@@ -786,7 +788,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             self.assertIsNotNone(window.mcd_peak_selector_combo.currentData())
             self.assertAlmostEqual(float(window._mcd_peak_manual_center_ev), float(target_point.energy_ev), places=10)
         finally:
-            window.close()
+            self._dispose_window(window)
 
     def test_peak_drag_is_ignored_while_toolbar_pan_is_active(self):
         from ui_qt.main_window import LoadedState, MainWindow
@@ -814,7 +816,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             finally:
                 window.toolbar.pan()
         finally:
-            window.close()
+            self._dispose_window(window)
 
     def test_peak_candidate_bar_and_markers_offer_nearby_features(self):
         from ui_qt.main_window import LoadedState, MainWindow
@@ -856,7 +858,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             window.mcd_peak_next_btn.click()
             self.assertEqual(window.mcd_peak_selector_combo.currentIndex(), (before_index + 1) % window.mcd_peak_selector_combo.count())
         finally:
-            window.close()
+            self._dispose_window(window)
 
     def test_two_resonance_branch_click_preserves_second_e0_and_field_navigation(self):
         from types import SimpleNamespace
@@ -909,7 +911,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             window.mcd_peak_field_next_btn.click()
             self.assertNotEqual(window.mcd_peak_field_combo.currentData(), old_field)
         finally:
-            window.close()
+            self._dispose_window(window)
 
     def test_result_highlight_does_not_jump_across_invalid_nearest_sample(self):
         from ui_qt.main_window import LoadedState, MainWindow
@@ -944,7 +946,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             self.assertFalse(any(line.get_label() == "_mcd_selected_result_marker" for line in window.mcd_peak_shift_ax.lines))
             self.assertTrue(any(np.allclose(np.asarray(line.get_xdata(), float), [0.0, 0.0]) for line in window.mcd_peak_shift_ax.lines))
         finally:
-            window.close()
+            self._dispose_window(window)
 
     def test_boundary_quality_is_hidden_from_selected_peak_and_map(self):
         from ui_qt.main_window import LoadedState, MainWindow
@@ -967,7 +969,7 @@ class MCDPeakShiftUITests(unittest.TestCase):
             self.assertNotIn("Boundary unreliable", window.mcd_peak_status.text())
             self.assertTrue(all(line.get_visible() for line in window._mcd_peak_track_lines))
         finally:
-            window.close()
+            self._dispose_window(window)
 
     def test_all_boundary_tracks_leave_no_table_rows_or_export(self):
         from ui_qt.main_window import LoadedState, MainWindow
@@ -989,4 +991,4 @@ class MCDPeakShiftUITests(unittest.TestCase):
             self.assertEqual(window.mcd_peak_table.rowCount(), 0)
             self.assertFalse(window.mcd_peak_export_btn.isEnabled())
         finally:
-            window.close()
+            self._dispose_window(window)

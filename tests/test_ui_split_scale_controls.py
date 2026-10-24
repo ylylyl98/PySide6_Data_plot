@@ -49,6 +49,7 @@ class SplitScaleControlTests(unittest.TestCase):
         with profile_phase("mainwindow_construction"):
             with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
                 self.window = MainWindow()
+                self.addCleanup(dispose_owned_window, self.window)
         with profile_phase("mainwindow_show_setup"):
             self.window.resize(1180, 820)
             self.window.show()
