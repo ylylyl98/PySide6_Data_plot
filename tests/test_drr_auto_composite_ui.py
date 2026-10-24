@@ -139,7 +139,11 @@ class AutoCompositeDialogTests(unittest.TestCase):
         self.assertNotEqual(calls[0][0], threading.get_ident())
         self.assertIs(calls[0][1], original)
         self.assertEqual(calls[0][2:], (False, .06, True))
-        self.assertIs(dialog.document, suggested.document)
+        self.assertEqual(dialog.document.default_source, suggested.document.default_source)
+        self.assertEqual(dialog.document.regions, suggested.document.regions)
+        self.assertEqual(len(dialog.document.sources), len(suggested.document.sources))
+        for actual, expected in zip(dialog.document.sources, suggested.document.sources):
+            self.assertIs(actual, expected)
         self.assertEqual(dialog.selected_source().key, "n")
         self.assertEqual(len(dialog._undo), 1)
         self.assertIsNone(dialog.saved_path)
@@ -255,10 +259,13 @@ class AutoCompositeDialogTests(unittest.TestCase):
                 dialog.auto_suggest()
                 replacement = replace(original, default_source="n")
                 dialog._commit(replacement)
+                committed = dialog.document
+                self.assertEqual(committed.default_source, "n")
+                self.assertEqual(committed.regions, replacement.regions)
             finally:
                 release.set()
             self.wait_job(dialog)
-        self.assertIs(dialog.document, replacement)
+        self.assertIs(dialog.document, committed)
         self.assertEqual(len(dialog._undo), 1)
         self.assertIn("outdated suggestion was discarded", dialog.status.text())
 

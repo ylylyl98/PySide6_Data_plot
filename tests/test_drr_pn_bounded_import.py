@@ -81,7 +81,8 @@ class ConditionedBoundedImportTests(unittest.TestCase):
             writes = [stack.enter_context(patch.object(DrrPnStore, name))
                       for name in ("save", "import_saved", "mark_used")]
             dependencies = self.validate()
-        self.assertEqual(dependencies, (*self.code, *(self.root / name for name in self.training)))
+        self.assertEqual(dependencies, tuple(path.resolve() for path in
+                         (*self.code, *(self.root / name for name in self.training))))
         for write in writes:
             write.assert_not_called()
         self.assertEqual(before, self.snapshot())

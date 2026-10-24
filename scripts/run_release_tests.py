@@ -382,7 +382,7 @@ def run_shard(plan_path, shard_id, repo, output_dir, timeout=900):
         report_path = output_dir / f"{unit_id}.result.json"
         log_path = output_dir / f"{unit_id}.log"
         events_path = output_dir / f"{unit_id}.events.jsonl"
-        command = [sys.executable, str(Path(__file__).resolve()), "_child",
+        command = [sys.executable, "-X", "faulthandler", str(Path(__file__).resolve()), "_child",
                    "--plan", str(Path(plan_path).resolve()), "--repo", str(repo),
                    "--unit", unit_id, "--report", str(report_path), "--events", str(events_path)]
         env = {**os.environ, "QT_QPA_PLATFORM": "offscreen", "PYTHONUNBUFFERED": "1"}

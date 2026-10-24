@@ -207,8 +207,6 @@ class SidebarLayoutRegressionTests(unittest.TestCase):
                     window.drr_edit_measurements_btn,
                     window.drr_clear_measurements_btn,
                     window.drr_edit_baselines_btn,
-                    window.drr_pn_background_btn,
-                    window.drr_baseline_autofind_btn,
                 ):
                     # Data commands stay above both parameter pages; lay out
                     # the applicable External recipe before checking geometry.
@@ -216,6 +214,7 @@ class SidebarLayoutRegressionTests(unittest.TestCase):
                     self.app.processEvents()
                     window.drr_data_controls.layout().activate()
                     self.app.processEvents()
+                    self.assertTrue(button.isVisible(), button.text())
                     parent = button.parentWidget()
                     self.assertIsNotNone(parent)
                     self.assertTrue(
@@ -248,8 +247,14 @@ class SidebarLayoutRegressionTests(unittest.TestCase):
             window.drr_baseline_combo.setCurrentText("External")
             window.drr_derivative_combo.setCurrentText("dE")
             self.app.processEvents()
-            pin = window.drr_pin_baseline_chk
-            self.assertLessEqual(pin.fontMetrics().horizontalAdvance(pin.text()), pin.width())
+            background_settings = window.drr_edit_baselines_btn
+            self.assertLessEqual(background_settings.fontMetrics().horizontalAdvance(
+                background_settings.text()), background_settings.width())
+            # Source and pin controls now live in Background settings. Their
+            # legacy identities remain available to controllers, but hidden.
+            for legacy in (window.drr_pin_baseline_chk, window.drr_pn_background_btn,
+                           window.drr_baseline_autofind_btn, window.drr_baseline_combo):
+                self.assertTrue(legacy.isHidden())
             self._expand(window, "Advanced derivative")
             for spin, label in ((window.drr_sg_window_spin, "X window points"),
                                 (window.drr_sg_poly_spin, "Polynomial order")):
@@ -261,12 +266,12 @@ class SidebarLayoutRegressionTests(unittest.TestCase):
                 )
                 self.app.processEvents()
                 for control in (
-                    pin,
+                    background_settings,
                     window.drr_derivative_combo,
                     window.drr_sg_window_spin,
                     window.drr_sg_poly_spin,
                 ):
-                    window.drr_sidebar_tabs.setCurrentIndex(0 if control is pin else 1)
+                    window.drr_sidebar_tabs.setCurrentIndex(0 if control is background_settings else 1)
                     self.app.processEvents()
                     self.app.processEvents()
                     description = control.objectName() or getattr(control, "text", lambda: "")()

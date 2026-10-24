@@ -69,7 +69,7 @@ class ProfileResumeTests(unittest.TestCase):
             state = profiler._load_resume_state(continuation)
 
             self.assertEqual(state["completed_ids"], {"test.a", "test.b", "test.c"})
-            self.assertEqual(state["ancestor_logs"], [str(root), str(continuation)])
+            self.assertEqual(state["ancestor_logs"], [str(root.resolve()), str(continuation.resolve())])
 
     def test_resume_does_not_treat_unfinished_start_as_completed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

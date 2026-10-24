@@ -207,7 +207,8 @@ class PnFeatureProtectionUiTests(unittest.TestCase):
             with patch("ui_qt.drr_pn_background_dialog.read_composite_background", return_value=doc):
                 dependencies = _reconstruction_import_dependencies(self.root, self.root / "unused.csv", settings,
                     SimpleNamespace(dependency_paths=lambda: (code,)), pair=self.pair, p_which="all", n_which="all")
-                self.assertEqual(dependencies, (code, *(self.root / name for name in names[2:])))
+                self.assertEqual(dependencies, tuple(path.resolve() for path in
+                                 (code, *(self.root / name for name in names[2:]))))
                 with self.assertRaisesRegex(ValueError, "settings"):
                     _reconstruction_import_dependencies(self.root, self.root / "unused.csv",
                         {**settings, "feature_protection": regions[:1]},

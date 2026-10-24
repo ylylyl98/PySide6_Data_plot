@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import numpy as np
-from PySide6.QtCore import QCoreApplication, QEvent, QThreadPool, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, QSettings, QThreadPool, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QTabWidget
 
@@ -21,6 +21,14 @@ from core.drr_pn_store import DrrPnStore
 from ui_qt.drr_pn_background_dialog import (DrrPnBackgroundDialog, load_pn_version,
                                            _assisted_import_dependencies, _reconstruction_import_dependencies)
 from ui_qt.theme import install_theme, theme_manager
+
+
+def _pump_worker_events(app):
+    app.processEvents()
+    # qWait's native loop can starve Python QRunnable work of the GIL.
+    # Yield it explicitly while still delivering queued Qt signals.
+    time.sleep(0.005)
+    app.processEvents()
 
 
 class PnBackgroundDialogTests(unittest.TestCase):
@@ -35,6 +43,7 @@ class PnBackgroundDialogTests(unittest.TestCase):
         self.pool = QThreadPool()
         self.pool.setMaxThreadCount(1)
         self.dialogs = []
+        self.windows = []
         self.energy = np.linspace(1.4, 1.9, 181)
         self.pname = "test_1K_1T_RotIn17.5deg_730nmc_0.3sx10_Pbackground.csv"
         self.nname = self.pname.replace("Pbackground", "Nbackground")
@@ -74,8 +83,7 @@ class PnBackgroundDialogTests(unittest.TestCase):
         self.app.processEvents()
         deadline = time.monotonic() + timeout
         while dialog._worker is not None and time.monotonic() < deadline:
-            self.app.processEvents()
-            QTest.qWait(5)
+            _pump_worker_events(self.app)
         self.assertIsNone(dialog._worker, dialog.status.text())
 
     def choose(self, dialog):
@@ -84,12 +92,12 @@ class PnBackgroundDialogTests(unittest.TestCase):
         self.wait(dialog)
 
     def tearDown(self):
-        for dialog in self.dialogs:
-            dialog.close()
+        for widget in (*self.dialogs, *self.windows):
+            widget.close()
         self.pool.waitForDone(10000)
         self.app.processEvents()
-        for dialog in self.dialogs:
-            dialog.deleteLater()
+        for widget in (*self.dialogs, *self.windows):
+            widget.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
         self.temp.cleanup()
 
@@ -638,7 +646,7 @@ class PnBackgroundDialogTests(unittest.TestCase):
         settings = result.report["settings"]
         deps = _reconstruction_import_dependencies(self.root, path, settings, api,
             pair=self.pair, p_which="all", n_which="all")
-        self.assertEqual(deps, (code, *(self.root / name for name in training)))
+        self.assertEqual(deps, (code.resolve(), *((self.root / name).resolve() for name in training)))
         version = self.store.import_saved(path, self.pair, algorithm_version=result.report["algorithm_version"],
                                           settings=settings, dependencies=deps)
         np.testing.assert_array_equal(compose_background(load_pn_version(self.root, version)["document"])[1],
@@ -692,7 +700,7 @@ class PnBackgroundDialogTests(unittest.TestCase):
                     # A complete proof is accepted for all three declared protocols.
                     deps = _reconstruction_import_dependencies(self.root, path, report["settings"], api,
                         pair=self.pair, p_which="all", n_which="all")
-                    self.assertEqual(deps, (code, *(self.root / name for name in training)))
+                    self.assertEqual(deps, (code.resolve(), *((self.root / name).resolve() for name in training)))
                     # The actual dialog dispatcher must still invoke this validator
                     # when the method flag is missing/false. A changed dependency
                     # must never be re-associated as a fresh generic import.
@@ -751,7 +759,7 @@ class PnBackgroundDialogTests(unittest.TestCase):
         version = self.store.save(document, key)
         deps = _reconstruction_import_dependencies(self.root, version.csv_path, settings, api,
             pair=self.pair, p_which="all", n_which="all")
-        self.assertEqual(deps, (code, *(self.root / name for name in training)))
+        self.assertEqual(deps, (code.resolve(), *((self.root / name).resolve() for name in training)))
 
     def test_raw_reconstruction_reuses_fingerprint_without_refit_or_context_override(self):
         dialog, names = self.reconstruction_dialog()
@@ -779,7 +787,7 @@ class PnBackgroundDialogTests(unittest.TestCase):
             dialog._generate(False)
             deadline = time.monotonic()+5
             while not entered.is_set() and time.monotonic()<deadline:
-                QTest.qWait(5)
+                _pump_worker_events(self.app)
             try:
                 self.assertTrue(entered.is_set())
                 self.assertFalse(dialog.training_repeats[0].isEnabled())
@@ -885,7 +893,7 @@ class PnBackgroundDialogTests(unittest.TestCase):
             dialog._generate(False)
             deadline = time.monotonic() + 5
             while not entered.is_set() and time.monotonic() < deadline:
-                QTest.qWait(5)
+                _pump_worker_events(self.app)
             try:
                 self.assertTrue(entered.is_set())
                 self.assertFalse(dialog.generation_mode.isEnabled())
@@ -961,7 +969,7 @@ class PnBackgroundDialogTests(unittest.TestCase):
         metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
         settings = {"sample_analysis": {"training_files": [self.sample]}}
         api = SimpleNamespace(dependency_paths=lambda: (code,))
-        self.assertEqual(_assisted_import_dependencies(self.root, version.csv_path, settings, api)[0], code)
+        self.assertEqual(_assisted_import_dependencies(self.root, version.csv_path, settings, api)[0], code.resolve())
         code.write_text("different implementation", encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "original implementation"):
             _assisted_import_dependencies(self.root, version.csv_path, settings, api)
@@ -1063,10 +1071,12 @@ class PnBackgroundDialogTests(unittest.TestCase):
             dialog._refresh_versions()
             deadline = time.monotonic() + 5
             while not entered.is_set() and time.monotonic() < deadline:
-                QTest.qWait(5)
-            self.assertTrue(entered.is_set())
-            dialog.reject()
-            release.set()
+                _pump_worker_events(self.app)
+            try:
+                self.assertTrue(entered.is_set())
+                dialog.reject()
+            finally:
+                release.set()
             self.wait(dialog)
         self.assertIsNone(dialog.selected_version)
         self.assertIsNone(dialog._current)
@@ -1083,11 +1093,13 @@ class PnBackgroundDialogTests(unittest.TestCase):
 
     def main_window(self):
         from ui_qt.main_window import MainWindow
+        settings = QSettings(str(self.root / "main-window.ini"), QSettings.IniFormat)
         with patch.object(MainWindow, "_restore_last_folder", lambda _self: None), \
-                patch.object(MainWindow, "_schedule_automatic_update_check", lambda _self: None):
+                patch.object(MainWindow, "_schedule_automatic_update_check", lambda _self: None), \
+                patch("ui_qt.main_window.QSettings", return_value=settings), \
+                patch("ui_qt.presentation_widget.QSettings", return_value=settings):
             window = MainWindow()
-        self.addCleanup(window.deleteLater)
-        self.addCleanup(window.close)
+        self.windows.append(window)
         return window
 
     def test_cancel_build_pn_preserves_assignments(self):
