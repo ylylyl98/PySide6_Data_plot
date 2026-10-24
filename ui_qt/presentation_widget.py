@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRect, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QCoreApplication, QObject, QRect, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QImage, QImageReader, QPainter, QPen, QPixmap
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
@@ -98,7 +98,9 @@ class _ThumbnailWorker(QRunnable):
         super().__init__()
         self.path = str(path)
         self.max_dimension = int(max_dimension)
-        self.signals = _ThumbnailSignals()
+        # QThreadPool releases the runnable on a worker thread. Keep its GUI
+        # signal object alive independently, then retire it via deleteLater.
+        self.signals = _ThumbnailSignals(QCoreApplication.instance())
 
     def run(self) -> None:
         image = QImage()
@@ -114,6 +116,7 @@ class _ThumbnailWorker(QRunnable):
             image = QImage()
         self.signals.result.emit((self.path, image))
         self.signals.finished.emit()
+        self.signals.deleteLater()
 
 
 class SlidePreview(QWidget):
@@ -288,7 +291,7 @@ class _DiscoveryWorker(QRunnable):
         super().__init__()
         self.root = root
         self.force = force
-        self.signals = _DiscoverySignals()
+        self.signals = _DiscoverySignals(QCoreApplication.instance())
 
     def run(self) -> None:
         try:
@@ -313,6 +316,9 @@ class _DiscoveryWorker(QRunnable):
             self.signals.failed.emit(str(exc))
         finally:
             self.signals.finished.emit()
+            # Also disconnect the completion lambda that captures this worker,
+            # so its QObject is not left to cyclic GC on an arbitrary thread.
+            self.signals.deleteLater()
 
 
 class PresentationBuilderWidget(QWidget):
