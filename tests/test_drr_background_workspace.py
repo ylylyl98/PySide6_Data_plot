@@ -12,7 +12,6 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
 from PySide6.QtCore import QCoreApplication, QEvent, QThreadPool
-from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog
 
 from core.drr_background_regions import DrrBackgroundRegion
@@ -78,7 +77,9 @@ class BackgroundWorkspaceTests(unittest.TestCase):
         deadline = time.monotonic() + 15
         while (dialog.pn._worker is not None or dialog.editor._worker is not None) and time.monotonic() < deadline:
             self.app.processEvents()
-            QTest.qWait(5)
+            # Let Python QRunnable work acquire the GIL between Qt event pumps.
+            time.sleep(0.005)
+            self.app.processEvents()
         self.assertIsNone(dialog.pn._worker, dialog.pn.status.text())
         self.assertIsNone(dialog.editor._worker, dialog.editor.status.text())
 
