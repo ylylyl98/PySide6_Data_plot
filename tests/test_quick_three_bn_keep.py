@@ -194,6 +194,15 @@ Basic.ApplicationWindow {
             self.assertTrue(catalog.filesModel.rows, repr(catalog.snapshot))
             if catalog.snapshot["selected"]:
                 self.click(self.find("source_catalog_clear"))
+            # Reopening restores the last successfully loaded group. Choose
+            # the next group through its real QML row before selecting files.
+            target_paths = {str(path) for path in paths}
+            group = next((row for row in catalog.groupsModel.rows
+                if target_paths <= set(row["members"])), None)
+            self.assertIsNotNone(group, repr(catalog.groupsModel.rows))
+            self.click(self.expose("source_catalog_group_" + group["id"],
+                "source_catalog_groups", catalog.groupsModel, group["id"]))
+            self.assertEqual(catalog.snapshot["selectedGroup"], group["id"])
             for path in paths:
                 self.click(self.expose("source_catalog_file_" + path.name,
                     "source_catalog_files", catalog.filesModel, path))
