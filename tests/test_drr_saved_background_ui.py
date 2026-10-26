@@ -169,18 +169,26 @@ class SavedBackgroundUiTests(unittest.TestCase):
         self.assertEqual(self.jobs[0].args[0].baseline_files, [self.p])
         self.assertEqual(workflow.source_intent(self.window).kind, 'p')
 
-    def test_no_saved_recipe_keeps_p_type_and_requires_review_without_guessing(self):
+    def test_no_saved_recipe_keeps_p_type_and_prepares_only_p_assignments_for_review(self):
         draft = self.intent('p')
         self.change_group()
         with patch('ui_qt.drr_auto_external.ExternalMatchRequest', side_effect=AssertionError('No cross-type guesses.')):
             self.deliver()
-        self.assertEqual(len(self.jobs), 1)
+        self.assertEqual(len(self.jobs), 2)
+        self.assertIsInstance(self.window._drr_external_request, workflow._FollowPnRequest)
         self.assertIs(workflow.source_intent(self.window), draft)
         self.assertFalse(self.window._drr_assignments)
         self.assertFalse(self.window.drr_baseline_files_manual)
         with patch.object(self.window.thread_pool, 'start', self.jobs.append):
             self.window.drr_controller._refresh_auto_external(selection_changed=True)
-        self.assertEqual(len(self.jobs), 1, 'Refreshing an unchanged unresolved group must not query history again.')
+        self.assertEqual(len(self.jobs), 2, 'An in-progress P match must not query history or start matching again.')
+        with patch.object(self.window, '_start_load') as start:
+            self.jobs[1].run()
+            self.app.processEvents()
+        start.assert_not_called()
+        self.assertIsNotNone(self.window._drr_pending_pn_plan)
+        self.assertEqual(self.window._drr_pending_pn_plan.kind, 'p')
+        self.assertFalse(self.window._drr_assignments)
 
     def test_no_saved_recipe_follows_bn_only_and_leaves_new_mapping_for_review(self):
         self.intent('bn')

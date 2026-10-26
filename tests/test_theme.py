@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from ui_qt.fluent_ui.style import render_qss_file
 from ui_qt.fluent_ui.tokens import ResolvedTheme, TokenValidationError
-from ui_qt.theme import PROJECT_ALIASES, ProjectTokenRepository, alias
+from ui_qt.theme import PROJECT_ALIASES, WORKSPACE_ALIAS_ROLES, ProjectTokenRepository, alias
 from tests.profile_phases import profile_phase
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QApplication, QDoubleSpinBox, QSpinBox
@@ -139,6 +139,60 @@ class ThemeInstallationTests(unittest.TestCase):
 
 
 class ThemeLayerTests(unittest.TestCase):
+    def test_workspace_aliases_follow_high_contrast_overrides(self) -> None:
+        """Quick and Widgets must use the same effective system palette."""
+        theme = _repository().resolve("dark", shell_profile="fluent-workbench")
+        effective = theme.with_alias_overrides(
+            {
+                "window_background": "#000000",
+                "canvas_background": "#101010",
+                "surface_secondary": "#202020",
+                "surface_background": "#303030",
+                "surface_tertiary": "#404040",
+                "text_primary": "#FFFFFF",
+                "text_secondary": "#EEEEEE",
+                "brand_background_subtle": "#000080",
+                "brand_foreground": "#FFFF00",
+                "border_subtle": "#CCCCCC",
+                "border_accessible": "#FFFFFF",
+            },
+            name="high-contrast",
+        )
+        for alias_name, base_role in WORKSPACE_ALIAS_ROLES.items():
+            self.assertEqual(effective.value(alias_name), effective.value(base_role))
+        for status in ("new", "processed", "saved"):
+            self.assertEqual(effective.value(f"source_{status}_background"), "#303030")
+            self.assertEqual(effective.value(f"source_{status}_foreground"), "#FFFFFF")
+            self.assertEqual(effective.value(f"source_{status}_border"), "#FFFFFF")
+
+    def test_workbench_text_and_actions_meet_normal_text_contrast(self) -> None:
+        def luminance(value: str) -> float:
+            color = QColor(value)
+            channels = (color.redF(), color.greenF(), color.blueF())
+            linear = [
+                channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+                for channel in channels
+            ]
+            return sum(channel * weight for channel, weight in zip(linear, (0.2126, 0.7152, 0.0722)))
+
+        pairs = [
+            (text, surface)
+            for text in ("heading_text", "section_text")
+            for surface in ("workspace_surface", "sidebar_surface", "chrome_surface", "control_surface")
+        ] + [
+            ("text_on_brand", "brand_background"),
+            ("text_on_brand", "brand_background_hover"),
+            ("text_on_brand", "brand_background_pressed"),
+            ("active_nav_foreground", "active_nav_background"),
+        ]
+        repository = _repository()
+        for name in ("light", "dark"):
+            theme = repository.resolve(name)
+            for foreground, background in pairs:
+                values = sorted((luminance(theme.value(foreground)), luminance(theme.value(background))))
+                ratio = (values[1] + 0.05) / (values[0] + 0.05)
+                self.assertGreaterEqual(ratio, 4.5, f"{name}: {foreground} on {background}: {ratio:.2f}")
+
     def test_repository_resolves_both_themes_with_project_aliases(self) -> None:
         repository = _repository()
         for name in ("light", "dark"):

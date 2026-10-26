@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 from core.drr_sources import resolve_source_path
+from core.typography import apply_figure_font, matplotlib_font_context
 from core.mcd import (
     McdBackgroundSuggestion, McdResult, McdSettings, background_fit_regions,
     detect_angles, discover_mcd_processing_status, low_field_mcd_branch_fits, match_mcd_angle,
@@ -1864,11 +1865,14 @@ class McdController:
             )
             if axis is None:
                 return
-            for artist in self._mcd_overlay_artists.get(name, ()):
-                axis.draw_artist(artist)
+            with matplotlib_font_context(axis):
+                for artist in self._mcd_overlay_artists.get(name, ()):
+                    axis.draw_artist(artist)
             return
-        for axis in self._mcd_blit_axes.get(name, ()):
-            self.figure.draw_artist(axis)
+        with matplotlib_font_context():
+            for axis in self._mcd_blit_axes.get(name, ()):
+                apply_figure_font(axis)
+                self.figure.draw_artist(axis)
         if name in {"pair", "linecut"} and name in self._mcd_blit_bboxes:
             overlay_name = f"{name}_overlay"
             bbox = self._mcd_blit_bboxes[name]

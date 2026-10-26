@@ -18,6 +18,7 @@ from core import export, plotting
 from core.compact_region_export import complete_title
 from core.loader import DataCube, load_dat
 from core.plotting import HeatmapParams, SplitColorScale
+from core.typography import with_plot_font
 
 
 def legacy_title(fig, text, left, right, *, top=.95, bottom=.85, obstacles=()):
@@ -125,7 +126,9 @@ class PngOptimizationTests(unittest.TestCase):
         self.assertEqual(title.get_text().replace('\n',' '),text)
         self.assertLess(len(calls),30, 'Fitting words should not trigger per-character font measurements')
 
+    @with_plot_font
     def test_title_pixels_match_legacy_layout_with_math_and_long_identifiers(self):
+        # Compare both layout algorithms under the application's Arial policy.
         for text in ('Device $TG-r_{BG}BG=0$ 720nmc repeat03',
                      'Identifier'+'AWVdTp5n2'*9,
                      'YZ365 720nmc TG-1.087BG=24 '*5):

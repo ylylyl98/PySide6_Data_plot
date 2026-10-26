@@ -6,6 +6,7 @@ the recursive inventory before reusing a snapshot, and builds only on changes.
 from __future__ import annotations
 
 from dataclasses import fields, is_dataclass
+from functools import lru_cache
 import hashlib
 import json
 import os
@@ -25,18 +26,27 @@ def _signature(path):
     return stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
 
 
-def _record_types():
+@lru_cache(maxsize=3)
+def _record_type(tag):
     # Fixed imports only: cache files cannot select arbitrary Python objects.
-    from core.data_io import PowerSeriesSource
-    from core.processing import PowerSeriesFile
-    from core.drr_sources import DrrSource
-    return {cls.__name__: cls for cls in (PowerSeriesSource, PowerSeriesFile, DrrSource)}
+    # Resolve the requested record alone so DRR snapshots never import the
+    # unrelated plotting, SciPy and pandas dependency chains of data_io.
+    if tag == 'DrrSource':
+        from core.drr_sources import DrrSource
+        return DrrSource
+    if tag == 'PowerSeriesSource':
+        from core.data_io import PowerSeriesSource
+        return PowerSeriesSource
+    if tag == 'PowerSeriesFile':
+        from core.processing import PowerSeriesFile
+        return PowerSeriesFile
+    return None
 
 
 def _encode(value, grids=None, grid_ids=None):
     if value is None or isinstance(value, (str, bool, int, float)):
         return value
-    if is_dataclass(value) and type(value) in _record_types().values():
+    if is_dataclass(value) and type(value) is _record_type(type(value).__name__):
         encoded = {}
         for field in fields(value):
             item = getattr(value, field.name)
@@ -70,7 +80,7 @@ def _decode(value, grids=()):
         return {_decode(k, grids): _decode(v, grids) for k, v in payload}
     if tag in ('tuple', 'list', 'set') and isinstance(payload, list):
         return {'tuple': tuple, 'list': list, 'set': set}[tag](_decode(v, grids) for v in payload)
-    cls = _record_types().get(tag)
+    cls = _record_type(tag)
     if cls is not None and isinstance(payload, dict):
         return cls(**{k: _decode(v, grids) for k, v in payload.items()})
     raise ValueError('Unsupported catalog type')
@@ -152,13 +162,14 @@ class SourceCatalogCache:
             if record['schema'] == 1:
                 self._write(record['inventory'], payload)
                 return record['inventory'], payload
-            from core.drr_sources import DrrSource
-            if isinstance(payload, list) and len(payload) <= 10000 and all(isinstance(item, DrrSource) for item in payload):
-                with _SNAPSHOT_LOCK:
-                    _DRR_SNAPSHOTS[key] = (signature, [row[:] for row in record['inventory']], tuple(payload))
-                    _DRR_SNAPSHOTS.move_to_end(key)
-                    while len(_DRR_SNAPSHOTS) > 4:
-                        _DRR_SNAPSHOTS.popitem(last=False)
+            if isinstance(payload, list) and len(payload) <= 10000:
+                from core.drr_sources import DrrSource
+                if all(isinstance(item, DrrSource) for item in payload):
+                    with _SNAPSHOT_LOCK:
+                        _DRR_SNAPSHOTS[key] = (signature, [row[:] for row in record['inventory']], tuple(payload))
+                        _DRR_SNAPSHOTS.move_to_end(key)
+                        while len(_DRR_SNAPSHOTS) > 4:
+                            _DRR_SNAPSHOTS.popitem(last=False)
             return record['inventory'], payload
         except (OSError, ValueError, TypeError, KeyError, RecursionError):
             return None
@@ -203,7 +214,13 @@ class SourceCatalogCache:
             with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=self.cache_root,
                                              suffix='.tmp', delete=False) as handle:
                 temporary = Path(handle.name)
-                json.dump(record, handle, ensure_ascii=False)
+                # dumps uses the C encoder; dump streams many small Python writes.
+                try:
+                    serialized = json.dumps(record, ensure_ascii=False)
+                except MemoryError:
+                    json.dump(record, handle, ensure_ascii=False)
+                else:
+                    handle.write(serialized)
             os.replace(temporary, self.path)
         except (OSError, TypeError, ValueError, RecursionError):
             pass

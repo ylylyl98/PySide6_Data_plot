@@ -9,6 +9,8 @@ fit operation is consulted.
 
 from __future__ import annotations
 
+from core.typography import save_figure
+
 from dataclasses import fields as dataclass_fields, is_dataclass
 from datetime import datetime, timezone
 import copy
@@ -829,9 +831,9 @@ def _plot_pngs(directory: Path, data: Mapping[str, Any], snapshot: Mapping[str, 
     def _save_png(fig, path):
         if width_scale > 1.0:
             compact_horizontal_margins(fig)
-            fig.savefig(path, dpi=DPI, bbox_inches=fig.bbox_inches, pad_inches=0)
+            save_figure(fig, path, dpi=DPI, bbox_inches=fig.bbox_inches, pad_inches=0)
         else:
-            fig.savefig(path, dpi=DPI)
+            save_figure(fig, path, dpi=DPI)
     energy = np.asarray(data["energy_ev"], float).ravel()
     fields = np.asarray(data["fields_t"], float).ravel()
     values = np.asarray(data["values"], float)
@@ -1306,7 +1308,7 @@ def _mcd_export_fingerprint(snapshot: Mapping[str, Any], windows: Sequence[Mappi
             return identities.get(value, value)
         return _jsonable(value)
 
-    content = {"render_version": 5, "snapshot": normalize(snapshot)}
+    content = {"render_version": 6, "snapshot": normalize(snapshot)}
     state = snapshot.get("plot_state", {})
     if isinstance(state, Mapping) and state.get("png_width_scale", 1.0) > 1.0:
         content["wide_layout_version"] = 1

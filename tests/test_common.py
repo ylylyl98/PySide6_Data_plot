@@ -66,8 +66,8 @@ def _assert_import_isolated(module_name: str) -> None:
 
 class CommonSymbolsTests(unittest.TestCase):
     def test_ui_metrics_contains_shell_density_keys(self) -> None:
-        self.assertEqual(UI_METRICS["left_width"], 380)
-        self.assertLess(UI_METRICS["sidebar_min_width"], UI_METRICS["left_width"])
+        self.assertEqual(UI_METRICS["left_width"], 320)
+        self.assertLessEqual(UI_METRICS["sidebar_min_width"], UI_METRICS["left_width"])
         self.assertGreater(UI_METRICS["sidebar_max_width"], UI_METRICS["left_width"])
         for key in (
             "sidebar_min_width",

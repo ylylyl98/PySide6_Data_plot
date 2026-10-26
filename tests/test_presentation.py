@@ -111,6 +111,25 @@ class PresentationTests(unittest.TestCase):
             self.assertEqual(Path(plans[0].images[2].path), paths[3])
             self.assertEqual(planned_slide_title(plans[0]), "Doping = 6.3 V")
 
+    def test_queue_planning_resolves_shared_parent_once_without_changing_order(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            images = [PresentationImage(root / f"run_D6p3_MCD_vs_B_E{index / 100 + 1.5:.2f}eV_W5meV.png")
+                      for index in reversed(range(30))]
+            expected = plan_presentation_slides(images, 12, "folder")
+            original = Path.resolve
+            resolved = []
+            def resolve(path, *args, **kwargs):
+                resolved.append(path)
+                return original(path, *args, **kwargs)
+            with patch.object(Path, "resolve", resolve):
+                actual = plan_presentation_slides(images, 12, "folder")
+            self.assertEqual(actual, expected)
+            self.assertEqual(resolved, [root])
+            self.assertEqual([item.path for plan in actual for item in plan.images],
+                             [item.path for item in reversed(images)])
+
     def test_exported_panel_labels_restart_after_automatic_grouping(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -1,4 +1,4 @@
-"""Original PNG layout with an opt-in, remembered wide-export multiplier."""
+"""Shared, remembered PNG layout and wide-export multiplier."""
 from dataclasses import replace
 
 from PySide6.QtWidgets import QComboBox, QDoubleSpinBox
@@ -20,6 +20,8 @@ def install_png_width_control(owner, toolbar):
     mode.setAccessibleName('PNG export layout')
     mode.addItem('PNG 1.0×', 'original')
     mode.addItem('Wide PNG', 'wide')
+    layout = str(owner.settings.value('export/png_layout', 'original'))
+    mode.setCurrentIndex(1 if layout == 'wide' else 0)
     mode.setToolTip('PNG 1.0× saves only the original width. For DRR, Wide PNG saves both 1.0× and the selected wider version.')
     mode.setAccessibleDescription(mode.toolTip())
     spin = QDoubleSpinBox(toolbar)
@@ -38,7 +40,7 @@ def install_png_width_control(owner, toolbar):
     except (TypeError, ValueError):
         value = 2.0
     spin.setValue(value)
-    spin.setEnabled(False)
+    spin.setEnabled(mode.currentData() == 'wide')
     tooltip = ('Wide PNG multiplier (default 2×). Select Wide PNG to enable it; '
                'height, font sizes and data ranges stay unchanged. Applies to main-plot '
                'PNG saves, PNG + DAT heatmaps and MCD Save Results. The on-screen plot stays unchanged.')
@@ -57,6 +59,7 @@ def install_png_width_control(owner, toolbar):
     owner.png_layout_combo = mode
     owner.png_width_spin = spin
     mode.currentIndexChanged.connect(lambda _index: spin.setEnabled(mode.currentData() == 'wide'))
+    mode.currentIndexChanged.connect(lambda _index: owner.settings.setValue('export/png_layout', mode.currentData()))
     spin.valueChanged.connect(lambda value: owner.settings.setValue('export/png_width_scale', value))
 
 

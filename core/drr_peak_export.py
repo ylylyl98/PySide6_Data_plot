@@ -1,6 +1,8 @@
 """Separate, lossless peak tables and comparison figures for DRR analysis."""
 from __future__ import annotations
 
+from core.typography import save_figure
+
 from dataclasses import replace
 from datetime import datetime, timezone
 import json
@@ -179,7 +181,7 @@ def _write_comparison(path, result, cube):
             if points:
                 ax.legend(fontsize=7, loc="best")
         fig.suptitle("Peak analysis — accepted tracks; crosses mark uncertainty")
-        fig.savefig(path, dpi=160, format="png")
+        save_figure(fig, path, dpi=160, format="png")
     finally:
         fig.clear()
 

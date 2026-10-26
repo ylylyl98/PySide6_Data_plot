@@ -5,50 +5,73 @@ small set of project-specific semantic aliases on top, and installs a single
 ``FluentThemeManager`` that owns the application palette, generated QSS, and
 system light/dark/high-contrast preference.
 
-Project-specific aliases (``source_new_*``, ``source_processed_*``,
-``source_saved_*``) describe workflow status badges that Fluent's generic
-status vocabulary does not cover. They are derived values documented here, not
-official Fluent tokens.
+Project colors adapt Fluent's neutral and brand roles to a quiet slate workbench.
+The versioned official token snapshot remains unchanged. ``source_new_*``,
+``source_processed_*`` and ``source_saved_*`` describe workflow status badges;
+workspace aliases below give Widgets and Quick the same surface vocabulary.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 from types import MappingProxyType
-from typing import Optional
+from typing import Mapping, Optional
 
 from PySide6.QtWidgets import QApplication
 
+from core.typography import FONT_FAMILY
 from ui_qt.fluent_ui.theme import FluentThemeManager, ThemeMode
 from ui_qt.fluent_ui.tokens import ResolvedTheme, TokenRepository
+from ui_qt.typography import install_application_font
 
 _RESOURCE_ROOT = Path(__file__).resolve().parent / "fluent_ui" / "resources"
 _QSS_TEMPLATE = Path(__file__).resolve().parent / "fluent_ui" / "app.qss.in"
 
-PROJECT_ALIASES: dict[str, dict[str, str]] = {
-    "light": {
-        "source_new_foreground": "#1769AA",
-        "source_new_background": "#EAF3FC",
-        "source_new_border": "#86B8E3",
-        "source_processed_foreground": "#237A3B",
-        "source_processed_background": "#EAF6ED",
-        "source_processed_border": "#8BC79A",
-        "source_saved_foreground": "#6F42A5",
-        "source_saved_background": "#F3EDFA",
-        "source_saved_border": "#BCA1D8",
-    },
-    "dark": {
-        "source_new_foreground": "#6CB8F0",
-        "source_new_background": "#15283A",
-        "source_new_border": "#3F6F9C",
-        "source_processed_foreground": "#7BD88F",
-        "source_processed_background": "#17331F",
-        "source_processed_border": "#3F7A50",
-        "source_saved_foreground": "#C9A0F0",
-        "source_saved_background": "#2A2136",
-        "source_saved_border": "#6F5A8F",
-    },
+from ui_qt.theme_tokens import PROJECT_ALIASES
+
+
+WORKSPACE_ALIAS_ROLES: dict[str, str] = {
+    "workspace_background": "window_background",
+    "workspace_surface": "canvas_background",
+    "sidebar_surface": "surface_secondary",
+    "control_surface": "surface_background",
+    "heading_text": "text_primary",
+    "section_text": "text_secondary",
+    "active_nav_background": "brand_background_subtle",
+    "active_nav_foreground": "brand_foreground",
+    "chrome_surface": "surface_tertiary",
+    "chrome_foreground": "text_secondary",
+    "chrome_border": "border_subtle",
 }
+
+
+def _workspace_aliases(aliases: Mapping[str, str]) -> dict[str, str]:
+    return {name: aliases[role] for name, role in WORKSPACE_ALIAS_ROLES.items()}
+
+
+class ProjectResolvedTheme(ResolvedTheme):
+    """Keep derived project roles in step with system-palette overrides."""
+
+    def with_alias_overrides(
+        self, overrides: Mapping[str, str], *, name: str | None = None
+    ) -> ResolvedTheme:
+        resolved = super().with_alias_overrides(overrides, name=name)
+        merged = dict(resolved.aliases)
+        merged.update(_workspace_aliases(merged))
+        if resolved.name == "high-contrast":
+            # Domain badges retain their text labels, while contrast themes own
+            # their background/foreground pair and visible boundary.
+            for status in ("new", "processed", "saved"):
+                merged[f"source_{status}_background"] = merged["surface_background"]
+                merged[f"source_{status}_foreground"] = merged["text_primary"]
+                merged[f"source_{status}_border"] = merged["border_accessible"]
+        return ProjectResolvedTheme(
+            name=resolved.name,
+            official=resolved.official,
+            aliases=MappingProxyType(merged),
+            source_metadata=resolved.source_metadata,
+            shell_profile=resolved.shell_profile,
+        )
 
 
 class ProjectTokenRepository(TokenRepository):
@@ -58,7 +81,8 @@ class ProjectTokenRepository(TokenRepository):
         resolved = super().resolve(theme, shell_profile=shell_profile)
         merged = dict(resolved.aliases)
         merged.update(PROJECT_ALIASES.get(resolved.name, {}))
-        return ResolvedTheme(
+        merged.update(_workspace_aliases(merged))
+        return ProjectResolvedTheme(
             name=resolved.name,
             official=resolved.official,
             aliases=MappingProxyType(merged),
@@ -95,6 +119,7 @@ def install_theme(
 ) -> FluentThemeManager:
     """Install the single application theme manager and apply the theme."""
     global _manager
+    install_application_font(app)
     from ui_qt.wheel_policy import install_wheel_value_guard
     install_wheel_value_guard(app)
     # The manager is an application-owned event filter. Replacing only the
@@ -122,6 +147,7 @@ def install_theme(
         mode=mode,
         shell_profile="fluent-workbench",
         prefer_fluent_font=False,
+        font_family=FONT_FAMILY,
         apply_body_pixel_size=False,
     )
     manager.apply()

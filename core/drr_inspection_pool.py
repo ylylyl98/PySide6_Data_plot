@@ -3,7 +3,7 @@ from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from concurrent.futures.process import BrokenProcessPool
 from multiprocessing import get_context
 
-from core.load_cancellation import LoadCancelled, check_load_cancelled, load_scope
+from core.load_cancellation import LoadCancelled, check_load_checkpoint, load_scope
 
 
 _stop = None
@@ -26,7 +26,7 @@ def _inspect(path):
         return inspect_csv_gate_profile(path, max_rows=None)
 
 
-def inspect_csv_profiles(paths):
+def inspect_csv_profiles(paths, *, on_profile=None):
     """Return path/profile pairs; startup failure falls back to caller's scan.
 
     At most two processes and four submitted files are retained. Cancellation
@@ -44,7 +44,7 @@ def inspect_csv_profiles(paths):
         pool = ProcessPoolExecutor(max_workers=2, mp_context=context,
                                    initializer=_initialize, initargs=(stop,))
         while True:
-            check_load_cancelled()
+            check_load_checkpoint()
             while len(pending) < 4:
                 path = next(remaining, None)
                 if path is None:
@@ -54,11 +54,15 @@ def inspect_csv_profiles(paths):
                 return result
             completed, _ = wait(pending, timeout=.1, return_when=FIRST_COMPLETED)
             for future in completed:
-                result[pending.pop(future)] = future.result()
+                path = pending.pop(future)
+                profile = future.result()
+                result[path] = profile
+                if on_profile is not None:
+                    on_profile(path, profile)
     except (BrokenProcessPool, OSError, RuntimeError):
         # A restricted host may not permit child processes. Never fail a
         # normal catalog refresh solely because acceleration is unavailable.
-        return {}
+        return result
     finally:
         if stop is not None:
             stop.set()

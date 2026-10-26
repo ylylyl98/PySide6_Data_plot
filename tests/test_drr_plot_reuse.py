@@ -6,12 +6,13 @@ class DrrPlotReuseTests(DrrDualViewRegressionTests):
     def test_split_color_partial_draw_matches_rebuild_for_both_products(self):
         from unittest.mock import patch
         w = self.window
-        w.resize(1500, 1000)
+        # Leave the shared Arial suptitle outside the color redraw rectangle.
+        w.resize(1700, 1100)
         w.show()
         w.drr_view_side_btn.setChecked(True)
         self._wait_derivative()
         for count in (2, 3):
-            w.resize(2200 if count == 3 else 1500, 1000)
+            w.resize(2200 if count == 3 else 1700, 1100)
             self.app.processEvents()
             self._set_silently(w.drr_split_spins['x0'], -.6)
             self._set_silently(w.drr_split_spins['x1'], .6)
@@ -19,6 +20,9 @@ class DrrPlotReuseTests(DrrDualViewRegressionTests):
             self._wait_derivative()
             w.canvas.draw()
             self.app.processEvents()
+            title = w.figure._suptitle.get_window_extent(w.canvas.get_renderer())
+            frame = w._drr_region_blitters['gate_view']._color_frame
+            self.assertTrue(all(not title.overlaps(box.padded(3)) for box in frame.bounds.values()))
             for product, controls in (('raw', w.drr_split_spins), ('second', w.drr_second_split_spins)):
                 with self.subTest(regions=count, product=product):
                     self._set_silently(controls['left_vmax'], 5. + count)
@@ -60,12 +64,22 @@ class DrrPlotReuseTests(DrrDualViewRegressionTests):
         self._set_silently(w.drr_split_spins['x1'], .6)
         w.drr_region_count_combo.setCurrentIndex(2)
         self._wait_derivative()
-        # Compress the separation deterministically, independent of the host
-        # font metrics, until the second map overlaps the first colorbar.
-        other = w._drr_heatmap_axes['second']
-        other.set_position(other.get_position().translated(-.08, 0.))
+        # Overlap header decorations, preserving disjoint measured-data
+        # surfaces. Moving a whole map was specific to the old right-side
+        # bars and now also overlaps gate overlays in the wider map layout.
+        raw_map = w._drr_heatmap_axes['raw']
+        other_map = w._drr_heatmap_axes['second']
+        raw_host = w._drr_heatmap_renders['raw'].colorbar_host
+        other_host = w._drr_heatmap_renders['second'].colorbar_host
+        renderer = w.canvas.get_renderer()
+        raw_header = raw_host.get_tightbbox(renderer)
+        quantity = other_host._dptk_header_quantity
+        quantity.set_x((raw_header.x1 - 8 - other_host.bbox.x0) / other_host.bbox.width)
         w.canvas.draw()
         self.app.processEvents()
+        renderer = w.canvas.get_renderer()
+        self.assertFalse(raw_map.bbox.overlaps(other_map.bbox))
+        self.assertTrue(raw_host.get_tightbbox(renderer).overlaps(quantity.get_window_extent(renderer)))
         self._set_silently(w.drr_split_spins['left_vmax'], 1.e6)
         with patch.object(w.canvas, 'draw', wraps=w.canvas.draw) as draw:
             w._plot_mode('DRR')
@@ -80,7 +94,9 @@ class DrrPlotReuseTests(DrrDualViewRegressionTests):
     def test_color_edit_repaints_only_changed_map_then_gate_keeps_new_colors(self):
         from unittest.mock import patch
         w = self.window
-        w.resize(1500, 1000)
+        # This case exercises a nonoverlapping color update; overlap fallback
+        # is covered separately, including figure titles and colorbar labels.
+        w.resize(1700, 1100)
         w.show()
         w.drr_view_side_btn.setChecked(True)
         self._wait_derivative()
@@ -89,6 +105,9 @@ class DrrPlotReuseTests(DrrDualViewRegressionTests):
         raw = w._drr_heatmap_axes['raw']
         other = w._drr_heatmap_axes['second']
         spectrum = w._drr_spectrum_axes['raw']
+        title = w.figure._suptitle.get_window_extent(w.canvas.get_renderer())
+        frame = w._drr_region_blitters['gate_view']._color_frame
+        self.assertTrue(all(not title.overlaps(box.padded(3)) for box in frame.bounds.values()))
         for limit in (100., 1.e5, 20.):
             self._set_silently(w.drr_spins['vmax'], limit)
             with patch.object(other, 'draw', wraps=other.draw) as unchanged, \
@@ -166,7 +185,7 @@ class DrrPlotReuseTests(DrrDualViewRegressionTests):
                     for render in w._drr_heatmap_renders.values():
                         self.assertEqual(len(render.images), count)
                         self.assertEqual(len(render.primary.axes.collections), count)
-                        self.assertEqual(len(render.colorbar_host.child_axes), 0 if count == 1 else count)
+                        self.assertEqual(len(render.colorbar_host.child_axes), count)
                     w.canvas.draw()
                     actual = np.asarray(w.canvas.buffer_rgba()).copy()
                     w._drr_reuse_state = None

@@ -7,7 +7,7 @@ import numpy as np
 from PySide6.QtCore import QObject, QTimer, Slot
 
 from core.color_limits import ColorRequest, calculate_bounds
-from ui_qt.common import Worker, focused_numeric_input
+from ui_qt.common import Worker, pending_numeric_input
 
 ASYNC_CELLS = 250_000
 
@@ -199,8 +199,7 @@ class DrrColorCompute(QObject):
         if getattr(owner, '_is_closing', False) or owner.loaded is None:
             self.clear()
             return
-        focused = focused_numeric_input(owner)
-        if focused is not None and focused.lineEdit().isModified():
+        if pending_numeric_input(owner) is not None:
             self.timer.start(90)
             return
         changed = False

@@ -8,9 +8,10 @@ main window as their shared application context during this first refactor.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from PySide6.QtWidgets import QWidget
+if TYPE_CHECKING:
+    from PySide6.QtWidgets import QWidget
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,8 @@ class FeatureSpec:
 
     def build(self, owner: Any) -> QWidget:
         if self.builder_name is None:
+            from PySide6.QtWidgets import QWidget
+
             return QWidget()
         return getattr(owner, self.builder_name)()
 

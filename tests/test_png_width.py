@@ -230,13 +230,33 @@ class PngWidthUiTests(unittest.TestCase):
             other_toolbar = QToolBar()
             install_png_width_control(second, other_toolbar)
             self.assertEqual(second.png_width_spin.value(), 1.5)
-            self.assertEqual(export_width(second), 1.)
-            self.assertFalse(second.png_width_spin.isEnabled())
+            self.assertEqual(export_width(second), 1.5)
+            self.assertTrue(second.png_width_spin.isEnabled())
             owner.png_layout_combo.setCurrentIndex(0)
             self.assertEqual(export_width(owner), 1.)
             self.assertEqual(spin.value(), 1.5)
+            third = SimpleNamespace(settings=QSettings(str(Path(folder) / 'settings.ini'), QSettings.IniFormat))
+            third_toolbar = QToolBar()
+            install_png_width_control(third, third_toolbar)
+            self.assertEqual(export_width(third), 1.)
+            self.assertEqual(third.png_width_spin.value(), 1.5)
+            self.assertFalse(third.png_width_spin.isEnabled())
             toolbar.close()
             other_toolbar.close()
+            third_toolbar.close()
+
+    def test_invalid_saved_layout_uses_original_without_losing_width(self):
+        with tempfile.TemporaryDirectory() as folder:
+            settings = QSettings(str(Path(folder) / 'settings.ini'), QSettings.IniFormat)
+            settings.setValue('export/png_layout', 'invalid')
+            settings.setValue('export/png_width_scale', 2.5)
+            owner = SimpleNamespace(settings=settings)
+            toolbar = QToolBar()
+            install_png_width_control(owner, toolbar)
+            self.assertEqual(export_width(owner), 1.)
+            self.assertFalse(owner.png_width_spin.isEnabled())
+            self.assertEqual(owner.png_width_spin.value(), 2.5)
+            toolbar.close()
 
     def test_old_or_invalid_width_never_enables_wide_export_at_startup(self):
         for stored, expected in ((1., 2.), (2.5, 2.5), ('invalid', 2.), ('nan', 2.)):

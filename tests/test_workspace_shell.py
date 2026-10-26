@@ -4,7 +4,7 @@ import unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QMainWindow, QStackedWidget, QSplitter, QSizePolicy, QWidget
+from PySide6.QtWidgets import QApplication, QBoxLayout, QMainWindow, QStackedWidget, QSplitter, QSizePolicy, QWidget
 
 from ui_qt.common import UI_METRICS
 from ui_qt.shell.workspace import WorkspaceShell
@@ -36,16 +36,30 @@ class WorkspaceShellTests(unittest.TestCase):
             self.assertIs(window.centralWidget(), central)
             self.assertIsInstance(central.layout().itemAt(0).widget(), QWidget)
             self.assertIs(central.layout().itemAt(0).widget(), navigation)
-            self.assertIs(central.layout().itemAt(1).widget(), shell.workspace_stack)
+            self.assertIs(central.layout().itemAt(1).widget(), shell.workspace_content)
             self.assertEqual(
                 [central.layout().itemAt(index).widget() for index in range(2)],
-                [navigation, shell.workspace_stack],
+                [navigation, shell.workspace_content],
             )
             self.assertEqual(
                 [central.layout().contentsMargins().left(), central.layout().contentsMargins().top(),
                  central.layout().contentsMargins().right(), central.layout().contentsMargins().bottom()],
-                [UI_METRICS["main_margin"]] * 4,
+                [0] * 4,
             )
+            self.assertEqual(central.layout().direction(), QBoxLayout.LeftToRight)
+            self.assertIs(shell.workspace_content.layout().itemAt(0).widget(), shell.header)
+            self.assertIs(shell.workspace_content.layout().itemAt(1).widget(), shell.workspace_stack)
+            self.assertEqual(left_panel.property("appRole"), "controlsSidebar")
+            self.assertEqual(plot_panel.property("appRole"), "workspaceCanvas")
+
+            shell.set_context("Reflectance", "Inspect differential reflectance maps.")
+            self.assertEqual(shell.title_label.text(), "Reflectance")
+            self.assertEqual(shell.subtitle_label.text(), "Inspect differential reflectance maps.")
+            self.assertEqual(shell.header.accessibleName(), "Reflectance workspace")
+            self.assertTrue(shell.eyebrow_label.isHidden())
+            self.assertTrue(shell.subtitle_label.isHidden())
+            self.assertIs(shell.header.layout().itemAt(0).widget(), shell.title_label)
+            self.assertIn("Inspect differential reflectance maps.", shell.title_label.toolTip())
 
             self.assertIsInstance(shell.workspace_splitter, QSplitter)
             self.assertEqual(shell.workspace_splitter.orientation(), Qt.Horizontal)
@@ -88,13 +102,102 @@ class WorkspaceShellTests(unittest.TestCase):
             self.assertIs(window.workspace_stack.widget(0), window.workspace_splitter)
             self.assertIs(window.workspace_stack.widget(1), window.presentation_widget)
             self.assertEqual(window.centralWidget().layout().count(), 2)
-            self.assertIs(window.centralWidget().layout().itemAt(1).widget(), window.workspace_stack)
+            self.assertIs(window.centralWidget().layout().itemAt(1).widget(), shell.workspace_content)
+            self.assertIs(window.sidebar_toggle_btn.parentWidget(), shell.header)
             self.assertIs(window.data_source_context.parentWidget(), window.menu_toolbar_host.main_toolbar)
             self.assertTrue(window.data_source_context.isVisible())
             self.assertFalse(window.tabs.tabBar().isVisible())
             self.assertFalse(window.workspace_splitter.childrenCollapsible())
         finally:
             window.close()
+
+    def test_collapsing_workflow_rail_keeps_controls_and_exposes_same_workflow_actions(self):
+        from PySide6.QtWidgets import QTabWidget
+        from ui_qt.shell.workflow_navigation import WorkflowNavigation
+
+        window = QMainWindow()
+        tabs = QTabWidget()
+        for label in ("PL", "DRR", "MCD Peak Shift", "Slides", "Tools"):
+            tabs.addTab(QWidget(), label)
+        navigation = WorkflowNavigation(tabs)
+        navigation.workflow_tabs.setTabVisible(2, False)
+        navigation.workflow_tabs.setTabEnabled(3, False)
+        navigation.workflow_tabs.currentChanged.connect(tabs.setCurrentIndex)
+        shell = WorkspaceShell(
+            window, navigation=navigation, left_panel=QWidget(), plot_panel=QWidget(),
+            presentation_widget=QWidget(), tools_widget=QWidget(),
+        )
+        manual_toggles = []
+        shell.rail_toggle_btn.clicked[bool].connect(manual_toggles.append)
+        try:
+            window.resize(1180, 700)
+            window.show()
+            self.app.processEvents()
+            header_height = shell.header.height()
+            self.assertTrue(shell.rail_visible)
+            self.assertTrue(shell.is_rail_visible())
+            shell.set_rail_visible(False)
+            self.app.processEvents()
+            self.assertFalse(navigation.isVisible())
+            self.assertFalse(shell.rail_toggle_btn.isChecked())
+            self.assertTrue(shell.left_panel.isVisible())
+            self.assertTrue(navigation.sidebar_toggle_btn.isChecked())
+            self.assertTrue(shell.workflow_selector_btn.isVisible())
+            self.assertEqual(shell.workflow_selector_btn.text(), "PL")
+            self.assertFalse(shell._workflow_actions[2].isVisible())
+            self.assertFalse(shell._workflow_actions[3].isEnabled())
+            self.assertEqual(manual_toggles, [])
+
+            shell._workflow_actions[1].trigger()
+            self.assertEqual(navigation.workflow_tabs.currentIndex(), 1)
+            self.assertEqual(tabs.currentIndex(), 1)
+            self.assertEqual(shell.workflow_selector_btn.text(), "DRR")
+            self.assertTrue(navigation.destination_buttons[1].isChecked())
+            self.assertEqual(shell.header.height(), header_height)
+
+            shell.rail_toggle_btn.click()
+            self.app.processEvents()
+            self.assertTrue(shell.is_rail_visible())
+            self.assertTrue(navigation.isVisible())
+            self.assertTrue(shell.workflow_selector_btn.isHidden())
+            self.assertTrue(shell.left_panel.isVisible())
+            self.assertEqual(manual_toggles, [True])
+        finally:
+            window.close()
+            window.deleteLater()
+            tabs.deleteLater()
+
+    def test_single_row_header_reuses_plot_toolbar_and_reclaims_its_previous_row(self):
+        from PySide6.QtWidgets import QToolBar, QVBoxLayout
+
+        window = QMainWindow()
+        plot = QWidget()
+        plot_layout = QVBoxLayout(plot)
+        toolbar = QToolBar(plot)
+        action = toolbar.addAction("Home")
+        canvas = QWidget(plot)
+        plot_layout.addWidget(toolbar)
+        plot_layout.addWidget(canvas, 1)
+        shell = WorkspaceShell(
+            window, navigation=QWidget(), left_panel=QWidget(), plot_panel=plot,
+            presentation_widget=QWidget(), plot_toolbar=toolbar,
+        )
+        try:
+            self.assertIs(shell.plot_toolbar, toolbar)
+            self.assertIs(toolbar.parentWidget(), shell.header)
+            self.assertEqual(toolbar.actions(), [action])
+            self.assertEqual(plot_layout.count(), 1)
+            self.assertIs(plot_layout.itemAt(0).widget(), canvas)
+            self.assertEqual(toolbar.minimumWidth(), 0)
+            self.assertTrue(shell.subtitle_label.isHidden())
+            shell.set_context("Differential reflectance", "Explore maps and spectra.")
+            self.assertEqual(shell.title_label.text(), "Differential reflectance")
+            self.assertEqual(shell.title_label.accessibleName(), "Differential reflectance")
+            self.assertIn("Explore maps and spectra.", shell.title_label.toolTip())
+            self.assertTrue(shell.subtitle_label.isHidden())
+        finally:
+            window.close()
+            window.deleteLater()
 
     def test_toolbar_source_context_is_independent_of_sidebar_and_reuses_source_widgets(self):
         from ui_qt.main_window import MainWindow

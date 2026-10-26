@@ -10,27 +10,159 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  preflight:
     runs-on: windows-latest
+    timeout-minutes: 5
+    outputs:
+      app-version: ${{ steps.version.outputs.app-version }}
+      zip-name: ${{ steps.version.outputs.zip-name }}
+      setup-name: ${{ steps.version.outputs.setup-name }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Resolve and validate version
+        id: version
+        shell: pwsh
+        run: |
+          $version = python scripts/validate_release_version.py --print-version
+          if ($LASTEXITCODE -ne 0) { throw "Could not read application version" }
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            python scripts/validate_release_version.py --tag "$env:GITHUB_REF_NAME"
+            if ($LASTEXITCODE -ne 0) { throw "Tag and application version do not match" }
+            $zipName = "DPTK-$env:GITHUB_REF_NAME-Windows-x64.zip"
+            $setupName = "DPTK-Setup-$env:GITHUB_REF_NAME-Windows-x64.exe"
+          } else {
+            $zipName = "DPTK-Windows-x64.zip"
+            $setupName = "DPTK-Setup-Windows-x64.exe"
+          }
+          "app-version=$version" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "zip-name=$zipName" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "setup-name=$setupName" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
       - name: Verify release tag is contained in main
         if: github.ref_type == 'tag'
         shell: pwsh
         run: |
           git fetch origin main --no-tags
-          git merge-base --is-ancestor "${{ github.sha }}" origin/main
+          if ($LASTEXITCODE -ne 0) { throw "Could not fetch main for release validation" }
+          git merge-base --is-ancestor "$env:GITHUB_SHA" origin/main
           if ($LASTEXITCODE -ne 0) {
-            throw "Release tag ${{ github.ref_name }} is not contained in main. Merge the release commit into main before publishing the tag."
+            throw "Release tag $env:GITHUB_REF_NAME is not contained in main. Merge the release commit into main before publishing the tag."
           }
+
+  test-plan:
+    needs: preflight
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
           cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+      - name: Create complete test plan
+        run: python scripts/run_release_tests.py plan --output build/release-tests/plan.json --shards 4
+      - name: Upload test plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-test-plan
+          path: build/release-tests/plan.json
+          if-no-files-found: error
+
+  tests:
+    name: Tests (shard ${{ matrix.shard }})
+    needs: test-plan
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+      - name: Download test plan
+        uses: actions/download-artifact@v4
+        with:
+          name: release-test-plan
+          path: build/release-tests
+      - name: Run isolated test shard
+        run: python scripts/run_release_tests.py run --plan build/release-tests/plan.json --shard ${{ matrix.shard }} --output-dir build/release-tests/shard-${{ matrix.shard }}
+      - name: Upload test report and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-test-shard-${{ matrix.shard }}
+          path: build/release-tests/shard-${{ matrix.shard }}/
+          if-no-files-found: warn
+
+  verify-tests:
+    needs: [test-plan, tests]
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Download test plan
+        uses: actions/download-artifact@v4
+        with:
+          name: release-test-plan
+          path: build/release-tests
+      - name: Download shard reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-test-shard-*
+          path: build/release-tests/results
+      - name: Verify every planned test passed
+        run: python scripts/run_release_tests.py verify --plan build/release-tests/plan.json --results-dir build/release-tests/results
+
+  build:
+    needs: preflight
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      APP_VERSION: ${{ needs.preflight.outputs.app-version }}
+      ZIP_NAME: ${{ needs.preflight.outputs.zip-name }}
+      SETUP_NAME: ${{ needs.preflight.outputs.setup-name }}
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
       - name: Install dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt -r requirements-build.txt
       - name: Install NSIS
@@ -88,31 +220,20 @@ jobs:
 
           "MAKENSIS_PATH=$makensis" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "MAKENSIS_PATH=$makensis"
-      - name: Resolve and validate version
-        if: github.event_name != 'pull_request'
-        shell: pwsh
-        run: |
-          $version = python scripts/validate_release_version.py --print-version
-          if ($LASTEXITCODE -ne 0) { throw "Could not read application version" }
-          if ("${{ github.ref_type }}" -eq "tag") {
-            python scripts/validate_release_version.py --tag "${{ github.ref_name }}"
-            if ($LASTEXITCODE -ne 0) { throw "Tag and application version do not match" }
-            $zipName = "DPTK-${{ github.ref_name }}-Windows-x64.zip"
-            $setupName = "DPTK-Setup-${{ github.ref_name }}-Windows-x64.exe"
-          } else {
-            $zipName = "DPTK-Windows-x64.zip"
-            $setupName = "DPTK-Setup-Windows-x64.exe"
-          }
-          "APP_VERSION=$version" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-          "ZIP_NAME=$zipName" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-          "SETUP_NAME=$setupName" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Run unit tests
-        run: python -m unittest discover -s tests -v
       - name: Run smoke check
         run: python scripts/smoke_check.py
       - name: Build Windows application
         if: github.event_name != 'pull_request'
         run: .\build_windows.bat
+      - name: Upload native Quick packaged-check evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-quick-packaged-checks
+          path: |
+            build/frozen-quick-report.json
+            build/frozen-quick-report-artifacts/
+          if-no-files-found: warn
       - name: Verify executable
         if: github.event_name != 'pull_request'
         shell: pwsh
@@ -122,16 +243,16 @@ jobs:
       - name: Package portable application
         if: github.event_name != 'pull_request'
         shell: pwsh
-        run: Compress-Archive -Path "dist\PySide6_Data_Plot" -DestinationPath "${{ env.ZIP_NAME }}" -Force
+        run: Compress-Archive -Path "dist\PySide6_Data_Plot" -DestinationPath "$env:ZIP_NAME" -Force
       - name: Build installer
         if: github.event_name != 'pull_request'
         shell: pwsh
-        run: .\scripts\build_installer.ps1 -Version "${{ env.APP_VERSION }}" -OutputFile "${{ env.SETUP_NAME }}" -MakensisPath "${{ env.MAKENSIS_PATH }}"
+        run: .\scripts\build_installer.ps1 -Version "$env:APP_VERSION" -OutputFile "$env:SETUP_NAME" -MakensisPath "$env:MAKENSIS_PATH"
       - name: Generate checksums
         if: github.event_name != 'pull_request'
         shell: pwsh
         run: |
-          $files = @("${{ env.ZIP_NAME }}", "${{ env.SETUP_NAME }}")
+          $files = @($env:ZIP_NAME, $env:SETUP_NAME)
           $lines = foreach ($file in $files) {
             $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
             "$hash  $file"
@@ -147,11 +268,13 @@ jobs:
             ${{ env.SETUP_NAME }}
             SHA256SUMS.txt
           if-no-files-found: error
+          compression-level: 0
 
   release:
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: build
+    needs: [build, verify-tests]
     runs-on: windows-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
@@ -165,7 +288,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = $env:GITHUB_REF_NAME
           $zipName = "DPTK-$tag-Windows-x64.zip"
           $setupName = "DPTK-Setup-$tag-Windows-x64.exe"
           $downloaded = @(Get-ChildItem -LiteralPath release-assets -File)
@@ -182,9 +305,9 @@ jobs:
               throw "Missing release asset: $asset"
             }
           }
-          gh release view $tag --repo "${{ github.repository }}" *> $null
+          gh release view $tag --repo "$env:GITHUB_REPOSITORY" *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag @assets --clobber --repo "${{ github.repository }}"
+            gh release upload $tag @assets --clobber --repo "$env:GITHUB_REPOSITORY"
           } else {
-            gh release create $tag @assets --generate-notes --repo "${{ github.repository }}" --title $tag
+            gh release create $tag @assets --generate-notes --repo "$env:GITHUB_REPOSITORY" --title $tag
           }

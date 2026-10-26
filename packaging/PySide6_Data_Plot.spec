@@ -14,6 +14,12 @@ icon_path = project_root / "assets" / "icons" / "app_icon.ico"
 # and then fails before the Qt window is created.
 matplotlib_datas = collect_data_files("matplotlib", includes=["mpl-data/**"])
 pptx_datas = collect_data_files("pptx")
+# Preserve the relative URLs used by Display.qml and its local components.
+# Qt's own QML plugins are collected by PyInstaller's PySide6.QtQml hook,
+# reached through the three explicit Qt Quick module imports below.
+quick_qml_datas = [
+    (str(project_root / "ui_qt" / "quick" / "qml"), "ui_qt/quick/qml"),
+]
 pywin32_binaries = [
     (get_pywin32_module_file_attribute("pythoncom"), "pywin32_system32"),
     (get_pywin32_module_file_attribute("pywintypes"), "pywin32_system32"),
@@ -66,10 +72,18 @@ analysis = Analysis(
         ),
         *matplotlib_datas,
         *pptx_datas,
+        *quick_qml_datas,
     ],
     hiddenimports=[
+        "run_quick",
+        "run_peak_analysis_quick",
+        "run_drr_analysis_quick",
+        "run_mcd_organizer_quick",
         "run_mcd_organizer",
         "ui_qt.mcd_organizer_window",
+        "PySide6.QtQuickWidgets",
+        "PySide6.QtQml",
+        "PySide6.QtQuick",
         *collect_submodules("pptx"),
         "pythoncom",
         "pywintypes",

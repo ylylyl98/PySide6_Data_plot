@@ -2,8 +2,6 @@
 import json
 from pathlib import Path
 from dataclasses import replace
-from core.loader import load_dat
-from core.drr_analysis_workspace import create_dataset
 
 
 def _metadata(path):
@@ -32,6 +30,8 @@ def discover_groups(folder):
 
 
 def load_group(metadata_path):
+    from core.loader import load_dat
+    from core.drr_analysis_workspace import create_dataset
     path=Path(metadata_path).resolve();payload=_metadata(path)
     dat=path.with_name(path.name.removesuffix('.metadata.json')+'.dat')
     cube=load_dat(dat);processing=payload['processing']

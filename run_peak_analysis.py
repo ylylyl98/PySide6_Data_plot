@@ -4,6 +4,12 @@ import hashlib
 from pathlib import Path
 import sys
 
+if __name__ == "__main__" and "--legacy-widgets" not in sys.argv:
+    from run_peak_analysis_quick import main as native_main
+    raise SystemExit(native_main(sys.argv[1:]))
+if __name__ == "__main__":
+    sys.argv.remove("--legacy-widgets")
+
 from PySide6.QtCore import QTimer, QProcess
 from PySide6.QtWidgets import QApplication
 
@@ -19,6 +25,8 @@ def main(argv=None):
     parser.add_argument('--reply-server',default='')
     args=parser.parse_args(argv)
     app=QApplication([sys.argv[0]]);app.setApplicationName('DPTK Peak Analysis');app.setOrganizationName('ylylyl98');app.setStyle('Fusion')
+    from ui_qt.typography import install_application_font
+    install_application_font(app)
     name='DPTK-Peak-'+hashlib.sha256(str(args.session.resolve()).casefold().encode()).hexdigest()[:24]
     message={'snapshot':str(args.snapshot.resolve()) if args.snapshot else None,'reply_server':args.reply_server}
     if send_message(name,message):return 0

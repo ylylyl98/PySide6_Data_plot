@@ -4,6 +4,11 @@ import argparse
 import hashlib
 import json
 import sys
+if __name__ == "__main__" and "--legacy-widgets" not in sys.argv:
+    from run_drr_analysis_quick import main as native_main
+    raise SystemExit(native_main(sys.argv[1:]))
+if __name__ == "__main__":
+    sys.argv.remove("--legacy-widgets")
 from PySide6.QtCore import QTimer
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
@@ -18,6 +23,8 @@ def main(argv=None):
     parser.add_argument('--session',type=Path,default=session_directory()/'workspace.npz')
     args=parser.parse_args(argv)
     app=QApplication([sys.argv[0]])
+    from ui_qt.typography import install_application_font
+    install_application_font(app)
     app.setApplicationName('DPTK DRR Analysis');app.setOrganizationName('ylylyl98');app.setStyle('Fusion')
     name='DPTK-DRR-'+hashlib.sha256(str(args.session.resolve()).casefold().encode()).hexdigest()[:24]
     message={'snapshot':str(args.snapshot.resolve()) if args.snapshot else None,'folder':str(Path(args.folder).resolve())}

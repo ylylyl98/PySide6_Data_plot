@@ -27,6 +27,13 @@ def plan(*, ready=True, warnings=(), heterogeneous=False):
         resolution=SimpleNamespace(numerical_path="heterogeneous" if heterogeneous else "common"))
 
 
+def pn_plan(candidates=("Pback.csv",)):
+    return SimpleNamespace(kind="p", which="all", automatic_candidates=False,
+        candidate_files=candidates, warnings=(), ready=True,
+        rows=(SimpleNamespace(measurement_file="sample.csv", baseline_file=candidates[0],
+            candidate_files=candidates, evidence="Matching acquisition conditions", warnings=()),))
+
+
 def batch_plan(*, warnings=()):
     """Four verified runs: nine measurements use BN001, six use BN002."""
     prefix = "YZ383_p2n1_9T_1.67KREF_730nmc_0p3sx10_RotIn94deg_"
@@ -97,6 +104,7 @@ class BackgroundSettingsTests(unittest.TestCase):
         dialog._source_widgets["pn"].click()
         self.assertEqual(dialog.draft.kind, "p")
         self.assertFalse(dialog.apply_btn.isEnabled())
+        dialog.pn_assignment_method.setCurrentIndex(dialog.pn_assignment_method.findData("common"))
         dialog.pn_files_btn.click()
         self.assertEqual(selected[0][0], "p")
         self.assertEqual(dialog.draft.files, ("p1.csv", "p2.csv"))
@@ -129,6 +137,104 @@ class BackgroundSettingsTests(unittest.TestCase):
         self.assertFalse(dialog.apply_btn.isEnabled())
         self.assertTrue(dialog.pn_files_btn.isHidden())
 
+    def test_new_pn_roles_start_with_an_empty_selected_matching_pool(self):
+        for kind in ("p", "n", "pn"):
+            dialog = self.dialog(BackgroundDraft(kind=kind), configure_composite=lambda *_: None)
+            self.assertEqual(dialog.pn_assignment_method.currentData(), "matched")
+            self.assertEqual(dialog.draft.pn_candidates, ())
+            self.assertFalse(dialog.pn_matching.match_btn.isEnabled())
+            self.assertFalse(dialog.apply_btn.isEnabled())
+            self.assertIn("Choose background files", dialog.status.text())
+            self.assertFalse(dialog.pn_composite_btn.isHidden())
+
+    def test_changing_to_an_unconfigured_pn_role_starts_with_no_candidate_files(self):
+        dialog = self.dialog(BackgroundDraft(kind="p", files=("Pback.csv",)))
+        self.assertEqual(dialog.pn_assignment_method.currentData(), "common")
+        dialog.pn_method.setCurrentIndex(dialog.pn_method.findData("n"))
+        self.assertEqual(dialog.pn_assignment_method.currentData(), "matched")
+        self.assertEqual(dialog.draft.pn_candidates, ())
+        dialog.pn_method.setCurrentIndex(dialog.pn_method.findData("p"))
+        self.assertEqual(dialog.pn_assignment_method.currentData(), "common")
+        self.assertEqual(dialog.draft.files, ("Pback.csv",))
+
+    def test_common_pn_draft_survives_visiting_the_empty_matching_pool(self):
+        original = BackgroundDraft(kind="n", files=("Nback.csv",), which="first")
+        dialog = self.dialog(original)
+        dialog.pn_assignment_method.setCurrentIndex(dialog.pn_assignment_method.findData("matched"))
+        self.assertEqual(dialog.draft.pn_candidates, ())
+        self.assertEqual(dialog.draft.files, ())
+        dialog.pn_assignment_method.setCurrentIndex(dialog.pn_assignment_method.findData("common"))
+        self.assertEqual(dialog.draft, original)
+
+    def test_pn_pool_change_is_private_and_cannot_expand_to_the_experiment(self):
+        original = BackgroundDraft(kind="p", files=("common.csv",))
+        dialog = self.dialog(original)
+        dialog._pn_candidates_changed(("Pback.csv",))
+        self.assertEqual(dialog.draft.pn_candidates, ("Pback.csv",))
+        self.assertEqual(dialog.draft.files, ())
+        self.assertEqual(dialog.pn_assignment_method.currentData(), "matched")
+        self.assertEqual(dialog.current, original)
+        dialog._pn_candidates_changed(None)
+        self.assertEqual(dialog.draft.pn_candidates, ())
+        self.assertFalse(dialog.apply_btn.isEnabled())
+        dialog.set_bn_busy(True)
+        dialog._pn_candidates_changed(("other.csv",))
+        self.assertEqual(dialog.draft.pn_candidates, ())
+
+    def test_legacy_automatic_pn_plan_keeps_only_assigned_backgrounds_and_requires_rematch(self):
+        matching = pn_plan(("Pback.csv", "previously_discovered.csv"))
+        matching.automatic_candidates = True
+        dialog = self.dialog(BackgroundDraft(kind="p", pn_plan=matching))
+        self.assertIs(dialog.draft.pn_plan, matching)
+        self.assertEqual(dialog.draft.pn_candidates, ("Pback.csv",))
+        self.assertEqual(dialog.pn_assignment_method.currentData(), "matched")
+        self.assertFalse(dialog.apply_btn.isEnabled())
+        self.assertIn("again", dialog.status.text())
+
+    def test_unresolved_legacy_automatic_pn_plan_does_not_select_discovered_files(self):
+        matching = pn_plan()
+        matching.automatic_candidates = True
+        matching.rows[0].baseline_file = ""
+        dialog = self.dialog(BackgroundDraft(kind="p", pn_plan=matching))
+        self.assertEqual(dialog.draft.pn_candidates, ())
+        self.assertFalse(dialog.apply_btn.isEnabled())
+
+    def test_pn_result_keeps_selected_files_including_unusable_choices(self):
+        selected = ("unused.csv", "Pback.csv")
+        dialog = self.dialog(BackgroundDraft(kind="p", pn_candidates=selected))
+        matching = pn_plan((os.path.abspath("Pback.csv"),))
+        dialog.set_pn_plan(matching)
+        self.assertEqual(dialog.draft.pn_candidates, selected)
+        self.assertIs(dialog.draft.pn_plan, matching)
+
+    def test_pn_result_outside_the_selected_pool_is_not_adopted(self):
+        dialog = self.dialog(BackgroundDraft(kind="p", pn_candidates=("Pback.csv",)))
+        dialog.set_pn_plan(pn_plan(("other.csv",)))
+        self.assertEqual(dialog.draft.pn_candidates, ("Pback.csv",))
+        self.assertIsNone(dialog.draft.pn_plan)
+        self.assertIn("outside the selected files", dialog.status.text())
+        self.assertFalse(dialog.apply_btn.isEnabled())
+
+    def test_pn_frame_change_rematches_only_the_selected_pool_after_returning_to_events(self):
+        selected = ("Pback.csv",)
+        dialog = self.dialog(BackgroundDraft(kind="p", pn_candidates=selected))
+        dialog.set_pn_plan(pn_plan(selected))
+        with patch.object(dialog.pn_matching, "match") as match:
+            dialog.pn_frames.setCurrentIndex(dialog.pn_frames.findData("first"))
+            self.assertIsNone(dialog.draft.pn_plan)
+            match.assert_not_called()
+            self.app.processEvents()
+            match.assert_called_once_with()
+        self.assertEqual(dialog.draft.pn_candidates, selected)
+
+    def test_deferred_pn_frame_rematch_is_ignored_after_clearing_the_pool(self):
+        dialog = self.dialog(BackgroundDraft(kind="p", pn_candidates=("Pback.csv",)))
+        with patch.object(dialog.pn_matching, "match") as match:
+            dialog.pn_frames.setCurrentIndex(dialog.pn_frames.findData("first"))
+            dialog._pn_candidates_changed(())
+            self.app.processEvents()
+            match.assert_not_called()
+
     def test_child_result_is_private_until_outer_apply(self):
         version = SimpleNamespace(version_id="version-123")
         def configure(_dialog, draft):
@@ -140,6 +246,31 @@ class BackgroundSettingsTests(unittest.TestCase):
         self.assertEqual(dialog.current.version, None)
         dialog.apply_btn.click()
         self.assertIs(dialog.selection.version, version)
+
+    def test_generated_composite_keeps_the_original_p_matching_draft_separate(self):
+        original = BackgroundDraft(kind="p", pn_candidates=("Pback.csv",), pn_plan=pn_plan())
+        version = SimpleNamespace(version_id="new-version")
+        dialog = self.dialog(original, configure_composite=lambda _dialog, draft:
+            replace(draft, kind="pn", version=version))
+        dialog.pn_composite_btn.click()
+        self.assertEqual(dialog.draft.kind, "pn")
+        self.assertEqual(dialog.pn_assignment_method.currentData(), "common")
+        self.assertIsNone(dialog.draft.pn_candidates)
+        self.assertIsNone(dialog.selection)
+        dialog.pn_method.setCurrentIndex(dialog.pn_method.findData("p"))
+        self.assertEqual(dialog.draft, original)
+        self.assertEqual(dialog.pn_assignment_method.currentData(), "matched")
+
+    def test_generated_composite_can_return_to_its_previous_matching_draft(self):
+        matching = pn_plan(("saved-composite.csv",))
+        matching.kind = "pn"
+        original = BackgroundDraft(kind="pn", pn_candidates=matching.candidate_files, pn_plan=matching)
+        version = SimpleNamespace(version_id="new-version")
+        dialog = self.dialog(original, configure_composite=lambda _dialog, draft: replace(draft, version=version))
+        dialog.pn_composite_btn.click()
+        self.assertEqual(dialog.pn_assignment_method.currentData(), "common")
+        dialog.pn_assignment_method.setCurrentIndex(dialog.pn_assignment_method.findData("matched"))
+        self.assertEqual(dialog.draft, original)
 
     def test_cancelled_child_picker_preserves_the_draft(self):
         original = BackgroundDraft(kind="n", files=("old.csv",), which="first")

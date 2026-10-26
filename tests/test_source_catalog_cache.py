@@ -1,5 +1,7 @@
 import tempfile
 import json
+from contextlib import contextmanager
+from io import StringIO
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -151,6 +153,63 @@ class SourceCatalogCacheTests(unittest.TestCase):
         with patch('core.source_catalog_cache.os.replace', side_effect=OSError('locked')):
             self.assertEqual(self.cache().refresh(lambda: 'new', force=True), 'new')
         self.assertEqual(self.cache().read(), 'old')
+        self.assertEqual(list(self.cache_root.glob('*.tmp')), [])
+
+    def test_writer_preserves_streaming_bytes_and_round_trips_grids_and_unicode(self):
+        from core.source_catalog_cache import _encode
+        cache = self.cache()
+        source = DrrSource('测量/quoted "name".csv', '光谱.csv', 'g', '', 1., False,
+                          gate_grid=((-0., 1e-12), (2.5, 3.)), spectral_grid=(700.1, 701.2))
+        payload = {'source': source, 'labels': ['ΔR/R', 'line\nbreak', '\\path']}
+        grids = []
+        record = dict(schema=2, folder=cache._identity, namespace=cache.namespace,
+                      inventory=[], payload=_encode(payload, grids, {}), grids=grids)
+        reference = StringIO()
+        json.dump(record, reference, ensure_ascii=False)
+        cache._write([], payload)
+        self.assertEqual(cache.path.read_bytes(), reference.getvalue().encode('utf-8'))
+        self.assertEqual(cache.read(), payload)
+
+    def test_writer_memory_fallback_preserves_format_and_readback(self):
+        cache = self.cache()
+        payload = {'unicode': '光谱', 'coordinates': (-0., 1e-12, 2.5)}
+        cache._write([], payload)
+        expected = cache.path.read_bytes()
+        with patch('core.source_catalog_cache.json.dumps', side_effect=MemoryError):
+            cache._write([], payload)
+        self.assertEqual(cache.path.read_bytes(), expected)
+        self.assertEqual(cache.read(), payload)
+
+    def test_partial_write_failure_keeps_previous_snapshot_and_cleans_temporary(self):
+        cache = self.cache()
+        cache._write([], 'old')
+        expected = cache.path.read_bytes()
+        original_temporary = tempfile.NamedTemporaryFile
+
+        @contextmanager
+        def interrupted(*args, **kwargs):
+            with original_temporary(*args, **kwargs) as handle:
+                original_write = handle.write
+                def partial_write(value):
+                    original_write(value[:20])
+                    raise OSError('Synthetic interrupted write')
+                with patch.object(handle, 'write', side_effect=partial_write):
+                    yield handle
+
+        with patch('core.source_catalog_cache.tempfile.NamedTemporaryFile', interrupted):
+            cache._write([], 'replacement')
+        self.assertEqual(cache.path.read_bytes(), expected)
+        self.assertEqual(cache.read(), 'old')
+        self.assertEqual(list(self.cache_root.glob('*.tmp')), [])
+
+    def test_encoding_failure_keeps_previous_snapshot_and_cleans_temporary(self):
+        cache = self.cache()
+        cache._write([], 'old')
+        expected = cache.path.read_bytes()
+        with patch('core.source_catalog_cache.json.dumps', side_effect=ValueError('Synthetic encoder failure')):
+            cache._write([], 'replacement')
+        self.assertEqual(cache.path.read_bytes(), expected)
+        self.assertEqual(cache.read(), 'old')
         self.assertEqual(list(self.cache_root.glob('*.tmp')), [])
 
     def test_inventory_error_never_reuses_or_certifies_old_cache(self):

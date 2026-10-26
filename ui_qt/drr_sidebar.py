@@ -75,7 +75,12 @@ def build_sidebar(owner, root, data, display, processing):
     for key, title, page in (("display", "Display", display),
                              ("processing", "Processing", processing)):
         scroll = owner._make_scrollable_tab(page, f"drr_{key}")
-        tabs.addTab(scroll, title)
+        if key == "display" and getattr(owner, "drr_display_backend", "widgets") == "quick":
+            from ui_qt.quick.drr_display_host import DrrDisplayHost
+            owner.drr_display_host = DrrDisplayHost(owner, scroll)
+            tabs.addTab(owner.drr_display_host, title)
+        else:
+            tabs.addTab(scroll, title)
         controls = list(_layout_controls(page.layout()))
         for first, second in zip(controls, controls[1:]):
             QWidget.setTabOrder(first, second)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from core.typography import FONT_FAMILY, save_figure, with_plot_font
+
 import csv
 from dataclasses import asdict, is_dataclass, replace
 from datetime import datetime, timezone
@@ -26,7 +28,7 @@ from matplotlib.font_manager import FontProperties
 from matplotlib.ticker import FixedFormatter, FixedLocator, FuncFormatter, NullFormatter, NullLocator
 
 from core.loader import DataCube
-from core.drr_export_title import display_title
+from core.drr_export_title import TITLE_POLICY_VERSION, display_title
 from core.plotting import COMPARE_PANEL_ORDER, HeatmapParams, plot_heatmap, resolve_split_boundary, plain_log_ticks, visible_mesh_data
 from core.png_render_timing import TimedPngCanvas, collect_png_timings, time_png_stage
 from core.png_geometry import widened_figsize
@@ -43,7 +45,7 @@ EXPORT_DPI = 150
 EXPORT_AXES_RECT = (0.16, 0.12, 0.76, 0.72)
 # Bump when the PNG canvas/layout changes so cached analyses refresh their
 # figure while retaining the already computed DAT product.
-HEATMAP_PNG_RENDER_VERSION = 2
+HEATMAP_PNG_RENDER_VERSION = 3
 DEFAULT_PROCESSED = "Processed Data"
 EXPORT_METADATA_SCHEMA_VERSION = 1
 
@@ -349,7 +351,7 @@ def _save_heatmap_png(path: Path, cube: DataCube, params: HeatmapParams, *, drr:
         # These exports use fixed axes positions, with no automatic layout.
         # Keep the complete figure canvas so every heatmap has the same pixel
         # dimensions and axes margins regardless of labels or colorbar text.
-        fig.savefig(
+        save_figure(fig,
             path,
             dpi=fig.dpi,
             facecolor=fig.get_facecolor(),
@@ -411,7 +413,7 @@ def _wrap_title_to_fig_span(
     max_w_px = max(40, (right_x - left_x) * wpx)
     if renderer is None:
         return "\n".join(textwrap.wrap(text, width=40)[:max_lines])
-    fp = FontProperties(size=fontsize, weight=weight)
+    fp = FontProperties(family=FONT_FAMILY, size=fontsize, weight=weight)
     words = text.split()
     lines: list[str] = []
     cur = ""
@@ -473,6 +475,7 @@ def _axis_edges_from_centers(values: np.ndarray, *, log_scale: bool = False) -> 
     return np.concatenate(([first], mids, [last]))
 
 
+@with_plot_font
 def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *, drr: bool):
     e = np.asarray(cube.energy, float).ravel()
     g = np.asarray(cube.gate, float).ravel()
@@ -1060,7 +1063,8 @@ def export_drr_png_and_dat(
     )
     plot_fingerprint = _fingerprint_json(
         {
-            "render_version": 7 if drr_style else HEATMAP_PNG_RENDER_VERSION,
+            "render_version": 8 if drr_style else HEATMAP_PNG_RENDER_VERSION,
+            **({"title_policy_version": TITLE_POLICY_VERSION, "display_title": display_title(params.title)} if drr_style else {}),
             **({"wide_header_version": 2} if params.png_width_scale > 1.0 else {}),
             "params": params,
         }
@@ -1161,7 +1165,7 @@ def export_drr_png_and_dat(
         outputs=[dat_path, *figure_paths],
         extra={
             **(metadata_extra or {}),
-            **({"display_title": display_title(params.title), "title_policy_version": 1} if drr_style else {}),
+            **({"display_title": display_title(params.title), "title_policy_version": TITLE_POLICY_VERSION} if drr_style else {}),
             "analysis_fingerprint": analysis_fingerprint,
             "plot_fingerprint": plot_fingerprint,
             **({"figures": figures,

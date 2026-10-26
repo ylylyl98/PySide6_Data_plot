@@ -19,6 +19,7 @@ def resolve_saved_group_background(
     *,
     progress=None,
     log=None,
+    saved_recipes=None,
 ) -> DrrBackgroundResolution | None:
     """Return the latest exact-group export recipe, or None without history.
 
@@ -40,7 +41,12 @@ def resolve_saved_group_background(
         return str(resolve_source_path(root, name)).casefold()
 
     wanted = {identity(name) for name in names}
-    _, records = _read_drr_metadata(root, require_drr_operation=True)
+    if saved_recipes is None:
+        _, records = _read_drr_metadata(root, require_drr_operation=True)
+    else:
+        # A caller restoring other recipe types can share this exact history
+        # snapshot, avoiding a second scan and a mid-load change of recipe.
+        records = tuple(saved_recipes)
     matches = [record for record in records
                if {identity(name) for name in record.measurement_files} == wanted]
     if not matches:

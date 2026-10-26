@@ -12,9 +12,6 @@ names so plotting and export code can keep using plain string cmaps.
 
 from __future__ import annotations
 
-import matplotlib
-from matplotlib.colors import ListedColormap
-
 # Stable Matplotlib names stored in combo itemData and passed to plotting and
 # export code.  These are never shown to users directly.
 RDBU_R_P0P45_ID = "dptk_rdbu_r_p0p45"
@@ -587,6 +584,10 @@ def resolve_cmap(value: str, default: str) -> str:
 
 def register_colormaps() -> None:
     """Register the custom colormaps with Matplotlib (idempotent)."""
+    # Selector labels and IDs are available before the first scientific plot.
+    import matplotlib
+    from matplotlib.colors import ListedColormap
+
     registry = matplotlib.colormaps
     for cmap_id, rgb in _CUSTOM_RGB:
         if cmap_id in registry:

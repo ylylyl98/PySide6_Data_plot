@@ -1,6 +1,8 @@
 """Curie–Weiss view of the Organizer's selected temperature series."""
 from __future__ import annotations
 
+from core.typography import save_figure
+
 import csv
 from datetime import datetime
 import json
@@ -585,7 +587,7 @@ class CurieWeissPanel(QWidget):
                      warnings=self.warnings,assumptions=self.method_note.text())
         path.write_text(json.dumps(payload,indent=2,ensure_ascii=False,allow_nan=False),encoding='utf-8')
         with self.method_canvas.publication_context():
-            self.method_figure.savefig(path.with_name(path.stem+'_plot.png'),dpi=180)
+            save_figure(self.method_figure, path.with_name(path.stem+'_plot.png'),dpi=180)
         return path
 
     def _save_method_comparison(self):
@@ -838,7 +840,7 @@ class CurieWeissPanel(QWidget):
             writer.writerows(self.points)
         (target/'fit.txt').write_text(self.summary.toPlainText() + '\n\n' + payload['assumptions'], encoding='utf-8')
         with self.canvas.publication_context():
-            self.figure.savefig(target/'fit.png', dpi=180, bbox_inches='tight')
+            save_figure(self.figure, target/'fit.png', dpi=180, bbox_inches='tight')
         if self.field_fits:
             rows = [dict(record_id=fit['record_id'], source=fit['source'], branch=fit['branch'],
                          temperature_k=fit['temperature_k'], **sample)
@@ -849,7 +851,7 @@ class CurieWeissPanel(QWidget):
                     writer.writeheader()
                     writer.writerows(rows)
             with self.field_canvas.publication_context():
-                self.field_figure.savefig(target/'field_fit_preview.png', dpi=180, bbox_inches='tight')
+                save_figure(self.field_figure, target/'field_fit_preview.png', dpi=180, bbox_inches='tight')
         return target
 
     def _save(self):

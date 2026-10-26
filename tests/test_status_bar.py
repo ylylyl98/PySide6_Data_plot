@@ -68,6 +68,24 @@ class StatusBarViewTests(unittest.TestCase):
         self.assertEqual(view.cursor_readback.text(), "")
         self.assertEqual(view.currentMessage(), "Loading...")
 
+    def test_busy_feedback_uses_the_existing_progress_and_keeps_workflow_message(self) -> None:
+        view = StatusBarView()
+        view.showMessage("Persistent workflow status")
+        view.progress.setRange(0, 100)
+        view.progress.setValue(35)
+        view.set_context("DRR")
+        view.set_busy(True, "Fitting backgrounds…")
+        self.assertFalse(view.progress.isHidden())
+        self.assertFalse(view._busy_label.isHidden())
+        self.assertEqual(view._busy_label.text(), "Fitting backgrounds…")
+        self.assertEqual(view.progress.value(), 35)
+        self.assertEqual(view.currentMessage(), "Persistent workflow status")
+        self.assertEqual(view._context.text(), "DRR")
+        self.assertTrue(view.property("fluentBusy"))
+        view.progress.hide()
+        self.assertTrue(view._busy_label.isHidden())
+        self.assertFalse(view.property("fluentBusy"))
+
     def test_main_window_composes_the_same_widgets(self) -> None:
         with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
             window = MainWindow()

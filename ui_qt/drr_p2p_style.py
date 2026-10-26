@@ -1,4 +1,6 @@
 """Independent publication figure and persistent P2P presentation controls."""
+
+from core.typography import save_figure
 from collections import Counter
 import numpy as np
 from matplotlib.figure import Figure
@@ -184,5 +186,5 @@ class P2PStyleMixin:
 
     def write_png(self,path,*,inspection=False):
         figure, options = self.png_export_snapshot(inspection=inspection)
-        try:figure.savefig(path, **options)
+        try:save_figure(figure, path, **options)
         finally:figure.clear()

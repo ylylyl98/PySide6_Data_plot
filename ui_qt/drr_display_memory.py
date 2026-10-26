@@ -12,7 +12,7 @@ from PySide6.QtCore import QSignalBlocker
 from PySide6.QtWidgets import QCheckBox, QGroupBox, QLabel, QPushButton, QVBoxLayout
 
 from core import drr_display_settings as history
-from ui_qt.common import focused_numeric_input
+from ui_qt.common import pending_numeric_input
 from ui_qt.drr_regions import settings_state, sync_visibility
 
 GLOBAL_KEY = 'drr/display_center_templates'
@@ -544,8 +544,8 @@ def _restore_status(owner, exact, template, center):
 def prepare_restore(owner, loaded, overrides=None):
     names = history.source_names(loaded.folder, loaded.selected_files or [loaded.primary_file], loaded.provenance_records) if loaded.mode == 'DRR' and loaded.folder else []
     owner._drr_memory_center = history.center_key(names) if names else None
-    focused = focused_numeric_input(owner)
-    if loaded.mode == 'DRR' and overrides is None and focused is not None and focused.lineEdit().isModified():
+    focused = pending_numeric_input(owner)
+    if loaded.mode == 'DRR' and overrides is None and focused is not None:
         key = next((key for key, widget in _controls(owner).items() if widget is focused), None)
         if getattr(owner, '_drr_memory_pending', None) is None:
             owner._drr_memory_pending_overrides = {}
@@ -741,8 +741,7 @@ def resume_pending(owner):
         owner._drr_memory_pending = None
         owner._drr_memory_pending_overrides = {}
         return
-    focused = focused_numeric_input(owner)
-    if focused is not None and focused.lineEdit().isModified():
+    if pending_numeric_input(owner) is not None:
         return
     overrides = {key: _value(_controls(owner)[key])} if key is not None else {}
     overrides.update(owner._drr_memory_pending_overrides)

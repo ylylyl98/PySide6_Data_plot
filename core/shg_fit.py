@@ -1,25 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 import numpy as np
 
 from core.shg import ShgProcessResult
-
-
-@dataclass(frozen=True)
-class ShgFitSettings:
-    enabled: bool = True
-    angle_min_deg: float | None = None
-    angle_max_deg: float | None = None
-    use_uncertainty_weights: bool = True
-    include_excluded_rows: bool = False
-    minimum_points: int = 6
-    minimum_span_deg: float = 45.0
-    phase_branch: int = 0
-
-    def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+from core.shg_settings import ShgFitSettings
 
 
 @dataclass(frozen=True)

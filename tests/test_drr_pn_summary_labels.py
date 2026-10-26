@@ -149,6 +149,31 @@ class PnSummaryLabelTests(unittest.TestCase):
         self.assertIn(f"{self.bn} [first]", label.toolTip())
         self.assertNotIn(f"{self.pn} [last]", label.toolTip())
 
+    def test_assigned_composites_outside_the_managed_directory_keep_saved_frame_labels(self):
+        backgrounds = ("saved_reference_a.csv", "saved_reference_b.csv")
+        self.owner.drr_selected_files = ["sample.csv", "repeat.csv"]
+        self.owner.drr_baseline_files_manual = list(backgrounds)
+        self.owner._drr_assignments = tuple(
+            DrrMeasurementAssignment(name, "External", (background,), "last")
+            for name, background in zip(self.owner.drr_selected_files, backgrounds))
+        self.owner._drr_assignments_automatic = True
+        self.intent(files=backgrounds)
+        label = self.refresh()
+        self.assertIn("2 backgrounds (1 + 1 measurements)", label.text())
+        for background in backgrounds:
+            self.assertIn(f"{background} [Saved composite · single-frame background]", label.toolTip())
+            self.assertNotIn(f"{background} [last]", label.toolTip())
+
+    def test_pending_pn_mapping_reports_review_with_its_source_type(self):
+        self.owner.drr_baseline_files_manual = []
+        self.owner._drr_pending_pn_plan = SimpleNamespace()
+        for kind, expected in (("pn", "P + N composite"), ("p", "P only"), ("n", "N only")):
+            with self.subTest(kind=kind):
+                self.intent(kind=kind)
+                label = self.refresh()
+                self.assertEqual(label.text(),
+                    f"{expected}: suggestions available — review in Background settings")
+
     def test_region_composite_does_not_relabel_default_raw_bn(self):
         self.owner.drr_baseline_files_manual = [self.bn]
         self.owner._drr_background_regions = (

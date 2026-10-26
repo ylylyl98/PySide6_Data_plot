@@ -8,6 +8,102 @@ from core import drr_sources as sources
 
 
 class DrrHistoryCacheTests(unittest.TestCase):
+    def test_common_member_references_resolve_each_descriptor_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            history = root / 'Processed Data' / 'DRR'
+            history.mkdir(parents=True)
+            measurements = ('a.csv', 'b.csv', 'c.csv')
+            backgrounds = ('first.csv', 'second.csv')
+            for name in (*measurements, *backgrounds):
+                (root / name).write_text(name)
+            (history / 'one.metadata.json').write_text(json.dumps({
+                'operation': 'DR/R',
+                'sources': [
+                    {'role': role, 'source_path': str(root / name), 'name': name}
+                    for role, names in (('measurement', measurements), ('background', backgrounds))
+                    for name in names],
+                'processing': {
+                    'baseline_selection': 'External', 'baseline_which': 'all',
+                    'drr_background_assignments': [
+                        {'measurement': str(root / name), 'baseline_files': list(backgrounds),
+                         'baseline_mode': 'External', 'baseline_which': 'all'}
+                        for name in measurements]}}))
+            with patch.object(sources, '_metadata_source_name',
+                              wraps=sources._metadata_source_name) as resolve:
+                records = sources._read_drr_metadata(root, require_drr_operation=True)[1]
+            self.assertEqual(resolve.call_count, len(measurements) + len(backgrounds))
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0].measurement_files, measurements)
+            self.assertEqual(tuple(item.baseline_files for item in records[0].member_assignments),
+                             (backgrounds,) * len(measurements))
+
+    def test_member_aliases_rebind_after_sources_move_between_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            history = root / 'Processed Data' / 'DRR'
+            history.mkdir(parents=True)
+            old = root / 'old'
+            new = root / 'Initial Data'
+            old.mkdir()
+            new.mkdir()
+            measurements = ('a.csv', 'b.csv')
+            backgrounds = ('background.csv',)
+            for name in (*measurements, *backgrounds):
+                (old / name).write_text('old ' + name)
+                (new / name).write_text('new ' + name)
+            # The recorded assignment spelling differs from its descriptor;
+            # only canonical path identity connects them.
+            def alias(name):
+                return str(old / '..' / 'old' / name)
+            (history / 'one.metadata.json').write_text(json.dumps({
+                'operation': 'DR/R',
+                'sources': [
+                    {'role': role, 'source_path': str(old / name), 'name': 'Initial Data/' + name}
+                    for role, names in (('measurement', measurements), ('background', backgrounds))
+                    for name in names],
+                'processing': {'baseline_selection': 'External',
+                    'drr_background_assignments': [
+                        {'measurement': alias(name), 'baseline_files': [alias(backgrounds[0])]}
+                        for name in measurements]}}))
+            first = sources._read_drr_metadata(root, require_drr_operation=True)[1][0]
+            self.assertEqual(first.measurement_files, tuple('old/' + name for name in measurements))
+            self.assertEqual(tuple(item.baseline_files for item in first.member_assignments),
+                             (('old/background.csv',),) * len(measurements))
+            for name in (*measurements, *backgrounds):
+                (old / name).unlink()
+            second = sources._read_drr_metadata(root, require_drr_operation=True)[1][0]
+            self.assertEqual(second.measurement_files, tuple('Initial Data/' + name for name in measurements))
+            self.assertEqual(tuple(item.baseline_files for item in second.member_assignments),
+                             (('Initial Data/background.csv',),) * len(measurements))
+
+    def test_symlink_target_change_invalidates_member_source_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            history = root / 'Processed Data' / 'DRR'
+            history.mkdir(parents=True)
+            first, second = root / 'first.csv', root / 'second.csv'
+            first.write_text('first')
+            second.write_text('different second')
+            alias = root / 'alias.csv'
+            try:
+                alias.symlink_to(first)
+            except OSError as exc:
+                self.skipTest(f'Test filesystem cannot create symbolic links: {exc}')
+            (history / 'one.metadata.json').write_text(json.dumps({
+                'operation': 'DR/R',
+                'sources': [{'role': 'measurement', 'source_path': str(alias)}],
+                'processing': {'drr_background_assignments': [
+                    {'measurement': str(alias), 'baseline_mode': 'Self (last frame)'}]}}))
+            record = sources._read_drr_metadata(root, require_drr_operation=True)[1][0]
+            self.assertEqual(record.measurement_files, ('first.csv',))
+            self.assertEqual(record.member_assignments[0].measurement_file, 'first.csv')
+            alias.unlink()
+            alias.symlink_to(second)
+            record = sources._read_drr_metadata(root, require_drr_operation=True)[1][0]
+            self.assertEqual(record.measurement_files, ('second.csv',))
+            self.assertEqual(record.member_assignments[0].measurement_file, 'second.csv')
+
     def test_edit_reparses_only_changed_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

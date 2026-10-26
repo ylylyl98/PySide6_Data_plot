@@ -158,7 +158,7 @@ class PlDualViewTests(unittest.TestCase):
             np.testing.assert_allclose(ax.get_xlim(), [1.3, 1.7])
             np.testing.assert_allclose(ax.lines[0].get_ydata(), [1, 1])
 
-    def test_save_action_writes_three_pngs_and_one_dat_with_independent_scales(self):
+    def test_save_action_writes_two_pngs_and_one_dat_with_independent_scales(self):
         from core.processing_run import save_as_dat
         source = Path(save_as_dat(self.cube.gate, self.cube.energy, self.cube.Z,
             user_folder=self.tmp.name, subfolder='input', basename_override='sample', name_suffix=''))
@@ -169,7 +169,7 @@ class PlDualViewTests(unittest.TestCase):
         self.w.pl_view_log_btn.click()
         self.w.pl_spins['vmin'].setValue(2)
         self.w.pl_spins['vmax'].setValue(80)
-        self.w.pl_export_pair_chk.setChecked(True)
+        self.assertFalse(hasattr(self.w, 'pl_export_pair_chk'))
         errors = []
         self.w._on_export_error = errors.append
         self.w._start_export('PL')
@@ -177,7 +177,7 @@ class PlDualViewTests(unittest.TestCase):
         self.app.processEvents()
         self.assertFalse(errors)
         output = source.parent / 'Processed Data' / 'PL'
-        self.assertEqual(len(list(output.glob('*.png'))), 3)
+        self.assertEqual(len(list(output.glob('*.png'))), 2)
         self.assertEqual(len(list(output.glob('*.dat'))), 1)
         metadata = json.loads(next(output.glob('*.metadata.json')).read_text(encoding='utf-8'))
         self.assertEqual(metadata['plot']['linear']['vmax'], 600)

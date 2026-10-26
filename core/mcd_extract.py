@@ -8,6 +8,8 @@ return sweep are never merged with the outward sweep.
 
 from __future__ import annotations
 
+from core.typography import save_figure
+
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from contextlib import contextmanager
@@ -1613,7 +1615,7 @@ def _export_group_mcd_png(path, records, branch, groups, colors, group_name=None
                 framealpha=.88,borderpad=.35,labelspacing=.25)
     topic = f"MCD vs B — {'increasing' if inc else 'decreasing'} | {group_name or 'All groups'}"
     _set_export_heading(figure,axis,topic,records)
-    figure.savefig(path,dpi=300,facecolor='white',bbox_inches=None)
+    save_figure(figure, path,dpi=300,facecolor='white',bbox_inches=None)
 
 
 def _export_comparison_png(
@@ -1653,7 +1655,7 @@ def _export_comparison_png(
             axis.grid(alpha=.2)
         figure.suptitle('Temperature comparison')
         temperature_curve_legend(figure, records, groups or initial_energy_groups(records), colors)
-        figure.savefig(path, dpi=300, facecolor='white', bbox_inches='tight')
+        save_figure(figure, path, dpi=300, facecolor='white', bbox_inches='tight')
         return
 
     branch_list = list(branches)
@@ -1760,7 +1762,7 @@ def _export_comparison_png(
             handles=[Patch(facecolor="#4a4a4a", label=f"Isolated: {isolated_text}")],
             loc="lower right", fontsize=8, framealpha=0.88, borderpad=0.3,
         )
-    figure.savefig(path, dpi=figure.dpi, facecolor="white", edgecolor="none",
+    save_figure(figure, path, dpi=figure.dpi, facecolor="white", edgecolor="none",
                    bbox_inches=None)
 
 
@@ -1898,7 +1900,7 @@ def _export_slope_png(
         FigureCanvasAgg(figure)
         draw_temperature_slope_panels(figure, records, energy_groups or initial_energy_groups(records),
                                       slope_metrics, branches, palette, energy_group_palette)
-        figure.savefig(path, dpi=300, facecolor='white', bbox_inches='tight')
+        save_figure(figure, path, dpi=300, facecolor='white', bbox_inches='tight')
         return
 
     if comparison_variable == 'E-field':
@@ -1908,7 +1910,7 @@ def _export_slope_png(
         groups = energy_groups or initial_energy_groups(records,group_tolerance_mev)
         draw_energy_slope_panels(figure,records,groups,slope_metrics,branches,group_tolerance_mev,palette,energy_group_palette,manual_record_ids,energy_record_palette,panel)
         _style_energy_slope_export(figure, records, groups, slope_metrics, branches, panel, palette, energy_group_palette)
-        figure.savefig(path,dpi=300,facecolor='white',edgecolor='none',bbox_inches=None)
+        save_figure(figure, path,dpi=300,facecolor='white',edgecolor='none',bbox_inches=None)
         return
 
     figure = Figure(figsize=(6.0, 4.5), dpi=300, facecolor="white")
@@ -1970,7 +1972,7 @@ def _export_slope_png(
     handles, labels = axis.get_legend_handles_labels()
     if handles:
         axis.legend(loc="best", fontsize=10, framealpha=0.9, borderpad=0.4)
-    figure.savefig(path, dpi=figure.dpi, facecolor="white", edgecolor="none",
+    save_figure(figure, path, dpi=figure.dpi, facecolor="white", edgecolor="none",
                    bbox_inches=None)
 
 

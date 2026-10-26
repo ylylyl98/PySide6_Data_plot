@@ -13,6 +13,11 @@ import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from core.typography import FONT_FAMILY
+
 WORKFLOWS = ("PL", "DRR", "Compare", "Power", "MCD", "MCD-Peak-Shift", "SHG", "Slides", "Tools")
 SCALES = ("1", "1.25", "1.5", "2")
 SHEET_GROUPS = {
@@ -102,7 +107,7 @@ def _git_metadata() -> tuple[str, bool]:
 
 def _ui_source_fingerprint() -> str:
     """Hash relevant UI/capture inputs by relative path and working bytes."""
-    files = [ROOT / "run_qt.py", ROOT / "scripts" / "preview_ui.py"]
+    files = [ROOT / "run_qt.py", ROOT / "scripts" / "preview_ui.py", ROOT / "core" / "typography.py"]
     files.extend(
         path
         for path in (ROOT / "ui_qt").rglob("*")
@@ -230,6 +235,7 @@ def _compose_sheet(entries, output: Path, *, width: int, row_height: int | None 
     from PySide6.QtCore import QRect, QSize, Qt
     from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
     from PySide6.QtWidgets import QApplication
+    from ui_qt.typography import install_application_font
 
     # QPainter text rendering requires a GUI application even though composition
     # itself is performed entirely against in-memory QImages.
@@ -240,6 +246,7 @@ def _compose_sheet(entries, output: Path, *, width: int, row_height: int | None 
         app = _GUI_APP
     else:
         _GUI_APP = app
+    install_application_font(app)
 
     label_width, cell_width, row_gap = _column_geometry(width)
     header_height = 58
@@ -258,13 +265,13 @@ def _compose_sheet(entries, output: Path, *, width: int, row_height: int | None 
     painter = QPainter(canvas)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     painter.setPen(QPen(QColor("#c4c9d1"), 1))
-    painter.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+    painter.setFont(QFont(FONT_FAMILY, 14, QFont.Weight.Bold))
     painter.drawText(QRect(label_width + row_gap, 0, cell_width, header_height), Qt.AlignmentFlag.AlignCenter, "Light")
     painter.drawText(QRect(label_width + 2 * row_gap + cell_width, 0, cell_width, header_height), Qt.AlignmentFlag.AlignCenter, "Dark")
     top = header_height + row_gap
     for index, (workflow, light, dark) in enumerate(rows):
         row_height = row_heights[index]
-        painter.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
+        painter.setFont(QFont(FONT_FAMILY, 13, QFont.Weight.Bold))
         painter.setPen(QPen(QColor("#26313d"), 1))
         painter.drawText(QRect(12, top, label_width - 20, row_height), Qt.AlignmentFlag.AlignVCenter, workflow)
         for column, image in enumerate((light, dark)):

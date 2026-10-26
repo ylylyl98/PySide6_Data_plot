@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QSizePolicy,
 )
-from ui_qt.fluent_ui.style import themed_icon
+from ui_qt.fluent_ui.style import apply_accessible_identity, set_fluent_property, themed_icon
 
 
 class MenuToolbarHost:
@@ -78,6 +78,7 @@ class MenuToolbarHost:
         self.main_toolbar.setObjectName("mainToolbar")
         self.main_toolbar.setMovable(False)
         self.main_toolbar.setFloatable(False)
+        self.main_toolbar.setAllowedAreas(Qt.TopToolBarArea)
         self.main_toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.main_toolbar.setIconSize(QSize(18, 18))
         self.load_action = QAction("Reload", window)
@@ -107,11 +108,23 @@ class MenuToolbarHost:
         self.move_now_action = QWidgetAction(window)
         self.move_now_action.setDefaultWidget(self.move_now_btn)
         self.data_maintenance_menu.addAction(self.move_now_action)
+        # Start with the persistent working context. Its expanding field gives
+        # way before the compact commands when the window becomes narrower.
+        self.main_toolbar.addAction(self.source_widget_action)
+        self.main_toolbar.addAction(self.source_separator_action)
         self.main_toolbar.addAction(self.load_action)
         self.main_toolbar.addAction(self.plot_action)
         self.main_toolbar.addAction(self.save_action)
-        self.main_toolbar.addAction(self.source_separator_action)
-        self.main_toolbar.addAction(self.source_widget_action)
+        for action, role, identifier, name in (
+            (self.load_action, "toolbarSecondaryAction", "command.reload", "Reload current workflow data"),
+            (self.plot_action, "toolbarSecondaryAction", "command.update", "Update current plot"),
+            (self.save_action, "toolbarPrimaryAction", "command.export", "Export current workflow"),
+        ):
+            button = self.main_toolbar.widgetForAction(action)
+            if button is not None:
+                button.setFocusPolicy(Qt.StrongFocus)
+                set_fluent_property(button, "appRole", role)
+                apply_accessible_identity(button, name=name, identifier=identifier)
         data_source_context.show()
         self.apply_theme()
 
@@ -119,7 +132,7 @@ class MenuToolbarHost:
         """Refresh approved Fluent SVG icons while preserving QAction identity."""
         self.load_action.setIcon(themed_icon("open-folder.svg", theme=theme))
         self.plot_action.setIcon(themed_icon("arrow-sync.svg", theme=theme))
-        self.save_action.setIcon(themed_icon("save.svg", theme=theme))
+        self.save_action.setIcon(themed_icon("save.svg", theme=theme, color_alias="text_on_brand"))
         self.show_results_action.setIcon(themed_icon("panel-results.svg", theme=theme))
         self.show_log_action.setIcon(themed_icon("panel-log.svg", theme=theme))
         if navigation_toolbar is None:

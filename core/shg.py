@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 import re
@@ -8,6 +8,8 @@ from typing import Sequence
 
 import numpy as np
 import pandas as pd
+
+from core.shg_settings import ShgSettings
 
 
 _NUMERIC_HEADER_RE = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)(?:\.\d+)?\s*(?:nm)?\s*$", re.IGNORECASE)
@@ -72,47 +74,6 @@ class ShgSweepData:
     source_rows: np.ndarray
     detected_columns: dict[str, str]
     angle_unit: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class ShgSettings:
-    peak_center_nm: float = 515.0
-    gate_min_nm: float = 513.0
-    gate_max_nm: float = 517.0
-    left_min_nm: float = 508.0
-    left_max_nm: float = 512.0
-    right_min_nm: float = 518.0
-    right_max_nm: float = 522.0
-    background_method: str = "local_linear"
-    sigma_clip: float = 3.0
-    remove_cosmic_rays: bool = True
-    cosmic_threshold_mad: float = 8.0
-    cosmic_window_points: int = 7
-    cosmic_max_width_points: int = 3
-    angle_scale: float = 1.0
-    angle_offset_deg: float = 0.0
-    angle_wrap_deg: float | None = None
-    include_failed_rows: bool = False
-
-    def to_dict(self) -> dict[str, object]:
-        payload = asdict(self)
-        payload.update(
-            {
-                "integration_wavelength_nm": self.peak_center_nm,
-                "integration_half_range_nm": 0.5 * (self.gate_max_nm - self.gate_min_nm),
-                "integration_interval_nm": [self.gate_min_nm, self.gate_max_nm],
-                "integration_source": (
-                    "cosmic_cleaned_background_subtracted_spectrum"
-                    if self.remove_cosmic_rays
-                    else "background_subtracted_spectrum"
-                ),
-                "left_sideband_gap_nm": self.gate_min_nm - self.left_max_nm,
-                "right_sideband_gap_nm": self.right_min_nm - self.gate_max_nm,
-                "left_sideband_width_nm": self.left_max_nm - self.left_min_nm,
-                "right_sideband_width_nm": self.right_max_nm - self.right_min_nm,
-            }
-        )
-        return payload
 
 
 @dataclass(frozen=True)

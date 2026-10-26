@@ -26,8 +26,10 @@ from core.drr_sources import inspect_csv_gate_profile
 from core.load_cancellation import LoadCancellation, LoadCancelled, load_scope
 paths = list(Path(sys.argv[1]).glob('*.csv'))
 expected = {p: inspect_csv_gate_profile(p, max_rows=None) for p in paths}
-actual = inspect_csv_profiles(paths)
+completed = []
+actual = inspect_csv_profiles(paths, on_profile=lambda path, profile: completed.append((path, profile)))
 assert actual == expected, (actual, expected)
+assert dict(completed) == expected
 assert not multiprocessing.active_children()
 token = LoadCancellation()
 timer = threading.Timer(.2, token.cancel)
@@ -65,16 +67,22 @@ assert not multiprocessing.active_children()
             original_stat = Path.stat
             class Stat:
                 def __init__(self, value):
+                    self._stat = value
                     self.st_size = value.st_size + 2*1024**2
                     self.st_mtime_ns = value.st_mtime_ns
                     self.st_mtime = value.st_mtime
                     self.st_mode = value.st_mode
+                def __getattr__(self, name):
+                    return getattr(self._stat, name)
             def stat(path, *args, **kwargs):
                 result = original_stat(path, *args, **kwargs)
                 return Stat(result) if path.suffix == '.csv' else result
-            def inspect(selected):
+            def inspect(selected, *, on_profile=None):
                 result = {p: inspect_csv_gate_profile(p, max_rows=None) for p in selected}
                 paths[0].write_text('Vbg,700\n0,2\n1,3\n', encoding='utf-8')
+                if on_profile is not None:
+                    for path, profile in result.items():
+                        on_profile(path, profile)
                 return result
             with patch.object(Path, 'stat', stat), patch('core.drr_inspection_pool.inspect_csv_profiles', side_effect=inspect):
                 sources = discover_drr_sources(root, cache=DrrSourceCache(root/'cache.json', load_on_init=False),

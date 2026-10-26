@@ -21,6 +21,7 @@ from ui_qt.common import QComboBox
 from ui_qt.theme import alias as theme_alias
 from ui_qt.source_picker_dialog import SourcePickerDialog
 from ui_qt.axes_region_blitter import AxesRegionBlitter
+from ui_qt.spectrum_caption import set_spectrum_title
 
 
 def _multi_lorentz_model_worker(x: np.ndarray, *p: float) -> np.ndarray:
@@ -743,7 +744,7 @@ class PlController:
         for line in list(self._pl_spectrum_ax.lines):
             if line not in {spectrum_line, getattr(self, "_pl_gate_line", None)}:
                 line.remove()
-        self._pl_spectrum_ax.set_title(f"Spectrum @ {gate_used:.6g} V")
+        set_spectrum_title(self._pl_spectrum_ax, f"Spectrum @ {gate_used:.6g} V")
         self._pl_spectrum_ax.set_xlabel("Photon Energy (eV)")
         self._pl_spectrum_ax.set_ylabel(cube.cbar_label)
         self._pl_spectrum_ax.grid(alpha=0.25)
@@ -791,7 +792,7 @@ class PlController:
             self._pl_spectrum_line = spectrum_line
         else:
             spectrum_line.set_data(x, np.asarray(y, float))
-        self._pl_spectrum_ax.set_title(f"Spectrum @ {gate_used:.6g} V")
+        set_spectrum_title(self._pl_spectrum_ax, f"Spectrum @ {gate_used:.6g} V")
         self._pl_spectrum_ax.set_xlabel("Photon Energy (eV)")
         self._pl_spectrum_ax.set_ylabel(cube.cbar_label)
         self._pl_spectrum_ax.grid(alpha=0.25)

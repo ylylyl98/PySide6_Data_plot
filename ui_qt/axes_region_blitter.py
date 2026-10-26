@@ -1,6 +1,8 @@
 """Small, ownership-aware Matplotlib region drawing helper."""
 from __future__ import annotations
 
+from core.typography import apply_figure_font, matplotlib_font_context, try_render_lock
+
 
 class AxesRegionBlitter:
     def __init__(self, canvas):
@@ -58,9 +60,16 @@ class AxesRegionBlitter:
         if self.axes not in self.canvas.figure.axes:
             self.disconnect()
             return False
+        if not self.axes.get_visible():
+            self.invalidate()
+            return False
         return True
 
     def draw(self) -> bool:
+        with try_render_lock() as available:
+            return self._draw_available() if available else False
+
+    def _draw_available(self) -> bool:
         if not self._owns_axes() or self._background is None:
             return False
         signature = self._signature()
@@ -74,9 +83,11 @@ class AxesRegionBlitter:
         if self.axes is None or self._background is None:
             return
         self.canvas.restore_region(self._background)
-        for artist in self.artists:
-            if artist.get_visible():
-                self.axes.draw_artist(artist)
+        with matplotlib_font_context():
+            for artist in self.artists:
+                if artist.get_visible():
+                    apply_figure_font(artist)
+                    self.axes.draw_artist(artist)
         self.canvas.blit(self.axes.bbox)
 
     def _signature(self):
@@ -112,9 +123,11 @@ class AxesRegionBlitter:
         # here recursively emits another draw_event and can overflow the stack.
         # The canvas is about to publish this renderer. Paint into it directly;
         # calling Qt blit/repaint here can service a pending idle draw mid-frame.
-        for artist in self.artists:
-            if artist.get_visible():
-                self.axes.draw_artist(artist)
+        with matplotlib_font_context():
+            for artist in self.artists:
+                if artist.get_visible():
+                    apply_figure_font(artist)
+                    self.axes.draw_artist(artist)
 
     def disconnect(self):
         if self._draw_cid is not None:

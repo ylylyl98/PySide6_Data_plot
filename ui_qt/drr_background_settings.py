@@ -41,6 +41,10 @@ class BackgroundDraft:
     calibration: Any = None
     bn_warnings_acknowledged: bool = False
     bn_candidates: tuple[str, ...] | None = None
+    pn_plan: Any = None
+    pn_candidates: tuple[str, ...] | None = None
+    pn_warnings_acknowledged: bool = False
+    saved_assignments: tuple = ()
 
 
 def _label(text, *, heading=False):
@@ -56,6 +60,14 @@ def _label(text, *, heading=False):
 
 def describe_background(draft: BackgroundDraft) -> str:
     """Compact summary shared by the dialog and its owning sidebar."""
+    if draft.saved_assignments:
+        label = "P+N" if draft.kind == "pn" else draft.kind.upper()
+        return f"{label} · {len(draft.saved_assignments)} saved measurement assignments"
+    if draft.kind in {"p", "n", "pn"} and draft.pn_plan is not None:
+        rows = tuple(draft.pn_plan.rows)
+        matches = sum(bool(row.baseline_file) for row in rows)
+        label = "P+N" if draft.kind == "pn" else draft.kind.upper()
+        return f"{label} · {matches}/{len(rows)} measurements matched"
     if draft.kind == "bn" and draft.bn_plan is not None:
         rows = tuple(getattr(draft.bn_plan, "rows", ()))
         matches = sum(bool(getattr(row, "baseline_file", None)) for row in rows)
@@ -155,6 +167,10 @@ class DrrBackgroundSettings(QDialog):
         self._bn_method_value = "common" if self._draft.kind == "bn" and self._draft.files and self._draft.bn_plan is None else "matched"
         self._bn_method_drafts = {}
         self._pn_files_key = object()
+        self._pn_assignment_value = self._pn_assignment_mode(self._draft)
+        self._draft = self._restrict_pn_pool(self._draft, self._pn_assignment_value)
+        self._pn_assignment_drafts = {}
+        self._pn_assignment_modes = {}
 
         layout = QVBoxLayout(self)
         self.applied_summary = _label("Applied: " + describe_background(current))
@@ -254,6 +270,36 @@ class DrrBackgroundSettings(QDialog):
     @staticmethod
     def _source_key(kind):
         return "pn" if kind in {"p", "n", "pn"} else kind if kind in {"bn", "self", "fitted"} else "bn"
+
+    @staticmethod
+    def _pn_assignment_mode(draft):
+        if draft.saved_assignments:
+            return "saved"
+        if draft.pn_plan is not None:
+            return "matched"
+        return "common" if draft.files or draft.version is not None else "matched"
+
+    @staticmethod
+    def _pn_plan_pool(plan):
+        if plan is None:
+            return ()
+        if not getattr(plan, "automatic_candidates", False):
+            return tuple(plan.candidate_files)
+        assigned = tuple(dict.fromkeys(row.baseline_file for row in getattr(plan, "rows", ())
+                                       if row.baseline_file))
+        if assigned:
+            return assigned
+        return tuple(dict.fromkeys(name
+            for assignment in getattr(getattr(plan, "resolution", None), "assignments", ())
+            for name in assignment.baseline_files))
+
+    @staticmethod
+    def _restrict_pn_pool(draft, mode):
+        if draft.kind in {"p", "n", "pn"} and mode == "matched" and draft.pn_candidates is None:
+            # Reuse the previously assigned backgrounds, never the unselected
+            # files discovered by a legacy experiment-wide automatic plan.
+            return replace(draft, pn_candidates=DrrBackgroundSettings._pn_plan_pool(draft.pn_plan))
+        return draft
 
     def _button(self, text, name, action):
         button = QPushButton(text)
@@ -459,6 +505,21 @@ class DrrBackgroundSettings(QDialog):
         form.addRow("&Method", self.pn_method)
         layout.addLayout(form)
         self.pn_method.currentIndexChanged.connect(self._pn_method_changed)
+        self.pn_assignment_method = QComboBox()
+        self.pn_assignment_method.setObjectName("drr_pn_assignment_method")
+        self.pn_assignment_method.setAccessibleName("P/N background assignment method")
+        self.pn_assignment_method.addItem("One background for all", "common")
+        self.pn_assignment_method.addItem("Match selected background files", "matched")
+        form.addRow("&Assignment", self.pn_assignment_method)
+        self.pn_assignment_method.currentIndexChanged.connect(self._pn_assignment_changed)
+        from ui_qt.drr_pn_matching_panel import PnMatchingPanel
+        self.pn_matching = PnMatchingPanel(self, folder=self.folder,
+            measurements=self.measurements, pool=self.pool, select_files=self._select_files)
+        self.pn_matching.planChanged.connect(self.set_pn_plan)
+        self.pn_matching.candidatesChanged.connect(self._pn_candidates_changed)
+        self.pn_matching.reviewChanged.connect(self._pn_review_changed)
+        self.pn_matching.busyChanged.connect(self.set_bn_busy)
+        layout.addWidget(self.pn_matching)
         self.pn_files_btn = self._button("Choose source files…", "drr_pn_source_files", self._choose_pn_files)
         layout.addWidget(self.pn_files_btn, 0, Qt.AlignLeft)
         self.pn_selector = self._inline_selector("P", single=False, kind="pn")
@@ -487,7 +548,7 @@ class DrrBackgroundSettings(QDialog):
         self.pn_source_frames_note.setObjectName("drr_pn_source_frames_note")
         self.pn_source_frames_note.setToolTip(SAVED_COMPOSITE_TOOLTIP)
         layout.addWidget(self.pn_source_frames_note)
-        self.pn_composite_btn = self._button("Configure P+N / saved history…", "drr_pn_configure", lambda: self._child("composite"))
+        self.pn_composite_btn = self._button("Generate P+N / saved history…", "drr_pn_configure", lambda: self._child("composite"))
         layout.addWidget(self.pn_composite_btn, 0, Qt.AlignLeft)
         return page
 
@@ -597,7 +658,8 @@ class DrrBackgroundSettings(QDialog):
                 fixed=False, bn_warnings_acknowledged=False)
         else:
             self._draft = replace(self._draft, files=tuple(files), bn_plan=None,
-                calibration=None, regions=(), version=None, bn_warnings_acknowledged=False)
+                calibration=None, regions=(), version=None, bn_warnings_acknowledged=False,
+                pn_plan=None, pn_warnings_acknowledged=False, saved_assignments=())
         self._bn_error = ""
         self._sync()
 
@@ -671,6 +733,8 @@ class DrrBackgroundSettings(QDialog):
     def _change_source(self, key):
         if self._updating or self._busy:
             return
+        if self._draft.kind in {"p", "n", "pn"}:
+            self._pn_assignment_modes[self._draft.kind] = self._pn_assignment_value
         self._drafts[self._draft.kind] = self._draft
         target = key
         if key == "pn":
@@ -682,6 +746,12 @@ class DrrBackgroundSettings(QDialog):
         self._draft = replace(next_draft, auto_bn_compare=self._draft.auto_bn_compare)
         if target == "bn" and (self._draft.bn_plan is not None or self._draft.files):
             self._bn_method_value = "matched" if self._draft.bn_plan is not None else "common"
+        if target in {"p", "n", "pn"}:
+            self._pn_assignment_value = ("saved" if self._draft.saved_assignments else
+                                         "matched" if self._draft.pn_plan is not None else
+                                         self._pn_assignment_modes.get(target, self._pn_assignment_mode(self._draft)))
+            self._draft = self._restrict_pn_pool(self._draft, self._pn_assignment_value)
+        self.pn_matching.error = ""
         self._bn_error = ""
         self._sync()
 
@@ -690,12 +760,70 @@ class DrrBackgroundSettings(QDialog):
             return
         self._change_source("pn")
 
+    def _pn_assignment_changed(self, *_):
+        if self._updating or self._busy:
+            return
+        value = self.pn_assignment_method.currentData()
+        self._pn_assignment_drafts[(self._draft.kind, self._pn_assignment_value)] = self._draft
+        self._pn_assignment_value = value
+        self._draft = self._pn_assignment_drafts.get((self._draft.kind, value), replace(
+            self._draft, files=(), regions=(), version=None, calibration=None,
+            bn_plan=None, pn_plan=None, pn_warnings_acknowledged=False, fixed=False, saved_assignments=()))
+        self._draft = self._restrict_pn_pool(self._draft, value)
+        self.pn_matching.error = ""
+        self._sync()
+
+    def _pn_candidates_changed(self, candidates):
+        if self._busy or self._closed or self._draft.kind not in {"p", "n", "pn"}:
+            return
+        self._pn_assignment_value = "matched"
+        self._draft = replace(self._draft, pn_candidates=tuple(candidates or ()), pn_plan=None,
+            pn_warnings_acknowledged=False, files=(), version=None, regions=(), fixed=False, saved_assignments=())
+        self._sync()
+
+    def _pn_review_changed(self, checked):
+        self._draft = replace(self._draft, pn_warnings_acknowledged=checked)
+        self._sync()
+
+    def set_pn_plan(self, plan):
+        if self._closed:
+            return
+        candidates = self._draft.pn_candidates
+        if candidates:
+            selected = {str(Path(self.folder, name).resolve()).casefold() for name in candidates}
+            if any(str(Path(self.folder, name).resolve()).casefold() not in selected
+                   for name in plan.candidate_files):
+                self.pn_matching.error = "Matching included a background outside the selected files. Choose backgrounds and match again."
+                self._sync()
+                return
+        else:
+            candidates = self._pn_plan_pool(plan)
+        self._pn_assignment_value = "matched"
+        self._draft = replace(self._draft, kind=plan.kind, which=plan.which, pn_plan=plan,
+            pn_candidates=tuple(candidates),
+            pn_warnings_acknowledged=False, files=(), version=None, regions=(),
+            bn_plan=None, calibration=None, fixed=False, saved_assignments=())
+        self.pn_matching.error = ""
+        self._sync()
+
     def _frames_changed(self, *_):
         if self._updating or self._busy:
             return
         combo = self.self_frames if self._draft.kind == "self" else self.bn_frames if self._draft.kind == "bn" else self.pn_frames
         self._draft = replace(self._draft, which=combo.currentData())
+        rematch = False
+        if self._draft.kind in {"p", "n", "pn"} and self._pn_assignment_value == "matched":
+            self._draft = replace(self._draft, pn_plan=None, pn_warnings_acknowledged=False)
+            rematch = bool(self._draft.pn_candidates)
         self._sync()
+        if rematch:
+            expected = (self._draft.kind, self._draft.which, self._draft.pn_candidates)
+            QTimer.singleShot(0, self, lambda: self._rematch_pn(expected))
+
+    def _rematch_pn(self, expected):
+        if (not self._closed and not self._busy and self._pn_assignment_value == "matched"
+                and (self._draft.kind, self._draft.which, self._draft.pn_candidates) == expected):
+            self.pn_matching.match()
 
     def _strategy_changed(self, *_):
         if not self._updating:
@@ -775,7 +903,8 @@ class DrrBackgroundSettings(QDialog):
         files = self._pick(self._draft.kind, self._draft.files, "Choose " + self._draft.kind.upper() + " source files")
         if files is not None:
             self._draft = replace(self._draft, files=files, regions=(), version=None,
-                                  calibration=None, bn_plan=None)
+                                  calibration=None, bn_plan=None, pn_plan=None,
+                                  pn_warnings_acknowledged=False, saved_assignments=())
             self._sync()
 
     def _child(self, key):
@@ -787,7 +916,17 @@ class DrrBackgroundSettings(QDialog):
             if result is not None:
                 if not isinstance(result, BackgroundDraft):
                     raise TypeError("Background workflow must return a BackgroundDraft.")
+                previous = self._draft
+                if previous.kind in {"p", "n", "pn"}:
+                    self._drafts[previous.kind] = previous
+                    self._pn_assignment_modes[previous.kind] = self._pn_assignment_value
+                    self._pn_assignment_drafts[(previous.kind, self._pn_assignment_value)] = previous
+                if result.kind in {"p", "n", "pn"} and result.kind != previous.kind:
+                    result = replace(result, pn_candidates=None)
                 self._draft = result
+                if result.kind in {"p", "n", "pn"}:
+                    self._draft = replace(result, pn_plan=None, pn_warnings_acknowledged=False, saved_assignments=())
+                    self._pn_assignment_value = "common"
                 self._bn_error = ""
                 self._sync()
         except Exception as exc:
@@ -1021,6 +1160,8 @@ class DrrBackgroundSettings(QDialog):
 
     def _can_fix(self):
         draft = self._draft
+        if draft.pn_plan is not None or draft.saved_assignments:
+            return False
         if draft.kind not in {"bn", "p", "n", "pn", "custom"}:
             return False
         plan = draft.bn_plan
@@ -1042,10 +1183,26 @@ class DrrBackgroundSettings(QDialog):
 
     def _validation(self):
         if self._busy:
-            return False, "Matching BN…"
+            return False, "Matching P/N…" if self._draft.kind in {"p", "n", "pn"} else "Matching BN…"
         draft = self._draft
         if self.measurement_count <= 0:
             return False, "Select measurements before applying a background."
+        if draft.saved_assignments:
+            return True, "Ready to apply the saved per-measurement background assignments."
+        if draft.kind in {"p", "n", "pn"} and self._pn_assignment_value == "matched":
+            if self.pn_matching.error:
+                return False, self.pn_matching.error
+            if not draft.pn_candidates:
+                return False, "Choose background files to match to the selected measurements."
+            if draft.pn_plan is None:
+                return False, "Match the selected background files to assign backgrounds to measurements."
+            if getattr(draft.pn_plan, "automatic_candidates", False):
+                return False, "Match the selected background files again to confirm this previous assignment."
+            if not draft.pn_plan.ready:
+                return False, "Unresolved P/N matches. Change candidate files or assign a compatible background to the unresolved rows."
+            if draft.pn_plan.warnings and not draft.pn_warnings_acknowledged:
+                return False, "Review the P/N matching evidence and accept the flagged matches."
+            return True, "Ready to apply. Every selected measurement keeps its assigned background."
         selector = (self.bn_common_selector if draft.kind == "bn" and self._bn_method_value == "common"
                     else self.pn_selector if draft.kind in {"p", "n"} else None)
         if selector is not None and draft.calibration is None and selector.problem:
@@ -1189,34 +1346,57 @@ class DrrBackgroundSettings(QDialog):
             if draft.kind in {"p", "n", "pn"}:
                 self.pn_method.setCurrentIndex(self.pn_method.findData(draft.kind))
             composite = draft.kind == "pn"
+            pn_matched = self._pn_assignment_value == "matched"
+            pn_saved = self._pn_assignment_value == "saved"
+            if draft.saved_assignments and self.pn_assignment_method.findData("saved") < 0:
+                self.pn_assignment_method.addItem("Saved measurement assignments", "saved")
+            elif not draft.saved_assignments and (draft.kind, "saved") not in self._pn_assignment_drafts:
+                index = self.pn_assignment_method.findData("saved")
+                if index >= 0:
+                    self.pn_assignment_method.removeItem(index)
+            self.pn_assignment_method.setCurrentIndex(self.pn_assignment_method.findData(self._pn_assignment_value))
+            self.pn_assignment_method.setEnabled(not self._busy)
+            self.pn_matching.setVisible(pn_matched)
+            self.pn_matching.configure(draft, busy=self._busy)
             self.pn_method.setEnabled(not self._busy)
-            self.pn_files_btn.setVisible(not composite and not inline)
+            self.pn_files_btn.setVisible(not composite and not inline and not pn_matched and not pn_saved)
             self.pn_files_btn.setEnabled(not self._busy and self._select_files is not None)
             self.pn_files_summary.setText(describe_background(draft))
             self.pn_files_summary.setToolTip("\n".join(draft.files))
-            self.pn_files_summary.setVisible(composite and bool(draft.version or draft.files))
-            self.pn_files_view.setVisible(not composite and bool(draft.files) and not inline)
+            self.pn_files_summary.setVisible(pn_saved or (not pn_matched and composite and bool(draft.version or draft.files)))
+            self.pn_files_view.setVisible(pn_saved or (not pn_matched and not composite and bool(draft.files) and not inline))
             if inline:
-                self.pn_selector.setVisible(not composite)
+                self.pn_selector.setVisible(not composite and not pn_matched and not pn_saved)
                 if draft.kind in {"p", "n"}:
                     self.pn_selector.set_role(draft.kind)
                     self.pn_selector.set_files(draft.files)
-                self.pn_selector.set_active(draft.kind in {"p", "n"})
-            files_key = tuple(draft.files) if draft.kind in {"p", "n"} else ()
+                self.pn_selector.set_active(draft.kind in {"p", "n"} and not pn_matched and not pn_saved)
+            files_key = (tuple(item.measurement_file + " → " + ", ".join(item.baseline_files)
+                               for item in draft.saved_assignments) if pn_saved else
+                         tuple(draft.files) if draft.kind in {"p", "n"} else ())
             if files_key != self._pn_files_key:
                 self._pn_files_key = files_key
                 self.pn_files_model.clear()
                 for name in files_key:
-                    item = QStandardItem(Path(name).name)
-                    item.setToolTip(str(Path(self.folder, name).resolve()))
+                    item = QStandardItem(name if pn_saved else Path(name).name)
+                    item.setToolTip(name if pn_saved else str(Path(self.folder, name).resolve()))
                     self.pn_files_model.appendRow(item)
-            self.pn_frames.setVisible(not composite)
-            self.repeat_note.setVisible(not composite)
+            self.pn_frames.setVisible(not composite and not pn_saved)
+            for index in range(self.pn_frames.count()):
+                method = self.pn_frames.itemData(index)
+                labels = ({"all": "Average all frames of each assigned background file",
+                           "first": "First frame of each assigned background file",
+                           "last": "Last frame of each assigned background file"} if pn_matched else
+                          {"all": "All frames from each file, then average",
+                           "first": "First frame from each file, then average",
+                           "last": "Last frame from each file, then average"})
+                self.pn_frames.setItemText(index, labels[method])
+            self.repeat_note.setVisible(not composite and not pn_matched and not pn_saved)
             self.pn_source_frames_note.setText(source_frame_summary(draft.version))
-            self.pn_source_frames_note.setVisible(composite and bool(draft.version or draft.files))
+            self.pn_source_frames_note.setVisible(not pn_matched and not pn_saved and composite and bool(draft.version or draft.files))
             self.pn_frames.setCurrentIndex(max(0, self.pn_frames.findData(draft.which)))
             self.pn_frames.setEnabled(not self._busy)
-            self.pn_composite_btn.setVisible(composite)
+            self.pn_composite_btn.setVisible(composite or pn_matched)
             self.pn_composite_btn.setEnabled(not self._busy and self._callbacks["composite"] is not None)
             self.self_frames.setCurrentIndex(max(0, self.self_frames.findData(draft.which)))
             self.self_frames.setEnabled(not self._busy)
@@ -1232,8 +1412,8 @@ class DrrBackgroundSettings(QDialog):
             self.group_strategy.setEnabled(not self._busy)
             self.strategy_note.setText("Each measurement keeps its own self frame." if draft.kind == "self" else
                 "Fitted backgrounds are evaluated for each measurement group." if draft.kind == "fitted" else
-                "Choose a common background before keeping it fixed." if not (draft.files or draft.version or draft.bn_plan) else
-                "A per-measurement BN mapping or group calibration must be reviewed for the next group." if not can_fix else
+                "Choose a common background before keeping it fixed." if not (draft.files or draft.version or draft.bn_plan or draft.pn_plan or draft.saved_assignments) else
+                "Per-measurement assignments or group calibration must be reviewed for the next group." if not can_fix else
                 "Following the type selects a background for each new group; fixed reuses this exact background.")
             self.group_strategy.setToolTip(self.strategy_note.text())
             self.strategy_note.setVisible(not can_fix)
@@ -1251,6 +1431,7 @@ class DrrBackgroundSettings(QDialog):
             self.auto_bn_compare.setChecked(draft.auto_bn_compare)
             self.auto_bn_compare.setEnabled(not self._busy)
             self.progress.setVisible(self._busy)
+            self.progress.setAccessibleName("Matching P/N backgrounds" if draft.kind in {"p", "n", "pn"} else "Matching BN backgrounds")
             self.draft_summary.setText("Draft: " + describe_background(draft))
             valid, message = self._validation()
             self.status.setText(message)
@@ -1270,6 +1451,7 @@ class DrrBackgroundSettings(QDialog):
 
     def _stop(self, *_):
         self._closed = True
+        self.pn_matching.stop()
         if self._bn_stop is not None:
             self._bn_stop.set()
         if self._worker is not None:

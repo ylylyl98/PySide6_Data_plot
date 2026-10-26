@@ -14,8 +14,7 @@ from typing import Any, Iterator
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.colors import to_rgba
-from matplotlib.text import Text
-from PySide6.QtGui import QFontInfo
+from core.typography import apply_figure_font, matplotlib_font_context
 
 from ui_qt.theme import theme_manager
 
@@ -120,24 +119,18 @@ def apply_display_theme(figure: Any, theme: MatplotlibDisplayTheme) -> None:
 
 
 class QtFontFigureCanvasQTAgg(FigureCanvasQTAgg):
-    """Use the inherited Qt font for plot text, retaining mathematical fallback."""
+    """Use the shared Arial policy for plot text and mathematical variants."""
 
     def apply_ui_font(self) -> None:
-        family = QFontInfo(self.font()).family() or self.font().family()
-        if not family:
-            return
-        families = [family, 'sans-serif']
-        for text in self.figure.findobj(match=Text):
-            if text.get_fontfamily() != families:
-                text.set_fontfamily(families)
+        apply_figure_font(self.figure)
 
     def draw(self, *args: Any, **kwargs: Any) -> Any:
-        self.apply_ui_font()
-        return super().draw(*args, **kwargs)
+        with matplotlib_font_context(self.figure):
+            return super().draw(*args, **kwargs)
 
     def print_figure(self, *args: Any, **kwargs: Any) -> Any:
-        self.apply_ui_font()
-        return super().print_figure(*args, **kwargs)
+        with matplotlib_font_context(self.figure):
+            return super().print_figure(*args, **kwargs)
 
 
 class ThemeAwareFigureCanvasQTAgg(QtFontFigureCanvasQTAgg):

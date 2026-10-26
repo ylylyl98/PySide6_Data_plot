@@ -2,6 +2,7 @@
 import numpy as np
 from matplotlib.backends.backend_agg import RendererAgg
 from matplotlib.transforms import Bbox
+from core.typography import matplotlib_font_context
 
 
 def _bounds(axes, renderer):
@@ -19,13 +20,18 @@ class ColorFrame:
         self.canvas = canvas
         self.groups = tuple(groups)
         renderer = canvas.get_renderer()
-        self.axis_bounds = {axis: _bounds((axis,), renderer) for group in self.groups for axis in group}
+        with matplotlib_font_context(canvas.figure):
+            self.axis_bounds = {axis: _bounds((axis,), renderer) for group in self.groups for axis in group}
         self.bounds = {group: _union([self.axis_bounds[axis] for axis in group]) for group in self.groups}
         self.spectra_bounds = None
         self.blank = None
 
     def redraw(self, helper, changed):
         """The caller has verified unchanged data, gate, layout and view limits."""
+        with matplotlib_font_context(self.canvas.figure):
+            return self._redraw(helper, changed)
+
+    def _redraw(self, helper, changed):
         canvas = self.canvas
         if (canvas.is_saving() or getattr(canvas, '_draw_pending', False)
                 or any(group not in self.bounds for group in changed)

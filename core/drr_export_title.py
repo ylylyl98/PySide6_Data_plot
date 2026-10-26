@@ -7,6 +7,15 @@ import re
 
 _DURATION = r'\d+(?:[p.]\d+)?\s*(?:ms|us|µs|s)'
 _EXPOSURE = rf'{_DURATION}\s*[x×]\s*\d+'
+TITLE_POLICY_VERSION = 2
+
+# These are generated product labels, not arbitrary parenthesized conditions.
+# Mixed-coordinate labels may contain the gate unit's own parentheses.
+_PRODUCT = (r'\((?:DR/R|d\(DR/R\)/dE|d2\(DR/R\)/dE2|'
+            r'd2\(DR/R\)/\(dE\s+d(?:[^()]|\([^()]*\))+\)|'
+            r'dE|d2E|dXdY|Advanced first derivative,\s*dE)\)')
+_PRODUCT_MARKER = re.compile(_PRODUCT, re.IGNORECASE)
+_PRODUCT_CHAIN = re.compile(rf'(?<!\S){_PRODUCT}(?:\s+{_PRODUCT})+\s*$', re.IGNORECASE)
 
 
 def display_title(original: str) -> str:
@@ -45,6 +54,12 @@ def display_title(original: str) -> str:
         if field.strip():
             kept.append(field.strip())
     result = re.sub(r'\s+', ' ', ' '.join(kept)).strip()
+    chain = _PRODUCT_CHAIN.search(result)
+    if chain is not None:
+        # Processing appends the current product to its source title. Retain
+        # only that final label in the PNG, preserving the full source title.
+        current = tuple(_PRODUCT_MARKER.finditer(chain.group()))[-1].group()
+        result = result[:chain.start()] + current
     for index, value in enumerate(protected):
         result = result.replace(f'PROTECTEDTITLETOKEN{index}TOKEN', value)
     return result
