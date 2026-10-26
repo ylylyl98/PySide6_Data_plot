@@ -9,6 +9,8 @@ Item {
     required property var colors
     required property var state
     property bool dragging: false
+    readonly property real footerHeight: spectrumToggle.implicitHeight + 16
+    readonly property real plotHeight: Math.max(0, height - footerHeight)
     readonly property bool spectrumVisible: state.spectrumVisible !== false
     readonly property real dividerY: state.dividerY === undefined ? 0.7 : state.dividerY
     readonly property real leftFraction: state.dividerLeft === undefined ? 0.12 : state.dividerLeft
@@ -23,7 +25,7 @@ Item {
         id: handle
         objectName: "app_inspection_divider"
         x: overlay.width * overlay.leftFraction
-        y: overlay.height * overlay.dividerY - height / 2
+        y: overlay.plotHeight * overlay.dividerY - height / 2
         width: Math.max(0, overlay.width * (overlay.rightFraction - overlay.leftFraction))
         height: 10
         visible: overlay.spectrumVisible
@@ -59,7 +61,7 @@ Item {
             onPositionChanged: function(mouse) {
                 if (!pressed) return
                 let position = mapToItem(overlay, mouse.x, mouse.y)
-                overlay.bridge.setParameter("dividerY", Math.max(0.05, Math.min(0.95, position.y / overlay.height)))
+                overlay.bridge.setParameter("dividerY", Math.max(0.05, Math.min(0.95, position.y / Math.max(1, overlay.plotHeight))))
             }
             onReleased: overlay.dragging = false
             onCanceled: overlay.dragging = false
@@ -68,14 +70,35 @@ Item {
         Basic.ToolTip.text: "Drag to resize heatmap / spectrum · Home restores 70 / 30"
         Basic.ToolTip.delay: 700
     }
+    Rectangle {
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        height: overlay.footerHeight
+        color: overlay.colors.surface
+        Rectangle { width: parent.width; height: 1; color: overlay.colors.divider }
+    }
     AppButton {
+        id: spectrumToggle
         objectName: "app_toggle_spectrum"
         colors: overlay.colors
         anchors.right: parent.right
         anchors.rightMargin: 8
-        y: overlay.spectrumVisible ? Math.max(0, handle.y + (handle.height - height) / 2) : 8
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: 8
+        width: Math.min(implicitWidth, Math.max(0, overlay.width - 16))
+        primary: !overlay.spectrumVisible
         text: overlay.spectrumVisible ? "Hide spectrum" : "Show spectrum"
         description: overlay.spectrumVisible ? "Hide the spectrum and expand the heatmap" : "Show the spectrum below the heatmap"
         onClicked: overlay.bridge.invoke("toggle-spectrum")
+        background: Rectangle {
+            radius: 4
+            color: spectrumToggle.primary ? overlay.colors.accent
+                 : spectrumToggle.down ? overlay.colors.pressed
+                 : spectrumToggle.hovered ? overlay.colors.hover : overlay.colors.control
+            border.width: spectrumToggle.visualFocus ? 2 : 1
+            border.color: spectrumToggle.visualFocus ? overlay.colors.focus
+                        : spectrumToggle.primary ? overlay.colors.accent : overlay.colors.border
+        }
     }
 }

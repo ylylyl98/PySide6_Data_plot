@@ -6,6 +6,7 @@ from core.mcd_peak_display import second_derivative_map
 from core.mcd_peak_shift import BOUNDARY_UNRELIABLE,source_spectra
 from ui_qt.quick import mcd_peak_workflow as workflow
 from ui_qt.spectrum_caption import set_spectrum_title
+from ui_qt.quick.spectrum_limits import fit_spectrum_y
 
 _COLORS=dict(pos="#1769aa",neg="#d1495b")
 
@@ -21,16 +22,17 @@ def update_field(bridge, *, draw=True):
     for channel,line in getattr(bridge,"_d2_lines",{}).items():
         spectrum=bridge._spectra[channel][index]
         grid,d2,_=second_derivative_map(energy,spectrum[None,:],values["derivativeWindow"]);line.set_data(grid,-d2[0])
-    for name in ("spectra","derivative"):
-        axis=bridge._axes.get(name)
-        if axis:
-            axis.relim();axis.autoscale_view(scalex=False,scaley=True)
-            set_spectrum_title(axis,(values["peakSource"] if name=="spectra" else "−d²R/dE²")+f" · B={result.pair_b[index]:.5g} T")
     for channel,line in getattr(bridge,"_field_cursors",{}).items():
         field=workflow.channel_view(result,channel).pair_b[index];line.set_ydata([field,field])
     cursor=getattr(bridge,"_result_cursor",None)
     if cursor is not None:cursor.set_xdata([result.pair_b[index],result.pair_b[index]])
     _candidate_markers(bridge)
+    for name in ("spectra","derivative"):
+        axis=bridge._axes.get(name)
+        if axis:
+            lines=bridge._raw_lines if name=="spectra" else bridge._d2_lines
+            fit_spectrum_y(axis,lines.values())
+            set_spectrum_title(axis,(values["peakSource"] if name=="spectra" else "−d²R/dE²")+f" · B={result.pair_b[index]:.5g} T")
     if draw:
         helper=bridge._configure_plot_blitter(
             tuple(bridge._axes[name] for name in ("spectra","derivative") if name in bridge._axes) or tuple(bridge._axes[name] for name in ("result",) if name in bridge._axes),
@@ -102,7 +104,9 @@ def render_peak(bridge):
             for channel,color in _COLORS.items():
                 line,=axis.plot([],[],color=color,lw=1,label=f"{getattr(result,'pos_angle' if channel=='pos' else 'neg_angle'):g}° / {channel}")
                 (bridge._raw_lines if name=="spectra" else bridge._d2_lines)[channel]=line
-            axis.set(xlabel="Photon energy (eV)",ylabel="Intensity (a.u.)" if name=="spectra" else "−d²R/dE²",xlim=(min(energy),max(energy)))
+            axis.set(xlabel="Photon energy (eV)",ylabel="Intensity (a.u.)" if name=="spectra" else "−d²R/dE²",xlim=(values["xmin"],values["xmax"]))
+            lines=tuple((bridge._raw_lines if name=="spectra" else bridge._d2_lines).values())
+            axis.callbacks.connect("xlim_changed",lambda axis,lines=lines:fit_spectrum_y(axis,lines))
             axis.legend(fontsize=7,loc="upper right")
             manual=axis.axvline(values["manualCenter"],color="#d17a00",ls=":",lw=1.2,visible=False);bridge._manual_lines.append(manual)
         elif name in {"map","map-neg"}:

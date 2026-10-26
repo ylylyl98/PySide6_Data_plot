@@ -324,6 +324,12 @@ class McdPeakBridge(McdBridge):
                 dict(type="summary",key="output",label="Results folder",value=self._output or "Experiment / Processed Data / MCD Peak Shift"),action("choose-output-folder","Change results folder…"),action("export","Export frozen CSV + metadata")])])
         return groups
 
+    def _fit_spectrum_y(self):
+        from ui_qt.quick.spectrum_limits import fit_spectrum_y
+        for name,lines in (("spectra",self._raw_lines),("derivative",self._d2_lines)):
+            axis=self._axes.get(name)
+            if axis is not None:fit_spectrum_y(axis,lines.values())
+
     def _render(self):
         if not self._current() or self._closed:return
         from ui_qt.quick.mcd_peak_plot import render_peak

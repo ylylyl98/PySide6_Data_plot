@@ -237,12 +237,18 @@ class PowerPlotMixin:
             self._spectrum.yaxis.set_major_formatter(PercentFormatter(xmax=1.))
             self._spectrum.axhline(0., color="#52647e", lw=.7)
         self._caption = self._spectrum.text(.02, .98, "", transform=self._spectrum.transAxes, va="top", fontsize=8)
+        self._spectrum.callbacks.connect("xlim_changed", self._fit_spectrum_y)
         if analysis:
             self._analysis_render_trends(*self._trend_axes)
         self._update_gate(publish=False)
         self._style_figure()
         self._navigation.update()
         self._apply_split()
+
+    def _fit_spectrum_y(self, axis=None):
+        from ui_qt.quick.spectrum_limits import fit_spectrum_y
+        lines = (*self._lines.values(), *self._analysis_artists)
+        return fit_spectrum_y(self._spectrum if axis is None else axis, lines)
 
     def _update_gate(self, *, publish=True):
         if self._spectrum is None or self._products is None or not self._products["cubes"]:
@@ -257,7 +263,6 @@ class PowerPlotMixin:
         selected = selected_rows.get(first_label, selected)
         first_index = selected if selected is not None and 0 <= selected < len(first.gate) else int(np.argmin(abs(first.gate - wanted)))
         used = float(first.gate[first_index]) if len(cubes) == 1 else wanted
-        parts = []
         for label, cube in cubes.items():
             index = selected_rows.get(label)
             if index is None or not 0 <= index < len(cube.gate):
@@ -265,7 +270,6 @@ class PowerPlotMixin:
             spectrum = np.asarray(cube.Z[index], float)
             self._lines[label].set_data(cube.energy, spectrum)
             self._lines[label].set_label(f"{label}: {float(cube.gate[index]):.6g} uW")
-            parts.append(spectrum[np.isfinite(spectrum)])
             true, display, rows = self._display_coordinates[label]
             exact = np.flatnonzero(rows == index)
             position = float(display[exact[0] if exact.size else np.argmin(abs(true - used))])
@@ -273,15 +277,9 @@ class PowerPlotMixin:
         self._values["gate"] = used
         self._caption.set_text(f"Spectrum @ {used:.9g} uW")
         self._spectrum.legend(fontsize=7, loc="upper right")
-        if self._values["mode"] == "vp":
-            self._spectrum.set_ylim(-1.05, 1.05)
-        elif any(part.size for part in parts):
-            finite = np.concatenate([part for part in parts if part.size])
-            low, high = float(np.min(finite)), float(np.max(finite))
-            pad = max((high - low) * .08, abs(low) * .005, 1e-12)
-            self._spectrum.set_ylim(low - pad, high + pad)
         if self._analysis_enabled():
             self._analysis_render_spectrum(self._spectrum, self._residual)
+        self._fit_spectrum_y()
         if publish:
             if (self._background_image is not None and self._background_bounds == self._canvas.figure.bbox.bounds
                     and not self._canvas.backend._timer.isActive()):

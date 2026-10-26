@@ -211,6 +211,33 @@ def _run_isolated():
             self.bridge.invoke("previous-gate")
             self.assertEqual(self.bridge._values["gate"], selected_gate)
 
+        def test_spectrum_y_follows_gate_x_window_and_vp_data(self):
+            import numpy as np
+            self.loaded()
+            self.bridge.setParameter("gate", 2.)
+            axis = self.bridge._spectrum
+            full = axis.get_ylim()
+            axis.set_xlim(1.72, 1.85)
+            narrowed = axis.get_ylim()
+            self.assertLess(narrowed[1], full[1] - 20.)
+            self.bridge.setParameter("gate", -2.)
+            self.assertLess(axis.get_ylim()[1], narrowed[1] - 10.)
+            self.bridge._navigation.push_current()
+            axis.set_ylim(5., 6.)
+            self.bridge._navigation.push_current()
+            self.bridge.setParameter("gate", 2.)
+            self.assertEqual(axis.get_ylim(), (5., 6.))
+            self.bridge.invoke("home")
+            self.assertTrue(axis.get_autoscaley_on())
+            np.testing.assert_allclose(axis.get_ylim(), narrowed)
+            self.bridge.setParameter("view", "vp")
+            self.plotted()
+            finite = np.concatenate([line.get_ydata() for line in self.bridge._lines.values()])
+            low, high = self.bridge._spectrum.get_ylim()
+            self.assertLess(low, np.min(finite))
+            self.assertGreater(high, np.max(finite))
+            self.assertLess(high - low, 1.)
+
         def test_color_edits_reuse_axes_and_restore_unclipped_source_values(self):
             import numpy as np
             self.loaded()

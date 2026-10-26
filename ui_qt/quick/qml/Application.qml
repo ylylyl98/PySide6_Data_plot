@@ -562,12 +562,14 @@ Controls.ApplicationWindow {
                             id: plotSurface
                             objectName: "app_plot_surface"
                             anchors.fill: parent
+                            anchors.bottomMargin: spectrumInspection.visible ? spectrumInspection.footerHeight : 0
                             visible: workspaceLoader.status !== Loader.Ready && workspaceLoader.status !== Loader.Error && !window.state.workspaceMessage
                             backend: workspaceLoader.status === Loader.Ready ? null : window.appBridge.plotBackend
                             Accessible.name: "Scientific plot workspace"
                         }
                         AppInspectionDivider {
-                            anchors.fill: plotSurface
+                            id: spectrumInspection
+                            anchors.fill: parent
                             visible: plotSurface.visible && window.state.inspectionVisible === true
                             bridge: window.appBridge
                             colors: window.colors

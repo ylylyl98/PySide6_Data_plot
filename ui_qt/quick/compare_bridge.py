@@ -854,6 +854,8 @@ class CompareBridge(QObject):
             self.setParameter("spectrumVisible", not self._values["spectrumVisible"])
         elif action in {"home", "back", "forward", "pan", "zoom"} and self._navigation is not None:
             getattr(self._navigation, action)()
+            if action in {"home", "back", "forward"} and self._spectrum is not None:
+                self._fit_spectrum_y()
             self._plot_tool = str(self._navigation.mode.name).lower() if self._navigation.mode else ""
         elif action == "export":
             self._export()
@@ -982,6 +984,7 @@ class CompareBridge(QObject):
             self._spectrum.axhline(0., color="#60718a", lw=.7)
         self._spectrum.legend(fontsize=8, loc="upper right")
         self._caption = self._spectrum.text(.02, .97, "", transform=self._spectrum.transAxes, ha="left", va="top", fontsize=9)
+        self._spectrum.callbacks.connect("xlim_changed", self._fit_spectrum_y)
         self._update_gate(publish=False)
         palette = self._palette
         figure.set_facecolor(palette["inset"])
@@ -1020,27 +1023,24 @@ class CompareBridge(QObject):
             for key, line in self._gate_lines.items():
                 self._maps[key].draw_artist(line)
 
+    def _fit_spectrum_y(self, axis=None):
+        from ui_qt.quick.spectrum_limits import fit_spectrum_y
+        return fit_spectrum_y(self._spectrum if axis is None else axis, self._lines.values())
+
     def _update_gate(self, *, publish=True):
         if self._spectrum is None:
             return
         import numpy as np
         from core.processing import nearest_gate_spectrum
-        selected, parts = [], []
+        selected = []
         for key, cube in self._derived.items():
             gate, spectrum = nearest_gate_spectrum(cube, self._values["gate"])
             selected.append(gate)
             self._lines[key].set_data(cube.energy, spectrum)
             self._gate_lines[key].set_ydata([gate, gate])
-            parts.append(spectrum[np.isfinite(spectrum)])
         self._values["gate"] = float(np.median(selected))
         self._caption.set_text(f"Compare spectra @ {self._values['gate']:.6g}")
-        finite = np.concatenate([part for part in parts if part.size]) if any(part.size for part in parts) else np.array([])
-        if self._values["view"] == "vp":
-            self._spectrum.set_ylim(-1.05, 1.05)
-        elif finite.size:
-            lo, hi = float(np.min(finite)), float(np.max(finite))
-            pad = max((hi - lo) * .08, abs(lo) * .005, 1e-12)
-            self._spectrum.set_ylim(lo - pad, hi + pad)
+        self._fit_spectrum_y()
         if publish:
             if (self._background_image is not None and self._background_bounds == self._canvas.figure.bbox.bounds
                     and not self._canvas.backend._timer.isActive()):

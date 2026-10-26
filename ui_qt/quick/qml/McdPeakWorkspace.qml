@@ -64,8 +64,9 @@ Rectangle {
             Layout.fillWidth: true
             Layout.fillHeight: true
             Layout.minimumHeight: 160
-            PlotSurface { objectName: "mcd_peak_plot_surface"; anchors.fill: parent; backend: page.bridge ? page.bridge.plotBackend : null; visible: page.state.inspectionVisible }
+            PlotSurface { objectName: "mcd_peak_plot_surface"; anchors.fill: parent; anchors.bottomMargin: spectrumInspection.visible ? spectrumInspection.footerHeight : 0; backend: page.bridge ? page.bridge.plotBackend : null; visible: page.state.inspectionVisible }
             AppInspectionDivider {
+                id: spectrumInspection
                 anchors.fill: parent
                 visible: page.state.inspectionVisible && page.state.compactInspection && (page.state.values?.peakPanel === "maps" || page.state.values?.showPeakMaps) && page.state.values?.peakPanel !== "result"
                 bridge: page.bridge

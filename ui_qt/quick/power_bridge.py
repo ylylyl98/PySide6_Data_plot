@@ -638,6 +638,8 @@ class PowerBridge(PowerAnalysisMixin, PowerPlotMixin, QObject):
             self.setParameter("spectrumVisible", not self._values["spectrumVisible"])
         elif action in {"home", "back", "forward", "pan", "zoom"} and self._navigation is not None:
             getattr(self._navigation, action)()
+            if action in {"home", "back", "forward"} and self._spectrum is not None:
+                self._fit_spectrum_y()
             self._plot_tool = str(self._navigation.mode.name).lower() if self._navigation.mode else ""
         elif action == "export":
             self._export()

@@ -42,8 +42,9 @@ Rectangle {
                 id: plotArea
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                PlotSurface { objectName: "power_plot_surface"; anchors.fill: parent; backend: page.bridge.plotBackend; visible: page.state.inspectionVisible }
+                PlotSurface { objectName: "power_plot_surface"; anchors.fill: parent; anchors.bottomMargin: spectrumInspection.visible ? spectrumInspection.footerHeight : 0; backend: page.bridge.plotBackend; visible: page.state.inspectionVisible }
                 AppInspectionDivider {
+                    id: spectrumInspection
                     width: plotArea.width * (page.state.dividerRight || .96)
                     height: plotArea.height
                     visible: page.state.inspectionVisible

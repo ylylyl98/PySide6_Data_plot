@@ -112,6 +112,30 @@ def _isolated():
             self.assertIs(self.bridge._methods,methods);self.assertEqual(self.bridge._axes,axes);self.assertIs(self.bridge._raw_lines["pos"],line)
             self.assertEqual(self.bridge._canvas.draw_count,draws);self.assertGreater(self.bridge._canvas.blit_count,blits)
             expected=workflow.source_spectra(self.bridge._products.result,"raw pos")[indices[-1]];np.testing.assert_array_equal(line.get_ydata(),expected)
+        def test_field_spectra_y_use_current_window_and_ignore_locator_markers(self):
+            header=self.source.read_text().splitlines()[0]
+            table=np.loadtxt(self.source,delimiter=",",skiprows=1)
+            table[:,2:]*=np.where(abs(table[:,0])<.001,100.,1.)[:,None]
+            np.savetxt(self.source,table,delimiter=",",header=header,comments="")
+            self.load();self.bridge._render();settle(50)
+            axis=self.bridge._axes["spectra"];full=axis.get_ylim()
+            axis.set_xlim(1.6,1.63)
+            narrowed=axis.get_ylim()
+            self.assertLess(narrowed[1]-narrowed[0],(full[1]-full[0])*.1)
+            self.bridge._navigation.push_current()
+            indices=self.bridge._field_indices()
+            self.bridge.setParameter("selectedField",int(indices[-1]));settle(40)
+            low,high=axis.get_ylim()
+            self.assertGreater(low,9000.);self.assertLess(high,11000.)
+            self.assertLess(high,narrowed[1]*.1)
+            axis.set_ylim(4.,5.)
+            self.bridge._navigation.push_current()
+            self.bridge.setParameter("selectedField",int(indices[0]));settle(40)
+            self.assertEqual(axis.get_ylim(),(4.,5.))
+            self.bridge.invoke("home");settle(40)
+            self.assertTrue(axis.get_autoscaley_on())
+            self.assertGreater(axis.get_ylim()[0],9000.);self.assertLess(axis.get_ylim()[1],11000.)
+
         def test_manual_reseek_merges_distinct_features_without_growing_duplicates(self):
             self.load();selected=self.bridge._peak_selected;track=workflow.track_for(self.bridge._methods,"Raw spectrum",selected)
             count=sum(len(analysis.tracks) for channels in self.bridge._methods.values() for analysis in channels.values())

@@ -25,7 +25,7 @@ class QuickApplicationBridgeTests(unittest.TestCase):
             result = subprocess.run(
                 [sys.executable, str(Path(__file__).resolve()), "--isolated"],
                 cwd=Path(__file__).resolve().parents[1], env=environment,
-                capture_output=True, text=True, timeout=150,
+                capture_output=True, text=True, timeout=240,
             )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("QUICK_APPLICATION_BRIDGE_TESTS=", result.stdout)
@@ -980,6 +980,10 @@ def _run_isolated():
                 np.testing.assert_allclose(line.get_ydata(), values)
                 np.testing.assert_allclose(line.get_xdata(), cube.energy)
                 np.testing.assert_allclose(gate_line.get_ydata(), [gate, gate])
+                low, high = spectrum_axis.get_ylim()
+                self.assertLess(low, np.min(values))
+                self.assertGreater(high, np.max(values))
+                self.assertLess(high - low, 1.3 * np.ptp(values))
                 fraction = axis.get_position().height / (axis.get_position().height + spectrum_axis.get_position().height)
                 self.assertAlmostEqual(fraction, .7)
             headers = [axis for axis in self.bridge._canvas.figure.axes if getattr(axis, "_dptk_inspection_header", False)]
@@ -1174,14 +1178,94 @@ def _run_isolated():
         def test_gate_spectrum_range_keeps_new_amplitude_visible(self):
             import numpy as np
             cube = self.make_cube()
-            self.bridge.set_cube(cube)
+            for workflow in ("pl", "drr"):
+                with self.subTest(workflow=workflow):
+                    self.bridge.selectWorkflow(workflow)
+                    self.bridge.set_cube(cube)
+                    self.wait_for_plot()
+                    for gate in (0, 3, -2):
+                        self.bridge.setParameter("gate", gate)
+                        settle()
+                        spectrum_axis, line = self.bridge._spectra[0]
+                        low, high = spectrum_axis.get_ylim()
+                        minimum, maximum = np.min(line.get_ydata()), np.max(line.get_ydata())
+                        self.assertLess(low, minimum)
+                        self.assertGreater(high, maximum)
+                        self.assertLess(high - low, 1.3 * (maximum - minimum))
+                        self.assertTrue(spectrum_axis.get_autoscaley_on())
+
+        def test_spectrum_y_follows_visible_x_in_pl_and_drr(self):
+            for workflow in ("pl", "drr"):
+                with self.subTest(workflow=workflow):
+                    self.bridge.selectWorkflow(workflow)
+                    cube = self.make_cube()
+                    cube.Z[1, -1] = 6000
+                    self.bridge.set_cube(cube)
+                    self.wait_for_plot()
+                    self.assertGreater(self.bridge._spectra[0][0].get_ylim()[1], 6000)
+                    # Changing either shared X axis must exclude the offscreen
+                    # outlier, including after PL's deferred viewport rebuild.
+                    self.bridge._spectra[0][0].set_xlim(1.7, 2.3)
+                    drain_until(lambda: not self.bridge._pl_range_timer.isActive())
+                    self.wait_for_plot()
+                    low, high = self.bridge._spectra[0][0].get_ylim()
+                    self.assertGreater(low, 2)
+                    self.assertLess(high, 8)
+                    self.bridge._maps[0][0].set_xlim(2.3, 1.7)
+                    drain_until(lambda: not self.bridge._pl_range_timer.isActive())
+                    self.wait_for_plot()
+                    low, high = self.bridge._spectra[0][0].get_ylim()
+                    self.assertGreater(low, 2)
+                    self.assertLess(high, 8)
+
+        def test_spectrum_manual_y_survives_gate_and_layout_until_new_source(self):
+            for workflow in ("pl", "drr"):
+                with self.subTest(workflow=workflow):
+                    self.bridge.selectWorkflow(workflow)
+                    self.load_dat(f"first-{workflow}.dat")
+                    spectrum_axis = self.bridge._spectra[0][0]
+                    spectrum_axis.set_ylim(4, 6)
+                    self.bridge.setParameter("gate", 3)
+                    self.assertEqual(spectrum_axis.get_ylim(), (4, 6))
+                    self.bridge.setParameter("sideBySide", True)
+                    self.wait_for_plot()
+                    self.assertEqual(self.bridge._spectra[0][0].get_ylim(), (4, 6))
+                    self.assertFalse(self.bridge._spectra[0][0].get_autoscaley_on())
+                    self.load_dat(f"second-{workflow}.dat", offset=100)
+                    self.assertTrue(self.bridge._spectra[0][0].get_autoscaley_on())
+                    low, high = self.bridge._spectra[0][0].get_ylim()
+                    self.assertGreater(low, 102)
+                    self.assertLess(high, 108)
+
+        def test_spectrum_home_restores_auto_y_for_current_gate(self):
+            self.bridge.set_cube(self.make_cube())
             self.wait_for_plot()
+            spectrum_axis = self.bridge._spectra[0][0]
+            self.bridge._navigation.push_current()
+            spectrum_axis.set_ylim(4, 6)
+            self.bridge._navigation.push_current()
             self.bridge.setParameter("gate", 3)
+            self.assertEqual(spectrum_axis.get_ylim(), (4, 6))
+            self.bridge.invoke("home")
             settle()
-            spectrum_axis, line = self.bridge._spectra[0]
-            low, high = spectrum_axis.get_ylim()
-            self.assertLessEqual(low, np.min(line.get_ydata()))
-            self.assertGreaterEqual(high, np.max(line.get_ydata()))
+            low, high = self.bridge._spectra[0][0].get_ylim()
+            self.assertTrue(self.bridge._spectra[0][0].get_autoscaley_on())
+            self.assertGreater(low, 5)
+            self.assertGreater(high, 40)
+
+        def test_spectrum_y_includes_visible_fit_and_shrinks_when_hidden(self):
+            self.bridge.set_cube(self.make_cube())
+            self.wait_for_plot()
+            state = self.bridge._manual_states["pl"]
+            state.update(cube=self.bridge._cube, row=1,
+                         fit=dict(x=self.bridge._cube.energy, y=[100, 105, 110, 103], centers=[]))
+            self.bridge._pl_draw_overlays()
+            low, high = self.bridge._spectra[0][0].get_ylim()
+            self.assertLess(low, 3)
+            self.assertGreater(high, 110)
+            self.bridge.setParameter("spectrum.showFit", False)
+            self.assertGreater(self.bridge._spectra[0][0].get_ylim()[0], 2)
+            self.assertLess(self.bridge._spectra[0][0].get_ylim()[1], 8)
 
         def test_split_and_spectrum_visibility_survive_rebuilds(self):
             self.bridge.set_cube(self.make_cube())

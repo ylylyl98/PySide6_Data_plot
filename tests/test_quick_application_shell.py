@@ -502,6 +502,8 @@ class QuickApplicationShellTests(unittest.TestCase):
 
     def test_native_inspection_divider_keyboard_drag_and_spectrum_toggle(self):
         handle = self.item("app_inspection_divider")
+        self.assertAlmostEqual(handle.y() + handle.height() / 2,
+            self.item("app_plot_surface").height() * self.bridge.snapshot["dividerY"])
         handle.forceActiveFocus()
         QTest.keyClick(self.window, Qt.Key_Up)
         self.assertIn(("parameter", "heatmapFraction", .72), self.bridge.calls)
@@ -516,6 +518,49 @@ class QuickApplicationShellTests(unittest.TestCase):
         self.assertFalse(self.bridge.snapshot["spectrumVisible"])
         self.assertFalse(handle.isVisible())
         self.assertTrue(self.item("app_toggle_spectrum").isVisible())
+        self.click("app_toggle_spectrum")
+        self.assertTrue(self.bridge.snapshot["spectrumVisible"])
+        self.assertTrue(handle.isVisible())
+
+    def test_spectrum_restore_stays_in_the_same_corner_in_all_themes_and_sizes(self):
+        from unittest.mock import patch
+        from ui_qt.quick.appearance import quick_colors
+
+        for theme in ("light", "dark", "high-contrast"):
+            with patch(__name__ + ".display_colors", return_value=quick_colors(theme)):
+                self.bridge.colorsChanged.emit()
+                for width in (1320, 720):
+                    with self.subTest(theme=theme, width=width):
+                        self.window.resize(width, 600)
+                        QTest.qWait(20)
+                        toggle = self.item("app_toggle_spectrum")
+                        parent = toggle.parentItem()
+                        corner = (toggle.x() + toggle.width(), toggle.y() + toggle.height())
+                        self.assertAlmostEqual(corner[0], parent.width() - 8)
+                        self.assertAlmostEqual(corner[1], parent.height() - 8)
+                        self.assertGreaterEqual(toggle.x(), 0)
+                        self.assertGreaterEqual(toggle.y(), 0)
+                        surface = self.item("app_plot_surface")
+                        self.assertGreaterEqual(toggle.mapToScene(toggle.boundingRect().topLeft()).y(),
+                            surface.mapToScene(surface.boundingRect().bottomRight()).y())
+                        self.assertEqual(toggle.property("text"), "Hide spectrum")
+                        self.assertEqual(toggle.property("background").property("color").alpha(), 255)
+                        self.click("app_toggle_spectrum")
+                        self.assertFalse(self.bridge.snapshot["spectrumVisible"])
+                        self.assertEqual(toggle.property("text"), "Show spectrum")
+                        self.assertTrue(toggle.property("primary"))
+                        self.assertEqual((toggle.x() + toggle.width(), toggle.y() + toggle.height()), corner)
+                        self.assertEqual(toggle.property("background").property("color").alpha(), 255)
+                        self.click("app_toggle_spectrum")
+                        self.assertTrue(self.bridge.snapshot["spectrumVisible"])
+                        self.assertFalse(toggle.property("primary"))
+                        self.assertEqual((toggle.x() + toggle.width(), toggle.y() + toggle.height()), corner)
+
+        self.click("app_toggle_spectrum")
+        self.item("app_toggle_spectrum").forceActiveFocus(Qt.TabFocusReason)
+        QTest.keyClick(self.window, Qt.Key_Space)
+        self.assertTrue(self.bridge.snapshot["spectrumVisible"])
+        self.assertEqual(self.warnings, [])
 
     def test_typed_qml_parameter_loader_receives_workflow_bridge(self):
         page = Path(self.temporary.name) / "TypedParameters.qml"

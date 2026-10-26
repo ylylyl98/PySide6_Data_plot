@@ -323,6 +323,30 @@ def _isolated():
             self.bridge.setParameter("xmin",1.55);settle(60)
             self.assertIsNot(self.bridge._axes["map"].collections[0],mesh)
 
+        def test_cursor_spectra_y_follow_current_energy_window_without_marker_bounds(self):
+            header=self.source.read_text().splitlines()[0]
+            table=np.loadtxt(self.source,delimiter=",",skiprows=1)
+            table[:,2:]*=np.where(abs(table[:,0])<.001,100.,1.)[:,None]
+            np.savetxt(self.source,table,delimiter=",",header=header,comments="")
+            self.load();settle(60)
+            axis=self.bridge._axes["spectra"];full=axis.get_ylim()
+            axis.set_xlim(1.5,1.56)
+            narrowed=axis.get_ylim()
+            self.assertLess(narrowed[1]-narrowed[0],(full[1]-full[0])*.4)
+            self.bridge._navigation.push_current()
+            axis.axvline(1.53,ymin=-1000,ymax=1000)
+            self.bridge.setParameter("bCursor",1.);settle(40)
+            low,high=axis.get_ylim()
+            self.assertGreater(low,9000.);self.assertLess(high,11000.)
+            self.assertLess(high,narrowed[1]*.1)
+            axis.set_ylim(4.,5.)
+            self.bridge._navigation.push_current()
+            self.bridge.setParameter("bCursor",-1.);settle(40)
+            self.assertEqual(axis.get_ylim(),(4.,5.))
+            self.bridge.invoke("home");settle(40)
+            self.assertTrue(axis.get_autoscaley_on())
+            self.assertGreater(axis.get_ylim()[0],9000.);self.assertLess(axis.get_ylim()[1],11000.)
+
         def test_color_edits_retain_mesh_zoom_science_and_exact_static_labels(self):
             from matplotlib.colors import Normalize,TwoSlopeNorm
             self.load();settle(60)

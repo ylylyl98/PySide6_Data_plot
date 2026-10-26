@@ -77,6 +77,7 @@ jobs:
           tests.test_quick_compare
           tests.test_quick_compare_startup
           tests.test_quick_heatmap_style
+          tests.test_quick_spectrum_limits
           tests.test_quick_power
           tests.test_quick_power_analysis
           tests.test_quick_peak_analysis

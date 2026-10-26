@@ -388,6 +388,34 @@ def _run_isolated():
             self.bridge.invoke("toggle-spectrum")
             self.assertEqual(self.bridge._values["heatmapFraction"], .61)
 
+        def test_spectrum_y_follows_power_x_window_and_vp_data(self):
+            import numpy as np
+            self.opened("intensity")
+            self.bridge.setParameter("gate", 100.)
+            axis = self.bridge._spectrum
+            full = axis.get_ylim()
+            axis.set_xlim(1.5, 1.54)
+            narrowed = axis.get_ylim()
+            self.assertLess(narrowed[1], full[1] * .1)
+            self.bridge.setParameter("gate", 1.)
+            self.assertLess(axis.get_ylim()[1], narrowed[1] * .5)
+            self.bridge._navigation.push_current()
+            axis.set_ylim(5., 6.)
+            self.bridge._navigation.push_current()
+            self.bridge.setParameter("gate", 100.)
+            self.assertEqual(axis.get_ylim(), (5., 6.))
+            self.bridge.invoke("home")
+            self.assertTrue(axis.get_autoscaley_on())
+            np.testing.assert_allclose(axis.get_ylim(), narrowed)
+            self.bridge.setParameter("mode", "vp")
+            wait(lambda: "products" not in self.bridge._running)
+            self.plotted()
+            finite = np.asarray(self.bridge._lines["VP"].get_ydata())
+            low, high = self.bridge._spectrum.get_ylim()
+            self.assertLess(low, np.min(finite))
+            self.assertGreater(high, np.max(finite))
+            self.assertLess(high - low, .5)
+
         def test_automatic_review_calibration_save_existing_another_and_reloaded_provenance(self):
             import numpy as np
             paths = self.reviewed()

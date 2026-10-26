@@ -375,6 +375,7 @@ class PlApplicationMixin:
     def _pl_draw_overlays(self,*,draw=True):
         if self._workflow not in self._manual_states:return
         import numpy as np
+        from ui_qt.quick.spectrum_limits import fit_spectrum_y
         state=self._manual_states[self._workflow];context=self._manual_context()
         if self._manual_task.busy and (context is None or self._manual_fit_token!=context[3]):
             self._manual_task.invalidate();state["status"]="Fit discarded: source, gate or range changed."
@@ -389,6 +390,7 @@ class PlApplicationMixin:
             fit=state["fit"] if selected and state["showFit"] else None
             fit_line.set_data((fit["x"],fit["y"]) if fit else ([],[]))
             centers.set_offsets(np.column_stack((fit["centers"],np.full(len(fit["centers"]),cube.gate[row]))) if fit else np.empty((0,2)))
+            fit_spectrum_y(spectrum)
         if context:
             cube,row,bounds,token=context
             lines=[state["status"]]

@@ -54,10 +54,12 @@ Rectangle {
                 id: plot
                 objectName: "compare_plot_surface"
                 anchors.fill: parent
+                anchors.bottomMargin: spectrumInspection.visible ? spectrumInspection.footerHeight : 0
                 backend: page.bridge.plotBackend
                 visible: page.state.inspectionVisible
             }
             AppInspectionDivider {
+                id: spectrumInspection
                 anchors.fill: parent
                 visible: page.state.inspectionVisible
                 bridge: page.bridge

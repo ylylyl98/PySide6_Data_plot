@@ -451,7 +451,10 @@ class McdBridge(QObject):
             elif action in {"clear-dark-pos","clear-dark-neg"}:self._values["dark_pos_file" if action.endswith("pos") else "dark_neg_file"]=None;self._queue_load()
             elif action in {"refresh","refresh-catalog"}:self._refresh_catalog()
             elif action in {"reload","update","recalculate"}:self._queue_load(immediate=True)
-            elif action in {"home","back","forward","pan","zoom"} and self._navigation:getattr(self._navigation,action)();self._publish()
+            elif action in {"home","back","forward","pan","zoom"} and self._navigation:
+                getattr(self._navigation,action)()
+                if action in {"home","back","forward"}:self._fit_spectrum_y()
+                self._publish()
             elif action=="auto-ranges":self._values.update(fixX=False,fixY=False,fixColors=False);self._auto_ranges();self._queue_plot()
             elif action=="toggle-spectrum":self.setParameter("spectrumVisible",not self._values["spectrumVisible"])
             elif action=="toggle-table":
@@ -776,12 +779,19 @@ class McdBridge(QObject):
         candidates=np.flatnonzero(allowed)
         return int(candidates[np.argmin(abs(fields[candidates]-self._values["bCursor"]))]) if len(candidates) else int(np.argmin(abs(fields-self._values["bCursor"])))
 
+    def _fit_spectrum_y(self):
+        from ui_qt.quick.spectrum_limits import fit_spectrum_y
+        for name in ("spectra","mcd"):
+            axis=self._axes.get(name)
+            if axis is not None:fit_spectrum_y(axis,(line for _,line in self._cursor_lines.get(name,())))
+
     def _update_cursor(self):
         if (not self._current() or self._plot_timer.isActive() or self._plot_blitter is None
                 or self._plot_blitter._background is None or not self._cursor_lines):return False
         from core.mcd_peak_shift import spectrum_energy_order
         from core.typography import try_render_lock
         from ui_qt.spectrum_caption import set_spectrum_title
+        from ui_qt.quick.spectrum_limits import fit_spectrum_y
         if self._cursor_blitter is None:
             # Paint unchanged dynamic axes into the clean frame once. Cropping
             # linecut tight-bboxes can erase adjacent axes' labels.
@@ -808,7 +818,7 @@ class McdBridge(QObject):
         for name in ("spectra","mcd"):
             axis=self._axes.get(name)
             if axis is not None:
-                axis.relim();axis.autoscale_view(scalex=False,scaley=True)
+                fit_spectrum_y(axis, (line for _,line in self._cursor_lines.get(name,())))
                 if name=="spectra":set_spectrum_title(axis,f"{values['spectraSource']} · B={result.pair_b[index]:.5g} T")
         for track,line in self._cursor_lines.get("features",()):
             point=min((point for point in track.get("points",()) if point.get("energy_ev") is not None),key=lambda point:abs(point["field_t"]-result.pair_b[index]),default=None)
@@ -823,6 +833,7 @@ class McdBridge(QObject):
         from core.plotting import HeatmapParams,plot_heatmap
         from ui_qt.inspection_colorbar import add_inspection_colorbar
         from ui_qt.spectrum_caption import set_spectrum_title
+        from ui_qt.quick.spectrum_limits import fit_spectrum_y
         self._ensure_plot();figure=self._canvas.figure
         if self._cursor_blitter:self._cursor_blitter.disconnect();self._cursor_blitter=None
         result=self._products.result;values=self._values;order=spectrum_energy_order(result);energy=np.sort(result.energy_ev);index=self._b_index()
@@ -885,11 +896,17 @@ class McdBridge(QObject):
                 self._cursor_lines["spectra"].append((channel,line))
             axis.set(xlabel="Photon energy (eV)",ylabel="Intensity (a.u.)");set_spectrum_title(axis,f"{values['spectraSource']} · B={result.pair_b[index]:.5g} T");axis.legend(fontsize=7)
             axis.set_xlim(values["xmin"],values["xmax"])
+            lines=tuple(line for _,line in self._cursor_lines["spectra"])
+            axis.callbacks.connect("xlim_changed",lambda axis,lines=lines:fit_spectrum_y(axis,lines))
+            fit_spectrum_y(axis,lines)
         if "mcd" in self._axes:
             axis=self._axes["mcd"];raw_line,=axis.plot(energy,result.pair_mcd_raw[index,order],label="Raw",alpha=.6);corrected_line,=axis.plot(energy,result.pair_mcd_corrected[index,order],label="Corrected")
             self._cursor_lines["mcd"]=[("raw",raw_line),("corrected",corrected_line)]
             axis.axvspan(values["center"]-values["width"]*.0005,values["center"]+values["width"]*.0005,color="#df8f00",alpha=.18)
             axis.set(xlabel="Photon energy (eV)",ylabel="MCD");set_spectrum_title(axis,"Paired MCD spectrum");axis.set_xlim(values["xmin"],values["xmax"]);axis.legend(fontsize=7)
+            lines=tuple(line for _,line in self._cursor_lines["mcd"])
+            axis.callbacks.connect("xlim_changed",lambda axis,lines=lines:fit_spectrum_y(axis,lines))
+            fit_spectrum_y(axis,lines)
         if "trace" in self._axes:
             axis=self._axes["trace"]
             selected=[metric for key,metric in (("showMean","mean"),("showMagnitude","field_signed_absolute_mean"),("showUnsigned","absolute_mean"),("showIntegral","integral")) if values[key]]

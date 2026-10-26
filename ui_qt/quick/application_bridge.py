@@ -1377,6 +1377,10 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             getattr(self._navigation, action)()
             if action in {"pan", "zoom"}:
                 self._plot_tool = action if self._navigation.mode else ""
+            else:
+                # Navigation restores the auto/manual flag after its limits.
+                # An automatic view must fit the currently selected gate.
+                self._pl_draw_overlays()
         elif action in {"reload", "update", "refresh"} and self._workflow == "drr" and self._sources:
             self._load_drr()
         elif action in {"reload", "update", "refresh"} and self._source is not None:
@@ -1500,7 +1504,15 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         from core.processing import nearest_gate_spectrum
         from ui_qt.axes_region_blitter import AxesRegionBlitter
         from ui_qt.inspection_colorbar import add_inspection_colorbar
+        from ui_qt.quick.spectrum_limits import fit_spectrum_y
         self._ensure_plot()
+        # Preserve explicit Y zoom while rebuilding the same product, but a
+        # newly loaded/processed cube starts with automatic spectrum limits.
+        manual_y = {}
+        for (axis, _), (spectrum_axis, _), cube in zip(self._maps, self._spectra, self._plot_cubes):
+            if not spectrum_axis.get_autoscaley_on():
+                product = axis._dptk_quick_render[2]
+                manual_y[id(cube), product] = spectrum_axis.get_ylim()
         for blitter in self._blitters:
             blitter.disconnect()
         self._blitters, self._maps, self._spectra, self._captions, self._plot_cubes = [], [], [], [], []
@@ -1538,14 +1550,10 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             caption = spectrum_axis.text(.02, .97, f"Spectrum @ {gate:g}",
                                          transform=spectrum_axis.transAxes,
                                          ha="left", va="top", fontsize=9)
-            # Use the full measurement's signal extent so stepping gates does
-            # not clip a stronger spectrum or invalidate the static axes.
-            import numpy as np
-            finite = cube.Z[np.isfinite(cube.Z)]
-            if finite.size:
-                lo, hi = float(finite.min()), float(finite.max())
-                margin = max(abs(hi - lo) * .05, abs(hi) * .001, 1e-12)
-                spectrum_axis.set_ylim(lo - margin, hi + margin)
+            if (id(cube), scale) in manual_y:
+                spectrum_axis.set_ylim(manual_y[id(cube), scale])
+            fit_spectrum_y(spectrum_axis)
+            spectrum_axis.callbacks.connect("xlim_changed", self._spectrum_x_changed)
             self._maps.append((axis, gate_line))
             self._spectra.append((spectrum_axis, line))
             self._captions.append(caption)
@@ -1629,6 +1637,11 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             if blitter.axes.get_visible() and not blitter.draw():
                 full_draw = True
         if full_draw:
+            self._canvas.draw_idle()
+
+    def _spectrum_x_changed(self, axis):
+        from ui_qt.quick.spectrum_limits import fit_spectrum_y
+        if not self._closed and fit_spectrum_y(axis):
             self._canvas.draw_idle()
 
     def _on_plot_press(self, event):
