@@ -280,17 +280,21 @@ class PlotSurface(QQuickPaintedItem):
     @Slot(object)
     def _window_changed(self, window):
         from shiboken6 import isValid
-        # Native window teardown can emit windowChanged after its C++ window
-        # is gone. Its connections and event filters have already been removed.
+        # During native teardown the wrapper can remain valid after its signal
+        # source is gone. Connection handles remain safe to disconnect then;
+        # accessing the old window's SignalInstance does not.
         if self._window is not None and isValid(self._window):
             self._window.removeEventFilter(self)
-            self._window.frameSwapped.disconnect(self._frame_swapped)
-            self._window.screenChanged.disconnect(self._sync_size)
+        for connection in getattr(self, "_window_connections", ()):
+            QObject.disconnect(connection)
+        self._window_connections = ()
         self._window = window
         if window is not None:
             window.installEventFilter(self)
-            window.frameSwapped.connect(self._frame_swapped)
-            window.screenChanged.connect(self._sync_size)
+            self._window_connections = (
+                window.frameSwapped.connect(self._frame_swapped),
+                window.screenChanged.connect(self._sync_size),
+            )
         self._sync_size()
 
     def eventFilter(self, watched, event):

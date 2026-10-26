@@ -672,6 +672,18 @@ Window {
             def click(name):
                 item = find(window.contentItem(), name)
                 self.assertIsNotNone(item, name)
+                # Newly visible Flow children need layout polish before their
+                # scene coordinates identify the intended mouse target.
+                item.parentItem().ensurePolished()
+                self.assertTrue(item.isVisible(), name)
+                self.assertTrue(item.isEnabled(), name)
+                presented = []
+                connection = window.frameSwapped.connect(lambda: presented.append(True))
+                try:
+                    window.update()
+                    wait(lambda: bool(presented))
+                finally:
+                    QObject.disconnect(connection)
                 point = item.mapToScene(item.boundingRect().center())
                 global_point = window.mapToGlobal(point.toPoint()).toPointF()
                 QCoreApplication.sendEvent(window, QMouseEvent(QEvent.Type.MouseButtonPress, point, global_point,

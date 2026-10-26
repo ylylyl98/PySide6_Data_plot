@@ -44,8 +44,9 @@ def _run_isolated():
     from matplotlib.figure import Figure
     from PySide6.QtCore import QByteArray, QCoreApplication, QEvent, QPoint, QPointF, QSize, Qt, QUrl
     from PySide6.QtGui import QGuiApplication, QHoverEvent, QImage, QKeyEvent, QMouseEvent, QPainter, QWheelEvent
-    from PySide6.QtQml import QQmlComponent, QQmlEngine
+    from PySide6.QtQml import QQmlApplicationEngine, QQmlComponent, QQmlEngine
     from PySide6.QtQuick import QQuickWindow
+    from shiboken6 import isValid
     from ui_qt.quick.plot_surface import PlotSurface, QuickFigureCanvas, register_plot_surface
 
     production_imports = set(sys.modules)
@@ -357,6 +358,77 @@ def _run_isolated():
                 QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
                 settle()
             unhandled.assert_not_called()
+            self.assertTrue(canvas.closed)
+
+        def test_window_migration_disconnects_old_frame_and_screen_signals(self):
+            canvas, _ = self.make_canvas()
+            surface = self.make_surface(canvas)
+            old_window, new_window = QQuickWindow(), QQuickWindow()
+            surface.setParentItem(old_window.contentItem())
+            surface._painted_generation = 1
+            old_window.frameSwapped.emit()
+            self.assertEqual(surface.presentedGeneration, 1)
+
+            surface.setParentItem(new_window.contentItem())
+            surface._painted_generation = 2
+            old_window.frameSwapped.emit()
+            self.assertEqual(surface.presentedGeneration, 1)
+            new_window.frameSwapped.emit()
+            self.assertEqual(surface.presentedGeneration, 2)
+            surface._size_pending = False
+            old_window.screenChanged.emit(None)
+            self.assertFalse(surface._size_pending)
+            new_window.screenChanged.emit(None)
+            self.assertTrue(surface._size_pending)
+
+            surface.setParentItem(None)
+            old_window.deleteLater()
+            new_window.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+        def test_detach_handles_deleted_signal_source_with_a_valid_window_wrapper(self):
+            canvas, _ = self.make_canvas()
+            surface = self.make_surface(canvas)
+            window, signal_source = QQuickWindow(), QQuickWindow()
+            # Model the teardown interval where the window wrapper is valid but
+            # its cached SignalInstances have already lost their native source.
+            window.frameSwapped = signal_source.frameSwapped
+            window.screenChanged = signal_source.screenChanged
+            surface.setParentItem(window.contentItem())
+            signal_source.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            self.assertTrue(isValid(window))
+            self.assertFalse(isValid(signal_source))
+            with self.assertRaisesRegex(RuntimeError, "Signal source has been deleted"):
+                window.frameSwapped.disconnect(surface._frame_swapped)
+            with patch("sys.excepthook") as unhandled:
+                surface.setParentItem(None)
+                settle()
+            unhandled.assert_not_called()
+            self.assertIsNone(surface._window)
+            self.assertEqual(surface._window_connections, ())
+            self.assertFalse(canvas.closed)
+            window.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+        def test_qml_engine_destruction_disposes_surface_without_callback_errors(self):
+            register_plot_surface()
+            engine = QQmlApplicationEngine()
+            engine.loadData(QByteArray(b'import QtQuick\nimport QtQuick.Window\nimport Dptk 1.0\n'
+                b'Window { visible: true; width: 320; height: 240; '
+                b'PlotSurface { objectName: "surface"; anchors.fill: parent } }'))
+            self.assertTrue(engine.rootObjects())
+            window = engine.rootObjects()[0]
+            surface = window.findChild(PlotSurface, "surface")
+            canvas = surface.set_figure(Figure())
+            settle()
+            with patch("sys.excepthook") as unhandled:
+                engine.deleteLater()
+                QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                settle()
+            unhandled.assert_not_called()
+            self.assertFalse(isValid(window))
+            self.assertFalse(isValid(surface))
             self.assertTrue(canvas.closed)
 
         def test_direct_parent_constructor_reports_native_frame_presentation(self):
