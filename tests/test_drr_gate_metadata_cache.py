@@ -18,7 +18,8 @@ class DrrGateMetadataCacheTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.base = Path(self.temporary.name)
+        # Catalog IDs and inspection paths resolve Windows 8.3 temp aliases.
+        self.base = Path(self.temporary.name).resolve()
         self.root = self.base / 'experiment'
         self.root.mkdir()
         self.cache_path = self.base / 'inspection.json'
