@@ -14,15 +14,19 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
+from shiboken6 import isValid
 import numpy as np
 
+from tests.ui_test_helpers import dispose_owned_window
 from core.loader import DataCube
 from core.processing import apply_sg_derivative_energy, compute_auto_limits
 from ui_qt.common import LoadedState
 from ui_qt.main_window import MainWindow
 
 
-class DrrDualViewRegressionTests(unittest.TestCase):
+class DrrDualViewFixture:
+    """Share DRR UI setup and helpers without inheriting test methods."""
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
@@ -31,10 +35,12 @@ class DrrDualViewRegressionTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory(prefix='drr-review-settings-')
         self.addCleanup(directory.cleanup)
         settings = QSettings(str(Path(directory.name) / 'ui.ini'), QSettings.IniFormat)
+        settings.setValue(MainWindow.SETTINGS_AUTO_UPDATE_CHECK, False)
         settings_patch = patch('ui_qt.main_window.QSettings', return_value=settings)
         settings_patch.start()
         self.addCleanup(settings_patch.stop)
-        with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
+        with patch.object(MainWindow, "_restore_last_folder", lambda _self: None), patch(
+                'ui_qt.presentation_widget.QSettings', return_value=settings):
             self.window = MainWindow()
         self.errors = Mock()
         self.window._show_error = self.errors
@@ -66,9 +72,8 @@ class DrrDualViewRegressionTests(unittest.TestCase):
         self.errors.assert_not_called()
 
     def tearDown(self):
-        self.window.close()
-        self.window.deleteLater()
-        self.app.processEvents()
+        dispose_owned_window(self.window)
+        self.assertFalse(isValid(self.window))
 
     @staticmethod
     def _set_silently(spin, value):
@@ -99,6 +104,8 @@ class DrrDualViewRegressionTests(unittest.TestCase):
             time.sleep(.005)
         self.fail('Derivative did not finish')
 
+
+class DrrDualViewRegressionTests(DrrDualViewFixture, unittest.TestCase):
     def test_layout_and_product_switches_retain_shared_zoom(self):
         w = self.window
         w.drr_view_side_btn.setChecked(True)

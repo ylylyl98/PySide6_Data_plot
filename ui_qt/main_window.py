@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QLineEdit,
     QListView,
     QListWidget,
@@ -2348,6 +2349,20 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         row_h.addWidget(head)
         row_h.addWidget(line, 1)
         v.addWidget(row)
+        old_parent = content.parentWidget()
+        old_layout = old_parent.layout() if old_parent is not None else None
+        if old_layout is not None:
+            # Qt's implicit reparenting deletes the old item in C++, which can
+            # leave a previously wrapped QWidgetItem in Shiboken's pointer map.
+            # Detach and delete that item through the binding before moving the
+            # live widget. Nested layouts share their enclosing widget parent.
+            from shiboken6 import delete as delete_layout_item
+            for candidate in (old_layout, *old_layout.findChildren(QLayout)):
+                index = candidate.indexOf(content)
+                if index >= 0:
+                    old_item = candidate.takeAt(index)
+                    delete_layout_item(old_item)
+                    break
         content.setVisible(bool(expanded))
         v.addWidget(content)
 

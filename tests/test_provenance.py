@@ -67,7 +67,7 @@ class ProvenanceTests(unittest.TestCase):
             original_hash = provenance.sha256_file
             def mutate(path):
                 value = original_hash(path)
-                if Path(path) == working:
+                if Path(path).resolve() == working.resolve():
                     # Make the mutation observable even if rapid Windows
                     # writes share the same timestamp. Same-size/restored-
                     # mtime changes are covered by their own test above.

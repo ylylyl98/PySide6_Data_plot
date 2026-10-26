@@ -859,9 +859,18 @@ To build the installer locally, install NSIS and run:
 ```
 
 To test packaging on GitHub without publishing a release, open **Actions**,
-select **Windows Build**, choose **Run workflow**, and download the
-`DPTK-Windows-x64` artifact after the run completes. It contains the portable
-ZIP, installer, and `SHA256SUMS.txt`.
+select **Windows Build**, and choose **Run workflow**. On a branch, the default
+`test_scope: quick` runs the same **Fast PR checks** workflow alongside
+packaging. Choose `full` to run the complete test suite in four parallel
+shards. Any tag ref always uses `full`, even when `quick` is
+selected; missing or unrecognized scope values also use `full`.
+
+After the selected checks and build succeed, download the `DPTK-Windows-x64`
+artifact. It contains the portable ZIP, installer, and `SHA256SUMS.txt`. Packaging
+can finish and expose this artifact before testing finishes, so a downloadable
+artifact alone does not mean the selected checks passed. A successful quick run
+confirms the representative checks, not complete regression coverage. Manual
+runs never create a GitHub Release.
 
 To publish a version, push a tag:
 
@@ -886,18 +895,23 @@ inherited tests belonging to different classes retain their distinct IDs.
 Unsupported custom discovery or parameterized test instances stop planning
 instead of silently changing the test behavior. Modules run in separate
 processes to isolate Qt object lifetimes and module state; the eight expensive
-fitted-BN modules are split into individual tests. Shard balancing uses recorded local
-timings where available and explicitly labelled estimates for the remaining
-tests and process startup. These weights determine placement, not pass/fail
-criteria or a promised GitHub runtime. Existing skip and expected-failure rules
-are retained.
+fitted-BN modules are split into individual tests. Shard balancing uses measured
+Windows CI execution-unit durations from `scripts/release_test_timings.json`,
+including process startup. Hints are keyed by module or full test ID and apply
+only when the test-module source and exact test-ID set still match; source
+fingerprints normalize Git's LF/CRLF checkout differences. New or changed units
+fall back to explicit estimates. The file
+records the source run and commit; it is optional for local fixture repositories.
+These weights affect placement only, not coverage, pass/fail criteria, or a
+promised runtime. Execution still checks byte-exact test sources and complete
+results. Existing skip and expected-failure rules are retained.
 
 Each shard uploads its test outcomes, timings and process logs as a
 `release-test-shard-*` artifact, including on test failure where the runner is
 still available. A failed test, abnormal process exit, timeout, or incomplete
 report blocks release. The portable build artifact can finish earlier; its
 presence alone does not mean the release checks passed. Manual **Run workflow**
-runs these same checks without creating a Release.
+with `test_scope: full` runs these same checks without creating a Release.
 
 To inspect the complete assignment without executing tests:
 
@@ -2113,19 +2127,25 @@ calling those helpers directly is separate from the normal GUI workflow.
 
 ## Smoke Check (No Test Framework Required)
 
-Pull requests to `main` run the required **quick-checks** workflow, with a
-10-minute time limit. It covers representative core behavior and the ordinary
-measured-BN workflow: candidate matching, batch assignments, manual selection,
+Pull requests to `main` run **Fast PR checks**, including native Qt Quick
+application and display checks. The required **quick-checks** job has a
+10-minute time limit and covers Arial typography, source catalogs, P/N assignment,
+representative core behavior, and the ordinary measured-BN workflow:
+candidate matching, batch assignments, manual selection,
 group overrides, background settings, saved recipes, and application guards.
-These checks do not run the expensive fitted-BN numerical qualification.
+These checks do not run the expensive fitted-BN numerical qualification. The
+same workflow is reused by **Windows Build** when manually building a branch
+with `test_scope: quick`; its test-module list is maintained in one place.
 
 When changing or using fitted-BN calibration, run **Actions → BN calibration
 validation → Run workflow** on the relevant branch. Its eight numerical test
 modules run in separate jobs, with up to four jobs in parallel. All existing
 numerical assertions and feature-protection thresholds are retained. This
 manual workflow is separate from the ordinary BN assignment PR gate; the
-Windows release workflow runs the full test suite in four parallel shards
-alongside packaging and requires all shard reports to pass before publishing.
+Windows release workflow runs the full test suite in four parallel shards for
+tag refs and manual `test_scope: full` builds, alongside packaging. Publishing
+still requires a tag push, a successful build, and successful verification of
+every full-suite shard report.
 
 Run:
 ```bash

@@ -5,7 +5,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from PySide6.QtCore import QSettings
+
 from tests import test_mcd_retention_export_integration as integration
+from tests.ui_test_helpers import dispose_owned_window
 
 _window = integration._window
 
@@ -15,11 +18,15 @@ class McdSaveScopeTests(unittest.TestCase):
     _window_with_result = integration.McdRetentionExportIntegrationTests._window_with_result
 
     def setUp(self):
-        self.window = self._window_with_result()
-        self.window._plot_mcd_unified()
-        self.addCleanup(self.window.close)
         self.output = tempfile.TemporaryDirectory()
         self.addCleanup(self.output.cleanup)
+        settings = QSettings(str(Path(self.output.name) / 'settings.ini'), QSettings.IniFormat)
+        settings.setValue('updates/check_automatically', False)
+        self.enterContext(patch('ui_qt.main_window.QSettings', return_value=settings))
+        self.enterContext(patch('ui_qt.presentation_widget.QSettings', return_value=settings))
+        self.window = self._window_with_result()
+        self.window._plot_mcd_unified()
+        self.addCleanup(dispose_owned_window, self.window)
         self.window.loaded.mcd_result.source_file = str(Path(self.output.name) / 'synthetic.csv')
         self.workers = []
         self.messages = []
@@ -112,7 +119,7 @@ class McdSaveScopeTests(unittest.TestCase):
                 source_dir.mkdir(parents=True)
                 w.loaded.mcd_result.source_file = str(source_dir / 'measurement.csv')
                 w._plot_mcd_unified()
-                expected = dataset_dir / 'Processed Data' / 'MCD'
+                expected = (dataset_dir / 'Processed Data' / 'MCD').resolve()
                 self.assertIn(str(expected), w.mcd_unified_controls.save_folder_label.text())
                 with patch('ui_qt.main_window.QFileDialog.getExistingDirectory', return_value='') as dialog:
                     w._queue_unified_mcd_export()

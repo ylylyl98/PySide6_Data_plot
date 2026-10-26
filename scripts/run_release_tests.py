@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
+from datetime import datetime
 import hashlib
 import importlib
 import importlib.util
@@ -27,22 +28,13 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_VERSION = 1
 ESTIMATED_PROCESS_STARTUP_SECONDS = 2.0
+TIMING_HINTS_PATH = "scripts/release_test_timings.json"
 ACCEPTABLE = {"success", "skip", "expected_failure"}
 SPLIT_MODULES = {
     "test_drr_bn_calibration", "test_drr_bn_joint",
     "test_drr_bn_joint_independent", "test_drr_bn_shrinkage",
     "test_drr_bn_shrinkage_independent", "test_drr_bn_d2_priority_independent",
     "test_drr_bn_derivative_protection", "test_drr_bn_d2_objective",
-}
-# Local serial observations, seconds, 2026-10-23. These are scheduling hints,
-# not predictions of GitHub runner time. All other weights are estimates.
-MEASURED_CALIBRATION = {
-    "test_descending_nonuniform_energy_and_explicit_repeat_order": 125.3,
-    "test_known_drift_passes_independent_confirmation_and_preserves_inputs": 34.4,
-    "test_no_drift_keeps_original_background": 2.7,
-    "test_real_narrow_peak_is_protected_including_native_derivative_stencil": 33.7,
-    "test_final_holdout_cannot_change_selected_candidate_or_fitted_parameters": 66.5,
-    "test_four_repeats_use_one_train_one_select_two_final": 22.1,
 }
 
 
@@ -137,12 +129,64 @@ def discover_tests(repo, tests_dir):
 
 def weight(test_id, module):
     short_module = module.rsplit(".", 1)[-1]
-    method = test_id.rsplit(".", 1)[-1]
-    if short_module == "test_drr_bn_calibration" and method in MEASURED_CALIBRATION:
-        return MEASURED_CALIBRATION[method], "measured_local_serial_2026-10-23"
     if short_module in SPLIT_MODULES:
         return 60.0, "estimated_expensive_bn_test"
     return 1.0, "estimated_test_count"
+
+
+def timing_source_digest(path):
+    # Scheduling hints must survive Git's LF/CRLF checkout conversion. The
+    # execution plan's independent, byte-exact source validation is unchanged.
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")).hexdigest()
+
+
+def read_timing_hints(repo):
+    path = repo / TIMING_HINTS_PATH
+    if not path.exists():
+        return {}, None
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            require(key not in result, f"Duplicate timing hint key: {key}")
+            result[key] = value
+        return result
+
+    def hex_digest(value, length=64):
+        return (isinstance(value, str) and len(value) == length
+                and all(char in "0123456789abcdef" for char in value))
+
+    raw = path.read_bytes()
+    data = json.loads(raw, object_pairs_hook=unique_object)
+    require(isinstance(data, dict) and set(data) == {"schema_version", "source", "units"}
+            and type(data["schema_version"]) is int and data["schema_version"] == 1,
+            "Invalid timing hints schema")
+    source = data["source"]
+    require(isinstance(source, dict)
+            and type(source.get("workflow_run_id")) is int and source["workflow_run_id"] > 0
+            and hex_digest(source.get("commit"), 40)
+            and hex_digest(source.get("plan_id"))
+            and isinstance(source.get("recorded_at_utc"), str)
+            and source["recorded_at_utc"].endswith("Z")
+            and source.get("measurement") == "unit_wall_seconds_including_startup",
+            "Invalid timing hints provenance")
+    datetime.strptime(source["recorded_at_utc"], "%Y-%m-%dT%H:%M:%SZ")
+    hints = data["units"]
+    require(isinstance(hints, dict), "Invalid timing hints units")
+    for key, hint in hints.items():
+        require(isinstance(key, str) and "." in key
+                and all(part.isidentifier() for part in key.split(".")),
+                f"Invalid stable timing key: {key}")
+        require(isinstance(hint, dict)
+                and set(hint) == {"duration_seconds", "source_sha256_lf", "test_ids_sha256"},
+                f"Invalid timing hint: {key}")
+        seconds = hint["duration_seconds"]
+        require(type(seconds) in (int, float) and math.isfinite(seconds) and 0 < seconds <= 86400,
+                f"Invalid timing duration: {key}")
+        require(hex_digest(hint["source_sha256_lf"]) and hex_digest(hint["test_ids_sha256"]),
+                f"Invalid timing fingerprint: {key}")
+    return hints, {"path": TIMING_HINTS_PATH, "sha256": hashlib.sha256(raw).hexdigest(),
+                   "source": source}
 
 
 def make_plan(repo, tests_dir="tests", shards=4):
@@ -150,6 +194,7 @@ def make_plan(repo, tests_dir="tests", shards=4):
     require(shards > 0, "shards must be positive")
     tests_dir = (repo / tests_dir).resolve().relative_to(repo).as_posix()
     before = source_snapshot(repo, tests_dir)
+    timing_hints, timing_provenance = read_timing_hints(repo)
     discovered, duplicates = discover_tests(repo, tests_dir)
     tests, groups = [], defaultdict(list)
     for test_id, case in sorted(discovered.items()):
@@ -160,9 +205,23 @@ def make_plan(repo, tests_dir="tests", shards=4):
         key = test_id if module.rsplit(".", 1)[-1] in SPLIT_MODULES else module
         groups[key].append(test_id)
     weights = {test["id"]: test["weight_seconds"] for test in tests}
-    units = [{"id": f"unit-{index:04d}", "test_ids": ids,
-              "weight_seconds": ESTIMATED_PROCESS_STARTUP_SECONDS + sum(weights[name] for name in ids)}
-             for index, (_, ids) in enumerate(sorted(groups.items()))]
+    modules = {test["id"]: test["module"] for test in tests}
+    units, timing_sources = [], {}
+    for index, (key, ids) in enumerate(sorted(groups.items())):
+        seconds = ESTIMATED_PROCESS_STARTUP_SECONDS + sum(weights[name] for name in ids)
+        basis = "estimated_tests_plus_startup"
+        hint = timing_hints.get(key)
+        if hint is not None:
+            module_path = modules[ids[0]].replace(".", "/") + ".py"
+            if module_path not in timing_sources:
+                timing_sources[module_path] = (timing_source_digest(repo / module_path)
+                                               if module_path in before else None)
+            if (hint["source_sha256_lf"] == timing_sources[module_path]
+                    and hint["test_ids_sha256"] == digest(sorted(ids))):
+                # The measured child wall time already includes process startup.
+                seconds, basis = hint["duration_seconds"], "measured_unit_wall"
+        units.append({"id": f"unit-{index:04d}", "test_ids": ids, "timing_key": key,
+                      "weight_seconds": seconds, "weight_basis": basis})
     assignments = [{"id": index, "unit_ids": [], "test_ids": [], "weight_seconds": 0.0}
                    for index in range(shards)]
     for unit in sorted(units, key=lambda item: (-item["weight_seconds"], item["id"])):
@@ -177,6 +236,7 @@ def make_plan(repo, tests_dir="tests", shards=4):
             "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             "process_startup_weight_seconds": ESTIMATED_PROCESS_STARTUP_SECONDS,
             "process_startup_weight_basis": "estimated_per_process",
+            "timing_hints": timing_provenance,
             "discovery_duplicates": duplicates, "tests": tests, "units": units,
             "shards": assignments, "shard_count": shards}
     plan["plan_id"] = digest(plan)
@@ -382,7 +442,7 @@ def run_shard(plan_path, shard_id, repo, output_dir, timeout=900):
         report_path = output_dir / f"{unit_id}.result.json"
         log_path = output_dir / f"{unit_id}.log"
         events_path = output_dir / f"{unit_id}.events.jsonl"
-        command = [sys.executable, str(Path(__file__).resolve()), "_child",
+        command = [sys.executable, "-X", "faulthandler", str(Path(__file__).resolve()), "_child",
                    "--plan", str(Path(plan_path).resolve()), "--repo", str(repo),
                    "--unit", unit_id, "--report", str(report_path), "--events", str(events_path)]
         env = {**os.environ, "QT_QPA_PLATFORM": "offscreen", "PYTHONUNBUFFERED": "1"}
@@ -500,6 +560,9 @@ def main(argv=None):
             write_json(args.output, plan)
             print(f"Planned {len(plan['tests'])} unique tests in {args.shards} shards; "
                   f"{len(plan['discovery_duplicates'])} imported duplicate IDs normalized.")
+            measured = sum(unit["weight_basis"] == "measured_unit_wall" for unit in plan["units"])
+            print(f"Scheduling weights: {measured} measured units; "
+                  f"{len(plan['units']) - measured} fallback estimates.")
             for shard in plan["shards"]:
                 print(f"Shard {shard['id']}: {len(shard['test_ids'])} tests, "
                       f"scheduling weight {shard['weight_seconds']:.1f} seconds (includes estimates)")

@@ -15,7 +15,7 @@ import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QLabel, QLineEdit, QListWidget, QMessageBox, QPushButton, QScrollArea, QSplitter, QStyle, QStyleOptionSpinBox, QToolButton, QWidget
@@ -24,7 +24,7 @@ from core.loader import DataCube
 from core.drr_sources import DrrSource
 from ui_qt.main_window import LoadedState, MainWindow, UI_METRICS
 from ui_qt.theme import alias as theme_alias, install_theme
-from tests.ui_test_helpers import wait_for_file_catalog
+from tests.ui_test_helpers import dispose_owned_window, wait_for_file_catalog
 from tests.profile_phases import profile_phase
 
 
@@ -38,9 +38,18 @@ class SplitScaleControlTests(unittest.TestCase):
             install_theme(cls.app, mode="light")
 
     def setUp(self) -> None:
+        settings_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(settings_dir.cleanup)
+        settings = QSettings(str(Path(settings_dir.name) / "settings.ini"), QSettings.IniFormat)
+        settings.setValue("updates/check_automatically", False)
+        for module in ("ui_qt.main_window", "ui_qt.presentation_widget"):
+            settings_patch = patch(f"{module}.QSettings", return_value=settings)
+            settings_patch.start()
+            self.addCleanup(settings_patch.stop)
         with profile_phase("mainwindow_construction"):
             with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
                 self.window = MainWindow()
+                self.addCleanup(dispose_owned_window, self.window)
         with profile_phase("mainwindow_show_setup"):
             self.window.resize(1180, 820)
             self.window.show()
@@ -62,9 +71,7 @@ class SplitScaleControlTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         with profile_phase("mainwindow_teardown"):
-            self.window.close()
-            self.window.deleteLater()
-            self.app.processEvents()
+            dispose_owned_window(self.window)
 
     def _wait_for_drr_catalog(self) -> None:
         with profile_phase("drr_event_wait"):
@@ -998,7 +1005,7 @@ class SplitScaleControlTests(unittest.TestCase):
         # The themed compact page may need vertical scrolling, but every
         # visible control remains reachable without horizontal clipping.
         for page, control in (
-            (None, self.window.drr_baseline_combo),
+            (None, self.window.drr_edit_baselines_btn),
             (0, self.window.drr_yaxis_combo),
             (1, self.window.drr_derivative_combo),
         ):
@@ -1009,12 +1016,17 @@ class SplitScaleControlTests(unittest.TestCase):
                     if button.text() == "Advanced derivative":
                         button.setChecked(True)
             page_scroll = scroll if page is None else self.window.drr_sidebar_tabs.currentWidget()
+            # Tab/expander changes must update the scroll range before we
+            # ask Qt to reveal a control in the newly laid-out page.
+            self.app.processEvents()
             page_scroll.ensureWidgetVisible(control)
             self.app.processEvents()
+            self.assertTrue(control.isVisible(), control.objectName())
             top_left = control.mapTo(page_scroll.viewport(), control.rect().topLeft())
             bottom_right = control.mapTo(page_scroll.viewport(), control.rect().bottomRight())
-            self.assertTrue(page_scroll.viewport().rect().contains(top_left))
-            self.assertTrue(page_scroll.viewport().rect().contains(bottom_right))
+            description = f"page={page} control={control.objectName()} bounds={top_left}, {bottom_right} viewport={page_scroll.viewport().rect()}"
+            self.assertTrue(page_scroll.viewport().rect().contains(top_left), description)
+            self.assertTrue(page_scroll.viewport().rect().contains(bottom_right), description)
 
     def test_workflow_navigation_is_above_the_collapsible_sidebar(self) -> None:
         self.assertFalse(self.window.tabs.tabBar().isVisible())

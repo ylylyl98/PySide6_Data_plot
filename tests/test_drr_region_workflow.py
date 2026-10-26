@@ -13,7 +13,9 @@ import numpy as np
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 from PySide6.QtWidgets import QApplication, QDialog
 from PySide6.QtCore import QSettings
+from shiboken6 import isValid
 
+from tests.ui_test_helpers import dispose_owned_window
 from core.drr_background_regions import DrrBackgroundRegion
 from core.drr_sources import DrrBackgroundResolution, DrrSourceCache, discover_drr_sources
 from core.drr_analysis_workspace import create_dataset
@@ -41,9 +43,10 @@ class RegionWorkflowTests(unittest.TestCase):
                 'Vbg,Vtg,' + ','.join(str(v) for v in np.linspace(740, 780, 81)) + '\n'
                 + '\n'.join(f'{i},0,' + ','.join([str(v)] * 81) for i, v in enumerate(values)) + '\n')
         settings = QSettings(str(self.root / 'settings.ini'), QSettings.IniFormat)
-        with patch.object(MainWindow, '_restore_last_folder', lambda _self: None), patch.object(
-                MainWindow, '_schedule_automatic_update_check', lambda _self: None), patch(
-                'ui_qt.main_window.QSettings', return_value=settings):
+        settings.setValue(MainWindow.SETTINGS_AUTO_UPDATE_CHECK, False)
+        with patch.object(MainWindow, '_restore_last_folder', lambda _self: None), patch(
+                'ui_qt.main_window.QSettings', return_value=settings), patch(
+                'ui_qt.presentation_widget.QSettings', return_value=settings):
             self.window = MainWindow()
         self.window._suspend_drr_autoplot = True
         self.window.current_folder = str(self.root)
@@ -62,9 +65,8 @@ class RegionWorkflowTests(unittest.TestCase):
         self.signal = SimpleNamespace(emit=lambda *_: None)
 
     def tearDown(self):
-        self.window.close()
-        self.window.deleteLater()
-        self.app.processEvents()
+        dispose_owned_window(self.window)
+        self.assertFalse(isValid(self.window))
 
     def options(self):
         with patch.object(self.window, '_launch_load_options') as launch:

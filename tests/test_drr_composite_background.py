@@ -278,7 +278,7 @@ class CompositeBackgroundTests(unittest.TestCase):
         before = self.output.read_bytes(), metadata.read_bytes()
         original = os.replace
         def fail_metadata(source, target):
-            if str(source).endswith('.tmp') and Path(target) == metadata:
+            if str(source).endswith('.tmp') and Path(target).resolve() == metadata.resolve():
                 raise OSError('simulated metadata promotion failure')
             return original(source, target)
         with patch.object(C.os, 'replace', side_effect=fail_metadata), self.assertRaisesRegex(OSError, 'simulated'):
@@ -292,7 +292,7 @@ class CompositeBackgroundTests(unittest.TestCase):
         metadata = C.composite_metadata_path(self.output)
         original = os.replace
         def fail_metadata(source, target):
-            if Path(target) == metadata:
+            if Path(target).resolve() == metadata.resolve():
                 raise OSError('simulated failure')
             return original(source, target)
         with patch.object(C.os, 'replace', side_effect=fail_metadata), self.assertRaises(OSError):

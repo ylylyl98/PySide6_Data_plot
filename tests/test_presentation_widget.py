@@ -4,13 +4,15 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
-from PySide6.QtCore import Qt, QThreadPool
+from PySide6.QtCore import Qt, QEventLoop, QSettings, QThreadPool, QTimer
 from PySide6.QtWidgets import QAbstractItemView, QApplication
 
+from tests.ui_test_helpers import dispose_owned_window
 from ui_qt.presentation_widget import PresentationBuilderWidget
 
 
@@ -20,21 +22,48 @@ class PresentationWidgetTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
+        settings_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(settings_dir.cleanup)
+        cache_environment = patch.dict(os.environ, LOCALAPPDATA=settings_dir.name)
+        cache_environment.start()
+        self.addCleanup(cache_environment.stop)
+        settings = QSettings(str(Path(settings_dir.name) / "settings.ini"), QSettings.IniFormat)
+        settings_patch = patch("ui_qt.presentation_widget.QSettings", return_value=settings)
+        settings_patch.start()
+        self.addCleanup(settings_patch.stop)
+        self.pool = QThreadPool()
         self.widget = PresentationBuilderWidget()
+        self.widget._thread_pool = self.pool
+        self.widget.preview._thumbnail_pool = self.pool
         self.widget.resize(1280, 760)
         self.widget.show()
 
     def tearDown(self) -> None:
         self.widget.close()
+        self.assertTrue(self.pool.waitForDone(5000), "presentation workers did not stop")
+        self.app.processEvents()
+        dispose_owned_window(self.widget)
 
     def _wait_for_discovery(self) -> None:
-        for _ in range(100):
-            self.app.processEvents()
-            if not self.widget._discovery_running:
-                return
-            QThreadPool.globalInstance().waitForDone(10)
-            self.app.processEvents()
-        self.fail("plot discovery worker did not finish")
+        self.app.processEvents()
+        if not self.widget._discovery_running:
+            return
+        # An idle pool returns immediately from waitForDone; counting those
+        # calls can time out before a queued completion gets a chance to run.
+        # Run Qt's event loop until discovery finishes, with a real 1 s bound.
+        loop = QEventLoop()
+        poll = QTimer(loop)
+        poll.setInterval(10)
+        poll.timeout.connect(lambda: loop.quit() if not self.widget._discovery_running else None)
+        watchdog = QTimer(loop)
+        watchdog.setSingleShot(True)
+        watchdog.timeout.connect(loop.quit)
+        poll.start()
+        watchdog.start(1000)
+        loop.exec()
+        poll.stop()
+        watchdog.stop()
+        self.assertFalse(self.widget._discovery_running, "plot discovery worker did not finish within 1 s")
 
     def test_plot_workspace_defaults_and_optional_controls_are_compact(self) -> None:
         self.assertFalse(self.widget.panel_labels_chk.isChecked())

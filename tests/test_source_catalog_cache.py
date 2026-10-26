@@ -2,6 +2,9 @@ import tempfile
 import json
 from contextlib import contextmanager
 from io import StringIO
+import subprocess
+import sys
+import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -246,6 +249,32 @@ class SourceCatalogCacheTests(unittest.TestCase):
         cache.refresh(lambda: [])
         (self.folder / 'new.png').write_bytes(b'figure')
         self.assertEqual(cache.refresh(lambda: ['new.png']), ['new.png'])
+
+    def test_plain_slide_snapshots_reopen_without_scientific_imports(self):
+        # A fresh interpreter must browse a plain PNG catalog without importing
+        # the numerical stack merely to check whether it is a DRR snapshot.
+        code = textwrap.dedent('''
+            import sys
+            from pathlib import Path
+            from core.source_catalog_cache import SourceCatalogCache
+            folder, cache_root = sys.argv[1:]
+            rows = [{'path': 'plot.png', 'relative_path': 'PL/plot.png',
+                     'workflow': 'PL', 'modified_time': 1.0, 'plot_kind': 'other'}]
+            for payload in (rows, [], {'plots': rows}):
+                cache = SourceCatalogCache(folder, 'Slides', Path(cache_root))
+                assert cache.refresh(lambda: payload, force=True) == payload
+                restarted = SourceCatalogCache(folder, 'Slides', Path(cache_root))
+                assert restarted.read() == payload
+                assert restarted.refresh(lambda: 'unnecessary rebuild') == payload
+            assert 'core.drr_sources' not in sys.modules
+            assert 'scipy' not in sys.modules
+            assert 'numpy' not in sys.modules
+        ''')
+        result = subprocess.run(
+            [sys.executable, '-S', '-c', code, str(self.folder), str(self.cache_root)],
+            cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == '__main__':
