@@ -29,7 +29,7 @@ def _read_json(path):
 
 def read_center_history(root, source, *, extra_roots=()):
     """Read every matching formally saved window off the UI thread."""
-    from core.data_io import list_mcd_csv_files
+    from core.mcd_catalog import list_mcd_csv_files
     root = Path(root)
     source = str(source).replace('\\', '/')
     sources = list_mcd_csv_files(str(root))

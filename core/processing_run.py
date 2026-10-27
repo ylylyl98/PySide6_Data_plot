@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from core.typography import FONT_FAMILY, save_figure, with_plot_font
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -715,8 +716,9 @@ def _soft_wrap_chars(text: str, max_cols: int) -> str:
     return "\n".join(lines)
 from matplotlib.font_manager import FontProperties
 
+@with_plot_font
 def _wrap_title_by_renderer(fig, axpos, cax_left_x0, text,
-                            *, fontsize=12, fontweight='bold', fontname=None):
+                            *, fontsize=12, fontweight='bold', fontname=FONT_FAMILY):
     """
     Wrap `text` across the span [axpos.x0, cax_left_x0].
     Safe even if no GUI/renderer is live (falls back to char-width wrap).
@@ -759,7 +761,7 @@ def _wrap_title_by_renderer(fig, axpos, cax_left_x0, text,
         approx_cols = max(10, int(avail_w_px / max(1.0, 0.55 * fontsize)))
         return _soft_wrap_chars(text.replace("~", " "), approx_cols)
 
-    fp = FontProperties(size=fontsize, weight=fontweight, family=fontname)
+    fp = FontProperties(size=fontsize, weight=fontweight, family=fontname or FONT_FAMILY)
     def width_px(s: str) -> float:
         w, h, d = renderer.get_text_width_height_descent(s, fp, ismath=False)
         return float(w)
@@ -960,7 +962,7 @@ def plot_heat_static_save(
     scale_suffix = ("_log" if log_scale else "_linear") if pl_mode else ""
     out_path = out_dir / f"{save_base}{scale_suffix}.png"
     _remove_lonely_x(fig)
-    fig.savefig(out_path, dpi=dpi, facecolor=fig.get_facecolor(),
+    save_figure(fig, out_path, dpi=dpi, facecolor=fig.get_facecolor(),
                 edgecolor='none', bbox_inches=None, pad_inches=0)    
     plt.close(fig)
     return str(out_path)
@@ -1236,7 +1238,7 @@ def plot_heat_interactive_locked(
         out_dir = Path(user_folder) / subfolder
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{base}.png"
-        fig.savefig(out_path, dpi=fig.dpi, facecolor=fig.get_facecolor(), edgecolor='none')
+        save_figure(fig, out_path, dpi=fig.dpi, facecolor=fig.get_facecolor(), edgecolor='none')
         if not stop_on_save and not include_controls:
             for a, vis, z, pos in saved_state:
                 a.set_position(pos)

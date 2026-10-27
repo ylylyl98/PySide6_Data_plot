@@ -7,13 +7,13 @@ if __name__ == '__main__':
 
 import sys
 import os
+import argparse
 import faulthandler
 import logging
 from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication
 
 from app_version import __version__
 
@@ -81,30 +81,47 @@ def load_app_icon() -> QIcon:
 
 def main() -> int:
     enable_crash_diagnostics()
-    if "--peak-analysis" in sys.argv:
-        index = sys.argv.index("--peak-analysis")
-        from run_peak_analysis import main as peak_main
-        return peak_main(sys.argv[index + 1:])
-    if "--drr-analysis" in sys.argv:
-        index = sys.argv.index("--drr-analysis")
-        from run_drr_analysis import main as analysis_main
-        return analysis_main(sys.argv[index + 1:])
-    if "--mcd-organizer" in sys.argv:
-        index = sys.argv.index("--mcd-organizer")
-        experiment = sys.argv[index + 1] if index + 1 < len(sys.argv) else str(Path.cwd())
-        from run_mcd_organizer import main as organizer_main
-
-        return organizer_main([experiment])
-
+    if "--mcd-organizer-quick" in sys.argv or "--mcd-organizer" in sys.argv:
+        index = sys.argv.index("--mcd-organizer-quick" if "--mcd-organizer-quick" in sys.argv else "--mcd-organizer")
+        from run_mcd_organizer_quick import main as organizer_quick_main
+        return organizer_quick_main(sys.argv[index + 1:])
+    if "--peak-analysis-quick" in sys.argv or "--peak-analysis" in sys.argv:
+        index = sys.argv.index("--peak-analysis-quick" if "--peak-analysis-quick" in sys.argv else "--peak-analysis")
+        from run_peak_analysis_quick import main as peak_quick_main
+        return peak_quick_main(sys.argv[index + 1:])
+    if "--drr-analysis-quick" in sys.argv or "--drr-analysis" in sys.argv:
+        index = sys.argv.index("--drr-analysis-quick" if "--drr-analysis-quick" in sys.argv else "--drr-analysis")
+        from run_drr_analysis_quick import main as drr_quick_main
+        return drr_quick_main(sys.argv[index + 1:])
+    if "--qt-quick" in sys.argv:
+        from run_quick import main as quick_main
+        return quick_main([value for value in sys.argv[1:] if value != "--qt-quick"], production=True)
+    if "--check-quick-display" in sys.argv:
+        from scripts.check_quick_display import check_quick_display
+        return check_quick_display()
     if "--check-powerpoint-integration" in sys.argv:
         from core.presentation import powerpoint_integration_available
 
         available, _message = powerpoint_integration_available()
         return 0 if available else 2
 
+    if "--legacy-widgets" not in sys.argv:
+        from run_quick import main as quick_main
+        return quick_main(sys.argv[1:], production=True)
+
     set_windows_app_user_model_id()
 
-    app = QApplication(sys.argv)
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--drr-display", choices=("quick", "widgets"),
+                        default=os.environ.get("DPTK_DRR_DISPLAY", "quick"))
+    display_options, qt_options = parser.parse_known_args([value for value in sys.argv[1:] if value != "--legacy-widgets"])
+    if display_options.drr_display not in {"quick", "widgets"}:
+        parser.error("DPTK_DRR_DISPLAY must be 'quick' or 'widgets'")
+
+    from PySide6.QtWidgets import QApplication
+    app = QApplication([sys.argv[0], *qt_options])
+    from ui_qt.typography import install_application_font
+    install_application_font(app)
     app.setApplicationName("DPTK Desktop")
     app.setApplicationVersion(__version__)
     app.setOrganizationName("ylylyl98")
@@ -118,7 +135,7 @@ def main() -> int:
 
     from ui_qt.main_window import MainWindow
 
-    window = MainWindow()
+    window = MainWindow(drr_display_backend=display_options.drr_display)
     if not app_icon.isNull():
         window.setWindowIcon(app_icon)
     window.show()

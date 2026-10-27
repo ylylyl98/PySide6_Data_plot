@@ -303,6 +303,7 @@ class FluentThemeManager(QObject):
         motion_mode: MotionMode = MotionMode.FULL,
         shell_profile: str | None = "fluent-workbench",
         prefer_fluent_font: bool = True,
+        font_family: str | None = None,
         apply_body_pixel_size: bool = False,
     ) -> None:
         super().__init__(app)
@@ -312,6 +313,7 @@ class FluentThemeManager(QObject):
         self.motion_mode = motion_mode
         self.shell_profile = shell_profile
         self.prefer_fluent_font = prefer_fluent_font
+        self.font_family = font_family
         self.apply_body_pixel_size = apply_body_pixel_size
         self.qss_template = Path(qss_template) if qss_template else Path(__file__).with_name("fluent.qss.in")
         self._qss_asset_cache = TemporaryDirectory(prefix="pyside6-fluent-ui-")
@@ -436,8 +438,12 @@ class FluentThemeManager(QObject):
         return self.mode
 
     def _build_font(self, theme: ResolvedTheme) -> QFont:
-        font = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont)
-        if self.prefer_fluent_font:
+        # Theme changes update colors without resetting the application's
+        # current size, weight or style. A project family remains authoritative.
+        font = QFont(self.app.font())
+        if self.font_family:
+            font.setFamily(self.font_family)
+        elif self.prefer_fluent_font:
             families = set(QFontDatabase.families())
             for candidate in ("Segoe UI Variable", "Segoe UI"):
                 if candidate in families:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from core.typography import save_figure
+
 import tempfile
 import sys
 import threading
@@ -21,7 +23,7 @@ from matplotlib.transforms import Bbox
 from ui_qt.png_export_controls import install_png_width_control, export_width, apply_export_width
 from matplotlib.widgets import SpanSelector
 from PySide6.QtCore import QFileSystemWatcher, QMimeData, QProcess, QSettings, Qt, QRunnable, QThreadPool, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent
+from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -175,6 +177,7 @@ from ui_qt.common import (
     Worker,
     WorkerSignals,
     focused_numeric_input,
+    pending_numeric_input,
 )
 from ui_qt.drr_display_memory import background_folder_key, guarded_auto, second_is_protected
 from ui_qt.compact_spinbox import CompactDoubleSpinBox
@@ -386,7 +389,7 @@ class _PlotToolbar(NavigationToolbar2QT):
             mpl.rcParams['savefig.directory'] = str(Path(path).parent)
         try:
             if Path(path).suffix.lower() != '.png':
-                self.canvas.figure.savefig(path)
+                save_figure(self.canvas.figure, path)
                 return
             owner = self.window()
             from ui_qt.drr_display_memory import capture_visible, remember_shared
@@ -650,8 +653,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
     SETTINGS_PL_AUTO_NEXT = "pl/auto_load_next"
     MAX_RECENT_FOLDERS = 8
 
-    def __init__(self):
+    def __init__(self, *, drr_display_backend: str = "widgets"):
         super().__init__()
+        if drr_display_backend not in {"widgets", "quick"}:
+            raise ValueError("DRR display backend must be 'quick' or 'widgets'")
+        self.drr_display_backend = drr_display_backend
         from ui_qt.wheel_policy import install_wheel_value_guard
         install_wheel_value_guard()
         register_colormaps()
@@ -660,6 +666,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._is_closing = False
         self.thread_pool = _MainWindowThreadPool(self)
         self.settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
+        saved_appearance = str(self.settings.value("ui/appearance", ""))
+        manager = theme_manager()
+        if manager is not None and saved_appearance in {"system", "light", "dark", "high-contrast"}:
+            manager.set_mode(saved_appearance)
         saved_mcd_filter = str(
             self.settings.value(self.SETTINGS_MCD_SOURCE_FILTER, "all")
         ).casefold()
@@ -756,6 +766,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._plot_redraw_pending: set[str] = set()
         self._automatic_update_timer: QTimer | None = None
         self._sidebar_last_expanded_width = UI_METRICS["left_width"]
+        self._comparison_navigation_active = False
+        self._comparison_navigation_restore = None
         self._drr_heatmap_ax = None
         self._drr_spectrum_ax = None
         self._drr_heatmap_axes: dict[str, Any] = {}
@@ -951,9 +963,19 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         # signal when the window is destroyed; closing still permits re-show.
         self.menu_toolbar_host.apply_theme(theme, navigation_toolbar=self.toolbar)
         self.mcd_controller._on_theme_changed(theme)
+        for mode, action in getattr(self, "appearance_actions", {}).items():
+            action.setChecked(str(getattr(self._theme_manager.mode, "value", self._theme_manager.mode)) == mode)
+
+    def _select_appearance(self, mode: str) -> None:
+        if self._theme_manager is not None:
+            self._theme_manager.set_mode(mode)
+            self.settings.setValue("ui/appearance", mode)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
         """Invalidate background callbacks and let active file reads finish."""
+        display_host = getattr(self, "drr_display_host", None)
+        if display_host is not None:
+            display_host.suspend()
         from ui_qt.drr_regions import save_settings
         from ui_qt.drr_display_memory import save_global_geometry
         save_global_geometry(self)
@@ -1509,6 +1531,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             plot_panel=right,
             presentation_widget=presentation_widget,
             tools_widget=self.tools_workspace,
+            plot_toolbar=self.toolbar,
         )
         # Compatibility aliases remain owned by MainWindow for existing callers.
         self.central_widget = self.workspace_shell.central_widget
@@ -1558,6 +1581,22 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._theme_manager.themeChanged.connect(
                 self._on_application_theme_changed
             )
+        appearance_menu = self.menu_toolbar_host.view_menu.addMenu("Appearance")
+        appearance_group = QActionGroup(self)
+        appearance_group.setExclusive(True)
+        self.appearance_actions = {}
+        for mode, title in (("system", "Follow system"), ("light", "Light"),
+                            ("dark", "Dark"), ("high-contrast", "High contrast")):
+            action = appearance_menu.addAction(title)
+            action.setCheckable(True)
+            action.setData(mode)
+            action.setEnabled(self._theme_manager is not None)
+            appearance_group.addAction(action)
+            action.triggered.connect(lambda checked, value=mode: self._select_appearance(value) if checked else None)
+            self.appearance_actions[mode] = action
+        if self._theme_manager is not None:
+            current_appearance = str(getattr(self._theme_manager.mode, "value", self._theme_manager.mode))
+            self.appearance_actions[current_appearance].setChecked(True)
         # Compatibility aliases remain owned by MainWindow for existing callers.
         self.show_log_action = self.menu_toolbar_host.show_log_action
         self.show_results_action = self.menu_toolbar_host.show_results_action
@@ -1577,6 +1616,30 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.move_now_btn.setEnabled(False)
         self.clean_verified_sources_chk.setChecked(False)
         self.show_sidebar_action.setShortcut("Ctrl+B")
+        self.workspace_shell.rail_toggle_btn.clicked.connect(self._on_navigation_visibility_chosen)
+        self._refresh_workspace_context()
+
+    def _on_navigation_visibility_chosen(self, _visible: bool) -> None:
+        # An explicit choice supersedes the automatic comparison transition.
+        self._comparison_navigation_restore = None
+
+    def _sync_comparison_navigation(self) -> None:
+        """Give paired plots the rail's width while keeping parameters visible."""
+        shell = getattr(self, "workspace_shell", None)
+        if shell is None:
+            return
+        mode = self._active_mode()
+        paired = ((mode == "DRR" and self._drr_side_by_side)
+                  or (mode == "PL" and self.pl_view_side_btn.isChecked()))
+        if paired == self._comparison_navigation_active:
+            return
+        self._comparison_navigation_active = paired
+        if paired:
+            self._comparison_navigation_restore = shell.is_rail_visible()
+            shell.set_rail_visible(False)
+        elif self._comparison_navigation_restore is not None:
+            shell.set_rail_visible(self._comparison_navigation_restore)
+            self._comparison_navigation_restore = None
 
     def _set_sidebar_visible(self, visible: bool) -> None:
         """Show or hide the contextual inspector without changing the active workflow."""
@@ -1623,6 +1686,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
     def _build_left_panel(self) -> QWidget:
         box = QWidget()
+        box.setObjectName("controlsSidebar")
+        set_fluent_property(box, "appRole", "controlSidebar")
         layout = QVBoxLayout(box)
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(UI_METRICS["row_spacing"])
@@ -1634,7 +1699,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         # Toolbar presentation is intentionally compact: one row with no
         # group-box framing or extra vertical padding.
         folder_grid.setContentsMargins(0, 0, 0, 0)
-        folder_grid.setSpacing(0)
+        folder_grid.setSpacing(6)
         self.folder_edit = QLineEdit()
         self.folder_edit.setObjectName("folderEdit")
         self.folder_edit.setReadOnly(True)
@@ -1648,6 +1713,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         )
         self.browse_btn = QPushButton("Browse Folder")
         self.browse_btn.setObjectName("browseFolderButton")
+        set_fluent_property(self.browse_btn, "fluentAppearance", "outline")
         self.browse_btn.setToolTip("Select a folder containing CSV data files")
         apply_accessible_identity(self.browse_btn, name="Browse Folder", identifier="source.browse")
         self.open_file_btn = QPushButton("Open File")
@@ -1664,6 +1730,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.refresh_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
         self.data_state_label = QLabel("Shown: no data")
         self.data_state_label.setObjectName("dataStateLabel")
+        set_fluent_property(self.data_state_label, "appRole", "sourceState")
         self.data_state_label.setToolTip("Shows whether the visible plot matches the current source selection")
         self.data_state_label.hide()
         self.recent_folder_combo = QComboBox()
@@ -1708,7 +1775,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 page = self._make_scrollable_tab(page, feature.key)
             index = self.tabs.addTab(page, feature.label)
             self.tabs.setTabToolTip(index, feature.description)
-        # Workflow navigation is rendered above the entire workspace.  This
+        # Workflow navigation lives beside the entire workspace. This
         # QTabWidget remains the page stack so existing tab-specific code and
         # keyboard behavior continue to work.
         self.tabs.tabBar().hide()
@@ -2256,8 +2323,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
     def _make_expander(self, title: str, content: QWidget, *, expanded: bool = True) -> QWidget:
         box = QWidget()
         v = QVBoxLayout(box)
-        v.setContentsMargins(0, 3, 0, 4)
-        v.setSpacing(4)
+        v.setContentsMargins(0, 5, 0, 6)
+        v.setSpacing(6)
         head = QToolButton()
         head.setCheckable(True)
         workflow = getattr(self, "_expander_workflow_context", "common")
@@ -2268,6 +2335,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         head.setChecked(bool(expanded))
         head.setAutoRaise(True)
         head.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        head.setFocusPolicy(Qt.StrongFocus)
+        head.setAccessibleName(title)
+        head.setToolTip("Expand or collapse " + title)
         set_fluent_property(head, "appRole", "expanderHead")
         line = QFrame()
         line.setFrameShape(QFrame.NoFrame)
@@ -2544,7 +2614,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                            ("pl_spins", "cmp_spins", "power_spins", "drr_spins")]
         cursor_controls.extend((getattr(self, "drr_gate_toolbar_spin", None),
                                 getattr(self, "shg_angle_cursor_spin", None)))
-        if delay_ms == 90 and focused is not None and focused not in cursor_controls:
+        display_bridge = getattr(getattr(self, "drr_display_host", None), "bridge", None)
+        quick_stepping = bool(display_bridge is not None and display_bridge.stepping)
+        if delay_ms == 90 and ((focused is not None and focused not in cursor_controls) or quick_stepping):
             # Held arrows repeat at intervals longer than the normal 90 ms
             # debounce. Keep those expensive redraws trailing the last step.
             delay_ms = 180
@@ -2576,12 +2648,11 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             return
         # A redraw queued by the previous field must not interrupt typing in
         # the next field or overwrite its uncommitted text with automatic limits.
-        focused = focused_numeric_input(self)
         text_editor = QApplication.focusWidget()
         label_pending = mode == "PL" and isinstance(text_editor, QLineEdit) and text_editor in (
             getattr(self, "pl_dat_yaxis_label_edit", None), getattr(self, "pl_dat_yaxis_unit_edit", None)
         ) and text_editor.isModified()
-        if (focused is not None and focused.lineEdit().isModified()) or label_pending:
+        if pending_numeric_input(self) is not None or label_pending:
             self._schedule_plot_redraw(mode)
             return
         if mode == 'DRR':
@@ -2664,8 +2735,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
     def _on_drr_display_ready(self):
         if self._is_closing:
             return
-        focused = focused_numeric_input(self)
-        if focused is not None and focused.lineEdit().isModified():
+        if pending_numeric_input(self) is not None:
             self._drr_display_ready_deferred = True
             self._schedule_plot_redraw('DRR')
             return
@@ -2795,6 +2865,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
     def _on_drr_side_by_side_changed(self, checked: bool) -> None:
         self._capture_drr_view_limits()
         self._drr_side_by_side = bool(checked)
+        self._sync_comparison_navigation()
         if checked:
             self._refresh_drr_second_split_ranges(force=True)
         # Side-by-side is a layout preference.  Keep the selected product
@@ -2985,23 +3056,28 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
     def _build_plot_panel(self) -> QWidget:
         box = QWidget()
+        box.setObjectName("plotWorkspace")
+        set_fluent_property(box, "appRole", "plotSurface")
         layout = QVBoxLayout(box)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         self.figure = Figure(figsize=(9, 7), dpi=100)
         self.canvas = ThemeAwareFigureCanvasQTAgg(self.figure)
         self.toolbar = _PlotToolbar(self.canvas, box)
+        self.toolbar.setObjectName("plotNavigationToolbar")
+        set_fluent_property(self.toolbar, "appRole", "plotCommandBar")
         layout.addWidget(self.toolbar)
         from ui_qt.peak_analysis_bridge import PeakAnalysisBridge
         self.peak_analysis_bridge = PeakAnalysisBridge(self, self.toolbar)
         install_png_width_control(self, self.toolbar)
         self.drr_plot_view_bar = QFrame()
         self.drr_plot_view_bar.setFrameShape(QFrame.NoFrame)
+        set_fluent_property(self.drr_plot_view_bar, "appRole", "plotCommandBar")
         self.drr_plot_view_bar.setVisible(False)
         set_fluent_property(self.drr_plot_view_bar, "fluentRole", "panel")
         drr_view_layout = QHBoxLayout(self.drr_plot_view_bar)
         drr_view_layout.setContentsMargins(8, 4, 8, 4)
-        drr_view_layout.setSpacing(0)
+        drr_view_layout.setSpacing(4)
         self.drr_view_raw_btn = QToolButton()
         self.drr_view_raw_btn.setText("ΔR/R")
         self.drr_view_raw_btn.setToolTip("Show the baseline-corrected ΔR/R product")
@@ -3055,14 +3131,18 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         drr_view_layout.addWidget(self.drr_raw_preview_btn)
         layout.addWidget(self.drr_plot_view_bar)
         from ui_qt.pl_views import build_bar
-        layout.addWidget(build_bar(self))
+        pl_view_bar = build_bar(self)
+        set_fluent_property(pl_view_bar, "appRole", "plotCommandBar")
+        pl_view_bar.layout().setSpacing(4)
+        layout.addWidget(pl_view_bar)
         self.cmp_plot_view_bar = QFrame()
         self.cmp_plot_view_bar.setFrameShape(QFrame.NoFrame)
+        set_fluent_property(self.cmp_plot_view_bar, "appRole", "plotCommandBar")
         self.cmp_plot_view_bar.setVisible(False)
         set_fluent_property(self.cmp_plot_view_bar, "fluentRole", "panel")
         view_layout = QHBoxLayout(self.cmp_plot_view_bar)
         view_layout.setContentsMargins(8, 4, 8, 4)
-        view_layout.setSpacing(0)
+        view_layout.setSpacing(4)
         self.cmp_view_intensity_btn = QToolButton()
         self.cmp_view_intensity_btn.setText("Intensity")
         self.cmp_view_intensity_btn.setToolTip("Show corrected KK/KKp intensity maps and spectra")
@@ -3078,11 +3158,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         layout.addWidget(self.cmp_plot_view_bar)
         self.power_plot_view_bar = QFrame()
         self.power_plot_view_bar.setFrameShape(QFrame.NoFrame)
+        set_fluent_property(self.power_plot_view_bar, "appRole", "plotCommandBar")
         self.power_plot_view_bar.setVisible(False)
         set_fluent_property(self.power_plot_view_bar, "fluentRole", "panel")
         power_view_layout = QHBoxLayout(self.power_plot_view_bar)
         power_view_layout.setContentsMargins(8, 4, 8, 4)
-        power_view_layout.setSpacing(0)
+        power_view_layout.setSpacing(4)
         self.power_view_intensity_btn = QToolButton()
         self.power_view_intensity_btn.setText("Intensity")
         self.power_view_intensity_btn.setToolTip("Show corrected power-dependent intensity map and spectrum")
@@ -3212,7 +3293,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         canvas_layout.setSpacing(0)
         canvas_layout.addWidget(self.canvas, 0, 0)
         self.empty_canvas_overlay = QLabel(
-            "Choose a valid source to display it automatically", self.canvas
+            "<h2>Open a measurement</h2>"
+            "<p>Choose a valid source to display it automatically.</p>"
+            "<p>Open a folder above, then select a dataset in the controls.</p>", self.canvas
         )
         self.empty_canvas_overlay.setObjectName("emptyCanvasOverlay")
         self.empty_canvas_overlay.setAlignment(Qt.AlignCenter)
@@ -3239,6 +3322,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         overlay = getattr(self, "empty_canvas_overlay", None)
         figure = getattr(self, "figure", None)
         if overlay is not None and figure is not None:
+            if getattr(self, "_data_state_loading", False):
+                overlay.setText("<h2>Loading measurements</h2><p>Reading data and preparing the plot…</p>")
+            elif getattr(self, "_data_state_error", None):
+                overlay.setText("<h2>Data could not be loaded</h2><p>Review the details in Run Log, then choose a valid source.</p>")
+            else:
+                overlay.setText("<h2>Open a measurement</h2>"
+                                "<p>Choose a valid source to display it automatically.</p>"
+                                "<p>Open a folder above, then select a dataset in the controls.</p>")
             overlay.setGeometry(self.canvas.rect())
             overlay.setVisible(not bool(figure.axes))
 
@@ -3278,6 +3369,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self.show_sidebar_action.toggled.connect(self._set_sidebar_visible)
         self.sidebar_toggle_btn.toggled.connect(self.show_sidebar_action.setChecked)
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.pl_view_side_btn.toggled.connect(lambda _checked: self._sync_comparison_navigation())
         for prefix in ("pl", "drr", "cmp"):
             combo: QComboBox = getattr(self, f"{prefix}_yaxis_combo")
             combo.currentTextChanged.connect(lambda _text, p=prefix: self._update_y_axis_controls(p))
@@ -4332,9 +4424,14 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
 
     def _set_stage(self, stage: str) -> None:
         self._status(f"State: {stage}")
-        if stage == "Loading...":
+        exporting = bool(self._export_in_progress) or stage == "Exporting..."
+        loading = stage == "Loading..."
+        if stage == "Exporting..." or (loading and not exporting):
             self._status_progress.setRange(0, 0)
-        self._status_progress.setVisible(stage == "Loading...")
+        self.status_bar_view.set_busy(
+            exporting or loading,
+            "Exporting…" if exporting else "Loading…",
+        )
         self._data_state_loading = stage == "Loading..."
         label = getattr(self, "data_state_label", None)
         if label is not None:
@@ -4349,6 +4446,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self._refresh_data_state_label()
             else:
                 self._refresh_data_state_label()
+        self._sync_empty_canvas_overlay()
 
     def _refresh_data_state_label(self) -> None:
         """Refresh source selection against the identity on the shared canvas."""
@@ -4367,16 +4465,19 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             if widget is not None:
                 widget.setToolTip("Data source status\n\n" + tooltip)
         if getattr(self, "_data_state_loading", False):
+            set_fluent_property(label, "fluentSeverity", "info")
             label.show()
             label.setText("Loading…")
             return
         state = getattr(self, "_data_state_error", None)
         if state:
+            set_fluent_property(label, "fluentSeverity", "danger")
             label.show()
             label.setText("Load failed")
             return
         if not shown:
             if selected:
+                set_fluent_property(label, "fluentSeverity", "warning")
                 label.show()
                 label.setText("Plot not updated")
             else:
@@ -4385,6 +4486,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         shown_mode = getattr(self, "_shown_draw_mode", None)
         shown_selection = tuple(getattr(self, "_shown_selection_identity", ()))
         if shown_mode != mode or shown_selection != selected:
+            set_fluent_property(label, "fluentSeverity", "warning")
             label.show()
             label.setText("Plot not updated")
         else:
@@ -4453,6 +4555,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         }.get(text)
 
     def _on_central_tab_changed(self, _index: int) -> None:
+        self._refresh_workspace_context()
+        self._sync_comparison_navigation()
         mode = self._active_mode()
         if mode in getattr(self, "_plot_redraw_pending", set()):
             timer = getattr(self, "_plot_redraw_timers", {}).get(mode)
@@ -4475,6 +4579,29 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 self._plot_mode("MCD")
             if self._unified_catalog_needed():
                 self._queue_mcd_unified_analysis()
+
+    def _refresh_workspace_context(self) -> None:
+        """Keep the workspace heading and status aligned with its destination."""
+        shell = getattr(self, "workspace_shell", None)
+        if shell is None:
+            return
+        label = self.tabs.tabText(self.tabs.currentIndex())
+        titles = {
+            "PL": ("Photoluminescence", "Inspect spectra, compare peaks, and prepare publication figures."),
+            "DRR": ("Differential reflectance", "Explore reflectance maps, derivatives, and background corrections."),
+            "Compare": ("Compare measurements", "Align channels and inspect intensity or valley polarization."),
+            "Power": ("Power dependence", "Compare sweeps and follow how spectral features change with power."),
+            "MCD": ("Magnetic circular dichroism", "Inspect field-dependent spectra and track selected features."),
+            "MCD Peak Shift": ("MCD peak tracking", "Follow reflection resonance energies across magnetic field."),
+            "SHG": ("Second-harmonic generation", "Process angular sweeps and inspect fitted symmetry."),
+            "Slides": ("Presentation builder", "Arrange processed figures into a PowerPoint presentation."),
+            "Tools": ("Data tools", "Organize measurements and inspect application diagnostics."),
+        }
+        title, subtitle = titles.get(label, (label, ""))
+        shell.set_context(title, subtitle, eyebrow="WORKSPACE / " + label.upper())
+        status = getattr(self, "status_bar_view", None)
+        if status is not None:
+            status.set_context(label)
 
     def _can_reuse_unified_mcd_view(self) -> bool:
         """Return whether an MCD tab reentry can retain its existing Figure."""
@@ -4582,6 +4709,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         current_label = self.tabs.tabText(self.tabs.currentIndex())
         slides_active = current_label == "Slides"
         tools_active = current_label == "Tools"
+        self.toolbar.setVisible(not slides_active and not tools_active)
         if tools_active and not self._tools_in_workspace:
             self._enter_tools_workspace()
         elif not tools_active and self._tools_in_workspace:
@@ -4678,6 +4806,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             self._data_state_loading = False
             self._data_state_error = "failed"
             self._refresh_data_state_label()
+            self._sync_empty_canvas_overlay()
         QMessageBox.critical(self, "Error", message)
 
     def _on_recent_folder_selected(self, index: int) -> None:
@@ -7071,7 +7200,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         self._active_load_cancel = None
         self._active_load_options = None
         self._active_load_succeeded = False
-        self._status_progress.setVisible(False)
+        status_view = getattr(self, "status_bar_view", None)
+        if status_view is not None:
+            status_view.set_busy(getattr(self, "_export_in_progress", False), "Exporting…")
         from ui_qt.drr_bn_group_choice import refresh_group_choices
         refresh_group_choices(self)
         if cancelled:
@@ -7083,6 +7214,9 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         elif succeeded:
             self._data_state_error = None
             self._refresh_data_state_label()
+        sync_overlay = getattr(self, "_sync_empty_canvas_overlay", None)
+        if sync_overlay is not None:
+            sync_overlay()
         if request_token is not None and finished_mode:
             tracker = self._load_requests.get(finished_mode)
             if tracker is not None:
@@ -8086,7 +8220,8 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
         gate_used, y = nearest_gate_spectrum(cube, gate_value)
         x = np.asarray(cube.energy, float).ravel()
         ax.plot(x, np.asarray(y, float), linewidth=1.3)
-        ax.set_title(f"Spectrum @ {gate_used:.6g} V")
+        from ui_qt.spectrum_caption import set_spectrum_title
+        set_spectrum_title(ax, f"Spectrum @ {gate_used:.6g} V")
         ax.set_xlabel("Photon Energy (eV)")
         ax.set_ylabel(ylabel)
         ax.grid(alpha=0.25)
@@ -10029,7 +10164,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                         1.0, float(self.figure.get_figwidth() * self.figure.dpi)
                     )
                     left_margin_px = float(np.clip(80.0, 70.0, 85.0))
-                    right_margin_px = 125.0 if self.drr_region_count_combo.currentData() == 3 else 55.0
+                    right_margin_px = 55.0
                     gs = self.figure.add_gridspec(
                         nrows=1, ncols=2,
                         left=left_margin_px / figure_width_px,
@@ -10039,28 +10174,29 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     )
                 else:
                     gs = self.figure.add_gridspec(
-                        nrows=2, ncols=2,
-                        width_ratios=[1.0, 0.035],
-                        height_ratios=[1.0, 1.0], wspace=0.12, hspace=0.28,
+                        nrows=2, ncols=1,
+                        height_ratios=[0.7, 0.3], wspace=0.12, hspace=0.20,
+                        top=0.90, bottom=0.13, right=0.93,
                     )
+                gs._dptk_inspection_header_height = 64 if both else 46
+                inspection_grids = [] if both else [gs]
                 gate_val = float(self._mode_spins(mode)["gate"].value())
                 shared_heat_ax = None
                 for index, (key, product_cube, product_params, _deriv, _used_win, _poly) in enumerate(products):
                     if both:
                         product_gs = gs[0, index].subgridspec(
-                            nrows=2, ncols=2,
-                            width_ratios=[1.0, 0.035],
-                            height_ratios=[1.0, 1.0],
-                            wspace=0.08, hspace=0.27,
+                            nrows=2, ncols=1,
+                            height_ratios=[0.7, 0.3],
+                            wspace=0.08, hspace=0.20,
                         )
-                        map_slot, cbar_slot, spectrum_slot = product_gs[0, 0], product_gs[0, 1], product_gs[1, 0]
+                        inspection_grids.append(product_gs)
+                        map_slot, spectrum_slot = product_gs[0, 0], product_gs[1, 0]
                     else:
-                        map_slot, cbar_slot, spectrum_slot = gs[0, 0], gs[0, 1], gs[1, 0]
+                        map_slot, spectrum_slot = gs[0, 0], gs[1, 0]
                     if shared_heat_ax is None:
                         ax1 = self.figure.add_subplot(map_slot)
                     else:
                         ax1 = self.figure.add_subplot(map_slot, sharex=shared_heat_ax, sharey=shared_heat_ax)
-                    cax = self.figure.add_subplot(cbar_slot)
                     ax2 = self.figure.add_subplot(spectrum_slot, sharex=ax1)
                     if both:
                         short_title = "ΔR/R" if key == "raw" else ("Mixed derivative (dXdY)" if self.drr_second_kind_combo.currentData() == "mixed" else "Second derivative")
@@ -10073,22 +10209,16 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                         )
                     render = plot_drr(ax1, self.drr_controller._drr_display_preview(product_cube), product_params)
                     self._drr_heatmap_renders[key] = render
-                    self._add_heatmap_colorbar(
-                        render, cax,
-                        label="" if both else product_params.cbar_label,
-                    )
+                    from ui_qt.inspection_colorbar import add_inspection_colorbar
+                    add_inspection_colorbar(self.figure, render, ax1, label=product_params.cbar_label)
                     if both and index > 0:
                         ax1.tick_params(axis="y", labelleft=False)
                         ax1.set_ylabel("")
-                    if both:
-                        ax1.set_xlabel("")
-                        ax1.tick_params(axis="x", labelbottom=False)
-                        if key == "second" and isinstance(
-                            cax.yaxis.get_major_formatter(), ScalarFormatter
-                        ):
-                            cax.ticklabel_format(
-                                axis="y", style="sci", scilimits=(-2, 2), useMathText=True,
-                            )
+                    # The linked spectrum owns the shared energy labels;
+                    # duplicate map labels otherwise collide with its title
+                    # when the workspace is short.
+                    ax1.set_xlabel("")
+                    ax1.tick_params(axis="x", labelbottom=False)
                     spectrum_ylabel = (
                         product_cube.cbar_label
                         if both and key == "second"
@@ -10118,6 +10248,12 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 gate_used, _, _ = self.drr_controller._current_drr_spectrum(plot_cube)
                 self.drr_controller._set_drr_gate_spin_value(gate_used)
                 self.drr_controller._update_drr_spectrum_and_gate_line(plot_cube)
+                from ui_qt.inspection_splitter import bind_inspection_splitter
+                bind_inspection_splitter(
+                    self, "DRR", grids=inspection_grids,
+                    maps=tuple(self._drr_heatmap_axes.values()),
+                    spectra=tuple(self._drr_spectrum_axes.values()), outer_grid=gs,
+                )
                 from ui_qt.drr_plot_reuse import remember
                 remember(self, products)
             elif mode == "MCD" and self.loaded.mcd_result is not None:
@@ -11376,7 +11512,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 params=params,
                 params_linear=pl_params['linear'],
                 params_log=pl_params['log'],
-                pl_include_pair=self.pl_export_pair_chk.isChecked(),
+                pl_include_pair=False,
                 cleanup_verified_sources=bool(self.clean_verified_sources_chk.isChecked()),
             )
         elif mode == "DRR":

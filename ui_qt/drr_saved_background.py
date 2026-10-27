@@ -34,6 +34,14 @@ def _kind(assignments):
     for item in assignments:
         if item.baseline_mode != 'External':
             kinds.add('self')
+            continue
+        # The matcher's persisted prefix preserves the source type when an
+        # imported composite has an arbitrary filename outside its usual folder.
+        matched_kind = next((kind for kind in ('p', 'n', 'pn')
+            if item.selection_reason.startswith(f'P/N match ({kind}): ')), None)
+        if matched_kind is not None:
+            kinds.add(matched_kind)
+            continue
         for name in item.baseline_source_files:
             parts = str(name).replace('\\', '/').casefold().split('/')
             if '.drr_bn_calibration' in parts or is_measured_bn_name(name):
@@ -51,17 +59,28 @@ def adopt_saved_background(owner, resolved):
     """Adopt a verified exported recipe without starting another load or writing stores."""
     from dataclasses import replace
     from ui_qt.drr_background_settings import BackgroundDraft
-    from ui_qt.drr_background_settings_workflow import _root_key
+    from ui_qt.drr_background_settings_workflow import _root_key, _prepare_saved_assignments
     assignments = tuple(resolved.assignments)
     # A saved recipe is already concrete. An old group's reviewed BN plan or
     # managed-version draft must not veto it or relabel its actual sources.
-    draft = BackgroundDraft(kind=_kind(assignments),
+    kind = _kind(assignments)
+    saved_assignments = assignments if kind in ('p', 'n', 'pn') and resolved.numerical_path == 'heterogeneous' else ()
+    # Missing files discovered after the worker finished must not escape a GUI
+    # slot; the load guard will leave this recipe pending for a fresh review.
+    try:
+        prepared = _prepare_saved_assignments(owner.current_folder, saved_assignments) if saved_assignments else None
+    except OSError:
+        prepared = None
+    draft = BackgroundDraft(kind=kind, saved_assignments=saved_assignments,
         which=assignments[0].baseline_which, auto_bn_compare=owner.drr_bn_auto_chk.isChecked())
     owner._drr_background_intent = draft
     owner._drr_background_intent_root = _root_key(owner)
     owner._drr_background_intent_selection = tuple(owner.drr_selected_files)
     owner._drr_bn_confirmation = None
     owner._drr_pending_bn_plan = None
+    owner._drr_pn_confirmation = None
+    owner._drr_pending_pn_plan = None
+    owner._drr_saved_assignments_confirmation = prepared
     owner._drr_baseline_user_selected = True
     owner._drr_external_auto_selected = True
     owner.drr_controller._restore_saved_drr_recipe(resolved)
@@ -155,6 +174,7 @@ def begin_saved_group_restore(owner, draft):
     owner._drr_baseline_user_selected = True
     owner._drr_external_auto_selected = False
     owner._drr_pending_bn_plan = None
+    owner._drr_pending_pn_plan = None
     owner._invalidate_drr_for_background_selection('Restoring this group\'s saved DRR background…')
     owner.drr_controller._update_drr_selection_labels()
     request = SavedBackgroundRequest(owner, draft, key)

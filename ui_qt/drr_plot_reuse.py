@@ -56,6 +56,7 @@ def _color_geometry(params):
 def _replace_regions(owner, render, cube, params, *, paired, key):
     """Keep map/linecut axes and measured right axes when region count changes."""
     axis, host = render.primary.axes, render.colorbar_host
+    inspection_header = bool(getattr(host, '_dptk_inspection_header', False))
     for mesh in render.images:
         if mesh.colorbar is not None:
             mesh.callbacks.disconnect(mesh.colorbar_cid)
@@ -74,8 +75,13 @@ def _replace_regions(owner, render, cube, params, *, paired, key):
     updated = heatmap_meshes(axis, cube, params)
     for mesh in updated.images:
         mesh._dptk_drr_mesh = True
-    owner._add_heatmap_colorbar(updated, host, label='' if paired else params.cbar_label)
-    if paired and key == 'second':
+    if inspection_header:
+        from ui_qt.inspection_colorbar import add_inspection_colorbar
+        add_inspection_colorbar(owner.figure, updated, axis,
+                                label=params.cbar_label, host=host)
+    else:
+        owner._add_heatmap_colorbar(updated, host, label='' if paired else params.cbar_label)
+    if not inspection_header and paired and key == 'second':
         from matplotlib.ticker import ScalarFormatter
         if isinstance(host.yaxis.get_major_formatter(), ScalarFormatter):
             host.ticklabel_format(axis='y', style='sci', scilimits=(-2, 2), useMathText=True)
@@ -110,6 +116,10 @@ def _move_boundaries(render, cube, params, layers):
     render.split_x2 = boundaries[1] if len(boundaries) == 2 else None
     for line, boundary in zip(render.boundary_artists, boundaries):
         line.set_xdata([boundary, boundary])
+    if getattr(render.colorbar_host, '_dptk_inspection_header', False):
+        # Header bars keep compact regional endpoint labels rather than the
+        # vertical colorbars' boundary titles.
+        return
     if len(meshes) == 2:
         titles = (f'x ≤ {boundaries[0]:.6g}', f'x ≥ {boundaries[0]:.6g}')
         location = 'center'
@@ -193,7 +203,9 @@ def try_update(owner):
         for helper in helpers.values():
             helper.invalidate()
     changed_groups = []
-    if len(products) == 2 and any(update[-1] for update in updates):
+    if (len(products) == 2 and any(update[-1] for update in updates)
+            and not any(getattr(update[1].colorbar_host, '_dptk_inspection_header', False)
+                        for update in updates)):
         grid = updates[0][1].primary.axes.get_subplotspec().get_topmost_subplotspec().get_gridspec()
         split = updates[0][3].split_scale
         right_margin = 125.0 if split is not None and split.split_x2 is not None else 55.0

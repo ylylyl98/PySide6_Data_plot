@@ -217,15 +217,15 @@ def logical_result_id(path: str | Path) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _group_identity(path: Path, group_by: str) -> tuple[str, str]:
-    metadata = plot_metadata(path)
+def _group_identity(path: Path, group_by: str, *, metadata=None, folder=None) -> tuple[str, str]:
+    metadata = plot_metadata(path) if metadata is None else metadata
     mode = str(group_by or "queue").casefold()
     if mode == "doping":
         value = metadata["doping"]
         normalized = _number_text(value)
         return f"doping:{normalized}", f"Doping = {normalized} V"
     if mode == "folder":
-        value = str(path.parent.resolve()).casefold()
+        value = str(path.parent.resolve()).casefold() if folder is None else folder
         return f"folder:{value}", path.parent.name
     if mode == "gate":
         vtg = _number_text(metadata["vtg"])
@@ -243,10 +243,10 @@ def _group_identity(path: Path, group_by: str) -> tuple[str, str]:
     return "queue", ""
 
 
-def _mcd_order_key(image: PresentationImage, folder_order: dict[str, int], queue_index: int):
+def _mcd_order_key(image: PresentationImage, folder_order: dict[str, int], queue_index: int, *, metadata=None, folder=None):
     path = Path(image.path)
-    metadata = plot_metadata(path)
-    folder = str(path.parent.resolve()).casefold()
+    metadata = plot_metadata(path) if metadata is None else metadata
+    folder = str(path.parent.resolve()).casefold() if folder is None else folder
     kind_order = {"mcd_combo": 0, "mcd_b": 1}.get(str(metadata["plot_kind"]), 2)
     energy = metadata["energy"]
     energy_key = float(energy) if isinstance(energy, Decimal) else float("inf")
@@ -264,22 +264,38 @@ def plan_presentation_slides(
         raise ValueError("Images per slide must be between 1 and 12.")
     if not images:
         return []
+    # Queue edits reuse the same parent folders many times. Resolve each once
+    # per plan, retaining canonical folder grouping without per-image disk I/O.
+    canonical_folders = {}
+    metadata = {}
+    def folder_for(path):
+        parent = Path(path).parent
+        if parent not in canonical_folders:
+            canonical_folders[parent] = str(parent.resolve()).casefold()
+        return canonical_folders[parent]
+    def metadata_for(path):
+        path = Path(path)
+        if path not in metadata:
+            metadata[path] = plot_metadata(path)
+        return metadata[path]
     grouped: dict[str, tuple[str, list[tuple[int, PresentationImage]]]] = {}
     for index, image in enumerate(images):
-        key, label = _group_identity(Path(image.path), group_by)
+        key, label = _group_identity(Path(image.path), group_by,
+                                     metadata=metadata_for(image.path), folder=folder_for(image.path))
         grouped.setdefault(key, (label, []))[1].append((index, image))
 
     slides: list[PlannedSlide] = []
     for key, (label, indexed_images) in grouped.items():
         folder_order: dict[str, int] = {}
         for _index, image in indexed_images:
-            folder = str(Path(image.path).parent.resolve()).casefold()
+            folder = folder_for(image.path)
             folder_order.setdefault(folder, len(folder_order))
         ordered = [
             image
             for queue_index, image in sorted(
                 indexed_images,
-                key=lambda pair: _mcd_order_key(pair[1], folder_order, pair[0]),
+                key=lambda pair: _mcd_order_key(pair[1], folder_order, pair[0],
+                    metadata=metadata_for(pair[1].path), folder=folder_for(pair[1].path)),
             )
         ]
         chunks = chunk_images(ordered, images_per_slide)

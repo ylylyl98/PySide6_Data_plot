@@ -55,7 +55,358 @@ pip install -r requirements.txt
 python run_qt.py
 ```
 
+### Legacy Widgets fallback
+
+Normal startup now opens the native Qt Quick application described below.
+The previous Widgets shell remains available for compatibility checks. Its DRR
+Display page can use either the embedded QML controls or Widgets controls.
+
+To use the Widgets display page, run:
+
+```powershell
+.venv\Scripts\python.exe run_qt.py --legacy-widgets --drr-display widgets
+```
+
+Within `--legacy-widgets`, `DPTK_DRR_DISPLAY=widgets` selects the same display fallback.
+A QML loading/rendering error also returns this embedded page to standard controls
+with a visible status message. Both views use the existing settings namespace,
+display-history format, numeric precision, Auto/Fix behavior, and export path.
+
+The legacy embedded QML view receives plain snapshots and commands through
+`ui_qt/quick/drr_display_bridge.py`. The legacy controls are a temporary adapter
+to the existing controllers; they remain the single compatibility state owner.
+Direct `MainWindow()` construction defaults to Widgets for existing embedded
+callers; use `MainWindow(drr_display_backend="quick")` to exercise the new view.
+
+The source and frozen application support an isolated page smoke check:
+
+```powershell
+.venv\Scripts\python.exe run_qt.py --check-quick-display
+```
+
+This check creates the real page, verifies a rendered frame, and tears it down
+using temporary settings and an empty data folder. The Quick bridge, QML input,
+fallback, and resource tests run in the separate `quick-display` CI job and are
+also discovered by the complete release suite. `build_windows.bat` additionally
+runs the isolated smoke check against the frozen EXE with software rendering.
+Native Windows visual checks are needed in addition to offscreen checks for
+fonts and graphics behavior.
+
+To compare the two views with the same synthetic DRR data, run each backend in
+a fresh process:
+
+```powershell
+.venv\Scripts\python.exe scripts/profile_quick_display.py --backend widgets --output build/quick-display/widgets.json
+.venv\Scripts\python.exe scripts/profile_quick_display.py --backend quick --output build/quick-display/quick.json
+```
+
+This isolated benchmark reports page startup and already-loaded gate-to-plot
+latency. It excludes file loading, analysis, and export; its measurements are
+specific to the selected platform and machine.
+
+### Native Qt Quick application
+
+The default application uses `QGuiApplication`, QML controls, and an
+Agg-to-Quick plot surface without constructing `MainWindow` or hidden Widgets.
+The empty shell presents before importing Matplotlib or NumPy; the first plot
+loads its Agg canvas lazily, preserving the same scientific plotting code.
+`python run_qt.py` and the packaged executable use this frontend by default.
+The independent analysis entry points and the existing `--peak-analysis`,
+`--drr-analysis`, and `--mcd-organizer` flags also open native Quick windows.
+
+```powershell
+.venv\Scripts\python.exe run_qt.py --qt-quick --demo
+.venv\Scripts\python.exe run_quick.py --workflow drr --open "measurement.dat"
+.venv\Scripts\python.exe run_quick.py --workflow cmp --open "sample_PL_KK.csv" --open "sample_PL_KKp.csv"
+.venv\Scripts\python.exe run_quick.py --workflow power --open "power-sweep.csv"
+.venv\Scripts\python.exe run_quick.py --workflow mcd --open "magnetic-field-sweep.csv"
+.venv\Scripts\python.exe run_quick.py --workflow shg --open "angular-sweep.csv"
+.venv\Scripts\python.exe run_quick.py --workflow slides
+.venv\Scripts\python.exe run_quick.py --workflow tools
+```
+
+Normal startup retains the existing `DPTK/PySide6_Data_Plot` preferences and recent
+folder list. Native settings use an application-data directory for caches;
+Windows registry keys are never interpreted as filesystem paths. Analysis
+windows retain their existing workspace format and default workspace location.
+Direct `run_quick.py`, `--demo`, and `--check` use temporary settings by default.
+Pass `--settings-file <path-to-test.ini>` to persist an explicit test profile.
+Opening real sources and explicitly exporting still reads/writes those selected
+data folders. Smoke checks should use synthetic files in temporary folders.
+Light, dark, system-following and high-contrast appearances are supported. A
+saved appearance is retained unless `--theme` explicitly overrides it.
+Application windows, controls and dialogs use Arial in every appearance mode.
+Plots and exported images also use Arial for titles, labels, ticks, legends and
+annotations, preserving their existing sizes and bold/italic styles. Mathematical
+text uses Arial where available, with symbol fallback for glyphs the font lacks.
+Dropdown options and selected lists use matching foreground/background colors
+for mouse and keyboard selection. File/folder pickers apply a temporary selection
+palette while open and restore the window palette when accepted or cancelled.
+Independent analysis windows and background settings follow the same appearance.
+
+PL includes a searchable source/history catalog, saved DAT selection, independent
+linear/log split color scales, fixed ranges, axis derivation/custom DAT labels,
+single-spectrum peak detection/Lorentz fitting, and separate PNG/DAT exports.
+First-save auto-next preserves its existing processing-history behavior. DRR
+reuses the **same approved `Display.qml` page**, with Data pinned above
+Display/Processing, independent regional colors, Auto/Fix, native CSV
+self/external loading, precomputed DAT/XLSX maps, and SG energy/mixed derivatives.
+Its native background window includes explicit per-measurement references, P/N
+generation and selection, BN comparison, fitted backgrounds, composite editing,
+and raw previews. Applying a draft trial-loads the full result before committing
+its background association; failed or cancelled applications retain the previous
+result. Exports retain per-measurement provenance and actual fitted denominators.
+The optional automatic BN comparison runs in a cancellable worker after loading.
+It retains explicit original-BN choices and activates a validated candidate only
+after a successful trial load. Changed SG settings revalidate managed candidates;
+without a current joint certificate, the original measured BN is restored.
+Background settings can reopen reports matching the current group, frame and SG
+settings without repeating the comparison.
+Use **Background…** to choose the reference type and manage its files together.
+Sources use one tab row in this order: **Self, BN, P, N, P + N, Fitted**. There is
+no separate External tab or duplicated source dropdown. Each source shows its
+own files; Self offers first/last frames only. New BN/P/N/P + N references
+default to averaging all frames within each file, then averaging files with equal
+weight. The page shows the current frame policy; **Advanced tools… > Reference
+frames** retains explicit first/last-frame overrides without silently changing
+existing drafts. Frames with different gate conditions are not interchangeable
+repeats; existing background validation still applies.
+**Advanced tools…** contains the tools relevant to that source, including P/N
+drafts and saved versions, fitting, composite editing, BN comparison and raw
+previews. Tools return through **Back to background** without changing the
+selected source type. Existing custom references retain their original type and
+files until another source is explicitly selected. Empty preview controls stay hidden in the selection view;
+**Diagnostics** opens the last preview report when needed.
+BN, P, N and P + N settings show available files on the left and selected
+references on the right immediately. The current frame policy and **Use files**
+control remain visible above the lists: share the same references across
+measurements, or match references to each measurement. The lists start in the current experiment folder;
+search and selection edit the current source's draft directly. Clicking or
+double-clicking a filename adds it; the checkbox toggles it. In the selected list,
+double-click, press Delete, or use **Remove** to remove a file. **Clear all** removes
+every selected reference, including files hidden by the search or outside the view.
+These gestures are shared with the measurement file picker.
+Switching source tabs retains each source's files and assignment method.
+**Show all CSV files** and **Browse files…** let you choose other files without
+introducing another source type. P and N generation still use independent
+single-role pickers with **Use selected** and **Close** actions.
+**Apply background** validates
+and loads it before changing the plotted result. **Close** retains the applied
+reference. After applying **Keep background across groups**, the chosen common
+reference survives failed or superseded CSV group loads and is validated again
+for each new group. Automatic BN comparison remains available for review while
+Keep is enabled; it does not replace that reference automatically.
+Opening processed raw CSVs through **Load CSV** or the measurement picker restores
+the latest export's background for that exact measurement selection, including
+frame choice, member assignments, regional references and fitted settings.
+An explicitly kept reference takes priority over history. Missing or incompatible
+saved references stop loading with a review message instead of silently using
+Self. History is read on the load worker and ordinary reloads preserve subsequent
+manual background edits. The embedded lists enumerate filenames and timestamps without
+inspecting CSV grids or processing history; changing a selection does not rescan
+the folder. The P/N page's **Load catalog** action explicitly loads acquisition
+details and saved versions when needed. File pickers start from
+the requesting workflow's folder and discard filenames retained from earlier
+save/open requests.
+The measurement picker reuses separate DRR source-inspection and processing-history
+caches. Cached or filename-only rows appear while fresh checks run; group and
+compatible-repeat actions wait for those checks. Explicitly chosen files can be
+loaded immediately and are validated by the measurement loader. Exported DAT
+results have a separate catalog, so exporting a result does not force a reread
+of unchanged raw CSVs. Checkbox changes update only the affected list rows.
+Completed gate/frame inspections are retained even when a scan is cancelled or
+superseded, including results returned by parallel workers. A later inventory
+preview reuses Vtg/Vbg/Vbias and frame summaries for unchanged files; only new
+or changed files need inspection. Unchanged refreshes also avoid rewriting the
+per-file inspection cache.
+Selecting or restoring a PL/DRR experiment folder prepares the list in the
+background before the picker opens. A lightweight display snapshot is retained
+even while acquisition prevents the full catalog from being certified. Reopening
+can show that snapshot before inventory checks; it does not enable unchecked
+group/repeat actions. Foreground measurement loads pause inspection and resume it
+after completion or cancellation cleanup.
+The picker has a title-bar close button and a **Close** action; both, and Escape,
+leave the loaded measurement unchanged. **Selection actions** groups the optional
+whole-group/repeat additions, while **Clear all** sits beside the chosen-file list.
+Acquisition groups use separated cards and explicit Unprocessed, Partial and
+Processed badges, with matching status badges on individual files. Catalog
+refreshes retain the visible row and selection. Reopening the picker centers the
+most recently loaded file and its acquisition group where scrolling permits.
+The position updates after each successful load; browsing, cancellation and
+failed loads do not replace it. Main-window **Clear** removes the
+selection but keeps this browsing position within the same folder and file type.
+Existing search/status filters still apply, and browsing manually cancels any
+pending positioning while a cold inventory is being inspected. Directory notifications check
+relevant source/result changes before scanning, so logs, previews and cache
+writes do not keep the picker loading. During acquisition, automatic checks wait
+until the source inventory has stayed unchanged for three seconds; lightweight
+probes keep the current rows and selection usable while frames are appended.
+**Refresh** still checks immediately. A failed directory probe preserves the
+validated list instead of starting another scan. Closing the measurement picker
+keeps its directory watches and pending inspection active. Hidden refreshes do
+not replace the main window's load/export status.
+Gate summaries combine set/measured channels only when their complete cached
+traces are identical; real differences stay separate. Equal frame-count endpoints
+appear once (for example, **541 frames** instead of **(541, 541) frames**).
+Both keep the top horizontal colorbars, 70/30 draggable heatmap/spectrum split,
+in-plot spectrum captions, spectrum hide/restore, and visible parameter sidebar
+when side-by-side hides the workflow rail. PL and DRR selections remain separate.
+Revisiting PL or DRR retains each workflow's figure, zoom/navigation state and
+spectrum overlays. Unchanged plots reuse their last image; edits, data loads,
+theme changes and actual viewport resizes still update the plot. Viewport sizing
+waits for the new page layout, avoiding redraws at the outgoing page's width.
+The other native scientific pages ignore repeated assignments of an unchanged
+palette, and the shell does not build a duplicate hidden parameter pane.
+Opening empty DRR, MCD and MCD Peak Shift controls defers numerical and plotting
+imports until needed. MCD defaults and source/history catalogs use lightweight
+modules; choosing a folder does not initialize the scientific stack. Processing
+dependencies load in the existing background worker when a measurement is opened.
+
+Compare now connects its own native controls and plot workspace to the application
+shell. It supports coherent channel groups, manual channel assignments, intensity
+and VP views, shared background correction, independent color limits, spectrum
+inspection, and domain PNG/DAT exports. Its file dialogs retain the requesting
+workflow and channel, and switching pages preserves each workflow's loaded data.
+The common plot toolbar acts on the active workspace, including Compare.
+
+SHG connects its single-file and Compare/Twist workflows, background and peak
+integration, angular fits, exclusions, result tables, settings and scientific
+exports. Its wide layout shows both spectra; compact layouts provide an explicit
+Raw/Corrected switch while retaining the angular result and residual plot.
+
+Power connects its catalog and explicit source-selection workspace, combined
+sweep review, intensity/VP plots, multi-peak fitting, manual refitting and power
+law analysis. Its separate export action saves the Power analysis package. Angle
+references carry over from Compare, while each page retains its own loaded data.
+Opening Power files enters selection; choose the desired single or paired view
+there before plotting.
+
+MCD connects its measured-channel processing, field and spectrum inspection,
+protected-region review, branch-aware window metrics and slopes, feature
+tracking and retained-result exports. Its source, dark-reference and output-folder
+dialogs have distinct roles; changing the results folder preserves the source
+selection. Local-fit and cancellation checks remain part of its native regression
+suite.
+
+MCD Peak Shift shares accepted processed products with MCD without reloading.
+It supports raw/derivative feature tracking, actual-field selection, field fits,
+manual feature merging and CSV/metadata export. MCD Organizer opens separately
+for saved-series comparisons, energy grouping, slope metrics, Curie-Weiss fits,
+field/temperature range scans, batch theta analysis and scientific exports.
+
+Slides uses its native source/queue/preview workspace and existing presentation
+services. Tools provides the run log and independent DRR Analysis/MCD Organizer entries.
+The Workflow menu can send the current committed DRR source to Analysis, even
+when the main page is displaying its derivative; the handoff never differentiates
+an already differentiated input. The standalone DRR workspace includes candidate
+inspection, history/comparison and peak-to-peak analysis.
+
+Peak Analysis opens from the plot toolbar or Workflow menu for PL, DRR, Compare
+intensity and Power intensity. It provides candidate caching/filtering, branches,
+PL fits/residuals, CSV/JSON/PNG exports and saved workspaces in a separate native
+process. Accepted overlays are bound to the numeric source and survive plot
+rebuilds; changing sources cannot reuse an unrelated result. VP is excluded.
+Repeated physical power coordinates keep their measured values and retain the
+standalone analyzer's explicit separate/aggregate-repeats error. The Power page's
+own analysis remains available for those data.
+
+Data Maintenance binds moving exported source CSVs to a verified successful
+export. Optional cleanup only removes verified temporary source copies and keeps
+their canonical originals; source/output changes invalidate the receipt. Source
+catalog refresh/rebuild, recent folders, local file drops, appearance preferences,
+About and the updater use native controls. Checks use temporary settings and
+synthetic files; they never download or launch a real installer.
+Saving files reports completion in the status bar and records output paths in
+**Log**. It preserves the current bottom-panel visibility and analysis text;
+**Analysis results** remains for scientific results such as peak finding and fitting.
+In the native PL/DRR toolbar, **PNG 1.0× / Wide PNG** and its width multiplier
+sit directly beside **Save PNG + DAT**. The multiplier defaults to 2×, accepts
+1–3×. The selected PNG mode and multiplier are shared export preferences and
+stay selected across measurements, group changes, PL/DRR tabs and app restarts.
+A fresh settings profile starts in PNG 1.0× mode. DRR Wide PNG
+saves both original and wider images for each selected product, sharing its DAT.
+
+For an isolated rendered-frame check and timing report:
+
+```powershell
+.venv\Scripts\python.exe run_quick.py --demo --check --report build/quick-application/smoke.json
+.venv\Scripts\python.exe scripts/profile_quick_startup.py --samples 3 --platform native --output build/quick-application/startup.json
+.venv\Scripts\python.exe scripts/profile_quick_application.py --policy incremental --samples 12 --platform native --output build/quick-application/incremental.json
+.venv\Scripts\python.exe scripts/profile_quick_application.py --policy full --samples 12 --platform native --output build/quick-application/full.json
+```
+
+The startup profiler alternates deferred imports and an emulation of the former
+eager-import boundary, using fresh temporary font caches for both. It measures
+the shell and first synthetic PL plot separately; it is not a legacy-app or
+whole-workflow benchmark. Reports include source hashes and every sample.
+
+The application profiler measures real QML input to the corresponding presented
+Quick frame, records GUI heartbeat gaps, and compares pixels to a fresh
+scientific rebuild. Its full/incremental comparison uses the same PL data and
+geometry; it is not a claim about loading, export, or whole-application speed.
+
+For a broader interaction audit, run
+`python scripts/profile_quick_main_interactions.py --output build/interaction-audit/main.json`
+and `python scripts/profile_quick_analysis_interactions.py --output build/interaction-audit/analysis.json`.
+These use temporary settings and synthetic data, separating GUI slot time,
+event-loop heartbeat gaps, and total completion time. Run performance probes
+serially, without simultaneous test suites. The main probe also exercises a
+background export holding the rendering lock: interactive redraws defer until
+that lock is free, while input and timers continue to run.
+Pass `--reference-full-redraw` to the main probe to emulate the former full
+rebuild, QuadMesh paint, and blocking render paths with identical data and
+Arial font setup. This is a controlled plotting comparison on current source,
+not a complete historical application benchmark.
+
+Native large rectilinear heatmaps paint original cell colors through a screen
+image path. Their complete measured arrays and cell boundaries remain intact;
+analysis, cursor values, and saved figures use the original meshes. Log axes,
+custom clipping/effects, and styled mesh edges keep the ordinary renderer.
+Color-only edits retain existing PL/DRR/Compare/Power axes and navigation.
+
+Peak Analysis reuses spectrum artists when changing rows and preserves the heatmap.
+The following benchmark compares the previous spectrum-rebuild/blit path and the
+retained-artist/blit path in the same process, with identical synthetic data and
+viewport. `--fit` includes fitted components and residuals:
+
+```powershell
+.venv\Scripts\python.exe scripts/profile_quick_peak_analysis.py --fit --output build/quick-peak-profile.json
+```
+
+`build_windows.bat` also checks the actual packaged executable across all nine
+workflow pages, synthetic PL/DRR/Compare inputs, and the three independent Quick
+workspaces. The checks use temporary settings and data, require rendered frames,
+and inspect diagnostic logs after process exit to catch shutdown errors. Run them
+separately with:
+
+```powershell
+.venv\Scripts\python.exe scripts/check_frozen_quick.py dist/PySide6_Data_Plot/PySide6_Data_Plot.exe --report build/frozen-quick-report.json
+.venv\Scripts\python.exe scripts/check_frozen_quick.py --source --report build/source-quick-report.json
+```
+
+These offscreen software-renderer checks do not exercise real instruments,
+external Office applications, installer downloads, or native GPU rendering.
+
 ## Editing plot controls
+
+The desktop uses a persistent workflow rail and a compact workspace heading.
+The **Controls** button (or **Ctrl+B**) hides the resizable parameter sidebar
+when the plot needs more width. **View → Appearance** switches between system,
+light, dark and high-contrast themes and remembers the choice.
+PL and DRR use a draggable divider with a default **70% heatmap / 30% spectrum**
+allocation. **Hide spectrum / Show spectrum** stays in the footer at the bottom
+right, outside the plot axes. Spectrum Y limits follow the current visible curves
+and X range in PL/DRR, Compare, Power, MCD and MCD Peak. Manual Y zoom is retained;
+**Home** restores automatic fitting. The spectrum title sits inside the plot.
+Parameters start in a narrower sidebar. Side-by-side views automatically
+hide only the far-left workflow rail, keeping the parameter controls available;
+the header still provides workflow selection and a navigation toggle.
+The compact command bars leave more room for plots at small window sizes.
+PL/DRR colorbars sit horizontally above each map, beside its title, following
+the export layout. Regional color scales remain independent and stay aligned
+when resizing the workspace or hiding the spectrum.
+PL export writes the separate linear/log PNGs and DAT; the extra combined
+side-by-side PNG option is no longer shown in the desktop.
 
 Numeric plot and processing controls commit typed values when you press
 **Enter** or move focus to another control. Label and unit edits also wait
@@ -82,7 +433,7 @@ In Display → Colors, the **ΔR/R** and **Derivative** tabs select which color
 controls to edit without changing the plotted view. Each product retains its own color map and limits;
 region count and X boundaries are shared. Auto changes the selected product's
 unfixed limits. Minimum and maximum editors are side by side, with their Fix
-controls below them. **More display settings** contains the right Y axis,
+controls beside their labels. **More display settings** contains the right Y axis,
 scale/clip options and display-memory preferences. Hidden controls retain their
 values for plotting and paired exports.
 
@@ -136,6 +487,12 @@ sharing are off by default. **Lock X range across files** is also off by default
 enabling it locks the current X range and active boundaries, including values
 restored from a preset. Its range and region layout survive app restarts. The
 status line and Fix tooltips explain the active scope.
+The native app also remembers manual **Fix M** Y and DR/D2E color limits across
+restarts without requiring an export, including each fixed regional endpoint.
+Fixed Y limits retain their Y-axis choice and custom coefficients. Whole-map
+D2E retains its manual color mode; **Auto** restores automatic scaling. Unfixed
+endpoints still follow the next measurement, and file/center presets do not
+become global manual defaults. Releasing a Fix updates this restart memory.
 **Restore Auto for this load** releases remembered ranges and manual fixes and
 turns off the cross-file X lock; **Clear this center template** keeps individual
 file snapshots.
@@ -281,6 +638,10 @@ omitted from the PNG mesh; DAT files and interactive heatmaps retain all data.
 Singular/nearly singular ranges and invalid log bounds retain the full extent
 so Matplotlib's automatic range handling stays consistent. PNG dimensions,
 color normalization, measured right axes and saved-image reuse are preserved.
+Generated product markers in the PNG title keep only the current product, so
+`(DR/R) (d2(DR/R)/dE2)` displays as `(d2(DR/R)/dE2)`. Original titles remain
+in metadata. Saving refreshes PNGs made under the earlier title policy while
+reusing unchanged DAT files.
 
 The export status follows PNG build, title fitting, draw and encoding/writing.
 Each newly rendered Raw/second product logs `build`, `title`, `draw`,
@@ -510,9 +871,9 @@ To build the installer locally, install NSIS and run:
 
 To test packaging on GitHub without publishing a release, open **Actions**,
 select **Windows Build**, and choose **Run workflow**. On a branch, the default
-`test_scope: quick` runs the same 27 test modules and smoke check as **Fast PR
-checks**, alongside packaging. Choose `full` to run the complete test suite in
-four parallel shards. Any tag ref always uses `full`, even when `quick` is
+`test_scope: quick` runs the same **Fast PR checks** workflow alongside
+packaging. Choose `full` to run the complete test suite in four parallel
+shards. Any tag ref always uses `full`, even when `quick` is
 selected; missing or unrecognized scope values also use `full`.
 
 After the selected checks and build succeed, download the `DPTK-Windows-x64`
@@ -852,6 +1213,26 @@ calling those helpers directly is separate from the normal GUI workflow.
     catalog refresh preserve selected paths. **Browse…** imports an external
     path for validation on Apply; it does not change the main result immediately.
 
+    P/N starts with **Match selected background files**. Choose **P only**,
+    **N only** or **P+N composite**, then choose the background files to make
+    available for this group. Matching uses only that selected candidate pool;
+    an empty pool waits for file selection instead of searching the experiment.
+    Add or remove candidate files to update the suggestions automatically, or
+    clear the list to start again. **Rematch selected files** reruns matching
+    within the selected pool. **One background for all** keeps the common reference option,
+    and the composite generation and saved-history entry remains available.
+
+    Inspect the mapping, select several measurement rows, and use **Assign to
+    selected** to give them one compatible candidate from the pool. The choice
+    shows the rows' current assignment, or indicates multiple backgrounds when
+    their assignments differ. Missing or ambiguous matches must be resolved,
+    and flagged matches require review before **Apply**. Matching uses acquisition conditions, native
+    spectral grids and available timing evidence; it does not generate a new
+    P/N composite or establish which spectrum is physically cleanest. Each
+    measurement is corrected with its assigned background before measurements
+    are averaged equally. DRR export metadata saves these assignments so the
+    exact measurement group's saved recipe can be restored later.
+
     Changes inside Background settings remain drafts until **Apply**. Nested editors return their
     selection to settings; generating/saving a version does not apply it.
     Cancel preserves the applied background and main view. Background-file
@@ -861,8 +1242,11 @@ calling those helpers directly is separate from the normal GUI workflow.
     the saved version's metadata; the internal output frame selector does not
     select frames from the original P/N measurements.
 
-    When reopening a measurement group through automatic background restoration
-    or the External source-type workflow, the newest saved DRR PNG/DAT export
+    With an explicit P/N candidate pool, switching measurement groups keeps
+    those files and prepares new matches for review; saved exports do not
+    replace the selected pool. Otherwise, when reopening a measurement group
+    through automatic background restoration or the External source-type
+    workflow, the newest saved DRR PNG/DAT export
     recipe for that exact selection restores its background files,
     frame choices and per-measurement assignments before applying the current
     source-type preference. **Fixed current background** keeps its explicit
@@ -1754,9 +2138,11 @@ calling those helpers directly is separate from the normal GUI workflow.
 
 ## Smoke Check (No Test Framework Required)
 
-Pull requests to `main` run the required **quick-checks** workflow, with a
-10-minute time limit. It covers representative core behavior and the ordinary
-measured-BN workflow: candidate matching, batch assignments, manual selection,
+Pull requests to `main` run **Fast PR checks**, including native Qt Quick
+application and display checks. The required **quick-checks** job has a
+10-minute time limit and covers Arial typography, source catalogs, P/N assignment,
+representative core behavior, and the ordinary measured-BN workflow:
+candidate matching, batch assignments, manual selection,
 group overrides, background settings, saved recipes, and application guards.
 These checks do not run the expensive fitted-BN numerical qualification. The
 same workflow is reused by **Windows Build** when manually building a branch

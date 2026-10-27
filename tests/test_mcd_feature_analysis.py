@@ -32,6 +32,41 @@ def _result(fields=(-1.0, -0.5, 0.5, 1.0)):
 
 
 class SelectedFeatureAnalysisTests(unittest.TestCase):
+    def test_optional_cancellation_preserves_default_numerical_payload(self):
+        result = _result()
+        catalog = detect_analysis_features(result, spectral_source="raw pos")
+        feature = next(item for item in catalog.features if item.domain == "spectrum" and item.kind == "peak")
+        baseline = analyze_selected_feature(result, feature, candidates=catalog.features)
+        checked = analyze_selected_feature(result, feature, candidates=catalog.features, cancel_check=lambda: False)
+        self.assertEqual(checked, baseline)
+
+    def test_local_fit_cancellation_escapes_after_one_actual_fit(self):
+        from unittest.mock import patch
+        from core.load_cancellation import LoadCancelled
+        from core.mcd_local_fit import mixed_model
+        from core.mcd_peak_shift import fit_local_resonance
+
+        result = _result(fields=(-.5, .5))
+        result.pair_raw_pos = np.asarray([
+            mixed_model((result.energy_ev - 1.68) * 1000., np.array([.1, 0., 1., .1, field, 4.]))
+            for field in result.pair_b
+        ])
+        catalog = detect_analysis_features(result, spectral_source="raw pos")
+        feature = next(item for item in catalog.features if item.domain == "spectrum" and item.kind == "peak")
+        completed = []
+
+        def actual_fit(*args, **kwargs):
+            value = fit_local_resonance(*args, **kwargs)
+            completed.append(value)
+            return value
+
+        with patch("core.mcd_peak_shift.fit_local_resonance", side_effect=actual_fit) as fitted:
+            with self.assertRaises(LoadCancelled):
+                analyze_selected_feature(result, feature, method="Local mixed fit", search_window_ev=(1.66, 1.70), cancel_check=lambda: bool(completed))
+        self.assertEqual(fitted.call_count, 1)
+        self.assertEqual(fitted.call_args.kwargs["max_starts"], 150)
+        self.assertEqual(completed[0].status, "ok")
+
     def test_selected_peak_returns_actual_channel_points_and_json_payload(self):
         result = _result()
         catalog = detect_analysis_features(result, spectral_source="raw pos")

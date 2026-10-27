@@ -122,12 +122,14 @@ class InlineSelectionTests(unittest.TestCase):
 
     def test_p_and_n_roles_keep_separate_multi_file_drafts(self):
         dialog = self.dialog(BackgroundDraft(kind='p'))
+        dialog.pn_assignment_method.setCurrentIndex(dialog.pn_assignment_method.findData('common'))
         self.choose(dialog.pn_selector, self.p1.source)
         self.choose(dialog.pn_selector, self.p2.source)
         self.assertEqual(dialog.draft.files, (self.p1.source, self.p2.source))
         self.assertIn('equally', dialog.repeat_note.text())
         dialog.pn_method.setCurrentIndex(dialog.pn_method.findData('n'))
         self.assertEqual(dialog.draft.files, ())
+        dialog.pn_assignment_method.setCurrentIndex(dialog.pn_assignment_method.findData('common'))
         self.choose(dialog.pn_selector, self.n.source)
         dialog.pn_method.setCurrentIndex(dialog.pn_method.findData('p'))
         self.assertEqual(dialog.draft.files, (self.p1.source, self.p2.source))

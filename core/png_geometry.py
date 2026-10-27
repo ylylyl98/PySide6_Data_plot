@@ -1,5 +1,6 @@
 """Horizontal canvas expansion shared by PNG export paths."""
 import math
+from core.typography import with_plot_font
 
 
 def widened_figsize(size, width_scale=1.0):
@@ -10,6 +11,7 @@ def widened_figsize(size, width_scale=1.0):
     return float(size[0]) * scale, float(size[1])
 
 
+@with_plot_font
 def compact_horizontal_margins(figure, *, padding_points=10.0):
     """Give wide exports' unused side margins to their axes, without cropping.
 

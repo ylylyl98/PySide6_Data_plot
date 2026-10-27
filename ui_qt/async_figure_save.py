@@ -1,4 +1,6 @@
 """Render a frozen Matplotlib figure without touching the live Qt canvas."""
+
+from core.typography import apply_figure_font, save_figure
 import pickle
 from pathlib import Path
 from time import perf_counter
@@ -25,7 +27,7 @@ def _render_snapshot_file(snapshot, path, options, *, width_scale=1.0):
     path = Path(path)
     temporary = path.with_name(f'.{path.stem}-{uuid4().hex}.tmp{path.suffix}')
     try:
-        figure.savefig(temporary, **options)
+        save_figure(figure, temporary, **options)
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -116,8 +118,6 @@ class FigureSaveJob(QObject):
 
 def save_figure_async(figure, path, *, after_save=None, width_scale=1.0, include_original_png=False, **options):
     widened_figsize(figure.get_size_inches(), width_scale)
-    apply_font = getattr(figure.canvas, 'apply_ui_font', None)
-    if callable(apply_font):
-        apply_font()
+    apply_figure_font(figure)
     return FigureSaveJob(figure, path, options, after_save=after_save,
                          width_scale=width_scale, include_original_png=include_original_png)

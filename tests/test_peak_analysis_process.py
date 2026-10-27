@@ -61,7 +61,9 @@ raise SystemExit(run_peak_analysis.main(sys.argv[3:]))
                 self.fail('Analysis process did not accept the snapshot.')
             try:
                 wait_count(1)
-                forwarded=subprocess.run([sys.executable,str(root/'run_peak_analysis.py'),'--session',str(session),'--snapshot',str(paths[1])],
+                # The observed owner above is the Widgets implementation;
+                # the executable entry point now defaults to Qt Quick.
+                forwarded=subprocess.run([sys.executable,str(root/'run_peak_analysis.py'),'--legacy-widgets','--session',str(session),'--snapshot',str(paths[1])],
                     cwd=root,env=env,capture_output=True,timeout=30,creationflags=flags)
                 self.assertEqual(forwarded.returncode,0,forwarded.stderr.decode(errors='replace'))
                 wait_count(2);stop.touch();_,errors=process.communicate(timeout=25)

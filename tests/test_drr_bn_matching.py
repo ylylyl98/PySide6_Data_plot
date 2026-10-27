@@ -63,6 +63,51 @@ class BnMatchPlanTests(unittest.TestCase):
         cache.confirm(plan, warnings_acknowledged=True)
         self.assertIs(cache.find(self.root, (self.measurement,)), plan)
 
+    def test_auto_bn_assigned_source_is_bound_to_load_and_export(self):
+        from ui_qt.quick.drr_background_workflow import BackgroundContext, BackgroundDraft, prepare_application
+        from ui_qt.quick.drr_workflow import DrrRequest, export_drr, load_drr
+        context = BackgroundContext(str(self.root), (self.measurement,), "tg", 3, 2)
+        prepared = prepare_application(context, BackgroundDraft(kind="bn", bn_plan=self.plan(),
+            bn_warnings_acknowledged=True))
+        request = DrrRequest((str(self.root / self.measurement),), background_mode="external",
+            y_axis="tg", window=3, experiment_folder=str(self.root), background_recipe=prepared.recipe)
+        environment = dict(MPLBACKEND="agg", MPLCONFIGDIR=str(self.root / "mpl"),
+            LOCALAPPDATA=str(self.root / "local"), XDG_CONFIG_HOME=str(self.root / "config"),
+            XDG_CACHE_HOME=str(self.root / "cache"))
+        with patch.dict(os.environ, environment), \
+                patch("core.drr_bn_matching.build_bn_match_plan") as rematch, \
+                patch("core.drr_sources.discover_drr_sources") as discover:
+            products = load_drr(request)
+            self.assertEqual({Path(item[0]).name for item in products.input_signatures},
+                {self.measurement, self.first})
+            source = self.root / self.first
+            before = source.stat()
+            source.write_bytes(source.read_bytes().replace(b"10,11,12", b"20,21,22"))
+            os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+            with self.assertRaisesRegex(ValueError, "changed since loading"):
+                export_drr(products, folder=str(self.root), raw_params=None, second_params=None, view="raw")
+            rematch.assert_not_called()
+            discover.assert_not_called()
+
+    def test_auto_bn_assigned_source_change_during_load_is_rejected(self):
+        from core.data_io import load_drr_resolved_cube
+        from ui_qt.quick.drr_background_workflow import BackgroundContext, BackgroundDraft, load_with_recipe, prepare_application
+        context = BackgroundContext(str(self.root), (self.measurement,), "tg", 3, 2)
+        prepared = prepare_application(context, BackgroundDraft(kind="bn", bn_plan=self.plan(),
+            bn_warnings_acknowledged=True))
+
+        def load_then_replace(*args, **kwargs):
+            cube = load_drr_resolved_cube(*args, **kwargs)
+            source = self.root / self.first
+            before = source.stat()
+            source.write_bytes(source.read_bytes().replace(b"10,11,12", b"20,21,22"))
+            os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+            return cube
+
+        with patch("core.data_io.load_drr_resolved_cube", side_effect=load_then_replace):
+            with self.assertRaisesRegex(ValueError, "changed during loading"):
+                load_with_recipe(context, prepared.recipe)
+
     def test_capture_logs_and_full_conditions_need_no_warnings(self):
         prefix = self.prefix+'polH_1mW_'
         measurement = self.write('TG_rep01.csv', 1000, prefix=prefix, varying=True)

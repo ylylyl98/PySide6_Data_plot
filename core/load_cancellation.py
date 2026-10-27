@@ -33,6 +33,13 @@ def check_load_cancelled():
         cancellation.check()
 
 
+def check_load_checkpoint():
+    """Allow cooperative pause only at boundaries with no source files open."""
+    cancellation = _current.get()
+    if cancellation is not None:
+        getattr(cancellation, "checkpoint", cancellation.check)()
+
+
 @contextmanager
 def load_scope(cancellation):
     scope = _current.set(cancellation)

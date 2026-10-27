@@ -17,6 +17,7 @@ from core.compare_history import compare_history_for_selection
 from core.export import compare_source_title, vp_compare_export_base, vp_compare_title
 from core.plotting import COMPARE_PANEL_ORDER
 from core.source_identity import match_source_identity
+from core.typography import matplotlib_font_context
 from core.processing import (
     background_correct_cube,
     classify_angle_state,
@@ -1372,13 +1373,7 @@ class CompareController:
             canvas = getattr(owner, "canvas", None)
             bbox = getattr(owner, "_cmp_blit_bbox", None)
             if canvas is not None and bbox is not None:
-                canvas.restore_region(owner._cmp_blit_background)
-                owner.figure.draw_artist(owner._cmp_linecut_ax)
-                for line in (getattr(owner, "_cmp_gate_lines", {}) or {}).values():
-                    axis = getattr(line, "axes", None)
-                    if axis is not None:
-                        axis.draw_artist(line)
-                canvas.blit(bbox)
+                self._draw_cmp_blit_frame()
                 owner._last_plot_params_key = current_key
                 return True
         xlim = linecut_ax.get_xlim()
@@ -1448,11 +1443,12 @@ class CompareController:
         if canvas is None or bbox is None or background is None or linecut is None:
             return
         canvas.restore_region(background)
-        owner.figure.draw_artist(linecut)
-        for line in (getattr(owner, "_cmp_gate_lines", {}) or {}).values():
-            axis = getattr(line, "axes", None)
-            if axis is not None:
-                axis.draw_artist(line)
+        with matplotlib_font_context(owner.figure):
+            owner.figure.draw_artist(linecut)
+            for line in (getattr(owner, "_cmp_gate_lines", {}) or {}).values():
+                axis = getattr(line, "axes", None)
+                if axis is not None:
+                    axis.draw_artist(line)
         canvas.blit(bbox)
 
     def _on_compare_canvas_draw(self, event=None) -> None:

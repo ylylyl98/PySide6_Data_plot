@@ -8,7 +8,7 @@ across a boundary without carrying live figures or widgets.
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 import copy
 from types import SimpleNamespace
 
@@ -23,6 +23,12 @@ from core.mcd_analysis import (
     _coerce_features,
 )
 from core.mcd_peak_shift import analyze_local_peak_shift, analyze_peak_shift
+
+
+def _check_cancelled(cancel_check: Callable[[], bool] | None) -> None:
+    if cancel_check is not None and cancel_check():
+        from core.load_cancellation import LoadCancelled
+        raise LoadCancelled()
 
 
 def _json_float(value: Any) -> float | None:
@@ -184,14 +190,21 @@ def _run_selected(
     half_width_ev: float,
     search_window_ev: tuple[float, float] | None = None,
     prominence_fraction: float | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> Any:
+    _check_cancelled(cancel_check)
     view = _result_for_channel(result, channel_source)
     field = feature.field_t
     if field is None:
         field = float(np.median(feature.support_fields)) if feature.support_fields else 0.0
     if method.casefold().strip() in {"local fit", "local mixed fit", "local"}:
         window = search_window_ev or (float(feature.energy_ev - half_width_ev), float(feature.energy_ev + half_width_ev))
-        return analyze_local_peak_shift(view, source=channel_source, seed_energy_ev=float(feature.energy_ev), locator_energy_ev=float(feature.energy_ev), feature_kind=feature.kind, window_ev=(float(window[0]), float(window[1])))
+        options = {}
+        if cancel_check is not None:
+            # Raise instead of returning a partial track when the caller stops
+            # a row-wise fit. The numerical default path remains unchanged.
+            options["cancel_check"] = lambda: _check_cancelled(cancel_check)
+        return analyze_local_peak_shift(view, source=channel_source, seed_energy_ev=float(feature.energy_ev), locator_energy_ev=float(feature.energy_ev), feature_kind=feature.kind, window_ev=(float(window[0]), float(window[1])), **options)
     options: dict[str, Any] = {
         "source": channel_source,
         "tracking_method": method,
@@ -217,6 +230,7 @@ def analyze_selected_feature(
     search_window_ev: Sequence[float] | None = None,
     prominence_fraction: float | None = None,
     reference_energy_ev: float | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Analyze only the selected catalog feature and supported trajectories.
 
@@ -225,6 +239,7 @@ def analyze_selected_feature(
     selections run the selected channel and a supported counterpart channel.
     ``Local mixed fit`` is run only when explicitly requested.
     """
+    _check_cancelled(cancel_check)
     selected = _feature(feature)
     normalized_window: tuple[float, float] | None = None
     if search_window_ev is not None:
@@ -293,6 +308,7 @@ def analyze_selected_feature(
         base["links"] = [link.to_dict() for link in links]
         return base
     for target in targets:
+        _check_cancelled(cancel_check)
         channel_source = _channel_source(target, source)
         try:
             run_half_width = float(half_width_ev)
@@ -305,7 +321,8 @@ def analyze_selected_feature(
                     base["status"] = "unsupported"
                     base["reason"] = "search_window_ev does not contain a valid seed span"
                     continue
-            analysis = _run_selected(result, target, method=method, channel_source=channel_source, half_width_ev=run_half_width, search_window_ev=normalized_window, prominence_fraction=prominence_fraction)
+            analysis = _run_selected(result, target, method=method, channel_source=channel_source, half_width_ev=run_half_width, search_window_ev=normalized_window, prominence_fraction=prominence_fraction, cancel_check=cancel_check)
+            _check_cancelled(cancel_check)
         except (ValueError, TypeError, np.linalg.LinAlgError) as exc:
             base["status"] = "unsupported"
             base["reason"] = f"selected analysis unavailable: {str(exc).splitlines()[0]}"

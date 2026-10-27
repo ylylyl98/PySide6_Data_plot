@@ -2,6 +2,7 @@ import unittest
 import tempfile
 import json
 from dataclasses import replace
+from unittest.mock import patch
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from core.export import _build_streamlit_style_heatmap_fig, export_drr_png_and_dat, EXPORT_FIGSIZE, EXPORT_AXES_RECT
 from tests.test_drr_three_regions import example
@@ -43,6 +44,109 @@ class DrrExportTitleTests(unittest.TestCase):
                          'sample TG-rBG=0 (DR/R)')
         self.assertEqual(display_title('sample | background mode=self_last | 2026-09-21_12-30-45 | unknown=2'),
                          'sample unknown=2')
+
+    def test_terminal_generated_product_chain_keeps_only_current_product(self):
+        from core.drr_export_title import display_title
+        cases = (
+            ('YZ383 pwn1 0T 1.67KREF 730nmc RotIn49deg TG+1BG=0 PIXIS (DR/R) (d2(DR/R)/dE2)',
+             'YZ383 pwn1 0T 1.67KREF 730nmc RotIn49deg TG+1BG=0 PIXIS (d2(DR/R)/dE2)'),
+            ('sample_PIXIS (DR/R external, avg 3) (d2(DR/R)/dE2)', 'sample PIXIS (d2(DR/R)/dE2)'),
+            ('sample (DR/R) (d(DR/R)/dE)', 'sample (d(DR/R)/dE)'),
+            ('sample (DR/R) (d(DR/R)/dE) (d2(DR/R)/dE2)', 'sample (d2(DR/R)/dE2)'),
+            ('sample (DR/R) (d2E)', 'sample (d2E)'),
+            ('sample (DR/R) (dXdY)', 'sample (dXdY)'),
+            ('sample (DR/R) (d2(DR/R)/(dE dGate (V)))', 'sample (d2(DR/R)/(dE dGate (V)))'),
+            ('sample (DR/R) (Advanced first derivative, dE)', 'sample (Advanced first derivative, dE)'),
+            ('sample (DR/R) (DR/R)', 'sample (DR/R)'),
+            ('sample (DR/R)', 'sample (DR/R)'),
+            ('sample (DR/R external, avg 3)', 'sample (DR/R)'),
+        )
+        for original, expected in cases:
+            with self.subTest(original=original):
+                self.assertEqual(display_title(original), expected)
+
+    def test_product_cleanup_preserves_unknown_conditions_and_math(self):
+        from core.drr_export_title import display_title
+        original = 'sample note=(DR/R) custom=d2E $x (DR/R) (d2E)$ (DR/R) (d2E)'
+        self.assertEqual(display_title(original), 'sample note=(DR/R) custom=d2E $x (DR/R) (d2E)$ (d2E)')
+        for original in ('sample (DR/R) (unknown product)', 'sample (DR/R) (d2E) unknown-condition',
+                         'sample (DR/R) custom=7 (d2E)', 'sample(DR/R) (d2E)'):
+            with self.subTest(original=original):
+                self.assertEqual(display_title(original), original)
+
+    def test_derivative_processing_title_remains_full_provenance(self):
+        from core.drr_export_title import display_title
+        from core.processing import apply_sg_derivative_energy
+        cube, _ = example()
+        original = 'sample_PIXIS (DR/R external, avg 3)'
+        cube.title = original
+        second, _ = apply_sg_derivative_energy(cube, derivative=2, window_length=5, polyorder=2)
+        self.assertEqual(cube.title, original)
+        self.assertEqual(second.title, original + ' (d2(DR/R)/dE2)')
+        self.assertEqual(second.cbar_label, 'd2(DR/R)/dE2')
+        self.assertEqual(display_title(second.title), 'sample PIXIS (d2(DR/R)/dE2)')
+
+    def test_regular_and_wide_render_only_current_product_marker(self):
+        cube, params = example()
+        original = 'sample_PIXIS (DR/R external, avg 3) (d2(DR/R)/dE2)'
+        for width in (1., 2.):
+            with self.subTest(width=width):
+                variant = replace(params, title=original, cbar_label='d2(DR/R)/dE2', png_width_scale=width)
+                fig = _build_streamlit_style_heatmap_fig(cube, variant, drr=True)
+                FigureCanvasAgg(fig).draw()
+                self.assertEqual(' '.join(fig.texts[0].get_text().split()), 'sample PIXIS (d2(DR/R)/dE2)')
+                quantity = next(text for text in fig.texts if text.get_gid() == 'drr-colorbar-quantity')
+                self.assertEqual(quantity.get_text(), 'd2(DR/R)/dE2')
+                self.assertEqual(variant.title, original)
+                fig.clear()
+
+    def test_old_png_title_policy_refreshes_figures_without_rewriting_dat(self):
+        from core import export
+        from core.drr_export_title import TITLE_POLICY_VERSION, display_title
+        cube, params = example()
+        original = 'sample PIXIS (DR/R) (d2(DR/R)/dE2)'
+        expected = 'sample PIXIS (d2(DR/R)/dE2)'
+        for width in (1., 2.):
+            with self.subTest(width=width), tempfile.TemporaryDirectory() as folder:
+                variant = replace(params, title=original, cbar_label='d2(DR/R)/dE2', png_width_scale=width)
+                kwargs = dict(folder=folder, cube=cube, params=variant, export_base='original_source_name',
+                              metadata_processing={'derivative_order': 2}, include_original_png=width > 1.)
+                def save_png(path, cube, params, **options):
+                    path.write_text(export.display_title(params.title), encoding='utf-8')
+                with patch.object(export, '_save_heatmap_png', side_effect=save_png) as render:
+                    with patch.object(export, 'display_title', side_effect=lambda title: title):
+                        first = export.export_drr_png_and_dat(**kwargs)
+                    metadata = first['dat'].with_suffix('.metadata.json')
+                    payload = json.loads(metadata.read_text(encoding='utf-8'))
+                    def old_fingerprint(plot):
+                        return export._fingerprint_json({'render_version': 7,
+                            **({'wide_header_version': 2} if plot['png_width_scale'] > 1. else {}), 'params': plot})
+                    payload['plot_fingerprint'] = old_fingerprint(payload['plot'])
+                    payload['display_title'], payload['title_policy_version'] = original, 1
+                    for record in payload['figures'].values():
+                        record['plot_fingerprint'] = old_fingerprint(record['plot'])
+                    metadata.write_text(json.dumps(payload), encoding='utf-8')
+                    dat_state = first['dat'].read_bytes(), first['dat'].stat().st_mtime_ns
+                    render.reset_mock()
+                    with patch.object(export, '_save_drr_dat_atomic', side_effect=AssertionError('Title change rewrote DAT')):
+                        updated = export.export_drr_png_and_dat(**kwargs)
+                    self.assertEqual(render.call_count, 2 if width > 1. else 1)
+                    self.assertEqual(updated['dat'], first['dat'])
+                    self.assertEqual((updated['dat'].read_bytes(), updated['dat'].stat().st_mtime_ns), dat_state)
+                    self.assertEqual(updated['dat'].stem, 'original_source_name')
+                    self.assertEqual(len(list(updated['dat'].parent.glob('*.dat'))), 1)
+                    for key in ('png', 'png_wide') if width > 1. else ('png',):
+                        self.assertEqual(first[key].read_text(encoding='utf-8'), original)
+                        self.assertEqual(updated[key].read_text(encoding='utf-8'), expected)
+                    current = json.loads(metadata.read_text(encoding='utf-8'))
+                    self.assertEqual(current['plot']['title'], original)
+                    self.assertEqual(current['display_title'], display_title(original))
+                    self.assertEqual(current['title_policy_version'], TITLE_POLICY_VERSION)
+                    render.reset_mock()
+                    reused = export.export_drr_png_and_dat(**kwargs)
+                    self.assertEqual(reused, updated)
+                    self.assertEqual(reused.save_status, 'reused')
+                    render.assert_not_called()
 
     def test_all_regions_fit_simplified_title_without_mutating_params(self):
         cube, params = example()

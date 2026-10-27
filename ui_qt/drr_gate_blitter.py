@@ -1,6 +1,8 @@
 """Redraw DRR linecut axes over a retained heatmap, including new ticks/titles."""
 from __future__ import annotations
 
+from core.typography import apply_figure_font, matplotlib_font_context, try_render_lock
+
 
 class DrrGateBlitter:
     def __init__(self, canvas):
@@ -56,7 +58,8 @@ class DrrGateBlitter:
     def draw_colors(self, changed, token):
         if token is None or token is not self._background or self._color_frame is None:
             return False
-        return self._color_frame.redraw(self, changed)
+        with try_render_lock() as available:
+            return self._color_frame.redraw(self, changed) if available else False
 
     def _owns_axes(self):
         axes = self.canvas.figure.axes
@@ -78,10 +81,15 @@ class DrrGateBlitter:
                               if a not in self.overlays))) for axis in figure.axes))
 
     def _draw_dynamic(self):
+        with matplotlib_font_context():
+            self._paint_dynamic()
+
+    def _paint_dynamic(self):
         renderer = self.canvas.get_renderer()
         # Repaint complete linecut axes: a new gate may change the title,
         # autoscaled Y limits, ticks, scientific offset and fit overlays.
         for axis in self.spectra:
+            apply_figure_font(axis)
             children = self.spectrum_artists((axis,))
             previous = [(a, a.get_animated()) for a in children]
             try:
@@ -93,6 +101,7 @@ class DrrGateBlitter:
                     artist.set_animated(animated)
         for artist in self.overlays:
             if artist.get_visible():
+                apply_figure_font(artist)
                 artist.axes.draw_artist(artist)
 
     def _on_canvas_draw(self, event):
@@ -113,6 +122,10 @@ class DrrGateBlitter:
             self._color_frame = ColorFrame(self.canvas, self.heatmaps)
 
     def draw(self):
+        with try_render_lock() as available:
+            return self._draw_available() if available else False
+
+    def _draw_available(self):
         if not self._owns_axes() or self._background is None:
             return False
         if self._signature() != self._static_signature:

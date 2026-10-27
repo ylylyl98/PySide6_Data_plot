@@ -233,8 +233,11 @@ class DrrDualSaveWorkflowTests(unittest.TestCase):
         w.show()
         self.app.processEvents()
         w._update_plot_view_bar_visibility()
+        self.assertEqual(w.width(), 1180)
         self.assertTrue(w.png_layout_combo.isVisible())
         self.assertTrue(w.png_width_spin.isVisible())
+        for control in (w.png_layout_combo, w.png_width_spin):
+            self.assertTrue(w.toolbar.rect().contains(control.geometry()), control.objectName())
         self.assertEqual(export_width(w), 1.)
         w.png_layout_combo.setCurrentIndex(1)
         w.png_width_spin.setValue(1.5)

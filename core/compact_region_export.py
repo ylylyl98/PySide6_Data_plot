@@ -4,8 +4,10 @@ import re
 from matplotlib.font_manager import FontProperties
 from matplotlib.ticker import FuncFormatter, NullLocator
 from core.png_render_timing import time_png_stage
+from core.typography import FONT_FAMILY, with_plot_font
 
 
+@with_plot_font
 def complete_title(fig, text, left, right, *, top=.95, bottom=.85, obstacles=()):
     """Fit all text by wrapping and reducing font size, never dropping words."""
     with time_png_stage('title'):
@@ -21,7 +23,7 @@ def _fit_title(fig, text, left, right, *, top, bottom, obstacles):
     artist = fig.text(left, top, '', ha='left', va='top', fontweight='bold', linespacing=1.0)
     words = re.findall(r'\$[^$]*\$|\S+', str(text))
     for size in np.arange(16., .5, -.5):
-        font = FontProperties(size=size, weight='bold')
+        font = FontProperties(family=FONT_FAMILY, size=size, weight='bold')
         measured = {}
 
         def measure(value):
@@ -66,6 +68,7 @@ def _fit_title(fig, text, left, right, *, top, bottom, obstacles):
     raise ValueError('Title is too long to fit the fixed export header.')
 
 
+@with_plot_font
 def compact_wide_header(fig, ax, text):
     """Use the measured header height instead of reserving three title lines.
 
@@ -109,6 +112,7 @@ def compact_wide_header(fig, ax, text):
     fig.texts.insert(0, fig.texts.pop())
 
 
+@with_plot_font
 def compact_colorbars(fig, render, *, left, right, bottom, label, drr_header=False):
     count = len(render.images)
     names = {1: ('',), 2: ('L', 'R'), 3: ('L', 'M', 'R')}[count]

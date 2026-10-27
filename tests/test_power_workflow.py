@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 from matplotlib.figure import Figure
@@ -13,6 +14,17 @@ from core.plotting import plot_heatmap, HeatmapParams
 
 
 class CorrectionTests(unittest.TestCase):
+    def test_empty_power_catalog_does_not_read_acquisition_metadata(self):
+        from core.power_workflow import group_power_measurement_sources
+        with patch('core.power_workflow._power_metadata_index',
+                   side_effect=AssertionError('Empty Power sources inspected acquisition sidecars')) as metadata, \
+             patch('core.power_manifest.manifest_assignments',
+                   side_effect=AssertionError('Empty Power sources inspected manifests')) as manifests:
+            for sources in ({}, None):
+                self.assertEqual(group_power_measurement_sources('unused-experiment', sources), [])
+            metadata.assert_not_called()
+            manifests.assert_not_called()
+
     def test_discovery_excludes_initial_data_copies(self):
         from core.power_workflow import discover_power_files
         with tempfile.TemporaryDirectory() as folder:

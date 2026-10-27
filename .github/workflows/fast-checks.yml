@@ -16,6 +16,108 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  native-quick:
+    name: Native Qt Quick application checks
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      QT_QPA_PLATFORM: offscreen
+      QT_QUICK_BACKEND: software
+      PYTHONIOENCODING: utf-8
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install runtime dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+      - name: Verify isolated native workflows and rendered Quick frames
+        run: >-
+          python -m unittest -v
+          tests.test_application_models
+          tests.test_quick_application_shell
+          tests.test_quick_selection_contrast
+          tests.test_quick_source_catalog_actions
+          tests.test_quick_source_catalog_stability
+          tests.test_quick_source_catalog_status
+          tests.test_quick_catalog_refresh_regression
+          tests.test_quick_catalog_clear_reopen
+          tests.test_quick_catalog_idle_integration
+          tests.test_quick_catalog_reopen_position
+          tests.test_quick_catalog_load_bookmark
+          tests.test_quick_catalog_summary
+          tests.test_quick_background_source_catalog
+          tests.test_quick_background_inline_browser
+          tests.test_quick_background_selection_gestures
+          tests.test_quick_keep_background
+          tests.test_quick_three_bn_keep
+          tests.test_quick_background_restore
+          tests.test_quick_background_restore_integration
+          tests.test_quick_workflow_switching
+          tests.test_quick_workflow_palette
+          tests.test_quick_startup
+          tests.test_quick_entrypoints
+          tests.test_quick_settings_storage
+          tests.test_frozen_quick_check
+          tests.test_quick_pl_native
+          tests.test_quick_application_bridge
+          tests.test_quick_file_dialogs
+          tests.test_quick_measurement_selection
+          tests.test_quick_plot_surface
+          tests.test_quick_main_responsiveness
+          tests.test_quick_raster_heatmaps
+          tests.test_drr_display_state
+          tests.test_quick_drr_restart_ranges
+          tests.test_quick_drr_workflow
+          tests.test_quick_drr_background
+          tests.test_quick_drr_background_selection
+          tests.test_quick_drr_bn_automatic
+          tests.test_quick_compare
+          tests.test_quick_compare_startup
+          tests.test_quick_heatmap_style
+          tests.test_quick_spectrum_limits
+          tests.test_quick_power
+          tests.test_quick_power_analysis
+          tests.test_quick_peak_analysis
+          tests.test_quick_peak_spectrum
+          tests.test_quick_update
+          tests.test_quick_data_maintenance
+          tests.test_quick_drr_analysis
+          tests.test_quick_mcd
+          tests.test_quick_mcd_peak
+          tests.test_quick_mcd_startup
+          tests.test_quick_organizer
+          tests.test_quick_shg
+          tests.test_quick_shg_startup
+          tests.test_quick_presentation
+
+  quick-display:
+    name: Qt Quick display checks
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      QT_QPA_PLATFORM: offscreen
+      QT_QUICK_BACKEND: software
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install runtime dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+      - name: Verify Quick controls and packaged resource contract
+        run: >-
+          python -m unittest -v
+          tests.test_drr_display_bridge
+          tests.test_drr_quick_display
+          tests.test_quick_display_packaging
+
   quick-checks:
     name: quick-checks
     runs-on: windows-latest
@@ -32,12 +134,28 @@ jobs:
           cache: pip
       - name: Install runtime dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+      - name: Verify Arial interface and plot typography
+        run: >-
+          python -m unittest -v
+          tests.test_ui_typography
+          tests.test_plot_system_font
+          tests.test_plot_typography
+          tests.test_partial_plot_typography
       - name: Run representative core tests
         run: >-
           python -m unittest -v
           tests.test_dat_loader
           tests.test_loader
           tests.test_processing_derivative
+          tests.test_drr_export_title
+          tests.test_source_catalog_cache
+          tests.test_drr_catalog_layers
+          tests.test_catalog_lightweight_imports
+          tests.test_drr_catalog_lightweight
+          tests.test_drr_catalog_reuse
+          tests.test_drr_gate_metadata_cache
+          tests.test_drr_inspection_pool
+          tests.test_drr_sources
           tests.test_drr_bn_settings_compatibility
           tests.test_drr_bn_fingerprint
           tests.test_drr_bn_store
@@ -65,5 +183,12 @@ jobs:
           tests.test_drr_background_settings_workflow
           tests.test_drr_background_entrypoints
           tests.test_drr_auto_external
+      - name: Run P/N background assignment regressions
+        run: >-
+          python -m unittest -v
+          tests.test_drr_pn_matching
+          tests.test_drr_pn_matching_ui
+          tests.test_drr_pn_settings_workflow
+          tests.test_drr_pn_summary_labels
       - name: Run smoke check
         run: python scripts/smoke_check.py

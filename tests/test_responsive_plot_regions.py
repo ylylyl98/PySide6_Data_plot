@@ -67,6 +67,35 @@ class RegionBlitterTests(unittest.TestCase):
         helper.disconnect()
         self.assertFalse(line.get_animated())
 
+    def test_hidden_axes_do_not_paint_animated_line_and_can_expand_again(self):
+        figure = Figure(figsize=(4, 3), dpi=100)
+        canvas = FigureCanvasAgg(figure)
+        axis = figure.add_subplot(111)
+        line, = axis.plot([0, 1], [0, 1], linewidth=5)
+        helper = AxesRegionBlitter(canvas)
+        helper.configure(axis, [line])
+        canvas.draw()
+        self.assertIsNotNone(helper._background)
+        connection = helper._draw_cid
+
+        axis.set_visible(False)
+        canvas.draw()
+        hidden = np.asarray(canvas.buffer_rgba()).copy()
+        self.assertFalse(helper.draw())
+        self.assertIsNone(helper._background)
+        self.assertEqual(helper._draw_cid, connection)
+        self.assertIs(helper.axes, axis)
+        figure.patch.draw(canvas.get_renderer())
+        np.testing.assert_array_equal(hidden, np.asarray(canvas.buffer_rgba()))
+
+        axis.set_visible(True)
+        canvas.draw()
+        self.assertIsNotNone(helper._background)
+        line.set_ydata([1, 0])
+        self.assertTrue(helper.draw())
+        self.assertFalse(np.array_equal(hidden, np.asarray(canvas.buffer_rgba())))
+        helper.disconnect()
+
     def test_full_redraw_handles_title_limits_and_resize(self):
         figure = Figure(figsize=(3, 2), dpi=100)
         canvas = FigureCanvasAgg(figure)

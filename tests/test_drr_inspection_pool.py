@@ -9,6 +9,15 @@ from core.drr_inspection_pool import inspect_csv_profiles
 from core.drr_sources import discover_drr_sources, DrrSourceCache, inspect_csv_gate_profile
 
 
+def _hold_worker_startup_until_cancelled(stop, started):
+    """Keep a real spawned worker in startup until pool cleanup releases it."""
+    from core.drr_inspection_pool import _initialize
+    _initialize(stop)
+    started.set()
+    if not stop.wait(10):
+        raise AssertionError('Pool cleanup did not stop its starting worker')
+
+
 class DrrInspectionPoolTests(unittest.TestCase):
     def test_spawned_workers_match_serial_inspection_and_release_children(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -21,26 +30,43 @@ class DrrInspectionPoolTests(unittest.TestCase):
             code = """
 from pathlib import Path
 import multiprocessing, sys, threading
+from concurrent.futures import ProcessPoolExecutor
+from unittest.mock import patch
 from core.drr_inspection_pool import inspect_csv_profiles
 from core.drr_sources import inspect_csv_gate_profile
 from core.load_cancellation import LoadCancellation, LoadCancelled, load_scope
+from tests.test_drr_inspection_pool import _hold_worker_startup_until_cancelled
 paths = list(Path(sys.argv[1]).glob('*.csv'))
 expected = {p: inspect_csv_gate_profile(p, max_rows=None) for p in paths}
-actual = inspect_csv_profiles(paths)
+completed = []
+actual = inspect_csv_profiles(paths, on_profile=lambda path, profile: completed.append((path, profile)))
 assert actual == expected, (actual, expected)
+assert dict(completed) == expected
 assert not multiprocessing.active_children()
 token = LoadCancellation()
-timer = threading.Timer(.2, token.cancel)
-timer.start()
+started = multiprocessing.get_context('spawn').Event()
+startup_seen = []
+def cancel_after_startup():
+    startup_seen.append(started.wait(10))
+    token.cancel()
+def start_blocked_pool(*args, **kwargs):
+    kwargs['initializer'] = _hold_worker_startup_until_cancelled
+    kwargs['initargs'] = (*kwargs['initargs'], started)
+    return ProcessPoolExecutor(*args, **kwargs)
+# Synchronize on real worker startup: tiny inputs can finish before a timer.
+# These waits are failure bounds, not guesses about process startup speed.
+canceller = threading.Thread(target=cancel_after_startup)
+canceller.start()
 try:
-    with load_scope(token):
+    with patch('core.drr_inspection_pool.ProcessPoolExecutor', side_effect=start_blocked_pool), load_scope(token):
         inspect_csv_profiles(paths)
 except LoadCancelled:
     pass
 else:
     raise AssertionError('Scan did not cancel during worker startup')
 finally:
-    timer.join()
+    canceller.join()
+assert startup_seen == [True], 'No worker entered startup before cancellation'
 assert not multiprocessing.active_children()
 """
             result = subprocess.run([sys.executable, '-c', code, folder], capture_output=True,
@@ -65,17 +91,22 @@ assert not multiprocessing.active_children()
             original_stat = Path.stat
             class Stat:
                 def __init__(self, value):
-                    self._value = value
+                    self._stat = value
                     self.st_size = value.st_size + 2*1024**2
-
+                    self.st_mtime_ns = value.st_mtime_ns
+                    self.st_mtime = value.st_mtime
+                    self.st_mode = value.st_mode
                 def __getattr__(self, name):
-                    return getattr(self._value, name)
+                    return getattr(self._stat, name)
             def stat(path, *args, **kwargs):
                 result = original_stat(path, *args, **kwargs)
                 return Stat(result) if path.suffix == '.csv' else result
-            def inspect(selected):
+            def inspect(selected, *, on_profile=None):
                 result = {p: inspect_csv_gate_profile(p, max_rows=None) for p in selected}
                 paths[0].write_text('Vbg,700\n0,2\n1,3\n', encoding='utf-8')
+                if on_profile is not None:
+                    for path, profile in result.items():
+                        on_profile(path, profile)
                 return result
             with patch.object(Path, 'stat', stat), patch('core.drr_inspection_pool.inspect_csv_profiles', side_effect=inspect):
                 sources = discover_drr_sources(root, cache=DrrSourceCache(root/'cache.json', load_on_init=False),

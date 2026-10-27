@@ -22,8 +22,8 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
-from core.processing import split_group_and_sort_key
-from core.load_cancellation import check_load_cancelled
+from core.measurement_names import split_group_and_sort_key
+from core.load_cancellation import check_load_cancelled, check_load_checkpoint
 from core.drr_background_regions import DrrBackgroundRegion, normalize_regions
 
 
@@ -117,6 +117,7 @@ class DrrSourceCache:
     ) -> None:
         self.path = Path(path) if path is not None else self.default_path()
         self._entries: dict[str, tuple[int, int, dict[str, object]]] = {}
+        self._dirty = False
         if load_on_init:
             self.load()
 
@@ -212,8 +213,10 @@ class DrrSourceCache:
         loaded_entries.update(memory_entries)
         self._entries = loaded_entries
 
-    def save(self) -> None:
+    def save(self, *, only_dirty: bool = False) -> None:
         """Persist inspection metadata without affecting source data files."""
+        if only_dirty and not self._dirty and self.path.is_file():
+            return
         payload = {
             "schema_version": self.SCHEMA_VERSION,
             "entries": {
@@ -233,8 +236,14 @@ class DrrSourceCache:
                 prefix=f".{self.path.name}.", suffix=".tmp", delete=False,
             ) as handle:
                 temporary = Path(handle.name)
-                json.dump(payload, handle, separators=(",", ":"))
+                try:
+                    serialized = json.dumps(payload, separators=(",", ":"))
+                except MemoryError:
+                    json.dump(payload, handle, separators=(",", ":"))
+                else:
+                    handle.write(serialized)
             temporary.replace(self.path)
+            self._dirty = False
         except (OSError, TypeError, ValueError):
             return
         finally:
@@ -259,19 +268,23 @@ class DrrSourceCache:
         metadata: dict[str, object],
     ) -> None:
         self._entries[identity] = (modified_ns, size_bytes, dict(metadata))
+        self._dirty = True
 
     def retain(self, identities: set[str]) -> None:
         for identity in tuple(self._entries):
             if identity not in identities:
                 self._entries.pop(identity, None)
+                self._dirty = True
 
     def clear(self) -> None:
+        self._dirty |= bool(self._entries)
         self._entries.clear()
 
     def clone(self) -> "DrrSourceCache":
         """Return an independent snapshot suitable for a background scan."""
         clone = DrrSourceCache.__new__(DrrSourceCache)
         clone.path = self.path
+        clone._dirty = self._dirty
         clone._entries = {}
         clone._entries = {
             identity: (modified_ns, size_bytes, dict(metadata))
@@ -618,38 +631,58 @@ def _metadata_source_name(root: Path, item: dict[str, object], *, require_exists
     return None if require_exists else fallback
 
 
-def _metadata_assignment_source(
-    root: Path,
-    raw_source: str,
-    descriptors: Sequence[dict[str, object]],
-    *,
-    role: str,
-) -> str | None:
-    """Resolve an assignment path through its corresponding source descriptor.
+class _MetadataSourceResolver:
+    """Reuse source decisions only while parsing one metadata sidecar.
 
-    Exported assignments historically contained only an absolute path.  When
-    an experiment folder moves, the source descriptor's portable ``name`` is
-    the authoritative recovery hint.  Match by any recorded path, then let
-    ``_metadata_source_name`` prefer the first existing descriptor path.
+    Common backgrounds occur in every member assignment. Resolving each path
+    and scanning its descriptors again adds no evidence within that sidecar's
+    existing dependency snapshot. First lookups still use the normal path and
+    existence checks; the enclosing parser verifies all those dependencies.
+    No resolver or memoized path is retained in the history caches.
     """
-    if not isinstance(raw_source, str) or not raw_source.strip():
-        return None
-    raw = raw_source.replace("\\", "/").casefold()
-    raw_identity = str(resolve_source_path(root, raw_source)).casefold()
-    for descriptor in descriptors:
-        if str(descriptor.get("role") or "").casefold() != role:
-            continue
-        aliases = [
-            value for key in ("source_path", "path", "processing_input_path", "name")
-            if isinstance((value := descriptor.get(key)), str) and value.strip()
-        ]
-        if any(
-            alias.replace("\\", "/").casefold() == raw
-            or str(resolve_source_path(root, alias)).casefold() == raw_identity
-            for alias in aliases
-        ):
-            return _metadata_source_name(root, descriptor)
-    return _metadata_source_name(root, {"source_path": raw_source})
+
+    def __init__(self, root: Path, descriptors: Sequence[dict[str, object]]):
+        self.root = root
+        self.descriptors = descriptors
+        self._names = {}
+        self._identities = {}
+        self._assignments = {}
+
+    def identity(self, source: str) -> str:
+        if source not in self._identities:
+            self._identities[source] = str(resolve_source_path(self.root, source)).casefold()
+        return self._identities[source]
+
+    def source_name(self, descriptor: dict[str, object]) -> str | None:
+        key = id(descriptor)
+        if key not in self._names:
+            self._names[key] = _metadata_source_name(self.root, descriptor)
+        return self._names[key]
+
+    def assignment_source(self, raw_source: str, *, role: str) -> str | None:
+        """Match recorded aliases in descriptor order, including moved roots."""
+        if not isinstance(raw_source, str) or not raw_source.strip():
+            return None
+        key = role, raw_source
+        if key in self._assignments:
+            return self._assignments[key]
+        raw = raw_source.replace("\\", "/").casefold()
+        raw_identity = self.identity(raw_source)
+        for descriptor in self.descriptors:
+            if str(descriptor.get("role") or "").casefold() != role:
+                continue
+            aliases = [
+                value for field in ("source_path", "path", "processing_input_path", "name")
+                if isinstance((value := descriptor.get(field)), str) and value.strip()
+            ]
+            if any(alias.replace("\\", "/").casefold() == raw
+                   or self.identity(alias) == raw_identity for alias in aliases):
+                result = self.source_name(descriptor)
+                break
+        else:
+            result = _metadata_source_name(self.root, {"source_path": raw_source})
+        self._assignments[key] = result
+        return result
 
 
 _DRR_HISTORY_CACHE: OrderedDict = OrderedDict()
@@ -741,7 +774,7 @@ def _parse_drr_metadata(root: Path, metadata_files: Sequence[Path], *,
     parent_paths = _METADATA_PATHS.get()
     shared_paths = parent_paths if parent_paths is not None else {}
     for path in metadata_files:
-        check_load_cancelled()
+        check_load_checkpoint()
         stamp = _history_file_signature(path)
         try:
             payload = _history_payload(path, stamp)
@@ -811,16 +844,17 @@ def _parse_drr_metadata_uncached(
         measurements: list[str] = []
         baselines: list[str] = []
         descriptors: list[dict[str, object]] = [item for item in inputs if isinstance(item, dict)]
+        resolver = _MetadataSourceResolver(root, descriptors)
         for item in inputs:
             if not isinstance(item, dict):
                 continue
             role = str(item.get("role") or "").casefold()
             if role not in {"measurement", "background"}:
                 continue
-            source = _metadata_source_name(root, item)
+            source = resolver.source_name(item)
             if source is None:
                 continue
-            identity = str(resolve_source_path(root, source)).casefold()
+            identity = resolver.identity(source)
             roles.setdefault(identity, set()).add(role)
             if role == "measurement":
                 measurements.append(source)
@@ -882,17 +916,17 @@ def _parse_drr_metadata_uncached(
                             if not has_mode and not raw_files:
                                 raise ValueError("assignment mode is missing")
                         parsed = DrrMeasurementAssignment.from_mapping(item)
-                        measurement_source = _metadata_assignment_source(
-                            root, parsed.measurement_file, descriptors, role="measurement"
+                        measurement_source = resolver.assignment_source(
+                            parsed.measurement_file, role="measurement"
                         )
                         baseline_sources = tuple(
-                            _metadata_assignment_source(root, source, descriptors, role="background")
+                            resolver.assignment_source(source, role="background")
                             or source
                             for source in parsed.baseline_files
                         )
                         regions = tuple(DrrBackgroundRegion(
                             region.xmin_ev, region.xmax_ev,
-                            tuple(_metadata_assignment_source(root, source, descriptors, role="background")
+                            tuple(resolver.assignment_source(source, role="background")
                                   or source for source in region.baseline_files),
                             region.baseline_which) for region in parsed.regions)
                         if measurement_source is None or any(not str(source).strip() for source in baseline_sources):
@@ -913,11 +947,11 @@ def _parse_drr_metadata_uncached(
                         break
                 if assignment_valid:
                     measurement_ids = [
-                        str(resolve_source_path(root, source)).casefold()
+                        resolver.identity(source)
                         for source in measurements
                     ]
                     assignment_ids = [
-                        str(resolve_source_path(root, item.measurement_file)).casefold()
+                        resolver.identity(item.measurement_file)
                         for item in member_assignments
                     ]
                     # The mapping is a complete keyed relation.  A partial,
@@ -1896,6 +1930,34 @@ def drr_source_paths(root: str | Path, *, include_all: bool = False) -> list[Pat
     return sorted({path for path in candidates if path.suffix.lower() in SUPPORTED_DRR_SUFFIXES})
 
 
+def _inspection_metadata(path: Path, profile: DrrGateProfile) -> dict[str, object]:
+    named_center = extract_wavelength_center_nm(path.name)
+    spectral_center = (inspect_csv_wavelength_center(path)
+                       if path.suffix.lower() == ".csv" and named_center is None else None)
+    return {
+        "gate_varies": profile.varies, "frame_count": profile.frame_count,
+        "gate_grid": profile.gate_grid, "spectral_grid": profile.spectral_grid,
+        "gate_direction": profile.gate_direction, "gate_ranges": profile.gate_ranges,
+        "gate_labels": profile.gate_labels, "grid_complete": profile.grid_complete,
+        "wavelength_center_nm": named_center if named_center is not None else spectral_center,
+        "wavelength_center_source": ("filename" if named_center is not None
+                                     else "spectral axis" if spectral_center is not None else ""),
+    }
+
+
+def _cache_inspection(cache, path, signature, metadata):
+    if cache is None:
+        return
+    try:
+        stat = path.stat()
+    except OSError:
+        return
+    # Do not certify a profile read across an acquisition append/replacement.
+    if (stat.st_mtime_ns, stat.st_size) == signature:
+        cache.put(str(path.resolve()).casefold(), modified_ns=signature[0],
+                  size_bytes=signature[1], metadata=metadata)
+
+
 def discover_drr_sources(
     root: str | Path,
     *,
@@ -1918,7 +1980,7 @@ def discover_drr_sources(
     signatures = {}
     if parallel_inspection:
         for path in candidates:
-            check_load_cancelled()
+            check_load_checkpoint()
             if path.suffix.lower() != '.csv':
                 continue
             try:
@@ -1932,12 +1994,15 @@ def discover_drr_sources(
         # Spawn/import costs outweigh any benefit for small refreshes.
         if len(signatures) >= 32 and sum(s[1] for s in signatures.values()) >= 32 * 1024**2:
             from core.drr_inspection_pool import inspect_csv_profiles
-            profiles = inspect_csv_profiles(signatures)
+            def completed(path, profile):
+                if cache is not None:
+                    _cache_inspection(cache, path, signatures[path], _inspection_metadata(path, profile))
+            profiles = inspect_csv_profiles(signatures, on_profile=completed)
 
     inspected: list[dict] = []
     seen: set[str] = set()
     for path in candidates:
-        check_load_cancelled()
+        check_load_checkpoint()
         if path.suffix.lower() not in SUPPORTED_DRR_SUFFIXES:
             continue
         identity = str(path.resolve()).casefold()
@@ -1965,36 +2030,8 @@ def discover_drr_sources(
                 if path.suffix.lower() == ".csv"
                 else DrrGateProfile(None, None)
             )
-            gate_varies, frame_count = profile.varies, profile.frame_count
-            named_center = extract_wavelength_center_nm(path.name)
-            spectral_center = (
-                inspect_csv_wavelength_center(path)
-                if path.suffix.lower() == ".csv" and named_center is None
-                else None
-            )
-            cached = {
-                "gate_varies": gate_varies,
-                "frame_count": frame_count,
-                "gate_grid": profile.gate_grid,
-                "spectral_grid": profile.spectral_grid,
-                "gate_direction": profile.gate_direction,
-                "gate_ranges": profile.gate_ranges,
-                "gate_labels": profile.gate_labels,
-                "grid_complete": profile.grid_complete,
-                "wavelength_center_nm": named_center if named_center is not None else spectral_center,
-                "wavelength_center_source": (
-                    "filename" if named_center is not None
-                    else "spectral axis" if spectral_center is not None
-                    else ""
-                ),
-            }
-            if cache is not None:
-                cache.put(
-                    identity,
-                    modified_ns=modified_ns,
-                    size_bytes=size_bytes,
-                    metadata=cached,
-                )
+            cached = _inspection_metadata(path, profile)
+            _cache_inspection(cache, path, (modified_ns, size_bytes), cached)
         inspected.append(
             {
                 "path": path,
@@ -2011,8 +2048,9 @@ def discover_drr_sources(
     return _assemble_drr_sources(experiment_root, inspected, include_history=include_history)
 
 
-def preview_drr_sources(root: str | Path, *, include_all: bool = False) -> list[DrrSource]:
-    """List identities without reading spectra or certifying acquisition grids."""
+def preview_drr_sources(root: str | Path, *, include_all: bool = False,
+                        cache: DrrSourceCache | None = None) -> list[DrrSource]:
+    """List identities, retaining validated summaries for unchanged files."""
     experiment_root = Path(root).resolve()
     inspected = []
     for path in drr_source_paths(experiment_root, include_all=include_all):
@@ -2024,11 +2062,13 @@ def preview_drr_sources(root: str | Path, *, include_all: bool = False) -> list[
         except OSError:
             continue
         center = extract_wavelength_center_nm(path.name)
+        cached = (cache.get(str(path.resolve()).casefold(), modified_ns=stat.st_mtime_ns,
+                            size_bytes=stat.st_size) if cache is not None else None)
         inspected.append(dict(path=path, identity=str(path.resolve()).casefold(),
                               modified=stat.st_mtime, size_bytes=stat.st_size,
-                              gate_varies=None, frame_count=None,
+                              **(cached if cached is not None else dict(gate_varies=None, frame_count=None,
                               wavelength_center_nm=center,
-                              wavelength_center_source='filename' if center is not None else ''))
+                              wavelength_center_source='filename' if center is not None else ''))))
     return _assemble_drr_sources(experiment_root, inspected, include_history=False)
 
 

@@ -75,10 +75,10 @@ class MenuToolbarHostTests(unittest.TestCase):
             self.assertFalse(host.main_toolbar.isMovable())
             self.assertEqual(
                 [action.text() for action in host.main_toolbar.actions()],
-                ["Reload", "Update now", "Save PNG + DAT", "", ""],
+                ["", "", "Reload", "Update now", "Save PNG + DAT"],
             )
-            self.assertEqual(host.main_toolbar.actions()[3], host.source_separator_action)
-            self.assertEqual(host.main_toolbar.actions()[4], host.source_widget_action)
+            self.assertEqual(host.main_toolbar.actions()[0], host.source_widget_action)
+            self.assertEqual(host.main_toolbar.actions()[1], host.source_separator_action)
             self.assertIs(host.source_widget_action.defaultWidget(), source)
             self.assertIs(host.main_toolbar.widgetForAction(host.source_widget_action), source)
             self.assertEqual(host.load_action.toolTip(), "Reload data for the active tab")
@@ -115,6 +115,18 @@ class MenuToolbarHostTests(unittest.TestCase):
             self.assertFalse(host.load_action.icon().isNull())
             self.assertFalse(host.plot_action.icon().isNull())
             self.assertFalse(host.save_action.icon().isNull())
+            self.assertEqual(
+                host.main_toolbar.widgetForAction(host.save_action).property("appRole"),
+                "toolbarPrimaryAction",
+            )
+            self.assertEqual(
+                host.main_toolbar.widgetForAction(host.load_action).property("appRole"),
+                "toolbarSecondaryAction",
+            )
+            self.assertEqual(
+                host.main_toolbar.widgetForAction(host.save_action).accessibleIdentifier(),
+                "command.export",
+            )
             self.assertEqual(host.main_toolbar.toolButtonStyle(), Qt.ToolButtonTextBesideIcon)
             self.assertEqual(host.panels_toolbar.toolButtonStyle(), Qt.ToolButtonTextBesideIcon)
             self.assertEqual(host.panels_toolbar.objectName(), "panelsToolbar")

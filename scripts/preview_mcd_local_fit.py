@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
 
 from core.mcd import McdSettings, process_mcd
 from core.mcd_peak_shift import analyze_local_peak_shift, source_spectra
+from core.typography import save_figure
 
 
 def main() -> None:
@@ -55,7 +56,7 @@ def main() -> None:
         summary["channels"][channel] = {"n_rows": len(centers), "n_valid": sum(value is not None for value in centers), "centers_ev": centers}
     fig.suptitle("YZ365 MCD local mixed absorptive/dispersive fit · seed 1.6436 eV")
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(args.output, dpi=160)
+    save_figure(fig, args.output, dpi=160)
     plt.close(fig)
     args.output.with_suffix(".json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps({"preview": str(args.output), "summary": str(args.output.with_suffix('.json'))}, indent=2))

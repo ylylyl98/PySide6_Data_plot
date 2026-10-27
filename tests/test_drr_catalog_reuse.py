@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+from io import StringIO
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,11 +11,55 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication, QDialog, QListWidget
+from PySide6.QtCore import QSettings
 
 from core.drr_sources import DrrSourceCache, discover_drr_sources, inspect_csv_gate
 
 
 class DrrCatalogReuseTests(unittest.TestCase):
+    def inspection_cache(self, root):
+        cache = DrrSourceCache(root / "drr-inspection.json", load_on_init=False)
+        identity = 'C:/data/测量 "one".csv'
+        metadata = dict(gate_varies=True, frame_count=2, gate_grid=((-0., 1e-12), (2.5, 3.)),
+            spectral_grid=(700.1, 701.2), gate_direction="Vbg increasing · Δ",
+            gate_ranges=((0., 2.5), (1e-12, 3.)), gate_labels=("Vbg", "Vtg"), grid_complete=True,
+            wavelength_center_nm=700.65, wavelength_center_source="spectral axis")
+        cache.put(identity, modified_ns=3, size_bytes=4, metadata=metadata)
+        return cache, identity, metadata
+
+    def test_save_preserves_streaming_bytes_and_round_trips_inspections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache, identity, metadata = self.inspection_cache(Path(tmp))
+            record = dict(schema_version=1, entries={identity:dict(modified_ns=3, size_bytes=4, metadata=metadata)})
+            reference = StringIO()
+            json.dump(record, reference, separators=(",", ":"))
+            cache.save()
+            self.assertEqual(cache.path.read_bytes(), reference.getvalue().encode("utf-8"))
+            restored = DrrSourceCache(cache.path)
+            self.assertEqual(restored.get(identity, modified_ns=3, size_bytes=4), metadata)
+
+    def test_save_memory_fallback_preserves_streaming_bytes_and_readback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache, identity, metadata = self.inspection_cache(Path(tmp))
+            cache.save()
+            expected = cache.path.read_bytes()
+            with patch("core.drr_sources.json.dumps", side_effect=MemoryError):
+                cache.save()
+            self.assertEqual(cache.path.read_bytes(), expected)
+            self.assertEqual(DrrSourceCache(cache.path).get(identity, modified_ns=3, size_bytes=4), metadata)
+
+    def test_save_replace_failure_keeps_old_cache_and_cleans_temporary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache, identity, metadata = self.inspection_cache(Path(tmp))
+            cache.save()
+            expected = cache.path.read_bytes()
+            cache.put("new.csv", modified_ns=5, size_bytes=6, metadata=metadata)
+            with patch.object(Path, "replace", side_effect=OSError("Synthetic locked destination")):
+                cache.save()
+            self.assertEqual(cache.path.read_bytes(), expected)
+            self.assertEqual(DrrSourceCache(cache.path).get(identity, modified_ns=3, size_bytes=4), metadata)
+            self.assertEqual(list(cache.path.parent.glob(".*.tmp")), [])
+
     def test_persistent_cache_reuses_unchanged_csv_after_restart(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -126,6 +171,9 @@ class DrrCatalogReuseTests(unittest.TestCase):
         app = QApplication.instance() or QApplication([])
         from core.drr_sources import DrrSource
         from ui_qt.main_window import MainWindow
+        temporary = tempfile.TemporaryDirectory(prefix="drr-catalog-dialog-")
+        self.addCleanup(temporary.cleanup)
+        settings = QSettings(str(Path(temporary.name) / "settings.ini"), QSettings.IniFormat)
 
         source = DrrSource(
             source="Initial Data/new_REF_760nmc_data.csv",
@@ -135,7 +183,8 @@ class DrrCatalogReuseTests(unittest.TestCase):
             modified_time=1.0,
             is_background=False,
         )
-        with patch.object(MainWindow, "_restore_last_folder", lambda _self: None):
+        with patch.object(MainWindow, "_restore_last_folder", lambda _self: None), \
+                patch("ui_qt.main_window.QSettings", return_value=settings):
             window = MainWindow()
         window.current_folder = tempfile.gettempdir()
         window.drr_available_sources = []

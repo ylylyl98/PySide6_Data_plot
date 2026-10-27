@@ -3,7 +3,7 @@
 The legacy processing widgets remain the numerical adapter. Source intent is
 separate from that adapter so changing groups cannot silently change BN to P/N.
 """
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from pathlib import Path
@@ -12,8 +12,9 @@ from threading import Event
 from PySide6.QtCore import QObject, Qt, Slot, QTimer
 from PySide6.QtWidgets import QDialog, QFileDialog
 
-from core.drr_sources import DrrBackgroundResolution, DrrMeasurementAssignment, portable_source_name
+from core.drr_sources import DrrBackgroundResolution, DrrMeasurementAssignment, portable_source_name, resolve_source_path
 from core.load_cancellation import LoadCancellation, check_load_cancelled
+from core.provenance import _digest_signature
 from ui_qt.common import Worker
 
 
@@ -22,6 +23,39 @@ FRAME_LABELS = {'first': 'First frame from each file, then average',
                 'all': 'Average all frames in each file, then average files'}
 KIND_LABELS = {'bn': 'BN', 'p': 'P only', 'n': 'N only', 'pn': 'P + N composite',
                'self': 'Self reference', 'fitted': 'Fitted background', 'custom': 'Custom background'}
+
+
+@dataclass(frozen=True)
+class _PreparedSavedAssignments:
+    root: str
+    assignments: tuple[DrrMeasurementAssignment, ...]
+    signatures: tuple[tuple[str, tuple[int, ...] | None], ...]
+
+
+def _prepare_saved_assignments(folder, assignments):
+    """Capture cheap signatures after the saved recipe's worker validation."""
+    files = tuple(dict.fromkeys(name for item in assignments
+        for name in (item.measurement_file, *item.baseline_source_files)))
+    signatures = []
+    for name in files:
+        path = resolve_source_path(folder, name)
+        signature = _digest_signature(path)
+        if signature is None:
+            raise FileNotFoundError(f'Saved DRR source is unavailable: {name}')
+        signatures.append((str(path), signature))
+    # Sidecars remain dependencies even when absent. Checking their stat does
+    # not read source contents on the GUI thread during saved-recipe adoption.
+    from core.drr_composite_background import composite_metadata_path
+    for name in dict.fromkeys(name for item in assignments for name in item.baseline_source_files):
+        path = composite_metadata_path(resolve_source_path(folder, name))
+        signatures.append((str(path), _digest_signature(path)))
+    return _PreparedSavedAssignments(str(Path(folder).resolve()), tuple(assignments), tuple(signatures))
+
+
+def _saved_assignments_current(prepared):
+    if not isinstance(prepared, _PreparedSavedAssignments):
+        return False
+    return all(_digest_signature(Path(path)) == signature for path, signature in prepared.signatures)
 
 
 def _context(owner):
@@ -64,6 +98,28 @@ def source_intent(owner):
     return None
 
 
+def _pn_candidate_pool(draft):
+    """Freeze only backgrounds already chosen; None never means folder discovery."""
+    if draft.pn_candidates is not None:
+        return tuple(dict.fromkeys(draft.pn_candidates))
+    if draft.pn_plan is not None:
+        if draft.pn_plan.automatic_candidates:
+            # A former discovery plan's unused inventory was never a user's
+            # chosen pool. Retain only references present in its assignments.
+            return tuple(dict.fromkeys(name for row in draft.pn_plan.rows
+                if row.assignment is not None for name in row.assignment.baseline_files))
+        return tuple(draft.pn_plan.candidate_files)
+    return tuple(dict.fromkeys(draft.files))
+
+
+def _pn_pool_matches_plan(folder, draft):
+    if not draft.pn_candidates or draft.pn_plan is None:
+        return False
+    def identities(names):
+        return {str(resolve_source_path(folder, name)).casefold() for name in names}
+    return identities(draft.pn_candidates) == identities(draft.pn_plan.candidate_files)
+
+
 def current_draft(owner):
     from ui_qt.drr_background_settings import BackgroundDraft
     from ui_qt.drr_region_backgrounds import frame_method
@@ -86,6 +142,12 @@ def current_draft(owner):
     plan = intent.bn_plan if intent is not None else None
     if plan is not None and tuple(plan.selected) != tuple(owner.drr_selected_files):
         plan = None
+    pn_plan = intent.pn_plan if intent is not None else None
+    if pn_plan is not None and tuple(pn_plan.selected) != tuple(owner.drr_selected_files):
+        pn_plan = None
+    saved_assignments = intent.saved_assignments if intent is not None else ()
+    if tuple(item.measurement_file for item in saved_assignments) != tuple(owner.drr_selected_files):
+        saved_assignments = ()
     which = ('first' if 'first' in mode else 'last') if kind == 'self' else frame_method(owner)
     return BackgroundDraft(kind=kind, files=files, which=which,
         regions=tuple(owner._drr_background_regions),
@@ -98,10 +160,21 @@ def current_draft(owner):
         bn_plan=plan if kind == 'bn' else None,
         bn_candidates=intent.bn_candidates if intent is not None else None,
         bn_warnings_acknowledged=bool(intent is not None and plan is intent.bn_plan
-                                      and intent.bn_warnings_acknowledged))
+                                      and intent.bn_warnings_acknowledged),
+        pn_plan=pn_plan if kind in ('p', 'n', 'pn') else None,
+        pn_candidates=(_pn_candidate_pool(intent) if intent is not None else files)
+                      if kind in ('p', 'n', 'pn') else None,
+        pn_warnings_acknowledged=bool(intent is not None and pn_plan is intent.pn_plan
+                                      and intent.pn_warnings_acknowledged),
+        saved_assignments=saved_assignments)
 
 
 def _select_files(owner, dialog, kind, current, title):
+    if kind in ('p_candidates', 'n_candidates', 'pn_candidates'):
+        files, _ = QFileDialog.getOpenFileNames(dialog, title, str(owner.current_folder),
+                                               'DRR CSV files (*.csv)')
+        return (tuple(portable_source_name(owner.current_folder, name) for name in files)
+                if files else None)
     owner._drr_source_dialog_accepted = None
     role = {'p': 'P', 'n': 'N', 'bn': 'BN', 'bn_candidates': 'BN'}.get(kind)
     role_options = {'background_role': role} if role else {}
@@ -164,7 +237,8 @@ class _InlineCatalogBridge(QObject):
                 return
         self.dialog.set_catalog_busy(True)
         selected = tuple(dict.fromkeys((*self.dialog.measurements, *self.dialog.draft.files,
-                                        *(self.dialog.draft.bn_candidates or ()))))
+                                        *(self.dialog.draft.bn_candidates or ()),
+                                        *(self.dialog.draft.pn_candidates or ()))))
         self.owner._queue_drr_catalog_refresh(auto=automatic, force=not automatic,
             old_source_files={source.source for source in self.owner.drr_available_sources},
             selected_sources=selected, catalog_only=True)
@@ -205,7 +279,9 @@ def _composite(owner, parent, draft, *, editing=False):
         selected = dialog.selection
         return replace(draft, kind='custom' if editing else 'pn', files=selected.files,
             which=selected.which, regions=selected.regions, version=selected.version,
-            allow_stale=selected.allow_stale, bn_plan=None, calibration=None)
+            allow_stale=selected.allow_stale, bn_plan=None, calibration=None,
+            pn_plan=None, pn_candidates=None if editing else tuple(selected.files),
+            pn_warnings_acknowledged=False, saved_assignments=())
     finally:
         dialog.deleteLater()
 
@@ -213,7 +289,8 @@ def _composite(owner, parent, draft, *, editing=False):
 def _custom(owner, parent, draft):
     files = _select_files(owner, parent, 'custom', draft.files, 'Choose custom background files')
     return (replace(draft, kind='custom', files=files, bn_plan=None, calibration=None,
-                    version=None, regions=(), fixed=False) if files else None)
+                    version=None, regions=(), fixed=False, pn_plan=None,
+                    pn_warnings_acknowledged=False, saved_assignments=()) if files else None)
 
 
 def _fit(owner, parent, draft):
@@ -237,7 +314,8 @@ def _fit(owner, parent, draft):
     dialog.info.setText(dialog.info.text() + ' Use in settings returns this preview. Apply there changes the main view.')
     try:
         dialog.exec()
-        return replace(draft, kind='fitted', fitted_result=result[-1], fixed=False) if result else None
+        return replace(draft, kind='fitted', fitted_result=result[-1], fixed=False,
+                       pn_plan=None, pn_warnings_acknowledged=False, saved_assignments=()) if result else None
     finally:
         dialog.stop()
         dialog.deleteLater()
@@ -277,7 +355,8 @@ def _calibration(owner, parent, draft):
     result = []
     def choose(value, original=False):
         result.append(replace(draft, kind='bn', files=tuple(files), which=which,
-            calibration={'payload': value, 'original': original}, bn_plan=None, fixed=False))
+            calibration={'payload': value, 'original': original}, bn_plan=None, fixed=False,
+            pn_plan=None, pn_warnings_acknowledged=False, saved_assignments=()))
         dialog.accept()
     dialog.applyRequested.connect(lambda value: choose(value))
     dialog.originalRequested.connect(lambda: choose(getattr(dialog, '_payload', None) or payload, True))
@@ -306,7 +385,8 @@ def edit_settings(owner, *, initial_kind=None):
     draft = applied
     if initial_kind is not None and draft.kind != initial_kind:
         draft = replace(draft, kind=initial_kind, files=(), regions=(), version=None,
-                        calibration=None, bn_plan=None, fixed=False, which='all')
+                        calibration=None, bn_plan=None, pn_plan=None,
+                        pn_warnings_acknowledged=False, saved_assignments=(), fixed=False, which='all')
     dialog = DrrBackgroundSettings(owner, current=applied, initial_draft=draft,
         measurements=tuple(owner.drr_selected_files),
         folder=str(owner.current_folder), pool=owner.thread_pool, confirmed_bn_cache=_cache(owner),
@@ -322,6 +402,11 @@ def edit_settings(owner, *, initial_kind=None):
     pending = getattr(owner, '_drr_pending_bn_plan', None)
     if pending is not None and pending.selected == tuple(owner.drr_selected_files) and draft.kind == 'bn':
         dialog.set_bn_plan(pending)
+    pending_pn = getattr(owner, '_drr_pending_pn_plan', None)
+    if (pending_pn is not None and pending_pn.selected == tuple(owner.drr_selected_files)
+            and pending_pn.kind == draft.kind
+            and Path(pending_pn.root).resolve() == Path(owner.current_folder).resolve()):
+        dialog.set_pn_plan(pending_pn)
     owner._drr_settings_dialog = dialog
     bridge = None
     if hasattr(owner, 'drr_available_sources') and hasattr(owner, '_queue_drr_catalog_refresh'):
@@ -350,6 +435,46 @@ def _validate(folder, selected, draft, axis, derivative_settings, *, progress, l
     check_load_cancelled()
     if draft.bn_plan is not None and draft.calibration is not None:
         raise ValueError('Choose the BN mapping or the calibrated reference, then review the draft again.')
+    if draft.saved_assignments:
+        from core.drr_composite_background import is_composite_background, read_composite_background
+        assignments = tuple(draft.saved_assignments)
+        if (draft.kind not in ('p', 'n', 'pn') or draft.pn_plan is not None
+                or draft.version is not None or draft.calibration is not None or draft.bn_plan is not None
+                or tuple(item.measurement_file for item in assignments) != tuple(selected)):
+            raise ValueError('Saved P/N assignments belong to another selection. Review the mapping again.')
+        prepared = _prepare_saved_assignments(folder, assignments)
+        if any(item.regions for item in assignments):
+            _validate_drr_external_spectral_grids(folder, selected, tuple(dict.fromkeys(
+                name for item in assignments for name in item.baseline_source_files)))
+        for item in assignments:
+            if item.baseline_mode != 'External':
+                raise ValueError('Saved P/N assignments require external references.')
+            _validate_drr_external_spectral_grids(folder, (item.measurement_file,), item.baseline_source_files)
+            for name in item.baseline_source_files:
+                path = resolve_source_path(folder, name)
+                if is_composite_background(path):
+                    read_composite_background(path)
+            check_load_cancelled()
+        if not _saved_assignments_current(prepared):
+            raise ValueError('Saved P/N inputs changed during verification. Review the mapping again.')
+        return draft, prepared
+    if draft.pn_plan is not None:
+        from core.drr_pn_matching import prepare_pn_confirmation
+        plan = draft.pn_plan
+        if not draft.pn_candidates:
+            raise ValueError('Choose background files before matching and applying P/N assignments.')
+        if plan.automatic_candidates:
+            raise ValueError('Rematch the selected background files before applying this P/N mapping.')
+        if draft.version is not None or draft.calibration is not None or draft.bn_plan is not None or draft.regions:
+            raise ValueError('Choose the P/N mapping or a common background, then review the draft again.')
+        if (draft.kind not in ('p', 'n', 'pn') or plan.kind != draft.kind or plan.which != draft.which
+                or not plan.ready or tuple(plan.selected) != tuple(selected)
+                or Path(plan.root).resolve() != Path(folder).resolve()):
+            raise ValueError('P/N inputs changed or matching is incomplete. Match again before applying.')
+        if not _pn_pool_matches_plan(folder, draft):
+            raise ValueError('The selected background files changed. Match the selected files again before applying.')
+        return draft, prepare_pn_confirmation(plan,
+            warnings_acknowledged=draft.pn_warnings_acknowledged)
     if draft.kind == 'bn' and draft.bn_plan is not None:
         from core.drr_bn_matching import BnMatchCache
         plan = draft.bn_plan
@@ -460,6 +585,24 @@ def _commit(owner, draft, version=None, *, start_load=True, persist=True):
         if version is None or version.plan != draft.bn_plan:
             raise ValueError('BN mapping needs verification before application.')
         _cache(owner).commit_confirm(version)
+    if draft.pn_plan is not None:
+        from core.drr_pn_matching import confirmation_is_current
+        if draft.pn_plan.automatic_candidates or not _pn_pool_matches_plan(owner.current_folder, draft):
+            raise ValueError('P/N mapping must be matched and verified within the selected background files.')
+        if version is None or getattr(version, 'plan', None) != draft.pn_plan:
+            raise ValueError('P/N mapping needs verification before application.')
+        if (tuple(draft.pn_plan.selected) != selected or draft.kind != draft.pn_plan.kind
+                or draft.which != draft.pn_plan.which
+                or Path(draft.pn_plan.root).resolve() != Path(owner.current_folder).resolve()
+                or not confirmation_is_current(version)):
+            raise ValueError('P/N inputs changed before application. Match again before applying.')
+    if draft.saved_assignments:
+        if (not isinstance(version, _PreparedSavedAssignments)
+                or version.assignments != tuple(draft.saved_assignments)
+                or tuple(item.measurement_file for item in version.assignments) != selected
+                or Path(version.root) != Path(owner.current_folder).resolve()
+                or not _saved_assignments_current(version)):
+            raise ValueError('Saved P/N inputs changed or need verification before application.')
     if draft.calibration is not None:
         from core.drr_bn_store import DrrBnStore
         payload = draft.calibration['payload']
@@ -492,6 +635,27 @@ def _commit(owner, draft, version=None, *, start_load=True, persist=True):
         common = len({(item.baseline_files, item.baseline_which) for item in resolution.assignments}) == 1
         draft = replace(draft, files=files, which='all', fixed=draft.fixed and common,
                         bn_plan=None if draft.fixed and common else plan)
+    elif draft.pn_plan is not None:
+        plan = draft.pn_plan
+        resolution = plan.resolution
+        files = tuple(dict.fromkeys(name for item in resolution.assignments for name in item.baseline_files))
+        common = len({(item.baseline_files, item.baseline_which) for item in resolution.assignments}) == 1
+        draft = replace(draft, files=files, fixed=draft.fixed and common,
+                        pn_candidates=tuple(plan.candidate_files),
+                        pn_plan=None if draft.fixed and common else plan)
+    elif draft.saved_assignments:
+        assignments = tuple(draft.saved_assignments)
+        recipes = {(item.baseline_files, item.baseline_which, item.regions) for item in assignments}
+        resolution = DrrBackgroundResolution(assignments=assignments,
+            numerical_path='common' if len(recipes) == 1 else 'heterogeneous',
+            reason='Retained the exact per-measurement recipe from the saved DRR export.')
+        files = tuple(dict.fromkeys(name for item in assignments for name in item.baseline_source_files))
+        draft = replace(draft, files=files, fixed=False, regions=())
+    if (draft.kind in ('p', 'n', 'pn') and draft.pn_plan is None
+            and (resolution is None or draft.saved_assignments)):
+        # A newly chosen common or restored reference replaces an older pool.
+        # Subsequent groups may match only among these selected source files.
+        draft = replace(draft, pn_candidates=tuple(draft.files))
     mode = ('Self (first frame)' if draft.which == 'first' else 'Self (last frame)') if draft.kind == 'self' else (
         'Fitted (sample)' if draft.kind == 'fitted' else 'External')
     _silent(owner.drr_baseline_combo, mode)
@@ -509,6 +673,7 @@ def _commit(owner, draft, version=None, *, start_load=True, persist=True):
     owner._drr_external_auto_selected = resolution is not None
     owner._drr_background_guess = None
     owner._drr_pending_bn_plan = None
+    owner._drr_pending_pn_plan = None
     if draft.kind == 'fitted':
         owner._drr_fitted_settings = draft.fitted_result or {}
         key = 'drr/fitted-background/' + hashlib.sha256(json.dumps(
@@ -517,6 +682,8 @@ def _commit(owner, draft, version=None, *, start_load=True, persist=True):
     owner._drr_background_intent, owner._drr_background_intent_root = draft, _root_key(owner)
     owner._drr_background_intent_selection = selected
     owner._drr_bn_confirmation = version if draft.bn_plan is not None else None
+    owner._drr_pn_confirmation = version if draft.pn_plan is not None else None
+    owner._drr_saved_assignments_confirmation = version if draft.saved_assignments else None
     owner.drr_controller._update_drr_selection_labels()
     owner._status(f'{KIND_LABELS[draft.kind]} applied. All {len(selected)} selected measurements remain in the average.')
     if selected and start_load:
@@ -585,6 +752,59 @@ class _FollowBnRequest(QObject):
         self.deleteLater()
 
 
+def _follow_pn(folder, selected, draft, cancelled, *, progress, log):
+    from core.drr_pn_matching import build_pn_match_plan
+    check_load_cancelled()
+    candidates = _pn_candidate_pool(draft)
+    if not candidates:
+        raise ValueError('Choose background files in Background settings before matching this measurement group.')
+    return build_pn_match_plan(folder, selected, kind=draft.kind,
+        candidate_files=candidates, which=draft.which, cancelled=cancelled)
+
+
+class _FollowPnRequest(QObject):
+    """Prepare a typed P/N suggestion for review when the measurement group changes."""
+    def __init__(self, owner, draft):
+        super().__init__(owner)
+        self.owner, self.draft = owner, draft
+        self.folder, self.selected = str(owner.current_folder), tuple(owner.drr_selected_files)
+        self.cancelled = Event()
+        self.worker = Worker(_follow_pn, self.folder, self.selected, draft, self.cancelled)
+        self.worker.signals.result.connect(self.complete, Qt.QueuedConnection)
+        self.worker.signals.error.connect(self.failed, Qt.QueuedConnection)
+        self.worker.signals.finished.connect(self.finished, Qt.QueuedConnection)
+
+    def current(self):
+        return (not self.cancelled.is_set() and not getattr(self.owner, '_is_closing', False)
+                and getattr(self.owner, '_drr_external_request', None) is self
+                and source_intent(self.owner) is self.draft
+                and str(self.owner.current_folder) == self.folder
+                and tuple(self.owner.drr_selected_files) == self.selected
+                and self.owner.drr_baseline_combo.currentText() == 'External')
+
+    @Slot(object)
+    def complete(self, plan):
+        if not self.current():
+            return
+        self.owner._drr_external_request = None
+        self.owner._drr_pending_pn_plan = plan
+        self.owner.drr_controller._update_drr_selection_labels()
+        self.owner._status(f'{KIND_LABELS[self.draft.kind]} suggestions are available. '
+            'Review the assignments and any flagged measurements in Background settings, then Apply.')
+
+    @Slot(str)
+    def failed(self, message):
+        if self.current():
+            self.owner._status('P/N matching could not finish: ' + message.split('\n\n', 1)[0])
+
+    @Slot()
+    def finished(self):
+        if getattr(self.owner, '_drr_external_request', None) is self:
+            self.owner._drr_external_request = None
+        self.owner.drr_controller._update_drr_baseline_controls()
+        self.deleteLater()
+
+
 def _bn_confirmation_ready(owner, draft):
     """File freshness alone cannot authorize a mapping for another selection."""
     from core.drr_bn_matching import confirmation_is_current
@@ -599,25 +819,65 @@ def _bn_confirmation_ready(owner, draft):
     return confirmation_is_current(prepared)
 
 
+def _pn_confirmation_ready(owner, draft):
+    from core.drr_pn_matching import confirmation_is_current
+    prepared = getattr(owner, '_drr_pn_confirmation', None)
+    plan = draft.pn_plan
+    selected = tuple(owner.drr_selected_files)
+    if (plan is None or getattr(prepared, 'plan', None) != plan
+            or plan.kind != draft.kind or plan.which != draft.which
+            or tuple(plan.selected) != selected
+            or not getattr(owner, '_drr_assignments_automatic', False)
+            or tuple(getattr(owner, '_drr_assignments', ())) != tuple(plan.resolution.assignments)
+            or getattr(owner, '_drr_background_intent_selection', None) != selected
+            or str(Path(plan.root).resolve()).casefold() != _root_key(owner)):
+        return False
+    return confirmation_is_current(prepared)
+
+
+def _saved_confirmation_ready(owner, draft):
+    prepared = getattr(owner, '_drr_saved_assignments_confirmation', None)
+    return bool(draft.saved_assignments
+        and isinstance(prepared, _PreparedSavedAssignments)
+        and prepared.assignments == tuple(draft.saved_assignments)
+        and getattr(owner, '_drr_assignments_automatic', False)
+        and tuple(getattr(owner, '_drr_assignments', ())) == prepared.assignments
+        and tuple(item.measurement_file for item in prepared.assignments) == tuple(owner.drr_selected_files)
+        and getattr(owner, '_drr_background_intent_selection', None) == tuple(owner.drr_selected_files)
+        and str(Path(prepared.root).resolve()).casefold() == _root_key(owner)
+        and _saved_assignments_current(prepared))
+
+
 def follow_source_type(owner, *, selection_changed=False, restore_saved=True):
     """Handle an explicit type without invoking the legacy cross-type resolver."""
     draft = source_intent(owner)
     if draft is None or owner.drr_baseline_combo.currentText() != 'External':
         return False
-    if owner.drr_pin_baseline_chk.isChecked() and draft.bn_plan is None:
+    if (owner.drr_pin_baseline_chk.isChecked() and draft.bn_plan is None
+            and draft.pn_plan is None and not draft.saved_assignments):
         return True
     if restore_saved:
         selection_changed = (selection_changed and tuple(owner.drr_selected_files)
                              != getattr(owner, '_drr_background_intent_selection', None))
-    if selection_changed and restore_saved:
+    explicit_pn_pool = (draft.kind in ('p', 'n', 'pn')
+                        and (draft.pn_plan is not None or draft.pn_candidates is not None))
+    if (selection_changed and restore_saved
+            and not explicit_pn_pool
+            and not (draft.kind in ('p', 'n', 'pn') and not _pn_candidate_pool(draft))):
         from ui_qt.drr_saved_background import begin_saved_group_restore
         if begin_saved_group_restore(owner, draft):
             return True
-    if not selection_changed and draft.bn_plan is None:
+    if (not selection_changed and draft.bn_plan is None and draft.pn_plan is None and not draft.saved_assignments
+            and not (draft.kind in ('p', 'n', 'pn') and not _pn_candidate_pool(draft))):
         return True
     if not selection_changed and draft.kind == 'bn' and draft.bn_plan is not None:
         if _bn_confirmation_ready(owner, draft):
             return True
+    if not selection_changed and draft.kind in ('p', 'n', 'pn') and draft.pn_plan is not None:
+        if _pn_confirmation_ready(owner, draft):
+            return True
+    if not selection_changed and draft.saved_assignments and _saved_confirmation_ready(owner, draft):
+        return True
     # Preserve the source type, but do not reuse a common background for a new
     # group unless the user explicitly chose Fixed current background.
     owner._drr_assignments = ()
@@ -627,6 +887,7 @@ def follow_source_type(owner, *, selection_changed=False, restore_saved=True):
     owner._drr_background_regions = ()
     owner._drr_baseline_user_selected = True
     owner._drr_external_auto_selected = False
+    owner._drr_pending_pn_plan = None
     owner._invalidate_drr_for_background_selection(
         f'{KIND_LABELS[draft.kind]}: open Background settings to review this group. The source type has been retained.')
     owner.drr_controller._update_drr_selection_labels()
@@ -637,15 +898,30 @@ def follow_source_type(owner, *, selection_changed=False, restore_saved=True):
             request = _FollowBnRequest(owner, draft)
             owner._drr_external_request = request
             owner.thread_pool.start(request.worker)
+    elif draft.kind in ('p', 'n', 'pn') and owner.drr_selected_files:
+        if not _pn_candidate_pool(draft):
+            owner.drr_controller._cancel_auto_external()
+            owner._status(f'{KIND_LABELS[draft.kind]}: choose background files in Background settings, '
+                          'then match those files to this measurement group.')
+            return True
+        request = getattr(owner, '_drr_external_request', None)
+        if not isinstance(request, _FollowPnRequest) or request.selected != tuple(owner.drr_selected_files):
+            owner.drr_controller._cancel_auto_external()
+            request = _FollowPnRequest(owner, draft)
+            owner._drr_external_request = request
+            owner.thread_pool.start(request.worker)
     return True
 
 
 def background_ready_for_load(owner):
-    """A fast signature guard prevents loading a changed automatic BN recipe."""
+    """A fast signature guard prevents loading a changed automatic recipe."""
     draft = source_intent(owner)
-    if draft is None or draft.bn_plan is None or owner.drr_baseline_combo.currentText() != 'External':
+    if (draft is None or owner.drr_baseline_combo.currentText() != 'External'
+            or (draft.bn_plan is None and draft.pn_plan is None and not draft.saved_assignments)):
         return True
-    if _bn_confirmation_ready(owner, draft):
+    if ((draft.bn_plan is not None and _bn_confirmation_ready(owner, draft))
+            or (draft.pn_plan is not None and _pn_confirmation_ready(owner, draft))
+            or (draft.saved_assignments and _saved_confirmation_ready(owner, draft))):
         return True
     follow_source_type(owner, selection_changed=True)
     return False

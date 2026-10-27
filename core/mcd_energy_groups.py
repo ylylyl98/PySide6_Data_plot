@@ -4,6 +4,7 @@ Centers are saved window coordinates, never fitted resonance energies.
 """
 from collections import Counter
 import numpy as np
+from core.typography import with_plot_font
 
 
 def initial_energy_groups(records, tolerance_mev=5.0):
@@ -105,6 +106,7 @@ def energy_record_colors(records, groups, group_colors, variable='E-field'):
     return result
 
 
+@with_plot_font
 def draw_energy_slope_panels(figure, records, groups, metrics, branches,
                              tolerance_mev=5., palette='tab10', group_colors=None, manual_record_ids=(), record_colors=None, panel="both"):
     """Return point artists with exact record identities for hover and picking."""
@@ -172,6 +174,7 @@ def draw_energy_slope_panels(figure, records, groups, metrics, branches,
     return point_artists
 
 
+@with_plot_font
 def temperature_curve_legend(figure, records, groups, colors):
     """Exact temperature swatches per group, shared by preview and export."""
     from matplotlib.lines import Line2D
@@ -215,6 +218,7 @@ def temperature_curve_legend(figure, records, groups, colors):
         figure.tight_layout(rect=(0, box.height/figure.bbox.height+.035, 1, .92))
 
 
+@with_plot_font
 def draw_temperature_slope_panels(figure, records, groups, metrics, branches,
                                   palette='tab10', group_colors=None):
     """Separate metric panels; fixed group hue and branch style, never cross groups."""

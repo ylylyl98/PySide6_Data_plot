@@ -241,6 +241,15 @@ jobs:
       - name: Build Windows application
         if: github.event_name != 'pull_request'
         run: .\build_windows.bat
+      - name: Upload native Quick packaged-check evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-quick-packaged-checks
+          path: |
+            build/frozen-quick-report.json
+            build/frozen-quick-report-artifacts/
+          if-no-files-found: warn
       - name: Verify executable
         if: github.event_name != 'pull_request'
         shell: pwsh

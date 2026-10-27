@@ -64,6 +64,7 @@ from core.processing import apply_sg_derivative_energy, clamp_sg_window, nearest
 from ui_qt.common import Worker, WrappedFilenameDelegate
 from ui_qt.theme import alias as theme_alias
 from ui_qt.source_picker_dialog import SourcePickerDialog
+from ui_qt.spectrum_caption import set_spectrum_title
 
 
 # ``None`` is a valid explicit request for the baseline DR/R product, so the
@@ -1118,7 +1119,7 @@ class DrrController:
             if all('pn backgrounds' in str(name).replace('\\', '/').casefold().split('/') for name in names):
                 return True
             return bool(intent is not None and intent.kind == 'pn'
-                        and names == tuple(intent.files))
+                        and all(name in intent.files for name in names))
 
         def _source_frames(names) -> str:
             version = (intent.version if intent is not None and intent.kind == 'pn'
@@ -1275,11 +1276,13 @@ class DrrController:
                     + '\nMissing region background: ' + ', '.join(Path(name).name for name in missing))
         from ui_qt.drr_background_settings_workflow import source_intent, KIND_LABELS
         intent = source_intent(self._owner)
-        pending_plan = getattr(self, '_drr_pending_bn_plan', None)
+        pending_plan = (getattr(self, '_drr_pending_pn_plan', None)
+                        if intent is not None and intent.kind in {'p', 'n', 'pn'}
+                        else getattr(self, '_drr_pending_bn_plan', None))
         if (self.drr_baseline_combo.currentText() == 'External' and not self.drr_baseline_files_manual
                 and intent is not None):
             self.drr_baseline_summary.setText(
-                'BN: suggestions available — review in Background settings' if pending_plan is not None
+                f'{KIND_LABELS[intent.kind]}: suggestions available — review in Background settings' if pending_plan is not None
                 else f'{KIND_LABELS[intent.kind]}: choose a background for this group')
         self._update_drr_baseline_controls()
         self._repopulate_drr_yaxis()
@@ -2933,7 +2936,7 @@ class DrrController:
                     self._drr_spectrum_lines = {**getattr(self, "_drr_spectrum_lines", {}), key: line}
                 else:
                     line.set_data(x, np.asarray(y, float))
-                axis.set_title(f"{product.cbar_label} @ {gate_used:.6g} V")
+                set_spectrum_title(axis, f"{product.cbar_label} @ {gate_used:.6g} V")
                 axis.set_xlabel("Photon Energy (eV)")
                 axis.set_ylabel(
                     "d²(DR/R)/dE²" if key == "second" else product.cbar_label
@@ -2958,7 +2961,7 @@ class DrrController:
             self._drr_spectrum_line = line
         else:
             line.set_data(x, np.asarray(y, float))
-        self._drr_spectrum_ax.set_title(f"Spectrum @ {gate_used:.6g} V")
+        set_spectrum_title(self._drr_spectrum_ax, f"Spectrum @ {gate_used:.6g} V")
         self._drr_spectrum_ax.set_xlabel("Photon Energy (eV)")
         self._drr_spectrum_ax.set_ylabel(cube.cbar_label)
         self._drr_spectrum_ax.grid(alpha=0.25)

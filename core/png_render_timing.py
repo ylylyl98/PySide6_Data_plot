@@ -5,6 +5,7 @@ from time import perf_counter
 
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.image import imsave
+from core.typography import matplotlib_font_context
 
 _context = ContextVar('png_render_timings', default=None)
 _labels = {'build': 'Building PNG', 'title': 'Fitting PNG title',
@@ -38,10 +39,18 @@ def time_png_stage(name):
 
 
 class TimedPngCanvas(FigureCanvasAgg):
+    def draw(self):
+        with matplotlib_font_context(self.figure):
+            return super().draw()
+
+    def print_figure(self, *args, **kwargs):
+        with matplotlib_font_context(self.figure):
+            return super().print_figure(*args, **kwargs)
+
     def _print_pil(self, filename_or_obj, fmt, pil_kwargs, metadata=None):
         # Agg's PIL path calls FigureCanvasAgg.draw directly, so overriding
         # canvas.draw would miss the save. Keep its one-draw sequence here.
-        with time_png_stage('draw'):
+        with matplotlib_font_context(self.figure), time_png_stage('draw'):
             FigureCanvasAgg.draw(self)
         with time_png_stage('encode_write'):
             imsave(filename_or_obj, self.buffer_rgba(), format=fmt, origin='upper',

@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 from ui_qt.matplotlib_theme import ThemeAwareFigureCanvasQTAgg
 from ui_qt.common import QDoubleSpinBox
 from ui_qt.time_format import format_local_timestamp
+from core.typography import matplotlib_font_context
 
 
 def fit_display_segments(fit: Mapping[str, Any], *, visible_min: float | None = None,
@@ -1870,8 +1871,9 @@ class McdUnifiedView(QWidget):
                 # A normal full draw already laid out text and painted the
                 # figure. Rebuild clean panel layers in that same renderer.
                 renderer = self.canvas.get_renderer()
-                for axis in self.figure.axes:
-                    axis.draw(renderer)
+                with matplotlib_font_context(self.figure):
+                    for axis in self.figure.axes:
+                        axis.draw(renderer)
             for key, axis in self.axes.items():
                 if axis is not None:
                     self._blit_backgrounds[key] = self.canvas.copy_from_bbox(axis.bbox)
@@ -1911,17 +1913,22 @@ class McdUnifiedView(QWidget):
     def _paint_panel_layers(self, key: str, artists: Iterable[Any]) -> None:
         axis = self.axes[key]
         markers = self._center_artists(key) if key in ('mcd_map', 'spectra', 'mcd_spectra') else []
-        for artist in artists:
-            if artist not in markers and artist.get_visible():
-                axis.draw_artist(artist)
-        if markers:
-            self._center_backgrounds[key] = self.canvas.copy_from_bbox(axis.bbox)
-            for artist in markers:
-                if artist.get_visible():
+        with matplotlib_font_context(axis):
+            for artist in artists:
+                if artist not in markers and artist.get_visible():
                     axis.draw_artist(artist)
+            if markers:
+                self._center_backgrounds[key] = self.canvas.copy_from_bbox(axis.bbox)
+                for artist in markers:
+                    if artist.get_visible():
+                        axis.draw_artist(artist)
 
     def _redraw_trace_panel(self) -> None:
         """Redraw the trace axes and tick labels without touching other panels."""
+        with matplotlib_font_context(self.figure):
+            self._paint_trace_panel()
+
+    def _paint_trace_panel(self) -> None:
         from matplotlib.patches import Rectangle
         from matplotlib.transforms import Bbox, IdentityTransform
         key = 'mcd_vs_b'
@@ -1965,9 +1972,10 @@ class McdUnifiedView(QWidget):
                     continue
                 if center_only and key in self._center_backgrounds:
                     self.canvas.restore_region(self._center_backgrounds[key])
-                    for artist in self._center_artists(key):
-                        if artist.get_visible():
-                            axis.draw_artist(artist)
+                    with matplotlib_font_context(axis):
+                        for artist in self._center_artists(key):
+                            if artist.get_visible():
+                                axis.draw_artist(artist)
                 else:
                     self.canvas.restore_region(background)
                     self._paint_panel_layers(key, dynamic.get(key, ()))
@@ -2003,16 +2011,17 @@ class McdUnifiedView(QWidget):
             except (AttributeError, RuntimeError, ValueError):
                 backgrounds = {}
         self._blit_backgrounds = backgrounds
-        for artists in dynamic.values():
-            for artist in artists:
-                try:
-                    # Animated artists were skipped by this full draw. Paint
-                    # them into its renderer now, before Qt presents it.
-                    if artist.get_animated() and artist.axes is not None and artist.get_visible():
-                        artist.axes.draw_artist(artist)
-                    artist.set_animated(False)
-                except AttributeError:
-                    pass
+        with matplotlib_font_context(self.figure):
+            for artists in dynamic.values():
+                for artist in artists:
+                    try:
+                        # Animated artists were skipped by this full draw. Paint
+                        # them into its renderer now, before Qt presents it.
+                        if artist.get_animated() and artist.axes is not None and artist.get_visible():
+                            artist.axes.draw_artist(artist)
+                        artist.set_animated(False)
+                    except AttributeError:
+                        pass
         if not self._blit_backgrounds and self.axes and not self._blit_rebuild_pending:
             self._blit_rebuild_pending = True
             QTimer.singleShot(0, self._rebuild_blit_after_full_draw)

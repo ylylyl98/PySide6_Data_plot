@@ -30,11 +30,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--scale", choices=SCALES, default="1")
     parser.add_argument("--width", type=int, default=1320)
     parser.add_argument("--height", type=int, default=820)
-    parser.add_argument("--sidebar-width", type=int, choices=range(320, 561), default=380)
+    parser.add_argument("--sidebar-width", type=int, choices=range(320, 561), default=320)
     demo = parser.add_mutually_exclusive_group()
     demo.add_argument("--demo-data", dest="demo_data", action="store_true", default=True)
     demo.add_argument("--no-demo-data", dest="demo_data", action="store_false")
     parser.add_argument("--screenshot", type=Path)
+    parser.add_argument("--drr-display", choices=("quick", "widgets"), default="quick")
     return parser.parse_args(argv)
 
 
@@ -333,7 +334,7 @@ def _expand_safe_sections(window, workflow: str) -> None:
             advanced.click()
 
 
-def build_preview_window(*, workflow: str, theme: str, scale: str, width: int, height: int, sidebar_width: int, demo_data: bool = True):
+def build_preview_window(*, workflow: str, theme: str, scale: str, width: int, height: int, sidebar_width: int, demo_data: bool = True, drr_display_backend: str = "widgets"):
     """Return ``(window, app, isolated_settings_path)`` for tests/tools."""
     os.environ["QT_SCALE_FACTOR"] = scale
     mpl_cache = tempfile.TemporaryDirectory(prefix="dptk-preview-mpl-")
@@ -361,7 +362,7 @@ def build_preview_window(*, workflow: str, theme: str, scale: str, width: int, h
     presentation_module.QSettings = isolated_settings_class
     try:
         with _deny_destructive_methods(MainWindow, PresentationBuilderWidget):
-            window = MainWindow()
+            window = MainWindow(drr_display_backend=drr_display_backend)
     finally:
         main_window_module.QSettings = original_main_settings
         presentation_module.QSettings = original_presentation_settings
@@ -420,6 +421,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             height=args.height,
             sidebar_width=args.sidebar_width,
             demo_data=args.demo_data,
+            drr_display_backend=args.drr_display,
         )
         window.show()
         app.processEvents()

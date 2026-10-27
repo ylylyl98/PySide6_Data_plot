@@ -1,4 +1,6 @@
 """Explicit per-series group mapping and common-range CW comparisons."""
+
+from core.typography import save_figure
 import copy
 import csv
 import json
@@ -442,7 +444,7 @@ class ThetaComparisonDialog(QDialog):
                 writer.writerows({k:json.dumps(v) if isinstance(v,dict) else v for k,v in r.items()} for r in records)
         for axis in ('efield','doping','sensitivity'):
             fig=Figure(figsize=(16,6) if method=='all' else (9,6),layout='constrained')
-            draw_comparison(fig,self.result,axis,self._visible_groups(),limits,reliable_y,method=method);fig.savefig(target/f'theta_{axis}.png',dpi=180)
+            draw_comparison(fig,self.result,axis,self._visible_groups(),limits,reliable_y,method=method);save_figure(fig, target/f'theta_{axis}.png',dpi=180)
         (target/'diagnostics.txt').write_text(self.details.toPlainText(),encoding='utf-8')
         return target
 

@@ -310,12 +310,12 @@ class SplitScaleControlTests(unittest.TestCase):
         self.app.processEvents()
         self.assertTrue(overlay.isVisible())
 
-    def test_data_source_spacing_is_tight_at_default_sidebar_width(self) -> None:
+    def test_source_toolbar_keeps_compact_horizontal_spacing(self) -> None:
         self.window.show()
         self.app.processEvents()
         margins = self.window.data_source_context.layout().contentsMargins()
         self.assertEqual((margins.left(), margins.top(), margins.right(), margins.bottom()), (0, 0, 0, 0))
-        self.assertEqual(self.window.data_source_context.layout().spacing(), 0)
+        self.assertEqual(self.window.data_source_context.layout().spacing(), 6)
 
     def test_sidebar_can_resize_within_bounds_and_canvas_remains_dominant(self) -> None:
         splitter = self.window.workspace_splitter

@@ -1,7 +1,7 @@
 """PL scale selection, independent color ranges and linked map layout."""
 from dataclasses import replace
 
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QToolButton, QCheckBox, QLabel
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QToolButton, QLabel
 from core.plotting import plot_pl, resolve_split_boundary
 from core.processing import compute_auto_limits
 
@@ -29,8 +29,6 @@ def build_bar(owner):
     owner.pl_scale_hint = QLabel('Color controls: Linear')
     row.addWidget(owner.pl_scale_hint)
     row.addStretch(1)
-    owner.pl_export_pair_chk = QCheckBox('Include side-by-side PNG')
-    row.addWidget(owner.pl_export_pair_chk)
     bar.setVisible(False)
     owner.pl_plot_view_bar = bar
     return bar
@@ -186,19 +184,26 @@ def draw(owner, cube):
     params = parameters(owner, cube)
     both = owner.pl_view_side_btn.isChecked()
     names = ('linear', 'log') if both else ('log' if owner.pl_log_chk.isChecked() else 'linear',)
-    grid = owner.figure.add_gridspec(2, len(names), height_ratios=[1.25, 1], hspace=.4, wspace=.36)
+    # Start with seventy percent for the map; the shared canvas divider keeps
+    # the user's current split while these linked axes are rebuilt.
+    grid = owner.figure.add_gridspec(
+        2, len(names), height_ratios=[.7, .3], hspace=.20, wspace=.36,
+        top=.90, bottom=.13, right=.93,
+    )
+    grid._dptk_inspection_header_height = 46
     owner._pl_heatmap_axes = {}
     first = None
     for column, name in enumerate(names):
-        panel_grid = grid[0, column].subgridspec(1, 2, width_ratios=[1, .035], wspace=.12)
-        ax = owner.figure.add_subplot(panel_grid[0, 0], sharex=first, sharey=first)
-        cax = owner.figure.add_subplot(panel_grid[0, 1])
+        ax = owner.figure.add_subplot(grid[0, column], sharex=first, sharey=first)
         if first is None:
             first = ax
         owner._pl_heatmap_axes[name] = ax
         panel = params[name]
         render = plot_pl(ax, cube, replace(panel, title=f'{panel.title} ({name.title()})'))
-        owner._add_heatmap_colorbar(render, cax, label=panel.cbar_label)
+        ax.set_xlabel('')
+        ax.tick_params(axis='x', labelbottom=False)
+        from ui_qt.inspection_colorbar import add_inspection_colorbar
+        add_inspection_colorbar(owner.figure, render, ax, label=panel.cbar_label)
         if column:
             ax.set_ylabel('')
             ax.tick_params(axis='y', labelleft=False)
@@ -217,6 +222,11 @@ def draw(owner, cube):
         first.set_xlim(owner._pl_view_limits[0])
         first.set_ylim(owner._pl_view_limits[1])
     owner._pl_limits_from_controls = False
+    from ui_qt.inspection_splitter import bind_inspection_splitter
+    bind_inspection_splitter(
+        owner, 'PL', grids=(grid,), maps=tuple(owner._pl_heatmap_axes.values()),
+        spectra=(owner._pl_spectrum_ax,), outer_grid=grid,
+    )
 
 
 def capture_view(owner):

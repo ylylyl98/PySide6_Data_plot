@@ -331,6 +331,8 @@ def group_power_measurement_sources(folder, sources, *, angle_refs=None,
     Unlike Compare grouping, power values never create buckets.  A source is
     one complete sweep, so unequal KK/KKp grids remain together.
     """
+    if not sources:
+        return []
     buckets = {}
     metadata_catalog = _power_metadata_index(folder)
     from core.power_manifest import manifest_assignments

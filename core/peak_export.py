@@ -1,4 +1,6 @@
 """Explicit, collision-safe CSV/JSON/PNG export of a Peak Analysis snapshot."""
+
+from core.typography import save_figure
 import csv
 from datetime import datetime
 from pathlib import Path
@@ -32,5 +34,5 @@ def export_dataset(folder, dataset):
     atomic_json(target/'analysis.json', {k: v for k, v in dataset.items() if k != 'cube'})
     fig = Figure(figsize=(8, 7)); FigureCanvasAgg(fig)
     build_figure(dataset, dataset['row'], True, bool(result.get('fits')), fig)
-    fig.savefig(target/'peaks.png', dpi=180); fig.clear()
+    save_figure(fig, target/'peaks.png', dpi=180); fig.clear()
     return str(target)

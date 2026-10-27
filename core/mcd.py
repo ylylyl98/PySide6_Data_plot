@@ -12,6 +12,8 @@ retaining a record of the reference used.
 
 from __future__ import annotations
 
+from core.typography import save_figure
+
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import csv
@@ -31,35 +33,10 @@ from scipy.signal import find_peaks, peak_widths, savgol_filter
 from app_version import __version__
 from core.loader import DataCube
 from core.load_cancellation import check_load_cancelled
-from core.source_identity import match_source_identity
+from core.mcd_settings import McdSettings
+from core.mcd_catalog import discover_mcd_processing_status
 
 EV_NM = 1239.841984
-
-
-@dataclass(frozen=True)
-class McdSettings:
-    pos_angle: float | None = None
-    neg_angle: float | None = None
-    max_sequence_gap: int = 3
-    max_delta_b: float = 0.1
-    pair_b_alignment: Literal["direct", "interpolate"] = "direct"
-    zero_window_t: float = 0.02
-    reference_mode: Literal["nearest", "window"] = "nearest"
-    bin_decimals: int = 3
-    gain_mode: Literal["per_wavelength", "smoothed", "scalar"] = "per_wavelength"
-    gain_smooth_window: int = 15
-    gain_smooth_poly: int = 2
-    correction_mode: Literal["global", "pair_scale", "pair_affine", "pair_spectral"] = "pair_spectral"
-    spectral_order: Literal[1, 2] = 2
-    background_ranges_ev: tuple[tuple[float, float], ...] = ()
-    background_selection: Literal["auto", "manual", "suggested"] = "auto"
-    suggestion_protected_ranges_ev: tuple[tuple[float, float], ...] = ()
-    manual_protected_ranges_ev: tuple[tuple[float, float], ...] = ()
-    suggestion_linear_validation_rms: float | None = None
-    suggestion_quadratic_validation_rms: float | None = None
-    suggestion_algorithm: str | None = None
-    dark_pos_file: str | None = None
-    dark_neg_file: str | None = None
 
 
 @dataclass
@@ -394,62 +371,6 @@ def detect_angles(path: str) -> tuple[float, ...]:
         raise ValueError("MCD angle column cannot contain missing values.")
     angles = _coalesce_angle_readback(angles)
     return tuple(float(value) for value in sorted(np.unique(angles)))
-
-
-def discover_mcd_processing_status(
-    experiment_root: str | Path,
-    sources: list[str] | tuple[str, ...],
-    *, ambiguous_sources: set[str] | None = None,
-) -> dict[str, str]:
-    """Map raw MCD sources to the newest matching saved-analysis timestamp."""
-    root = Path(experiment_root)
-    metadata_root = root / "Processed Data" / "MCD"
-    if not metadata_root.is_dir():
-        return {}
-    raw_sources = [str(source) for source in sources]
-    status: dict[str, str] = {}
-    ambiguous: set[str] = set()
-    try:
-        settings_files = metadata_root.rglob("*_MCD_settings*.json")
-        for settings_path in settings_files:
-            try:
-                payload = json.loads(settings_path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError):
-                continue
-            if not isinstance(payload, dict):
-                continue
-            if str(payload.get("workflow", "")).casefold() != "mcd":
-                continue
-            descriptor = payload.get("sources", [])
-            if isinstance(descriptor, list) and descriptor:
-                descriptor = next((item for item in descriptor if isinstance(item, dict) and str(item.get("role", "")).casefold() == "measurement"), {})
-            elif not isinstance(descriptor, dict):
-                descriptor = {}
-            matched, uncertain = match_source_identity(
-                root, raw_sources,
-                relative_path=str(payload.get("source_relative_path", descriptor.get("source_relative_path", "") if descriptor else "")),
-                path=str(payload.get("source_path", descriptor.get("source_path", "") if descriptor else "")),
-                legacy_name=str(payload.get("source_file", descriptor.get("source_file", descriptor.get("filename", "")) if descriptor else payload.get("filename", ""))),
-            )
-            ambiguous.update(uncertain)
-            if matched is None:
-                continue
-            created = str(payload.get("created_utc", "")).strip()
-            if not created:
-                try:
-                    created = datetime.fromtimestamp(
-                        settings_path.stat().st_mtime, timezone.utc
-                    ).isoformat()
-                except OSError:
-                    created = "processed"
-            if created > status.get(matched, ""):
-                status[matched] = created
-    except OSError:
-        return status
-    ambiguous.difference_update(status)
-    if ambiguous_sources is not None:
-        ambiguous_sources.update(ambiguous)
-    return status
 
 
 def _pair_angles(
@@ -2137,7 +2058,7 @@ def export_mcd_analysis_bundle(
         metric_labels.append(f"{label} (right axis)" if metric_name == "integral" else label)
     if len(metric_handles) > 1:
         axis.legend(metric_handles, metric_labels, fontsize=7.2, frameon=True, framealpha=0.82, loc=annotation_layout["metric_legend"], borderpad=0.35, labelspacing=0.28, handlelength=2.4)
-    fig.savefig(figure_path, dpi=fig.dpi, facecolor="white", edgecolor="none", pad_inches=0)
+    save_figure(fig, figure_path, dpi=fig.dpi, facecolor="white", edgecolor="none", pad_inches=0)
 
     # Pairing diagnostics depend on the loaded/pairing analysis, not the
     # integration center. Keep one stable file instead of one copy per center.

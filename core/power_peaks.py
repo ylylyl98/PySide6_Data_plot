@@ -1,5 +1,7 @@
 """Single-peak analysis of power sweeps, in photon energy coordinates."""
 
+from core.typography import save_figure
+
 from dataclasses import dataclass, asdict, field
 import csv
 import json
@@ -279,5 +281,5 @@ def export_peak_analysis(folder, payload):
     if payload['metric'] == 'Integrated area':
         from core.power_law_analysis import draw_power_laws
         draw_power_laws(axes[0], payload.get('power_laws', []))
-    figure.savefig(base.with_suffix(".png"), dpi=200)
+    save_figure(figure, base.with_suffix(".png"), dpi=200)
     return base.with_suffix(".csv")
