@@ -148,14 +148,20 @@ class SidebarLayoutRegressionTests(unittest.TestCase):
                 window.mcd_peak_jump_spin,
                 window.mcd_peak_max_spin,
             )
-            viewport = window.mcd_peak_shift_tab_scroll.viewport()
+            scroll = window.mcd_peak_shift_tab_scroll
+            viewport = scroll.viewport()
             for sidebar_width in (320, 380, 480, 320):
                 window.workspace_splitter.setSizes(
                     [sidebar_width, max(1, window.workspace_splitter.width() - sidebar_width)]
                 )
                 self.app.processEvents()
                 for spin in controls:
-                    window.mcd_peak_shift_tab_scroll.ensureWidgetVisible(spin)
+                    # Spin boxes expose a text-cursor rectangle to Qt, so
+                    # ensureWidgetVisible can leave the control's edge clipped.
+                    # Request the complete control bounds for this layout check.
+                    center = spin.mapTo(scroll.widget(), spin.rect().center())
+                    scroll.ensureVisible(center.x(), center.y(),
+                                         spin.width() // 2 + 1, spin.height() // 2 + 1)
                     self.app.processEvents()
                     self.assertTrue(spin.isVisible(), spin.text())
                     self.assertLessEqual(spin.width(), 240, spin.objectName() or spin.text())

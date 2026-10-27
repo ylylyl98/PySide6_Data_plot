@@ -61,7 +61,7 @@ def _isolated():
     class Cases(unittest.TestCase):
         def setUp(self):
             self.temporary = TemporaryDirectory(prefix="quick-catalog-status-")
-            self.base = Path(self.temporary.name)
+            self.base = Path(self.temporary.name).resolve()
             self.bridge = SourceCatalogBridge(settings=QSettings(str(self.base / "settings.ini"), QSettings.IniFormat))
             self.bridge._workflow, self.bridge._folder, self.bridge._only_new = "drr", str(self.base), False
             self.bridge._catalog_validated = True

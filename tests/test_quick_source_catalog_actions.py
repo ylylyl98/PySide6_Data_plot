@@ -52,7 +52,7 @@ class QuickSourceCatalogActionsTests(unittest.TestCase):
 
     def setUp(self):
         self.temporary = TemporaryDirectory(prefix="quick-catalog-actions-")
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         settings = QSettings(str(self.root / "settings.ini"), QSettings.IniFormat)
         self.bridge = _CatalogBridge(settings)
         self.paths = [str(self.root / f"measurement-{index}.csv") for index in (1, 2)]

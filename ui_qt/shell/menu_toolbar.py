@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QToolBar,
+    QStyle,
     QWidgetAction,
     QWidget,
     QSizePolicy,
@@ -151,6 +152,28 @@ class MenuToolbarHost:
             filename = nav_icons.get(action.text())
             if filename:
                 action.setIcon(themed_icon(filename, theme=theme))
+                button = navigation_toolbar.widgetForAction(action)
+                if button is not None:
+                    # Match the existing icon-only presentation with its
+                    # compact padding, keeping PNG inputs out of overflow.
+                    set_fluent_property(button, "fluentIconOnly", True)
+                    apply_accessible_identity(button, name=action.text(), description=action.toolTip())
+        # Give these commands priority over the shrinkable workspace title.
+        # Later tools and the cursor readout can still use native overflow.
+        prefix = []
+        for action in navigation_toolbar.actions():
+            widget = navigation_toolbar.widgetForAction(action)
+            if widget is None or not action.isVisible():
+                continue
+            prefix.append(widget)
+            if widget.objectName() == "png_width_spin":
+                layout = navigation_toolbar.layout()
+                margins = layout.contentsMargins()
+                width = sum(max(item.minimumWidth(), item.sizeHint().width()) for item in prefix)
+                width += len(prefix) * max(0, layout.spacing()) + margins.left() + margins.right()
+                width += navigation_toolbar.style().pixelMetric(QStyle.PM_ToolBarExtensionExtent)
+                navigation_toolbar.setMinimumWidth(width)
+                break
 
 
 __all__ = ["MenuToolbarHost"]

@@ -95,9 +95,10 @@ def _run_isolated():
             self.rebuilds = []
             super().__init__(**kwargs)
 
-        def _rebuild_plot(self):
+        def _rebuild_plot_available(self):
+            # A busy render lock defers an attempt without reconstructing axes.
             self.rebuilds.append(self._workflow)
-            super()._rebuild_plot()
+            super()._rebuild_plot_available()
 
     class SwitchingCases(unittest.TestCase):
         def setUp(self):

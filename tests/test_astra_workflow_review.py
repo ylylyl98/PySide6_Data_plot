@@ -381,6 +381,7 @@ class AstraCompareReviewTests(unittest.TestCase):
         from PIL import Image
         from PySide6.QtWidgets import QApplication, QMainWindow
         from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
+        from core.typography import save_figure
         from ui_qt.main_window import _PlotToolbar
         from ui_qt.controllers_compare import CompareController
         app = QApplication.instance() or QApplication([])
@@ -404,7 +405,8 @@ class AstraCompareReviewTests(unittest.TestCase):
                 expected = Path(tmp) / "expected.png"
                 saved = Path(tmp) / "saved.png"
                 window.canvas.draw()
-                window.figure.savefig(expected)
+                # The baseline must use the Arial font applied by blit rendering.
+                save_figure(window.figure, expected)
                 self.assertTrue(controller._configure_cmp_blitting())
                 with patch.object(NavigationToolbar2QT, "save_figure", side_effect=lambda *a: window.figure.savefig(saved)):
                     toolbar.save_figure()

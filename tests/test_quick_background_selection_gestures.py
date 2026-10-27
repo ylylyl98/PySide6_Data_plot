@@ -54,7 +54,7 @@ def _isolated():
         def setUp(self):
             self.temporary = TemporaryDirectory(prefix="quick-background-gestures-")
             self.addCleanup(self.temporary.cleanup)
-            self.root = Path(self.temporary.name)
+            self.root = Path(self.temporary.name).resolve()
             self.raw = self.root / "experiment" / "Initial Data" / "REF"
             self.raw.mkdir(parents=True)
             self.folder = self.root / "experiment"

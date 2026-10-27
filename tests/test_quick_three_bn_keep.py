@@ -55,7 +55,7 @@ def _isolated():
         def setUp(self):
             self.temporary = TemporaryDirectory(prefix="quick-three-bn-case-")
             self.addCleanup(self.temporary.cleanup)
-            self.root = Path(self.temporary.name)
+            self.root = Path(self.temporary.name).resolve()
             self.raw = self.root / "Initial Data" / "REF"
             self.raw.mkdir(parents=True)
             prefix = "YZ383_p2n1_9T_1.67KREF_"

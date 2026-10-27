@@ -28,7 +28,7 @@ def _isolated():
     from copy import deepcopy
     from dataclasses import replace
     import numpy as np
-    from PySide6.QtCore import QCoreApplication, QEvent, QLocale, QObject, Property, QSettings, Qt, QUrl, Signal, Slot
+    from PySide6.QtCore import QCoreApplication, QEvent, QLocale, QObject, Property, QSettings, Qt, QTimer, QUrl, Signal, Slot
     from PySide6.QtGui import QGuiApplication, QKeyEvent, QMouseEvent
     from PySide6.QtQml import QQmlComponent, QQmlEngine
     from PySide6.QtQuick import QQuickItem, QQuickWindow
@@ -50,6 +50,14 @@ def _isolated():
             app.processEvents()
             time.sleep(.001)
         app.processEvents()
+
+    def wait_until(predicate, description, timeout=5):
+        deadline = time.monotonic() + timeout
+        while not predicate():
+            if time.monotonic() >= deadline:
+                raise AssertionError('Timed out waiting for ' + description)
+            app.processEvents()
+            time.sleep(.001)
 
     class RootBridge(QObject):
         snapshotChanged = Signal()
@@ -125,16 +133,32 @@ def _isolated():
             self.assertEqual(self.state.snapshot["numbers"]["raw.vmin"]["step"], 1)
             events = []
             self.state.parameterChanged.connect(lambda key, value: events.append((key, value)))
+            debounce = self.state._debounce
+            timeouts = []
+            debounce.timeout.connect(lambda: timeouts.append(True))
             for _ in range(3):
                 self.assertTrue(self.state.stepNumber("raw.vmin", 1))
-                settle(50)
+                self.assertTrue(debounce.isActive())
             self.assertEqual(events, [])
+            self.assertEqual(self.state.snapshot["numbers"]["raw.vmin"]["value"], -97.)
             self.state.setEditing("axis.xmax", True)
-            settle(220)
+            self.assertFalse(debounce.isActive())
+            # Pump a full debounce interval while editing, using a real timer
+            # as the boundary instead of assuming when Qt will dispatch it.
+            edit_interval = []
+            guard = QTimer(self.state)
+            guard.setSingleShot(True)
+            guard.timeout.connect(lambda: edit_interval.append(True))
+            guard.start(debounce.interval())
+            wait_until(lambda: edit_interval, "debounce interval during pending edit")
+            self.assertEqual(timeouts, [])
             self.assertEqual(events, [])
             self.state.setEditing("axis.xmax", False)
-            settle(200)
+            self.assertTrue(debounce.isActive())
+            wait_until(lambda: events, "coalesced change after editing ends")
             self.assertEqual(events, [("raw.vmin", -97.)])
+            self.assertEqual(timeouts, [True])
+            self.assertFalse(debounce.isActive())
 
         def test_auto_retains_fixed_bounds_and_derivative_manual_range(self):
             self.state.setNumber("raw.vmin", "-50")

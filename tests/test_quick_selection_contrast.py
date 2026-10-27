@@ -441,7 +441,7 @@ QtObject {
 
     def test_real_source_catalog_group_file_and_chosen_rows_keep_readable_hover(self):
         catalog = self.bridge.catalog
-        identifier = str(Path(self.temporary.name) / "synthetic_selection.csv")
+        identifier = str(Path(self.temporary.name).resolve() / "synthetic_selection.csv")
         catalog._configure("drr", self.temporary.name, [identifier], False)
         catalog._catalog = dict(sources=(), files=[dict(id=identifier, name="synthetic_selection.csv",
             source="synthetic_selection.csv", kind="measurement", status="new", saved=False,
@@ -455,14 +455,18 @@ QtObject {
         self.bridge.sourceCatalogRequested.emit()
         dialog = window.findChild(QObject, "quick_source_catalog")
         self.wait(lambda: dialog is not None and dialog.property("visible"), "source catalog did not open")
+        row_names = ("source_catalog_group_synthetic_group",
+                     "source_catalog_file_synthetic_selection.csv",
+                     "source_catalog_chosen_synthetic_selection.csv")
+        # Popup visibility precedes creation of its ListView delegates.
+        self.wait(lambda: all(window.findChild(QObject, name) is not None
+                              or any(item.objectName() == name for item in visual_items(window.contentItem()))
+                              for name in row_names), "source catalog delegates did not become ready")
         for mode in MODES:
             with self.subTest(mode=mode):
                 self.bridge.appearance.setMode(mode)
                 self.app.processEvents()
-                candidates = [self.item(window, name) for name in (
-                    "source_catalog_group_synthetic_group",
-                    "source_catalog_file_synthetic_selection.csv",
-                    "source_catalog_chosen_synthetic_selection.csv")]
+                candidates = [self.item(window, name) for name in row_names]
                 self.assertTrue(any(item.property("highlighted") for item in candidates))
                 for row in candidates:
                     QTest.mouseMove(window, row.mapToScene(row.boundingRect().center()).toPoint())

@@ -16,6 +16,7 @@ os.environ.setdefault("MPLBACKEND", "agg")
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
+from time import monotonic
 import unittest
 from unittest.mock import patch
 
@@ -92,8 +93,11 @@ class QuickDrrWorkflowTests(unittest.TestCase):
                           second_params=self.params(products.second) if products.second is not None else None,
                           view=view, **kwargs)
 
-    def wait(self, predicate):
-        for _ in range(1000):
+    def wait(self, predicate, *, timeout=30):
+        # Real PNG writes and font rendering can exceed five seconds on CI.
+        # Wait for completion, with a wall-clock bound for a stuck operation.
+        deadline = monotonic() + timeout
+        while monotonic() < deadline:
             self.app.processEvents()
             if predicate():
                 return

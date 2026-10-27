@@ -55,7 +55,7 @@ def _run_isolated():
         def setUp(self):
             self.temporary = TemporaryDirectory(prefix="catalog-refresh-case-")
             self.addCleanup(self.temporary.cleanup)
-            self.base = Path(self.temporary.name)
+            self.base = Path(self.temporary.name).resolve()
             self.root = self.base / "experiment"
             self.raw = self.root / "Initial Data" / "REF"
             self.history = self.root / "Processed Data" / "DRR"

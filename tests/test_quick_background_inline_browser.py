@@ -52,7 +52,7 @@ def _isolated():
         def setUp(self):
             self.temporary = TemporaryDirectory(prefix="quick-background-inline-")
             self.addCleanup(self.temporary.cleanup)
-            self.base = Path(self.temporary.name)
+            self.base = Path(self.temporary.name).resolve()
             self.root = self.base / "experiment"
             self.raw = self.root / "Initial Data" / "REF"
             self.raw.mkdir(parents=True)

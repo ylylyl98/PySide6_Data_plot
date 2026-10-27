@@ -9,6 +9,7 @@ import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.image import imread
 from PySide6.QtWidgets import QApplication
+from core.typography import save_figure
 
 
 class AsyncFigureSaveTests(unittest.TestCase):
@@ -23,7 +24,8 @@ class AsyncFigureSaveTests(unittest.TestCase):
             ax = fig.subplots()
             ax.plot([0, 1], [2, 3]); ax.set_title('Frozen title')
             reference = Path(folder) / 'reference.png'
-            fig.savefig(reference, dpi=120)
+            # Compare snapshots with the same Arial publication font as exports.
+            save_figure(fig, reference, dpi=120)
             target = Path(folder) / 'target.png'
             job = save_figure_async(fig, target, dpi=120)
             fig.clear()
