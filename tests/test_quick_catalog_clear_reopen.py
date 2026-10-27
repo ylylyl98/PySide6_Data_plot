@@ -15,7 +15,7 @@ class QuickCatalogClearReopenProcessTests(unittest.TestCase):
             environment = dict(os.environ, QT_QPA_PLATFORM="offscreen", QT_QUICK_BACKEND="software",
                 MPLBACKEND="agg", MPLCONFIGDIR=directory, XDG_CONFIG_HOME=directory,
                 XDG_CACHE_HOME=directory, LOCALAPPDATA=directory, QML_DISK_CACHE_PATH=directory,
-                PYTHONIOENCODING="utf-8")
+                PYTHONIOENCODING="utf-8", PYTHONFAULTHANDLER="1")
             result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--isolated"],
                 cwd=Path(__file__).resolve().parents[1], env=environment,
                 capture_output=True, text=True, timeout=120)
@@ -32,12 +32,20 @@ def _run_isolated():
     from time import monotonic, sleep
     from unittest.mock import patch
 
-    from PySide6.QtCore import QSettings
+    from PySide6.QtCore import QEvent, QSettings
     from PySide6.QtGui import QGuiApplication
 
     from ui_qt.quick import source_catalog
 
     app = QGuiApplication([])
+
+    def dispose(bridge):
+        # Signal closures can retain a case after close(). Destroy its Qt
+        # objects here, before a later worker triggers cyclic GC off-thread.
+        bridge.close()
+        bridge.deleteLater()
+        app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        app.processEvents()
 
     class RecordingCatalog(source_catalog.SourceCatalogBridge):
         def __init__(self, **kwargs):
@@ -71,7 +79,7 @@ def _run_isolated():
             self.settings = QSettings(str(self.base / "settings.ini"), QSettings.IniFormat)
             self.settings.setValue("drr/source_unprocessed_only", False)
             self.catalog = RecordingCatalog(settings=self.settings)
-            self.addCleanup(self.catalog.close)
+            self.addCleanup(dispose, self.catalog)
             self.addCleanup(self.catalog.release.set)
 
         def csv(self, name):
@@ -140,7 +148,7 @@ def _run_isolated():
             from ui_qt.quick.application_bridge import QuickApplicationBridge
             with patch.object(source_catalog, "SourceCatalogBridge", RecordingCatalog):
                 owner = QuickApplicationBridge(settings=self.settings)
-            self.addCleanup(owner.close)
+            self.addCleanup(dispose, owner)
             self.addCleanup(owner._source_catalog.release.set)
             self.catalog = owner._source_catalog
             owner.selectWorkflow("drr")
@@ -185,7 +193,7 @@ def _run_isolated():
             from ui_qt.quick.application_bridge import QuickApplicationBridge
             with patch.object(source_catalog, "SourceCatalogBridge", RecordingCatalog):
                 owner = QuickApplicationBridge(settings=self.settings)
-            self.addCleanup(owner.close)
+            self.addCleanup(dispose, owner)
             self.addCleanup(owner._source_catalog.release.set)
             self.catalog = owner._source_catalog
             owner.selectWorkflow("drr")
@@ -211,7 +219,7 @@ def _run_isolated():
                     with self.measurement.open("a", encoding="utf-8") as stream:
                         stream.write("2,3,4,5\n")
                     self.catalog = RecordingCatalog(settings=self.settings)
-                    self.addCleanup(self.catalog.close)
+                    self.addCleanup(dispose, self.catalog)
                     self.addCleanup(self.catalog.release.set)
                     with self.accepted_preview() as (cancellation, _):
                         future = self.catalog._future
@@ -380,7 +388,7 @@ def _run_isolated():
         def test_main_clear_discards_pending_automatic_next_intent(self):
             from ui_qt.quick.application_bridge import QuickApplicationBridge
             owner = QuickApplicationBridge(settings=self.settings)
-            self.addCleanup(owner.close)
+            self.addCleanup(dispose, owner)
             owner._pl_auto_next_pending = str(self.measurement)
             owner.invoke("clear-files")
             self.assertIsNone(owner._pl_auto_next_pending,
