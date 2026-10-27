@@ -140,7 +140,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         feature = next(item for item in FEATURES if item.key == self._workflow)
         available = self._workflow in {"pl", "drr"}
         state = dict(title=feature.description, workspaceTitle=feature.description, workflow=self._workflow,
-                    exportLabel={"shg": "Export analysis", "mcd": "Save MCD package", "mcd_peak_shift": "Save peak CSV + metadata"}.get(self._workflow, "Save PNG + DAT"),
+                    exportLabel={"shg": "Save XLSX + settings", "mcd": "Save MCD package", "mcd_peak_shift": "Save peak CSV + metadata"}.get(self._workflow, "Save PNG + DAT"),
                     pngExportSupported=available, pngLayout=self._pl_values["pngLayout"], pngWidth=self._pl_values["pngWidth"],
                     sourcePath=self._folder, recentFolders=list(self._recent_folders), status=self._status, busy=self._busy,
                     sourceFolderUrl=QUrl.fromLocalFile(self._folder).toString() if self._folder else "",
@@ -475,6 +475,14 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
     def _log_export_paths(self, key, paths):
         # Export receipts must not replace scientific analysis or change layout.
         if paths:
+            if key == "shg":
+                folders = {}
+                for path in map(Path, paths):
+                    folders.setdefault(path.parent, []).append(path.name)
+                self._child_log(key, "Exported files:\n" + "\n\n".join(
+                    str(folder) + "\n" + "\n".join("  " + name for name in names)
+                    for folder, names in folders.items()))
+                return
             self._child_log(key, "Exported files:\n" + "\n".join(map(str, paths)))
 
     def _child_status(self, key, message):
@@ -607,6 +615,9 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         if key == "drr":
             self._ensure_drr_display()
             self._drr_display.setActive(True)
+            # Apply deferred edits after restoring the DRR context, so their
+            # signals and the retained dirty state share one scheduled rebuild.
+            self._drr_display._flush_changes()
         elif key in {"cmp", "shg", "mcd", "mcd_peak_shift", "power"}:
             self._ensure_workflow_bridge(key)
         elif key == "slides":

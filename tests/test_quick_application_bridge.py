@@ -678,7 +678,7 @@ def _run_isolated():
             self.assertIsNone(default_surface.property("backend"))
             self.assertIs(self.bridge.plotBackend, child.plotBackend)
             self.assertTrue(self.qml_item(window, "quick_shg_workspace").property("visible"))
-            self.assertEqual(self.qml_item(window, "app_export").property("text"), "Export analysis")
+            self.assertEqual(self.qml_item(window, "app_export").property("text"), "Save XLSX + settings")
             self.assertTrue(self.bridge.snapshot["canExport"])
             self.bridge.invoke("pan")
             self.assertEqual(self.bridge.snapshot["plotTool"], "pan")
@@ -694,8 +694,15 @@ def _run_isolated():
             drain_until(lambda: not child._pending and not child.snapshot["busy"], timeout=45)
             self.assertEqual(child.snapshot["error"], "")
             self.assertTrue(child.snapshot["resultPaths"])
+            self.assertEqual({Path(output).name for output in child.snapshot["resultPaths"]},
+                             {"shg.xlsx", "analysis_settings.json"})
             self.assertTrue(all(Path(output).is_file() and Path(output).is_relative_to(self.root)
                                 for output in child.snapshot["resultPaths"]))
+            receipt = self.bridge.snapshot["logText"].split("shg: Exported files:")[-1]
+            folder = Path(child.snapshot["resultPaths"][0]).parent
+            self.assertEqual(receipt.count(str(folder)), 1)
+            for output in child.snapshot["resultPaths"]:
+                self.assertIn("  " + Path(output).name, receipt)
 
         def test_compare_file_dialog_is_bound_to_the_requesting_workflow_and_channel(self):
             self.bridge.selectWorkflow("cmp")

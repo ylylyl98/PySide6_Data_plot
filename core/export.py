@@ -194,12 +194,16 @@ def _name_no_csv_ext(file_name: str) -> str:
 
 
 def safe_stem(file_name: str, max_len: int = 140) -> str:
+    if max_len < 1:
+        raise ValueError("An export stem needs at least one character.")
     stem = _name_no_csv_ext(file_name).replace("$", "")
     stem = re.sub(r'[<>:"/\\|?*]+', "_", stem)
     stem = re.sub(r"\s+", " ", stem).strip().replace(" ", "_")
     if len(stem) <= max_len:
         return stem
-    head = 90
+    if max_len <= 3:
+        return stem[:max_len]
+    head = 90 if max_len > 92 else max(1, (max_len - 2) * 2 // 3)
     tail = max_len - head - 2
     return stem[:head] + "__" + stem[-tail:]
 
@@ -1430,6 +1434,58 @@ def export_power_series_png_and_dat(
     return {"png": png_path, "dat": dat_path}
 
 
+SHG_RESULT_FIELDS = (
+    "sweep_axis", "target_angle_deg", "measured_angle_deg", "raw_measured_angle_deg",
+    "move_error_deg", "move_ok", "acquisition_ok", "cosmic_pixels_removed", "cosmic_ray_flag",
+    "background_subtracted_integrated_area_counts_nm", "integration_wavelength_nm",
+    "integration_half_range_nm", "integration_min_nm", "integration_max_nm",
+    "area_uncertainty_counts_nm", "peak_height_counts", "peak_wavelength_nm",
+    "baseline_slope_counts_per_nm", "baseline_at_center_counts", "baseline_rms_counts", "gate_points",
+    "fit_intensity_counts_nm", "fit_residual_counts_nm", "fit_included", "source_csv", "source_row",
+    "included", "quality_flag",
+)
+
+
+def iter_shg_result_rows(data, result, settings, fit=None):
+    """Yield complete, numeric point records shared by CSV and workbook exports."""
+    from core.load_cancellation import check_load_cancelled
+    angle = np.asarray(result.measured_angle_deg, float)
+    order = np.argsort(np.where(np.isfinite(angle), angle, np.inf), kind="stable")
+    for index in order:
+        check_load_cancelled()
+        idx = int(index)
+        yield {
+            "sweep_axis": data.sweep_axis[idx],
+            "target_angle_deg": data.target_angle_deg[idx],
+            "measured_angle_deg": result.measured_angle_deg[idx],
+            "raw_measured_angle_deg": data.measured_angle_deg[idx],
+            "move_error_deg": data.move_error_deg[idx],
+            "move_ok": int(bool(data.move_ok[idx])),
+            "acquisition_ok": int(bool(data.acquisition_ok[idx])),
+            "cosmic_pixels_removed": int(result.cosmic_pixels_removed[idx]),
+            "cosmic_ray_flag": int(result.cosmic_pixels_removed[idx] > 0),
+            "background_subtracted_integrated_area_counts_nm": result.integrated_area[idx],
+            "integration_wavelength_nm": float(settings.peak_center_nm),
+            "integration_half_range_nm": float(0.5 * (settings.gate_max_nm - settings.gate_min_nm)),
+            "integration_min_nm": float(settings.gate_min_nm),
+            "integration_max_nm": float(settings.gate_max_nm),
+            "area_uncertainty_counts_nm": result.area_uncertainty[idx],
+            "peak_height_counts": result.peak_height[idx],
+            "peak_wavelength_nm": result.peak_wavelength_nm[idx],
+            "baseline_slope_counts_per_nm": result.baseline_slope[idx],
+            "baseline_at_center_counts": result.baseline_at_center[idx],
+            "baseline_rms_counts": result.baseline_rms[idx],
+            "gate_points": int(result.gate_points[idx]),
+            "fit_intensity_counts_nm": fit.fitted_intensity[idx] if fit is not None else None,
+            "fit_residual_counts_nm": fit.residual[idx] if fit is not None else None,
+            "fit_included": int(bool(fit.fit_mask[idx])) if fit is not None else 0,
+            "source_csv": data.source_file,
+            "source_row": int(data.source_rows[idx]),
+            "included": int(bool(result.included[idx])),
+            "quality_flag": result.quality_flags[idx],
+        }
+
+
 def export_shg_results(
     folder: str,
     *,
@@ -1438,94 +1494,32 @@ def export_shg_results(
     settings: ShgSettings,
     fit: ShgAngularFitResult | None = None,
     processed_name: str = DEFAULT_PROCESSED,
+    output_stem: str | None = None,
 ) -> Dict[str, Path]:
     """Export a spreadsheet-friendly angle curve and reproducible SHG settings."""
-    out_dir = ensure_processed_dir(folder, processed_name)
-    center_tag = f"{settings.peak_center_nm:g}".replace(".", "p")
-    base = f"{safe_stem(data.source_file)}_SHG_{center_tag}nm_area_vs_measured_angle"
-    csv_path = _unique_path(out_dir, base, ".csv")
+    from core.shg_export_paths import shg_curve_stem, validate_shg_output_paths
+    out_dir = Path(folder) / processed_name
+    if output_stem is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", output_stem):
+        raise ValueError("SHG output names must be short filename stems without a directory.")
+    base = output_stem or shg_curve_stem(folder, out_dir, data.source_file, settings.peak_center_nm)
+    base = _unique_result_stem(out_dir, base, (".csv", "_settings.json"))
+    csv_path = out_dir / f"{base}.csv"
     settings_path = csv_path.with_name(f"{csv_path.stem}_settings.json")
+    validate_shg_output_paths([csv_path, settings_path])
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    fields = [
-        "sweep_axis",
-        "target_angle_deg",
-        "measured_angle_deg",
-        "raw_measured_angle_deg",
-        "move_error_deg",
-        "move_ok",
-        "acquisition_ok",
-        "cosmic_pixels_removed",
-        "cosmic_ray_flag",
-        "background_subtracted_integrated_area_counts_nm",
-        "integration_wavelength_nm",
-        "integration_half_range_nm",
-        "integration_min_nm",
-        "integration_max_nm",
-        "area_uncertainty_counts_nm",
-        "peak_height_counts",
-        "peak_wavelength_nm",
-        "baseline_slope_counts_per_nm",
-        "baseline_at_center_counts",
-        "baseline_rms_counts",
-        "gate_points",
-        "fit_intensity_counts_nm",
-        "fit_residual_counts_nm",
-        "fit_included",
-        "source_csv",
-        "source_row",
-        "included",
-        "quality_flag",
-    ]
-    angle = np.asarray(result.measured_angle_deg, float)
-    order = np.argsort(np.where(np.isfinite(angle), angle, np.inf), kind="stable")
+    def _csv_value(value):
+        if value is None:
+            return ""
+        if isinstance(value, (float, np.floating)):
+            return f"{value:.12g}" if math.isfinite(value) else ""
+        return value
 
-    def _value(array: np.ndarray, index: int) -> object:
-        value = np.asarray(array)[index]
-        if isinstance(value, (np.bool_, bool)):
-            return int(bool(value))
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            return value
-        return "" if not math.isfinite(numeric) else f"{numeric:.12g}"
-
-    with csv_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
+    with csv_path.open("x", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=SHG_RESULT_FIELDS)
         writer.writeheader()
-        for index in order:
-            idx = int(index)
-            writer.writerow(
-                {
-                    "sweep_axis": data.sweep_axis[idx],
-                    "target_angle_deg": _value(data.target_angle_deg, idx),
-                    "measured_angle_deg": _value(result.measured_angle_deg, idx),
-                    "raw_measured_angle_deg": _value(data.measured_angle_deg, idx),
-                    "move_error_deg": _value(data.move_error_deg, idx),
-                    "move_ok": int(bool(data.move_ok[idx])),
-                    "acquisition_ok": int(bool(data.acquisition_ok[idx])),
-                    "cosmic_pixels_removed": int(result.cosmic_pixels_removed[idx]),
-                    "cosmic_ray_flag": int(result.cosmic_pixels_removed[idx] > 0),
-                    "background_subtracted_integrated_area_counts_nm": _value(result.integrated_area, idx),
-                    "integration_wavelength_nm": f"{settings.peak_center_nm:.12g}",
-                    "integration_half_range_nm": f"{0.5 * (settings.gate_max_nm - settings.gate_min_nm):.12g}",
-                    "integration_min_nm": f"{settings.gate_min_nm:.12g}",
-                    "integration_max_nm": f"{settings.gate_max_nm:.12g}",
-                    "area_uncertainty_counts_nm": _value(result.area_uncertainty, idx),
-                    "peak_height_counts": _value(result.peak_height, idx),
-                    "peak_wavelength_nm": _value(result.peak_wavelength_nm, idx),
-                    "baseline_slope_counts_per_nm": _value(result.baseline_slope, idx),
-                    "baseline_at_center_counts": _value(result.baseline_at_center, idx),
-                    "baseline_rms_counts": _value(result.baseline_rms, idx),
-                    "gate_points": int(result.gate_points[idx]),
-                    "fit_intensity_counts_nm": _value(fit.fitted_intensity, idx) if fit is not None else "",
-                    "fit_residual_counts_nm": _value(fit.residual, idx) if fit is not None else "",
-                    "fit_included": int(bool(fit.fit_mask[idx])) if fit is not None else 0,
-                    "source_csv": data.source_file,
-                    "source_row": int(data.source_rows[idx]),
-                    "included": int(bool(result.included[idx])),
-                    "quality_flag": result.quality_flags[idx],
-                }
-            )
+        for row in iter_shg_result_rows(data, result, settings, fit):
+            writer.writerow({key: _csv_value(value) for key, value in row.items()})
 
     settings_payload = {
         "mode": "SHG Processing",
@@ -1559,7 +1553,8 @@ def export_shg_results(
             {"role": "settings", "filename": settings_path.name},
         ],
     }
-    settings_path.write_text(json.dumps(settings_payload, indent=2), encoding="utf-8")
+    with settings_path.open("x", encoding="utf-8") as handle:
+        handle.write(json.dumps(settings_payload, indent=2))
     return {"csv": csv_path, "settings": settings_path}
 
 
@@ -1575,6 +1570,28 @@ def export_shg_twist_comparison(
     processed_name: str = DEFAULT_PROCESSED,
 ) -> Dict[str, Path]:
     """Export both SHG curves plus combined fit and twist-angle summaries."""
+    from core.shg_export_paths import validate_shg_output_paths
+    out_dir = Path(folder) / processed_name
+    # All eight files belong to one result. Reserve the same collision suffix
+    # for the entire set, including settings-only remnants of an earlier export.
+    names = ("reference.csv", "reference_settings.json", "sample.csv", "sample_settings.json",
+             "combined.csv", "fit_summary.csv", "twist_summary.csv", "comparison_settings.json")
+    for index in range(1000):
+        collision = "" if index == 0 else f"_{index:02d}"
+        candidates = []
+        for name in names:
+            path = Path(name)
+            stem = path.stem
+            if stem.endswith("_settings"):
+                stem = stem[:-len("_settings")] + collision + "_settings"
+            else:
+                stem += collision
+            candidates.append(out_dir / (stem + path.suffix))
+        if not any(path.exists() for path in candidates):
+            break
+    else:
+        raise FileExistsError("Could not allocate collision-safe SHG comparison filenames.")
+    validate_shg_output_paths(candidates)
     reference_paths = export_shg_results(
         folder,
         data=reference_data,
@@ -1582,6 +1599,7 @@ def export_shg_twist_comparison(
         settings=settings,
         fit=twist.reference_fit,
         processed_name=processed_name,
+        output_stem=candidates[0].stem,
     )
     sample_paths = export_shg_results(
         folder,
@@ -1590,16 +1608,9 @@ def export_shg_twist_comparison(
         settings=settings,
         fit=twist.sample_fit,
         processed_name=processed_name,
+        output_stem=candidates[2].stem,
     )
-    out_dir = ensure_processed_dir(folder, processed_name)
-    base = (
-        f"{safe_stem(reference_data.source_file, 60)}_vs_"
-        f"{safe_stem(sample_data.source_file, 60)}_SHG_twist"
-    )
-    combined_path = _unique_path(out_dir, f"{base}_combined", ".csv")
-    fit_summary_path = _unique_path(out_dir, f"{base}_fit_summary", ".csv")
-    twist_summary_path = _unique_path(out_dir, f"{base}_twist_summary", ".csv")
-    settings_path = twist_summary_path.with_name(f"{twist_summary_path.stem}_settings.json")
+    combined_path, fit_summary_path, twist_summary_path, settings_path = candidates[4:]
 
     combined_fields = [
         "dataset",
@@ -1614,7 +1625,7 @@ def export_shg_twist_comparison(
         "processing_included",
         "quality_flag",
     ]
-    with combined_path.open("w", encoding="utf-8", newline="") as handle:
+    with combined_path.open("x", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=combined_fields)
         writer.writeheader()
         for label, data, result, fit in (
@@ -1658,7 +1669,7 @@ def export_shg_twist_comparison(
         "point_count",
         "angle_span_deg",
     ]
-    with fit_summary_path.open("w", encoding="utf-8", newline="") as handle:
+    with fit_summary_path.open("x", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fit_fields)
         writer.writeheader()
         for label, data, fit in (
@@ -1694,7 +1705,7 @@ def export_shg_twist_comparison(
         "absolute_twist_angle_deg",
         "twist_uncertainty_deg",
     ]
-    with twist_summary_path.open("w", encoding="utf-8", newline="") as handle:
+    with twist_summary_path.open("x", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=twist_fields)
         writer.writeheader()
         writer.writerow(
@@ -1750,7 +1761,8 @@ def export_shg_twist_comparison(
             {"role": "settings", "filename": settings_path.name},
         ],
     }
-    settings_path.write_text(json.dumps(settings_payload, indent=2), encoding="utf-8")
+    with settings_path.open("x", encoding="utf-8") as handle:
+        handle.write(json.dumps(settings_payload, indent=2))
     return {
         "reference_csv": reference_paths["csv"],
         "reference_settings": reference_paths["settings"],

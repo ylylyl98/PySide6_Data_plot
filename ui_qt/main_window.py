@@ -107,8 +107,6 @@ from core.export import (
     export_pl_pngs_and_dat,
     export_power_series_png_and_dat,
     export_power_vp_pngs_and_dat,
-    export_shg_results,
-    export_shg_twist_comparison,
 )
 from core.loader import DataCube, resolve_dat_y_axis
 from core.workflow_request import LatestRequest, RequestToken
@@ -12151,74 +12149,37 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
             and loaded.shg_result is not None
             and options.shg_settings is not None
         ):
-            if loaded.shg_compare:
-                package_base = (
-                    f"{Path(loaded.shg_data.source_file).stem}_vs_"
-                    f"{Path(loaded.shg_data_b.source_file).stem}_SHG_twist"
-                    if loaded.shg_data_b is not None
-                    else f"{Path(loaded.shg_data.source_file).stem}_SHG_twist"
-                )
-            else:
-                package_base = (
-                    f"{Path(loaded.shg_data.source_file).stem}_SHG_"
-                    f"{options.shg_settings.peak_center_nm:g}nm"
-                )
-            shg_package_dir = create_unique_package_dir(
-                Path(folder) / "Processed Data" / "SHG", package_base
+            from core.shg_export_paths import create_shg_package_dir
+            from core.shg_workbook import export_shg_workbook
+            shg_results, shg_fits = (loaded.shg_result,), (loaded.shg_fit,)
+            if loaded.shg_compare and loaded.shg_result_b is not None:
+                shg_results += (loaded.shg_result_b,)
+                shg_fits += (loaded.shg_fit_b,)
+            shg_package_dir = create_shg_package_dir(
+                folder, tuple(result.data.source_file for result in shg_results),
+                shg_results[0].settings.peak_center_nm,
+                compare=len(shg_results) == 2, reserve_staging=True,
             )
-            shg_processed_subfolder = str(
-                Path("Processed Data") / "SHG" / shg_package_dir.name
-            )
-            if (
-                loaded.shg_compare
-                and loaded.shg_data_b is not None
-                and loaded.shg_result_b is not None
-                and loaded.shg_twist is not None
-            ):
-                paths = export_shg_twist_comparison(
-                    folder,
-                    reference_data=loaded.shg_data,
-                    reference_result=loaded.shg_result,
-                    sample_data=loaded.shg_data_b,
-                    sample_result=loaded.shg_result_b,
-                    settings=options.shg_settings,
-                    twist=loaded.shg_twist,
-                    processed_name=shg_processed_subfolder,
-                )
-                log.emit(f"Exported {len(paths)} SHG comparison and twist files.")
-                out_folder = str(paths["combined_csv"].parent)
-            elif loaded.shg_compare and loaded.shg_data_b is not None and loaded.shg_result_b is not None:
-                reference_paths = export_shg_results(
-                    folder,
-                    data=loaded.shg_data,
-                    result=loaded.shg_result,
-                    settings=options.shg_settings,
-                    fit=loaded.shg_fit,
-                    processed_name=shg_processed_subfolder,
-                )
-                sample_paths = export_shg_results(
-                    folder,
-                    data=loaded.shg_data_b,
-                    result=loaded.shg_result_b,
-                    settings=options.shg_settings,
-                    fit=loaded.shg_fit_b,
-                    processed_name=shg_processed_subfolder,
-                )
-                paths = {"reference_csv": reference_paths["csv"], "sample_csv": sample_paths["csv"]}
-                log.emit("Exported both SHG processed CSVs; twist summary unavailable because the fit is disabled or failed.")
-                out_folder = str(reference_paths["csv"].parent)
-            else:
-                paths = export_shg_results(
-                    folder,
-                    data=loaded.shg_data,
-                    result=loaded.shg_result,
-                    settings=options.shg_settings,
-                    fit=loaded.shg_fit,
-                    processed_name=shg_processed_subfolder,
-                )
-                log.emit(f"Exported SHG CSV: {paths['csv'].name}")
-                log.emit(f"Exported SHG settings: {paths['settings'].name}")
-                out_folder = str(paths["csv"].parent)
+            published = False
+            try:
+                with tempfile.TemporaryDirectory(prefix=".shg-export-", dir=folder) as temporary:
+                    staged = Path(temporary) / shg_package_dir.name
+                    export_shg_workbook(
+                        folder, results=shg_results, fits=shg_fits,
+                        twist=loaded.shg_twist if len(shg_results) == 2 else None,
+                        fit_settings=loaded.shg_fit_settings or options.shg_fit_settings,
+                        processed_name=str(staged),
+                    )
+                    check_load_cancelled()
+                    shg_package_dir.rmdir()
+                    staged.replace(shg_package_dir)
+                    published = True
+            finally:
+                if not published and shg_package_dir.is_dir():
+                    shg_package_dir.rmdir()
+            log.emit("Exported SHG workbook: shg.xlsx (angle curves and all-angle spectra)")
+            log.emit("Exported SHG settings: analysis_settings.json")
+            out_folder = str(shg_package_dir)
             files_to_move = list(loaded.selected_files)
             if loaded.shg_result.background_file or (
                 loaded.shg_result_b is not None and loaded.shg_result_b.background_file

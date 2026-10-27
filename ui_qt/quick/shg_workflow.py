@@ -142,7 +142,7 @@ def load_shg(request: ShgRequest, cancellation=None, previous: ShgProducts | Non
         fits, twist, fit_message = [None] * len(results), None, ""
         if request.fit_settings.enabled:
             # Preserve a valid individual fit if the other comparison curve
-            # cannot be fitted. Processing and CSV export remain available.
+            # cannot be fitted. Processing and workbook export remain available.
             errors = []
             if len(results) == 2:
                 try:
@@ -164,12 +164,12 @@ def load_shg(request: ShgRequest, cancellation=None, previous: ShgProducts | Non
         return ShgProducts(request, tuple(results), tuple(fits), twist, fit_message, before)
 
 
-def export_shg(products: ShgProducts, cancellation=None):
-    import json
+def export_shg(products: ShgProducts, cancellation=None, *, include_csv=False, include_cleaned=False):
     import os
     from tempfile import TemporaryDirectory
     from core.load_cancellation import load_scope, check_load_cancelled
-    from core.export import create_unique_package_dir, export_shg_results, export_shg_twist_comparison
+    from core.shg_workbook import export_shg_workbook
+    from core.shg_export_paths import create_shg_package_dir
     request = products.request
     with load_scope(cancellation):
         if products.signatures != fingerprints(dict(request.sources).values()):
@@ -177,42 +177,17 @@ def export_shg(products: ShgProducts, cancellation=None):
         root = Path(request.folder)
         if not root.is_dir():
             raise ValueError("The SHG experiment folder no longer exists.")
-        first = Path(products.results[0].data.source_file).stem
-        base = (f"{first}_vs_{Path(products.results[1].data.source_file).stem}_SHG_twist"
-                if request.mode == "compare" else f"{first}_SHG_{request.settings.peak_center_nm:g}nm")
-        package = create_unique_package_dir(root / "Processed Data" / "SHG", base)
+        package = create_shg_package_dir(root, tuple(result.data.source_file for result in products.results),
+            request.settings.peak_center_nm, compare=request.mode == "compare", reserve_staging=True)
         published = False
         try:
             # Stage outside the history tree. A failed/cancelled multi-file
             # export must never make a partial analysis appear processed.
             with TemporaryDirectory(prefix=".shg-export-", dir=root) as temporary:
                 staged = Path(temporary) / package.name
-                if products.twist is not None:
-                    paths = export_shg_twist_comparison(str(root),
-                        reference_data=products.results[0].data, reference_result=products.results[0],
-                        sample_data=products.results[1].data, sample_result=products.results[1],
-                        settings=request.settings, twist=products.twist, processed_name=str(staged))
-                else:
-                    paths = {}
-                    for index, result in enumerate(products.results):
-                        prefix = ("reference_" if index == 0 else "sample_") if len(products.results) == 2 else ""
-                        outputs = export_shg_results(str(root), data=result.data, result=result,
-                            settings=request.settings, fit=products.fits[index], processed_name=str(staged))
-                        paths.update({prefix + key: path for key, path in outputs.items()})
-                # Preserve the legacy schema and add portable exact identities.
-                # Legacy writers retain the original source string in `name`,
-                # which may be absolute for native external-file selection.
-                for path in paths.values():
-                    if Path(path).suffix.lower() != ".json":
-                        continue
-                    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-                    for descriptor in payload.get("inputs", ()):
-                        source = Path(descriptor["source_path"]).resolve()
-                        descriptor["name"] = source.name
-                        if source.is_relative_to(root.resolve()):
-                            descriptor["source_relative_path"] = source.relative_to(root.resolve()).as_posix()
-                    payload["fit_settings"] = request.fit_settings.to_dict()
-                    Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                paths = export_shg_workbook(str(root), results=products.results, fits=products.fits,
+                    twist=products.twist, fit_settings=request.fit_settings, fit_message=products.fit_message,
+                    processed_name=str(staged), include_csv=bool(include_csv), include_cleaned=bool(include_cleaned))
                 check_load_cancelled()
                 if products.signatures != fingerprints(dict(request.sources).values()):
                     raise ValueError("An SHG source changed while exporting. Reload before exporting.")

@@ -32,6 +32,7 @@ _CHOICES = {
     "spectrumPanel": ("raw", "corrected"),
 }
 _DISPLAY = {"angleCursor", "spectrumView", "comparisonView", "showTable", "spectrumPanel"}
+_EXPORT_OPTIONS = {"exportCsv", "exportCleaned"}
 _SOURCES = {"single", "reference", "sample", "background", "backgroundA", "backgroundB"}
 
 
@@ -56,7 +57,7 @@ class ShgBridge(QObject):
             spectrumView="raw_cleaned", comparisonView="raw", angleScale=1., angleOffset=0.,
             angleWrap="none", includeFailed=False, angleCursor=0., fitEnabled=True,
             fitMin=0., fitMax=180., fitWeights=True, fitIncludeExcluded=False, phaseBranch=0,
-            showTable=False, spectrumPanel="raw")
+            showTable=False, spectrumPanel="raw", exportCsv=False, exportCleaned=False)
         self._sources, self._catalog, self._result_paths = {}, [], []
         self._products = self._requested = None
         self._sequence = self._catalog_sequence = 0
@@ -93,12 +94,20 @@ class ShgBridge(QObject):
     def snapshot(self):
         current = self._current()
         products = self._products if current else None
+        results_folder = Path(self._result_paths[0]).parent if self._result_paths else None
+        results_label = ""
+        if results_folder is not None:
+            try:
+                results_label = results_folder.relative_to(self._folder).as_posix()
+            except ValueError:
+                results_label = results_folder.name
         return dict(workflow="shg", title="SHG", status=self._status, error=self._error,
             busy=self._busy, catalogBusy=self._catalog_busy, progress=-1 if self._busy else 0,
             mode=self._values["mode"], sourcePath=self._folder, sources=dict(self._sources),
             catalog=[dict(item) for item in self._catalog], parameterGroups=self._parameter_groups(),
             inspectionVisible=current and not self._error, sideBySide=False, canExport=current and not self._busy and not self._error,
             resultPaths=list(self._result_paths), plotTool=self._plot_tool, showTable=self._values["showTable"],
+            resultsFolder=str(results_folder) if results_folder is not None else "", resultsFolderLabel=results_label,
             compactInspection=self._compact_inspection(), spectrumPanel=self._values["spectrumPanel"],
             angleCursor=self._values["angleCursor"], fitMessage=products.fit_message if products else "",
             summary=self._summary(products), fitSummary=self._fit_summary(products), rows=self._rows(products),
@@ -316,7 +325,7 @@ class ShgBridge(QObject):
         self._values[key] = normalized
         if key == "cosmicWindow":
             self._values["cosmicMaxWidth"] = min(self._values["cosmicMaxWidth"], normalized - 1)
-        if key == "historyFilter":
+        if key == "historyFilter" or key in _EXPORT_OPTIONS:
             self._publish()
         elif key in _DISPLAY:
             if key == "showTable":
@@ -376,6 +385,13 @@ class ShgBridge(QObject):
             self._queue_load(immediately=True)
         elif action == "export":
             self._export()
+        elif action in {"open-results-folder", "copy-results-folder"} and self._result_paths:
+            from PySide6.QtGui import QDesktopServices, QGuiApplication
+            folder = Path(self._result_paths[0]).parent
+            if action == "copy-results-folder":
+                QGuiApplication.clipboard().setText(str(folder))
+            elif not folder.is_dir() or not QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder))):
+                self.statusMessage.emit("The exported SHG folder could not be opened: " + str(folder))
         elif action in {"home", "back", "forward", "pan", "zoom"} and self._navigation is not None:
             getattr(self._navigation, action)()
             self._plot_tool = str(self._navigation.mode.name).lower() if self._navigation.mode else ""
@@ -399,9 +415,11 @@ class ShgBridge(QObject):
         self._sequence += 1
         self._cancellation = cancellation = LoadCancellation()
         products = self._products
+        include_csv, include_cleaned = self._values["exportCsv"], self._values["exportCleaned"]
         self._busy, self._operation = True, "export"
-        self._message("Exporting SHG analysis package…")
-        self._start(self._sequence, "export", lambda: export_shg(products, cancellation))
+        self._message("Saving SHG workbook, spectra and settings…")
+        self._start(self._sequence, "export", lambda: export_shg(products, cancellation,
+            include_csv=include_csv, include_cleaned=include_cleaned))
 
     def _import_settings(self, name):
         import json
@@ -424,8 +442,16 @@ class ShgBridge(QObject):
             translated.update({target: settings[source] for source, target in mapping.items() if source in settings})
             translated["angleWrap"] = str(int(settings["angle_wrap_deg"])) if settings.get("angle_wrap_deg") else "none"
             twist = payload.get("twist_fit") or {}
-            fit = payload.get("angular_fit") or twist.get("reference_fit") or {}
+            fits = payload.get("angular_fits") or {}
+            if not isinstance(twist, dict) or not isinstance(fits, dict):
+                raise ValueError("The SHG JSON has invalid fitting results.")
+            fit = payload.get("angular_fit") or twist.get("reference_fit") or next(
+                (item for item in fits.values() if isinstance(item, dict) and item), {})
+            if not isinstance(fit, dict):
+                raise ValueError("The SHG JSON has invalid fitting results.")
             fit_settings = payload.get("fit_settings", fit.get("settings", {}))
+            if not isinstance(fit_settings, dict):
+                raise ValueError("The SHG JSON has invalid fitting settings.")
             fit_map = dict(enabled="fitEnabled", angle_min_deg="fitMin", angle_max_deg="fitMax",
                 use_uncertainty_weights="fitWeights", include_excluded_rows="fitIncludeExcluded", phase_branch="phaseBranch")
             translated["fitEnabled"] = bool(fit)
@@ -856,7 +882,10 @@ class ShgBridge(QObject):
             return dict(key="source." + role, type="choice", label=label, value=current, options=options,
                 enabled=editable, description=description)
         compare = value["mode"] == "compare"
-        data = [choice("mode", "Workflow", [("single", "Single file"), ("compare", "Compare / Twist angle")])]
+        data = [dict(key="mode", label="Workflow", type="tabs", value=value["mode"], enabled=editable,
+            options=[dict(value="single", label="Single file", objectName="shg_single"),
+                     dict(value="compare", label="Compare / Twist", objectName="shg_compare",
+                          description="Compare reference A and sample B / twist angle")])]
         for role, label in (("reference", "Reference A"), ("sample", "Sample B")) if compare else (("single", "SHG measurement"),):
             data.extend([source(role, label, filtered=True), action("choose-" + role, "Choose " + label + "…")])
         data.extend([action("clear-files", "Clear"), action("refresh-catalog", "Refresh")])
@@ -884,6 +913,10 @@ class ShgBridge(QObject):
                 number("fitMax", "Maximum (°)", pair="fit", pairLabel="Fit angle range", shortLabel="Maximum"),
                 flag("fitWeights", "Use area-uncertainty weights"), flag("fitIncludeExcluded", "Include excluded rows in fit"),
                 {**number("phaseBranch", "90° phase branch"), "enabled": editable and compare}]),
+            dict(key="export", title="Export", fields=[
+                dict(key="export-note", type="summary", value="Save one XLSX workbook and one settings JSON. Includes angle curves and spectra for every measured angle."),
+                flag("exportCsv", "CSV copies", description="Also save each workbook sheet as a CSV file for plain-text analysis."),
+                flag("exportCleaned", "Cosmic-cleaned spectra", description="Add full-wavelength spectra after cosmic-ray removal, before background subtraction. Raw and corrected spectra are always saved.")]),
             dict(key="history", title="History and settings", advanced=True, fields=[
                 choice("historyFilter", "CSV history", [(key, key.title()) for key in ("all", "new", "processed", "unknown")]),
                 dict(key="history-note", type="summary", value="Saved export history indicates prior source roles; it does not verify current processing settings."),
