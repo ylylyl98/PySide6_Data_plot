@@ -39,10 +39,10 @@ if {log_error!r}:
 ''']
 
     def test_matrix_covers_nine_workflows_scientific_inputs_and_three_standalones(self):
-        fixtures = {key: self.root / key for key in ("pl", "drr", "peak_snapshot", "drr_snapshot", "drr_analysis_folder", "organizer_folder")}
+        fixtures = {key: self.root / key for key in ("pl", "drr", "drr_csv", "peak_snapshot", "drr_snapshot", "drr_analysis_folder", "organizer_folder")}
         fixtures["compare"] = (self.root / "KK.csv", self.root / "KKp.csv")
         cases = build_cases(fixtures)
-        self.assertEqual(len(cases), 17)
+        self.assertEqual(len(cases), 18)
         self.assertEqual({case.workflow for case in cases if case.name.startswith("empty-")}, set(WORKFLOWS))
         self.assertEqual({case.kind for case in cases}, {"main", "peak", "drr", "organizer"})
 
@@ -58,6 +58,15 @@ if {log_error!r}:
         report["Errors"] = "single QML error"
         self.assertIn("single QML error", inspect_report(report, SmokeCase("shell", ())))
         self.assertTrue(inspect_report([], SmokeCase("shell", ())))
+        pending = dict(self.shell_report(), workflow="drr", timing_ms={}, background_required=True,
+            background_dialog_open=True, can_export=False, background_visible_frames=1)
+        case = SmokeCase("background", (), workflow="drr", expect_background=True)
+        self.assertEqual(inspect_report(pending, case), [])
+        for key, value in (("background_required", False), ("background_dialog_open", False),
+                           ("can_export", True), ("background_visible_frames", 0),
+                           ("timing_ms", {"first_plot_frame_ms": 1.})):
+            with self.subTest(key=key):
+                self.assertTrue(inspect_report({**pending, key: value}, case))
 
     def test_drr_report_includes_postload_datasets_render_and_warning_checks(self):
         report = dict(application="QGuiApplication", qmlRoots=1, widgetsImported=False, warnings=[], error="", datasets=1, renderedFrames=2)

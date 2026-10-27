@@ -112,9 +112,16 @@ def main(argv=None, *, production=False):
         if generation > 0 and "first_plot_frame_ms" not in timings:
             timings["first_plot_frame_ms"] = (perf_counter() - started) * 1000
     surface.framePresented.connect(plot_presented)
+    background_window = window.findChild(QObject, "drr_background_window")
+    background_frames = []
+    def background_presented():
+        if bridge._background_open and background_window.isVisible():
+            background_frames.append(perf_counter())
+            timings.setdefault("background_settings_frame_ms", (perf_counter() - started) * 1000)
+    background_window.frameSwapped.connect(background_presented)
     timer = QTimer()
     deadline = perf_counter() + 30
-    stable_frame = {"generation": -1, "since": 0.0}
+    stable_frame = {"state": None, "since": 0.0}
     def active_surface():
         backend = bridge.plotBackend
         def find(item):
@@ -136,30 +143,38 @@ def main(argv=None, *, production=False):
                       and (plot_timer is None or not plot_timer.isActive()) and not backend._timer.isActive())
         if plot_ready:
             plot_presented(generation)
-        # Power file opening intentionally enters its explicit selection/review
-        # workspace. Selecting an action there starts its plot workflow.
-        expected_plot = args.demo or bool(args.sources) and args.workflow != "power"
-        if generation != stable_frame["generation"]:
-            stable_frame.update(generation=generation, since=perf_counter())
+        # Power and unresolved DRR CSV selections intentionally wait for an
+        # explicit user action before producing scientific plots.
+        awaiting_background = (args.workflow == "drr" and bridge.snapshot.get("backgroundRequired", False)
+            and bridge._background_open and not bridge.snapshot["busy"])
+        expected_plot = args.demo or bool(args.sources) and args.workflow != "power" and not awaiting_background
+        ready_state = (generation, awaiting_background)
+        if ready_state != stable_frame["state"]:
+            stable_frame.update(state=ready_state, since=perf_counter())
         if perf_counter() - stable_frame["since"] < .15 and perf_counter() < deadline:
             return
         child_state = owner.snapshot
         busy = bridge.snapshot["busy"] or child_state.get("catalogBusy", False) or child_state.get("analysisBusy", False)
-        if (not frames or busy or (expected_plot and not plot_ready)) and perf_counter() < deadline:
+        missing_frame = (not frames or busy or (expected_plot and not plot_ready)
+            or awaiting_background and not background_frames)
+        if missing_frame and perf_counter() < deadline:
             return
-        if not frames or busy or (expected_plot and not plot_ready):
+        if missing_frame:
             errors.append("Native Quick smoke did not reach a rendered frame before its deadline")
         if args.sources and child_state.get("error"):
             errors.append(child_state["error"])
         if args.capture:
             args.capture.parent.mkdir(parents=True, exist_ok=True)
-            captured = window.grabWindow()
+            captured = (background_window if awaiting_background else window).grabWindow()
             if captured.isNull() or not captured.save(str(args.capture), "PNG"):
                 errors.append("Native Quick window capture failed")
         report = dict(status="ok" if not errors else "error", errors=errors, timing_ms=timings,
                       widgets_imported="PySide6.QtWidgets" in sys.modules,
                       settings_isolated=not persistent and args.settings_file is None,
                       scientific_imports_at_shell_frame=shell_imports,
+                      background_required=bridge.snapshot.get("backgroundRequired", False),
+                      background_dialog_open=bridge._background_open, can_export=bridge.snapshot.get("canExport", False),
+                      background_visible_frames=len(background_frames),
                       workflow=bridge.snapshot["workflow"], visible_frames=len(frames),
                       supported_scope="native shell, PL, DRR, Compare, Power, MCD, MCD Peak Shift, SHG, Slides and separate analysis windows")
         if report["widgets_imported"]:

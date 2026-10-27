@@ -226,12 +226,44 @@ Rectangle {
             Layout.fillWidth: true
             columns: root.width >= 680 ? 2 : 1
             columnSpacing: 12
-            Choice {
-                field: "frame"
-                inlineLabel: true
-                label: "Reference frame"
+            RowLayout {
+                id: selfFrames
+                objectName: "drr_background_self_frames"
+                Layout.fillWidth: true
                 visible: root.state.kind === "self"
-                descriptor: ({items: (root.state.choices?.frame?.items || []).slice(0, 2), current: root.state.choices?.frame?.current || 0})
+                spacing: 6
+                function selectFrame(index, focus) {
+                    if (root.state.busy || root.invalid) return
+                    index = Math.max(0, Math.min(1, index))
+                    if (root.state.choices?.frame?.current !== index)
+                        root.bridge.setChoice("frame", index)
+                    if (focus) frameButtons.itemAt(index).forceActiveFocus(Qt.TabFocusReason)
+                }
+                Note { Layout.fillWidth: false; text: "Reference frame" }
+                Repeater {
+                    id: frameButtons
+                    model: ["First frame", "Last frame"]
+                    delegate: AppButton {
+                        required property int index
+                        required property string modelData
+                        objectName: "drr_background_self_frame_" + (index === 0 ? "first" : "last")
+                        colors: root.colors
+                        text: modelData
+                        description: "Use the " + (index === 0 ? "first" : "last") + " measurement frame as the Self reference after Apply."
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: 1
+                        checkable: true
+                        autoExclusive: true
+                        checked: root.state.choices?.frame?.current === index
+                        enabled: !root.state.busy && !root.invalid
+                        Accessible.role: Accessible.RadioButton
+                        Accessible.name: modelData
+                        onClicked: selfFrames.selectFrame(index, false)
+                        Keys.priority: Keys.BeforeItem
+                        Keys.onLeftPressed: selfFrames.selectFrame(index - 1, true)
+                        Keys.onRightPressed: selfFrames.selectFrame(index + 1, true)
+                    }
+                }
             }
             Note {
                 id: frameSummary

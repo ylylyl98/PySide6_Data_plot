@@ -220,6 +220,13 @@ def make_plan(repo, tests_dir="tests", shards=4):
                     and hint["test_ids_sha256"] == digest(sorted(ids))):
                 # The measured child wall time already includes process startup.
                 seconds, basis = hint["duration_seconds"], "measured_unit_wall"
+            else:
+                # Changed tests no longer have a current measurement, but a
+                # known expensive unit must not collapse to a count estimate.
+                # This only estimates placement; execution validates the new
+                # plan's byte-exact sources and complete test IDs independently.
+                seconds = max(seconds, hint["duration_seconds"])
+                basis = "estimated_previous_unit_wall"
         units.append({"id": f"unit-{index:04d}", "test_ids": ids, "timing_key": key,
                       "weight_seconds": seconds, "weight_basis": basis})
     assignments = [{"id": index, "unit_ids": [], "test_ids": [], "weight_seconds": 0.0}

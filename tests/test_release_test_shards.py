@@ -131,16 +131,32 @@ class ReleaseTestShardTests(unittest.TestCase):
         self.source("test_child.py", "from suite.fixture_base import Base\nclass Derived(Base): pass\n")
         self.source("test_control.py", PASSING)
         self.make_plan()
-        self.timing_hints({"suite.fixture_base": 10, "suite.test_child": 20, "suite.test_control": 30})
+        hint_path, hints = self.timing_hints(
+            {"suite.fixture_base": 10, "suite.test_child": 20, "suite.test_control": 30})
+        with self.subTest(change="source-only"):
+            self.source("fixture_base.py", base + "\n# same tests, changed source\n")
+            self.make_plan()
+            source_only = release.read_json(self.plan)
+            by_key = {u["timing_key"]: u for u in source_only["units"]}
+            self.assertEqual(by_key["suite.fixture_base"]["weight_basis"], "estimated_previous_unit_wall")
+            self.assertEqual(by_key["suite.fixture_base"]["weight_seconds"], 10)
+            self.assertEqual(by_key["suite.test_child"]["weight_basis"], "measured_unit_wall")
+            self.assertEqual(len(source_only["tests"]), 3)
         self.source("fixture_base.py", base + "\n    def test_added(self):\n        self.fail('new regression')\n")
-        self.make_plan()
-        plan = release.read_json(self.plan)
-        by_key = {u["timing_key"]: u for u in plan["units"]}
-        for key in ("suite.fixture_base", "suite.test_child"):
-            self.assertEqual(by_key[key]["weight_basis"], "estimated_tests_plus_startup")
-            self.assertEqual(by_key[key]["weight_seconds"], 4)
-        self.assertEqual(by_key["suite.test_control"]["weight_seconds"], 30)
-        self.assertEqual(len(plan["tests"]), 5)
+        for previous in ((10, 20), (1, 2)):
+            with self.subTest(change="source-and-inherited-membership", previous=previous):
+                for key, seconds in zip(("suite.fixture_base", "suite.test_child"), previous):
+                    hints["units"][key]["duration_seconds"] = seconds
+                release.write_json(hint_path, hints)
+                self.make_plan()
+                plan = release.read_json(self.plan)
+                by_key = {u["timing_key"]: u for u in plan["units"]}
+                for key, seconds in zip(("suite.fixture_base", "suite.test_child"), previous):
+                    self.assertEqual(by_key[key]["weight_basis"], "estimated_previous_unit_wall")
+                    self.assertEqual(by_key[key]["weight_seconds"], max(4, seconds))
+                self.assertEqual(by_key["suite.test_control"]["weight_basis"], "measured_unit_wall")
+                self.assertEqual(by_key["suite.test_control"]["weight_seconds"], 30)
+                self.assertEqual(len(plan["tests"]), 5)
         self.run_shard(expected=1)
         self.verify(expected=1)
 
@@ -280,7 +296,7 @@ class ReleaseTestShardTests(unittest.TestCase):
         self.source("test_broken.py", "raise ImportError('fixture dependency missing')\n")
         self.assertIn("discovery failed", self.make_plan(expected=1).stdout)
 
-    def test_four_shards_accept_success_skip_expected_failure_and_fixture_skip(self):
+    def test_release_shards_accept_success_skip_expected_failure_and_fixture_skip(self):
         self.source("test_outcomes.py", """
             import unittest
             class Outcomes(unittest.TestCase):
@@ -309,11 +325,16 @@ class ReleaseTestShardTests(unittest.TestCase):
                     pass
         """)
         self.source("test_other.py", PASSING)
-        self.make_plan(shards=4)
-        for shard in range(4):
+        # Exercise every release shard with real work, including indices 10/11.
+        for index in range(9):
+            self.source(f"test_extra_{index:02d}.py", PASSING)
+        self.make_plan(shards=12)
+        plan = release.read_json(self.plan)
+        self.assertTrue(all(shard["unit_ids"] for shard in plan["shards"]))
+        for shard in range(12):
             self.run_shard(shard)
         result = self.verify()
-        self.assertIn("Verified 6 unique tests across 4 shards", result.stdout)
+        self.assertIn("Verified 15 unique tests across 12 shards", result.stdout)
 
     def test_assertion_failure_blocks_run_and_verification(self):
         self.source("test_bad.py", PASSING.replace("self.assertTrue(True)", "self.fail('broken')"))

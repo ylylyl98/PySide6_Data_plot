@@ -165,6 +165,10 @@ def _run_isolated():
 
         def select(self, owner, path):
             owner.selectFiles([QUrl.fromLocalFile(str(path))])
+            if owner._workflow == "drr":
+                self.load_idle(owner)
+                self.assertTrue(owner.snapshot["backgroundRequired"])
+                owner.drrBackgroundBridge.invoke("apply")
 
         @contextmanager
         def blocked_loader(self, workflow, *, error=False, gates=None):
@@ -174,13 +178,13 @@ def _run_isolated():
             pending = list(gates if gates is not None else [self.gate()])
             calls = []
 
-            def load(request):
+            def load(request, **kwargs):
                 index = len(calls)
                 calls.append(request)
                 pending[index].wait()
                 if error:
                     raise ValueError("Synthetic foreground load failure")
-                return real_load(request)
+                return real_load(request, **kwargs)
 
             with patch.object(module, name, side_effect=load):
                 yield pending
@@ -265,7 +269,7 @@ def _run_isolated():
             self.assertFalse(self.catalog._foreground_busy)
             self.assertEqual(owner.snapshot["status"], expected_status,
                 "Background completion must not replace the load outcome")
-            self.assertEqual(self.dialog_requests, [])
+            self.assertEqual(self.dialog_requests, ["background"] if workflow == "drr" else [])
 
         def test_successful_pl_and_drr_loads_resume_idle_inspection(self):
             for workflow in ("pl", "drr"):

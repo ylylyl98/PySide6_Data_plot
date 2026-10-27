@@ -34,6 +34,7 @@ class SmokeCase:
     kind: str = "main"
     workflow: str = "pl"
     expect_plot: bool = False
+    expect_background: bool = False
 
 
 def isolated_environment(root):
@@ -98,6 +99,8 @@ def create_fixtures(root):
         np.savetxt(path, table, delimiter=",", header=header, comments="", fmt="%.12g")
         channels.append(path)
     output["compare"] = tuple(channels)
+    output["drr_csv"] = root / "synthetic_REF_730nmc.csv"
+    output["drr_csv"].write_bytes(channels[0].read_bytes())
     dataset = create_dataset(pl, "PL", "PL", str(output["pl"]), "Synthetic fitted PL")
     dataset["settings"].update(min_snr=0., neighbor_support=0)
     dataset = analyze_dataset(analyze_dataset(dataset, "detect"), "fit")
@@ -121,6 +124,8 @@ def build_cases(fixtures):
     cases.extend(SmokeCase("empty-" + workflow, ("--workflow", workflow), workflow=workflow) for workflow in WORKFLOWS)
     cases.extend((SmokeCase("synthetic-pl-dat", ("--workflow", "pl", "--open", str(fixtures["pl"])), expect_plot=True),
         SmokeCase("synthetic-drr-dat", ("--workflow", "drr", "--open", str(fixtures["drr"])), workflow="drr", expect_plot=True),
+        SmokeCase("synthetic-drr-csv-background", ("--workflow", "drr", "--open", str(fixtures["drr_csv"])),
+            workflow="drr", expect_background=True),
         SmokeCase("synthetic-compare-csv", ("--workflow", "cmp", "--open", str(fixtures["compare"][0]),
             "--open", str(fixtures["compare"][1])), workflow="cmp", expect_plot=True),
         SmokeCase("standalone-peak", ("--peak-analysis-quick", "--snapshot", str(fixtures["peak_snapshot"])), kind="peak", expect_plot=True),
@@ -175,6 +180,10 @@ def inspect_report(report, case):
         plot_frame = timings.get("first_plot_frame_ms", 0) if isinstance(timings, dict) else 0
         if case.expect_plot and (not isinstance(plot_frame, (int, float)) or plot_frame <= 0):
             errors.append("The scientific Agg plot did not reach a presented Quick frame")
+        if case.expect_background and (report.get("background_required") is not True
+                or report.get("background_dialog_open") is not True or report.get("can_export") is not False
+                or not report.get("background_visible_frames", 0) or plot_frame):
+            errors.append("The DRR CSV must open background settings without a provisional plot or export")
     elif case.kind == "drr":
         if report.get("widgetsImported") is not False:
             errors.append("The DRR report did not confirm widgetsImported=false")

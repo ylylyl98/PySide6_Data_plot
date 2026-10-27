@@ -13,9 +13,49 @@ class QuickBackgroundTests(unittest.TestCase):
             env = dict(os.environ, QT_QPA_PLATFORM="offscreen", QT_QUICK_BACKEND="software", QT_SCALE_FACTOR="1",
                        MPLBACKEND="agg", MPLCONFIGDIR=temporary, LOCALAPPDATA=temporary,
                        XDG_CONFIG_HOME=temporary, XDG_CACHE_HOME=temporary, QML_DISK_CACHE_PATH=temporary)
-            result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--isolated"],
-                cwd=Path(__file__).resolve().parents[1], env=env, capture_output=True, text=True, timeout=180)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for mode in ("--cold-settings", "--isolated"):
+                with self.subTest(mode=mode):
+                    result = subprocess.run([sys.executable, str(Path(__file__).resolve()), mode],
+                        cwd=Path(__file__).resolve().parents[1], env=env, capture_output=True, text=True, timeout=180)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+def _cold_settings():
+    """The first background choice must not pay for unused plotting/analysis."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from PySide6.QtCore import QSettings
+    from PySide6.QtGui import QGuiApplication
+    from ui_qt.quick.drr_background_bridge import DrrBackgroundBridge
+    from ui_qt.quick.drr_background_workflow import BackgroundContext, BackgroundDraft
+
+    app = QGuiApplication([])
+    with TemporaryDirectory() as folder:
+        bridge = DrrBackgroundBridge(settings=QSettings(str(Path(folder) / "cold.ini"), QSettings.Format.IniFormat))
+        try:
+            context = BackgroundContext(folder, ("measurement.csv",))
+            bridge.open(context)
+            assert bridge.draft.which == "last"
+            for frame in (0, 1):
+                bridge.setChoice("frame", frame)
+                assert bridge.draft.which == ("first", "last")[frame]
+            bridge.invoke("page:raw")
+            bridge.invoke("plot:home")
+            bridge.invoke("page:settings")
+            bridge.invoke("cancel")
+            # Reopening a saved draft restores its choice without constructing
+            # a preview or importing the fitting code for its default values.
+            bridge.open(context, BackgroundDraft(which="first"))
+            assert bridge.draft.which == "first"
+            assert bridge.canvas is None and bridge.plotBackend is None
+            assert bridge.snapshot["plotTool"] == ""
+            forbidden = {"core.loader", "core.processing_run", "core.drr_bn_calibration", "core.drr_fitted_background"}
+            unexpected = [name for name in sys.modules if name in forbidden
+                or name.split(".", 1)[0] in {"scipy", "matplotlib"}]
+            assert not unexpected, unexpected
+            app.processEvents()
+        finally:
+            bridge.close()
+    return 0
 
 
 def _isolated():
@@ -480,6 +520,8 @@ def _isolated():
 
 
 if __name__ == "__main__":
+    if "--cold-settings" in sys.argv:
+        raise SystemExit(_cold_settings())
     if "--isolated" in sys.argv:
         raise SystemExit(_isolated())
     unittest.main()

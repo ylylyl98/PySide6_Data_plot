@@ -33,11 +33,13 @@ class _CanvasBackend(QObject):
     closed = Signal()
     drawFailed = Signal(str)
     cursorChanged = Signal(int)
+    cursorTextChanged = Signal()
     _drawRequested = Signal()
 
     def __init__(self, canvas):
         super().__init__()
         self._canvas_ref = weakref.ref(canvas)
+        self._cursor_text = ""
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._draw)
@@ -48,6 +50,15 @@ class _CanvasBackend(QObject):
     def frameGeneration(self):
         canvas = self._canvas_ref()
         return canvas.frame_generation if canvas is not None else 0
+
+    @Property(str, notify=cursorTextChanged)
+    def cursorText(self):
+        return self._cursor_text
+
+    def set_cursor_text(self, text):
+        if text != self._cursor_text:
+            self._cursor_text = text
+            self.cursorTextChanged.emit()
 
     @Slot()
     def _queue_draw(self):
@@ -120,6 +131,8 @@ class _SurfaceOwnership:
     def dispose(self, *_):
         canvas, owned = self.canvas, self.owned
         self.canvas, self.owned = None, False
+        if canvas is not None and not canvas.closed:
+            canvas.backend.set_cursor_text("")
         if owned and canvas is not None and not canvas.closed:
             canvas.close()
 
@@ -161,6 +174,7 @@ class PlotSurface(QQuickPaintedItem):
         self.setAntialiasing(False)
         self._paintCompleted.connect(self._mark_painted)
         self.windowChanged.connect(self._window_changed)
+        self.visibleChanged.connect(self._visibility_changed)
         self.destroyed.connect(self._ownership.dispose)
         # QQuickItem's constructor can attach to a parent's window before our
         # Python signal connections exist. Bind that already-established window
@@ -212,6 +226,7 @@ class PlotSurface(QQuickPaintedItem):
         if canvas is self.canvas:
             return
         if self._backend is not None:
+            self._backend.set_cursor_text("")
             self._backend.frameReady.disconnect(self._accept_frame)
             self._backend.closed.disconnect(self._backend_closed)
             self._backend.cursorChanged.disconnect(self._set_cursor)
@@ -228,12 +243,18 @@ class PlotSurface(QQuickPaintedItem):
         self.paintedGenerationChanged.emit()
         self.presentedGenerationChanged.emit()
         if self._backend is not None:
+            self._backend.set_cursor_text("")
             self._backend.frameReady.connect(self._accept_frame)
             self._backend.closed.connect(self._backend_closed)
             self._backend.cursorChanged.connect(self._set_cursor)
             self._sync_size()
         self.backendChanged.emit()
         self.update()
+
+    @Slot()
+    def _visibility_changed(self):
+        if not self.isVisible() and self._backend is not None:
+            self._backend.set_cursor_text("")
 
     @Slot()
     def close(self):

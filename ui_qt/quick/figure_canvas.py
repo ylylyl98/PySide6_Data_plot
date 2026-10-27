@@ -44,6 +44,28 @@ class QuickFigureCanvas(FigureCanvasAgg):
         self.last_render_ms = 0.0
         self.last_error = ""
         self.backend = _CanvasBackend(self)
+        self._cursor_callbacks = (
+            self.mpl_connect("motion_notify_event", self._cursor_motion),
+            self.mpl_connect("figure_leave_event", self._clear_cursor),
+            self.mpl_connect("draw_event", self._clear_cursor),
+            self.mpl_connect("resize_event", self._clear_cursor),
+        )
+
+    def _cursor_motion(self, event):
+        if self.closed or event.canvas is not self:
+            return
+        axis, x, y = event.inaxes, event.xdata, event.ydata
+        text = ""
+        if (axis is not None and axis in self.figure.axes and axis.get_visible()
+                and x is not None and y is not None and math.isfinite(x) and math.isfinite(y)):
+            # Keep Matplotlib's data transforms and axis-specific formatters
+            # (including log, inverted, date and polar axes).
+            text = axis.format_coord(x, y)
+        self.backend.set_cursor_text(text)
+
+    def _clear_cursor(self, event=None):
+        if event is None or event.canvas is self:
+            self.backend.set_cursor_text("")
 
     @property
     def frameReady(self):
@@ -145,6 +167,9 @@ class QuickFigureCanvas(FigureCanvasAgg):
             return
         self.closed = True
         self.backend._timer.stop()
+        self._clear_cursor()
+        for callback in self._cursor_callbacks:
+            self.mpl_disconnect(callback)
         try:
             CloseEvent("close_event", self)._process()
         finally:
