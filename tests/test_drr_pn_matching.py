@@ -26,7 +26,7 @@ class PnMatchingTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.measurement = self.write('TG_rep01', 1000, varying=True)
 
     def write(self, token, stamp, *, gate=-10, varying=False, prefix=None, columns='740,760,780'):
@@ -282,7 +282,7 @@ class PnMatchingTests(unittest.TestCase):
         external.write_text('Vbg,Vtg,740,760,780\n-10,-10,10,11,12\n-10,-10,11,12,13\n')
         plan = self.plan(candidate_files=(str(external),))
         self.assertTrue(plan.ready)
-        self.assertEqual(Path(plan.rows[0].baseline_file), external)
+        self.assertEqual(Path(plan.rows[0].baseline_file), external.resolve())
 
     def test_cancelled_worker_does_not_return_an_applicable_plan(self):
         stopped = Event()
