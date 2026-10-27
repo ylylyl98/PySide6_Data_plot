@@ -30,22 +30,6 @@ Rectangle {
             Layout.margins: 7
             spacing: 4
             AppButton {
-                objectName: "shg_single"
-                colors: page.colors
-                text: "Single file"
-                primary: page.state.mode === "single"
-                enabled: !page.state.busy
-                onClicked: page.bridge.setParameter("mode", "single")
-            }
-            AppButton {
-                objectName: "shg_compare"
-                colors: page.colors
-                text: "Compare / Twist"
-                primary: page.state.mode === "compare"
-                enabled: !page.state.busy
-                onClicked: page.bridge.setParameter("mode", "compare")
-            }
-            AppButton {
                 objectName: "shg_reload"
                 colors: page.colors
                 text: "Reload"
@@ -207,6 +191,44 @@ Rectangle {
             Layout.fillWidth: true
             Layout.margins: 8
             spacing: 3
+            RowLayout {
+                objectName: "shg_results_folder_row"
+                Layout.fillWidth: true
+                visible: !!page.state.resultsFolder
+                spacing: 5
+                Text {
+                    objectName: "shg_results_folder"
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 0
+                    text: page.state.resultsFolderLabel || ""
+                    property string fullPath: page.state.resultsFolder || ""
+                    elide: Text.ElideMiddle
+                    color: page.colors.muted
+                    font.pixelSize: 11
+                    Accessible.name: "Saved SHG folder"
+                    Accessible.description: fullPath
+                    Basic.ToolTip.visible: folderHover.hovered
+                    Basic.ToolTip.text: fullPath
+                    Basic.ToolTip.delay: 500
+                    HoverHandler { id: folderHover }
+                }
+                AppButton {
+                    objectName: "shg_open_results_folder"
+                    colors: page.colors
+                    text: "Open folder"
+                    compact: true
+                    description: "Open the saved SHG results folder"
+                    onClicked: page.bridge.invoke("open-results-folder")
+                }
+                AppButton {
+                    objectName: "shg_copy_results_folder"
+                    colors: page.colors
+                    text: "Copy path"
+                    compact: true
+                    description: "Copy the full SHG results folder path"
+                    onClicked: page.bridge.invoke("copy-results-folder")
+                }
+            }
             Text {
                 objectName: "shg_fit_summary"
                 Layout.fillWidth: true

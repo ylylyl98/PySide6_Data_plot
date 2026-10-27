@@ -409,7 +409,7 @@ def _run_isolated():
             self.assertEqual(len(self.bridge._products.signatures), 2)
 
         def test_real_export_values_metadata_unique_packages_history_and_settings_roundtrip(self):
-            import csv
+            from openpyxl import load_workbook
             import numpy as np
             self.bridge.setParameter("backgroundMethod", "local_quadratic")
             first, second = self.compare()
@@ -423,7 +423,7 @@ def _run_isolated():
             self.settled()
             self.assertEqual(self.bridge.snapshot["error"], "", self.bridge.snapshot["status"])
             paths = list(map(Path, self.bridge.snapshot["resultPaths"]))
-            self.assertEqual(len(paths), 8)
+            self.assertEqual({path.name for path in paths}, {"shg.xlsx", "analysis_settings.json"})
             self.assertTrue(all(path.is_file() and path.is_relative_to(self.root / "Processed Data" / "SHG") for path in paths))
             package = paths[0].parent
             metadata_path = next(path for path in paths if path.suffix == ".json" and "twist_fit" in json.loads(path.read_text(encoding="utf-8")))
@@ -432,9 +432,16 @@ def _run_isolated():
             self.assertEqual(metadata["workflow"], "SHG")
             self.assertEqual(metadata["twist_fit"]["phase_branch"], -1)
             self.assertEqual({item["role"] for item in metadata["inputs"]}, {"reference", "sample"})
-            combined = next(path for path in paths if "combined" in path.stem)
-            with combined.open(encoding="utf-8", newline="") as stream:
-                rows = list(csv.DictReader(stream))
+            with (package / "shg.xlsx").open("rb") as stream:
+                workbook = load_workbook(stream, read_only=True, data_only=True)
+                try:
+                    table = workbook["Diagnostics"].iter_rows(values_only=True)
+                    columns = next(table)
+                    rows = [dict(zip(columns, row)) for row in table]
+                    self.assertIn("Reference_Raw", workbook.sheetnames)
+                    self.assertIn("Sample_Raw", workbook.sheetnames)
+                finally:
+                    workbook.close()
             self.assertEqual(len(rows), 78)
             values = [float(row["background_subtracted_integrated_area_counts_nm"]) for row in rows]
             np.testing.assert_allclose(sorted(values), sorted(np.concatenate([result.integrated_area for result in expected.results])), rtol=1e-10)
@@ -458,17 +465,62 @@ def _run_isolated():
             self.assertTrue(all(path.is_file() for path in paths))
             self.assertEqual(self.settings.allKeys(), ["unrelated/preserved"])
 
-        def test_fit_disabled_pair_exports_both_csv_and_settings_without_twist(self):
+        def test_fit_disabled_pair_exports_one_workbook_and_settings_without_twist(self):
             self.bridge.setParameter("fitEnabled", False)
             self.compare()
             self.assertIsNone(self.bridge._products.twist)
             self.bridge.invoke("export")
             self.settled()
-            self.assertEqual(len(self.bridge.snapshot["resultPaths"]), 4)
-            self.assertEqual(sum(Path(name).suffix == ".json" for name in self.bridge.snapshot["resultPaths"]), 2)
+            self.assertEqual(len(self.bridge.snapshot["resultPaths"]), 2)
+            self.assertEqual(sum(Path(name).suffix == ".json" for name in self.bridge.snapshot["resultPaths"]), 1)
             for name in self.bridge.snapshot["resultPaths"]:
                 if name.endswith(".json"):
-                    self.assertIsNone(json.loads(Path(name).read_text(encoding="utf-8"))["angular_fit"])
+                    payload = json.loads(Path(name).read_text(encoding="utf-8"))
+                    self.assertIsNone(payload.get("twist_fit"))
+                    self.assertFalse(payload["fit_settings"]["enabled"])
+
+        def test_export_options_keep_processed_data_and_add_optional_copies(self):
+            from openpyxl import load_workbook
+            self.loaded()
+            products, sequence = self.bridge._products, self.bridge._sequence
+            self.assertFalse(self.fields()["exportCsv"]["value"])
+            self.assertFalse(self.fields()["exportCleaned"]["value"])
+            self.bridge.setParameter("exportCsv", True)
+            self.bridge.setParameter("exportCleaned", True)
+            self.settled()
+            self.assertIs(self.bridge._products, products)
+            self.assertEqual(self.bridge._sequence, sequence)
+            self.assertTrue(self.bridge.snapshot["canExport"])
+            self.bridge.invoke("export")
+            self.settled()
+            self.assertEqual(self.bridge.snapshot["error"], "")
+            paths = list(map(Path, self.bridge.snapshot["resultPaths"]))
+            self.assertEqual(sum(path.suffix == ".json" for path in paths), 1)
+            self.assertTrue(any(path.suffix == ".csv" for path in paths))
+            with next(path for path in paths if path.suffix == ".xlsx").open("rb") as stream:
+                workbook = load_workbook(stream, read_only=True)
+                try:
+                    self.assertIn("Spectra_Cleaned", workbook.sheetnames)
+                    self.assertEqual(sum(path.suffix == ".csv" for path in paths), len(workbook.sheetnames))
+                finally:
+                    workbook.close()
+
+        def test_partial_comparison_fit_settings_roundtrip_stays_enabled(self):
+            self.compare(second=self.source("short-sample.csv", count=3))
+            self.assertIsNotNone(self.bridge._products.fits[0])
+            self.assertIsNone(self.bridge._products.fits[1])
+            self.assertIsNone(self.bridge._products.twist)
+            expected = self.bridge._products.request.fit_settings
+            self.bridge.invoke("export")
+            self.settled()
+            self.assertEqual(self.bridge.snapshot["error"], "")
+            settings_path = next(path for path in self.bridge.snapshot["resultPaths"] if path.endswith(".json"))
+            self.bridge.setParameter("fitEnabled", False)
+            self.settled()
+            self.bridge.openFiles("settings", [QUrl.fromLocalFile(settings_path)])
+            self.settled()
+            self.assertEqual(self.bridge._products.request.fit_settings, expected)
+            self.assertTrue(self.bridge._values["fitEnabled"])
 
         def test_fit_exclusion_weights_and_disabled_fit_settings_are_reproducible(self):
             from core.shg_fit import fit_shg_angular_result
@@ -511,13 +563,13 @@ def _run_isolated():
                 self.settled()
                 self.assertEqual(self.bridge.snapshot["error"], "")
                 paths = list(map(Path, self.bridge.snapshot["resultPaths"]))
-                self.assertEqual(len(paths), 8)
-                self.assertEqual(len(set(paths)), 8)
+                self.assertEqual(len(paths), 2)
+                self.assertEqual(len(set(paths)), 2)
                 roles = {item["path"]: item["roles"] for item in self.bridge.snapshot["catalog"]}
                 self.assertIn("reference", roles[str(first)])
                 self.assertIn("sample", roles[str(second)])
-                metadata = next(json.loads(path.read_text(encoding="utf-8")) for path in paths
-                    if path.suffix == ".json" and "twist_summary" in path.stem)
+                metadata = next(value for path in paths if path.suffix == ".json"
+                    for value in [json.loads(path.read_text(encoding="utf-8"))] if "twist_fit" in value)
                 self.assertEqual({item["source_path"] for item in metadata["inputs"]}, {str(first), str(second)})
                 self.assertEqual(next(item for item in metadata["inputs"] if item["role"] == "reference")["source_relative_path"], "inside/same.csv")
 
@@ -570,7 +622,7 @@ def _run_isolated():
                 target.mkdir(parents=True)
                 (target / "partial_settings.json").write_text('{"workflow":"SHG"}', encoding="utf-8")
                 raise OSError("Synthetic SHG writer failure")
-            with patch("core.export.export_shg_results", side_effect=fail):
+            with patch("core.shg_workbook.export_shg_workbook", side_effect=fail):
                 self.bridge.invoke("export")
                 self.settled()
             self.assertIn("Synthetic SHG writer failure", self.bridge.snapshot["error"])
@@ -609,11 +661,11 @@ def _run_isolated():
             self.assertEqual([kind for kind, _ in completions], ["load"])
             started.clear()
             release.clear()
-            def delayed_export(*args):
+            def delayed_export(*args, **kwargs):
                 started.set()
                 if not release.wait(5):
                     raise AssertionError("Synthetic SHG export was not released")
-                return export_shg(*args)
+                return export_shg(*args, **kwargs)
             with patch("ui_qt.quick.shg_workflow.export_shg", side_effect=delayed_export):
                 self.bridge.invoke("export")
                 wait(started.is_set)
@@ -629,15 +681,16 @@ def _run_isolated():
 
         def test_native_qml_controls_plot_table_keyboard_and_narrow_layout(self):
             from PySide6.QtQml import QQmlApplicationEngine
-            from PySide6.QtCore import QCoreApplication, QEvent
-            from PySide6.QtGui import QKeyEvent, QMouseEvent
+            from PySide6.QtCore import QCoreApplication, QEvent, QPointF
+            from PySide6.QtGui import QDesktopServices, QKeyEvent, QMouseEvent
             from shiboken6 import isValid
             from ui_qt.quick.plot_surface import register_plot_surface
             register_plot_surface()
             colors = dict(surface="#F3F5F8", control="#FFFFFF", text="#1D293B", muted="#46566D",
                 border="#C6D0DE", accent="#2167C5", hover="#F3F6FA", pressed="#E5EBF3", disabled="#8A97A9",
                 selectedText="#FFFFFF", inset="#E9EDF3", divider="#D9E1EB", focus="#155DBC", accentText="#155DBC",
-                selected="#E5EFFD", selectedBorder="#B7D0F3", error="#B42318")
+                selected="#E5EFFD", selectedBorder="#B7D0F3", error="#B42318",
+                controlDisabled="#EDF0F4", borderDisabled="#DDE2E9")
             self.loaded()
             engine = QQmlApplicationEngine()
             engine.setInitialProperties(dict(bridge=self.bridge, colors=colors))
@@ -669,14 +722,12 @@ Window {
                     if found is not None:
                         return found
                 return None
-            def click(name):
-                item = find(window.contentItem(), name)
-                self.assertIsNotNone(item, name)
-                # Newly visible Flow children need layout polish before their
-                # scene coordinates identify the intended mouse target.
-                item.parentItem().ensurePolished()
-                self.assertTrue(item.isVisible(), name)
-                self.assertTrue(item.isEnabled(), name)
+
+            def visible_text(root, value):
+                if root.isVisible() and root.property("text") == value:
+                    return True
+                return any(visible_text(child, value) for child in root.childItems())
+            def present():
                 presented = []
                 connection = window.frameSwapped.connect(lambda: presented.append(True))
                 try:
@@ -684,6 +735,17 @@ Window {
                     wait(lambda: bool(presented))
                 finally:
                     QObject.disconnect(connection)
+
+            def click(name, *, require_enabled=True):
+                item = find(window.contentItem(), name)
+                self.assertIsNotNone(item, name)
+                # Newly visible Flow children need layout polish before their
+                # scene coordinates identify the intended mouse target.
+                item.parentItem().ensurePolished()
+                self.assertTrue(item.isVisible(), name)
+                if require_enabled:
+                    self.assertTrue(item.isEnabled(), name)
+                present()
                 point = item.mapToScene(item.boundingRect().center())
                 global_point = window.mapToGlobal(point.toPoint()).toPointF()
                 QCoreApplication.sendEvent(window, QMouseEvent(QEvent.Type.MouseButtonPress, point, global_point,
@@ -692,10 +754,137 @@ Window {
                     Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier))
                 app.processEvents()
                 return item
+
+            def key(key_code):
+                QCoreApplication.sendEvent(window, QKeyEvent(QEvent.Type.KeyPress, key_code, Qt.KeyboardModifier.NoModifier))
+                QCoreApplication.sendEvent(window, QKeyEvent(QEvent.Type.KeyRelease, key_code, Qt.KeyboardModifier.NoModifier))
+                app.processEvents()
+
+            def assert_mode(mode):
+                # Switching source roles can rebuild parameter delegates. Always
+                # inspect the current visual tree, not an old editor instance.
+                tabs = find(window.contentItem(), "app_parameter_mode")
+                self.assertIsNotNone(tabs, "SHG workflow tabs")
+                self.assertIn("TabBar", tabs.metaObject().className())
+                self.assertEqual(self.fields()["mode"]["type"], "tabs")
+                self.assertEqual(tabs.property("count"), 2)
+                self.assertEqual(tabs.property("currentIndex"), ("single", "compare").index(mode))
+                self.assertEqual(self.bridge.snapshot["mode"], mode)
+                for value in ("single", "compare"):
+                    button = find(tabs, "shg_" + value)
+                    self.assertIsNotNone(button, value)
+                    self.assertEqual(button.property("checked"), value == mode)
+                    self.assertIsNone(find(window.findChild(QObject, "workspace"), "shg_" + value),
+                                      "The workspace must not duplicate the workflow selector")
+                return tabs
+
+            def assert_tabs_fit():
+                present()
+                pane = window.findChild(QObject, "parameters")
+                tabs = assert_mode(self.bridge.snapshot["mode"])
+                self.assertGreater(tabs.width(), 0)
+                for name in ("app_parameter_mode", "shg_single", "shg_compare"):
+                    item = find(window.contentItem(), name)
+                    position = item.mapToItem(pane, QPointF(0, 0))
+                    self.assertGreaterEqual(position.x(), -1, name)
+                    self.assertLessEqual(position.x() + item.width(), pane.width() + 1, name)
+                    self.assertGreater(item.height(), 0, name)
+                first, second = find(tabs, "shg_single"), find(tabs, "shg_compare")
+                first_position = first.mapToItem(tabs, QPointF(0, 0))
+                second_position = second.mapToItem(tabs, QPointF(0, 0))
+                self.assertLessEqual(first_position.x() + first.width(), second_position.x() + 1)
+                for button in (first, second):
+                    label = button.property("contentItem")
+                    self.assertLessEqual(label.implicitHeight(), label.height() + 1,
+                                         "The workflow tab label must not be clipped")
+
+            capture_prefix = os.environ.get("DPTK_SHG_CAPTURE", "")
+            def capture(name):
+                if capture_prefix:
+                    present()
+                    target = Path(capture_prefix + "-" + name + ".png")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    self.assertTrue(window.grabWindow().save(str(target)))
+
             surface = window.findChild(QObject, "shg_plot_surface")
             self.assertIs(surface.property("backend"), self.bridge.plotBackend)
             wait(lambda: surface.property("presentedGeneration") == self.bridge._canvas.frame_generation
                 and surface.property("presentedGeneration") > 0)
+            assert_mode("single")
+            assert_tabs_fit()
+            capture("single-wide")
+            click("shg_compare")
+            assert_mode("compare")
+            self.assertFalse(self.bridge.snapshot["inspectionVisible"])
+            assert_tabs_fit()
+            capture("compare-wide")
+            click("shg_single")
+            self.settled()
+            self.plotted()
+            assert_mode("single")
+            find(window.contentItem(), "shg_single").forceActiveFocus()
+            key(Qt.Key.Key_Right)
+            assert_mode("compare")
+            self.assertTrue(find(window.contentItem(), "shg_compare").hasActiveFocus(),
+                            "Changing workflow must retain keyboard focus in the tab strip")
+            key(Qt.Key.Key_Left)
+            self.settled()
+            self.plotted()
+            assert_mode("single")
+            # State restoration changes the bridge without a mouse activation.
+            self.bridge.setParameter("mode", "compare")
+            app.processEvents()
+            assert_mode("compare")
+            self.bridge.setParameter("mode", "single")
+            self.settled()
+            self.plotted()
+            assert_mode("single")
+            # Hold the actual export worker so disabled state is observable,
+            # including attempts to click a tab while its sources are frozen.
+            from ui_qt.quick.shg_workflow import export_shg
+            export_started, release_export = threading.Event(), threading.Event()
+            self.addCleanup(release_export.set)
+            def delayed_export(*args, **kwargs):
+                export_started.set()
+                if not release_export.wait(10):
+                    raise AssertionError("Synthetic SHG export was not released")
+                return export_shg(*args, **kwargs)
+            with patch("ui_qt.quick.shg_workflow.export_shg", side_effect=delayed_export):
+                self.bridge.invoke("export")
+                try:
+                    wait(export_started.is_set)
+                    tabs = assert_mode("single")
+                    self.assertFalse(tabs.isEnabled())
+                    self.assertFalse(find(tabs, "shg_single").isEnabled())
+                    self.assertFalse(find(tabs, "shg_compare").isEnabled())
+                    click("shg_compare", require_enabled=False)
+                    assert_mode("single")
+                finally:
+                    release_export.set()
+                self.settled()
+            self.assertEqual(self.bridge.snapshot["error"], "")
+            self.assertTrue(assert_mode("single").isEnabled())
+            results_folder = Path(self.bridge.snapshot["resultPaths"][0]).parent
+            self.assertEqual(Path(self.bridge.snapshot["resultsFolder"]), results_folder)
+            self.assertEqual(self.bridge.snapshot["resultsFolderLabel"], results_folder.relative_to(self.root).as_posix())
+            self.assertTrue(self.bridge.snapshot["resultsFolderLabel"].startswith("Processed Data/SHG/"))
+            folder_label = window.findChild(QObject, "shg_results_folder")
+            self.assertTrue(window.findChild(QObject, "shg_results_folder_row").isVisible())
+            self.assertEqual(folder_label.property("text"), self.bridge.snapshot["resultsFolderLabel"])
+            self.assertEqual(folder_label.property("fullPath"), str(results_folder))
+            present()
+            hover_point = folder_label.mapToScene(folder_label.boundingRect().center())
+            QCoreApplication.sendEvent(window, QMouseEvent(QEvent.Type.MouseMove, hover_point,
+                window.mapToGlobal(hover_point.toPoint()).toPointF(), Qt.MouseButton.NoButton,
+                Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier))
+            wait(lambda: visible_text(window.contentItem(), str(results_folder)))
+            with patch.object(QDesktopServices, "openUrl", return_value=True) as open_folder:
+                click("shg_open_results_folder")
+                open_folder.assert_called_once_with(QUrl.fromLocalFile(str(results_folder)))
+            with patch.object(QGuiApplication, "clipboard") as clipboard:
+                click("shg_copy_results_folder")
+                clipboard.return_value.setText.assert_called_once_with(str(results_folder))
+            capture("export-wide")
             click("shg_table")
             self.assertTrue(self.bridge.snapshot["showTable"])
             self.assertTrue(window.findChild(QObject, "shg_results_table").isVisible())
@@ -722,6 +911,16 @@ Window {
             self.assertLessEqual(window.findChild(QObject, "parameters").width(), 221)
             self.assertGreater(window.findChild(QObject, "workspace").width(), 400)
             self.assertGreater(surface.width(), 400)
+            present()
+            folder_label = window.findChild(QObject, "shg_results_folder")
+            self.assertTrue(folder_label.property("truncated"), "Narrow layouts should shorten the displayed folder")
+            folder_row = window.findChild(QObject, "shg_results_folder_row")
+            for name in ("shg_results_folder", "shg_open_results_folder", "shg_copy_results_folder"):
+                control = window.findChild(QObject, name)
+                offset = control.mapToItem(folder_row, QPointF(0, 0))
+                self.assertGreaterEqual(offset.x(), -1, name)
+                self.assertLessEqual(offset.x() + control.width(), folder_row.width() + 1, name)
+            capture("export-narrow")
             wait(lambda: self.bridge.snapshot["compactInspection"] and not self.bridge._plot_timer.isActive()
                 and not self.bridge._canvas.backend._timer.isActive())
             self.assertEqual(len(self.bridge._canvas.figure.axes), 3)
@@ -732,11 +931,16 @@ Window {
             self.plotted()
             self.assertEqual(self.bridge._canvas.figure.axes[0].get_ylabel(), "Counts")
             click("shg_compare")
-            self.assertEqual(self.bridge.snapshot["mode"], "compare")
+            assert_mode("compare")
+            assert_tabs_fit()
+            capture("compare-narrow")
             self.assertFalse(self.bridge.snapshot["inspectionVisible"])
             click("shg_single")
             self.settled()
             self.plotted()
+            assert_mode("single")
+            assert_tabs_fit()
+            capture("single-narrow")
             requested = []
             self.bridge.sourceDialogRequested.connect(lambda *args: requested.append(args))
             click("app_parameter_choose-single")

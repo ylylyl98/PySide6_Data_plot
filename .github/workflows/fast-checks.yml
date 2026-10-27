@@ -161,6 +161,9 @@ jobs:
           tests.test_drr_bn_store
           tests.test_drr_bn_integration
           tests.test_shg_fit
+          tests.test_shg_workbook
+          tests.test_shg_legacy_workbook
+          tests.test_shg_export_paths
           tests.test_power_series
           tests.test_compare_vp
           tests.test_colormaps

@@ -273,6 +273,14 @@ SHG connects its single-file and Compare/Twist workflows, background and peak
 integration, angular fits, exclusions, result tables, settings and scientific
 exports. Its wide layout shows both spectra; compact layouts provide an explicit
 Raw/Corrected switch while retaining the angular result and residual plot.
+Single file and Compare / Twist are persistent tabs above the SHG controls,
+with keyboard left/right navigation. After exporting, the workspace shows a
+compact relative results-folder path; hover for the full path, or use Open
+folder and Copy path. Export receipts list the folder once and its filenames.
+Save XLSX + settings writes one Origin-friendly workbook and one settings JSON.
+All measured-angle spectra are included as wavelength rows and angle columns;
+choose angles after importing into Origin. Optional CSV copies and full-band
+cosmic-cleaned spectra are off by default and do not trigger reprocessing.
 
 Power connects its catalog and explicit source-selection workspace, combined
 sweep review, intensity/VP plots, multi-peak fitting, manual refitting and power
@@ -993,13 +1001,54 @@ processed-result storage.
 | DRR | `Processed Data/DRR/` | averaged or derivative DAT, metadata, PNG |
 | Compare | `Processed Data/Compare/` | channel DAT/PNG/metadata and VP results |
 | MCD | `Processed Data/MCD/<analysis package>/` | map DAT/PNG/metadata, MCD(B) CSV/PNG, diagnostics, settings |
-| SHG | `Processed Data/SHG/<analysis package>/` | area-vs-angle CSV, settings, fit/twist summaries |
+| SHG | `Processed Data/SHG/<analysis package>/` | `shg.xlsx` with angular results and all-angle spectra, `analysis_settings.json` |
 | Power Dependence | `Processed Data/Power Dependence/<package>/` | KK/KKp/VP DAT, PNG, metadata |
 
 MCD package names use a readable source, energy, and window identity such as
-`<source>_MCD_E1.650000eV_W5meV`. SHG single analyses use
-`<source>_SHG_<center>nm`; twist analyses use
-`<reference>_vs_<sample>_SHG_twist`. Power packages use one of:
+`<source>_MCD_E1.650000eV_W5meV`. SHG single analyses use bounded names such as
+`single_<short-source>_515nm_<identity>`; comparisons use
+`compare_<short-reference>_vs_<short-sample>_515nm_<identity>`. The identity
+is an eight-character source hash; repeated exports receive a numeric suffix.
+SHG packages contain `shg.xlsx` and `analysis_settings.json` by default. The
+workbook opens on `Overview`, which prominently identifies Reference A and
+Sample B (or the single measurement) with separate filenames and full source
+paths. It also lists background sources, processing windows, export time and a
+worksheet guide, so a workbook copied on its own still identifies the compared
+files. Long paths wrap within the overview. Optional CSV copies include
+`overview.csv` with the same source information.
+The `Plot` sheet contains independent angle/intensity/error column groups
+for each source, `Fit` contains smooth model curves within each actual fit range,
+`Summary` records fitted parameters and twist results or their unavailable status,
+and `Diagnostics` retains the complete per-acquisition results and source rows.
+Missing values are blank rather than zero. Optional CSV copies use the same tables.
+
+`Spectra_Raw` and `Spectra_Corrected` store every acquisition as a separate column:
+the first column is wavelength in nm and the remaining columns are intensity in
+counts, labelled with the processed measured angle and source-row identity.
+Repeated angles are preserved, including records excluded from the angular fit;
+their status and original/processed angles remain in the diagnostics and metadata.
+For comparisons, `Reference_Raw`/`Reference_Corrected` and
+`Sample_Raw`/`Sample_Corrected` retain each source's own wavelength grid. Raw
+spectra retain the full recorded band. Corrected spectra use cosmic-cleaned data
+minus the fitted background, restricted to the peak and sideband interval for
+local/external background models; no-background mode retains the full band.
+Optional `Spectra_Cleaned` (or `Reference_Cleaned`/`Sample_Cleaned`) sheets retain
+the full band after cosmic-ray removal without subtracting a background. Spectral
+counts are distinct from integrated angular intensities in counts·nm.
+
+In Origin, import the desired XLSX sheet with its first row as column names.
+For spectra, designate the first column X and the selected angle columns Y. For
+`Plot`, designate each independent group X/Y/Y Error; for `Fit`, use X/Y groups.
+XLSX column labels describe these roles but do not automatically set Origin's
+column designations. Select any angle columns to overlay their spectra, without
+choosing export angles in advance. Numerical rows remain plain numeric cells.
+
+The JSON keeps full source identities, processing and fitting settings, spectrum
+column mappings, units, and the output manifest. Existing SHG CSV/JSON packages
+remain readable and are not renamed. The legacy CSV export APIs remain available
+to scripts. New paths include a Windows-compatible length budget; overly deep
+experiment roots receive an actionable error.
+Power packages use one of:
 `<group>_PowerDep`, `<KK-group>_vs_<KKp-group>_IntensityCompare`, or
 `<KK-group>_vs_<KKp-group>_VP`. Package names are sanitized for Windows and
 macOS. Related numerical files, metadata, figures, and diagnostics stay
