@@ -206,7 +206,6 @@ class DrrBackgroundBridge(QObject):
         if not isinstance(context, BackgroundContext):
             raise TypeError("BackgroundContext is required.")
         self.cancel()
-        had_raw_preview = self._raw_preview is not None
         self._raw_preview, self._raw_preview_key = None, None
         self._texts["rawSource"] = ""
         self._raw_role, self._raw_scope = "measurement", "single"
@@ -215,6 +214,7 @@ class DrrBackgroundBridge(QObject):
             self._navigation.pan()
         elif self._navigation is not None and self._navigation.mode.name == "ZOOM":
             self._navigation.zoom()
+        self._clear_preview_artists()
         self._context, self._raw_snapshot, self._catalog = context, raw_snapshot, tuple(catalog)
         self._catalog_loaded, self._pn_catalog = False, ()
         if current is not None:
@@ -242,8 +242,6 @@ class DrrBackgroundBridge(QObject):
             self._pn_files = {"P": tuple(self._version.pair.p_files), "N": tuple(self._version.pair.n_files)}
         self._set_fit_recipe(self._draft.fitted_result or {})
         self._status = f"{len(context.measurements)} measurements. Browse references directly, or load the P/N catalog when needed."
-        if had_raw_preview:
-            self._draw_preview()
         self._refresh()
 
     def _templates(self):
@@ -1254,6 +1252,23 @@ class DrrBackgroundBridge(QObject):
             self._draw_preview()
         self._run(lambda token: load_preview(snapshot, role, scope, source=name), complete, "Loading original intensity without DRR or derivative processing…")
 
+    def _clear_preview_artists(self):
+        """Release the previous context without creating or drawing a canvas."""
+        if self._raw_gate_blitter:
+            self._raw_gate_blitter.disconnect()
+        self._raw_gate_blitter = None
+        self._raw_preview_key = None
+        self._raw_heatmap = self._raw_gate_line = None
+        self._raw_spectrum_axis = self._raw_spectrum_line = None
+        if self._span:
+            self._span.disconnect_events()
+            self._span = None
+        if self.canvas is not None:
+            self.canvas.backend._timer.stop()
+            self.canvas.backend.set_cursor_text("")
+            self.canvas.figure.clear()
+            self._navigation.update()
+
     def _draw_preview(self, *, alternate=None):
         has_preview = (self._page == "fit" and self._fit_raw is not None
             or self._page == "bn" and self._bn_payload is not None
@@ -1272,17 +1287,8 @@ class DrrBackgroundBridge(QObject):
             if self._raw_gate_line is not None:self._raw_gate_line.set_ydata([cube.gate[gate]]*2)
             if not self._raw_gate_blitter.draw():self.canvas.draw_idle()
             return
-        if self._raw_gate_blitter:self._raw_gate_blitter.disconnect()
-        self._raw_gate_blitter = None
-        self._raw_preview_key = None
-        self._raw_spectrum_axis = self._raw_spectrum_line = None
-        if self._span:
-            self._span.disconnect_events()
-            self._span = None
+        self._clear_preview_artists()
         figure = self.canvas.figure
-        figure.clear()
-        self._raw_heatmap = None
-        self._raw_gate_line = None
         axes = figure.add_subplot(111)
         axes.set_xlabel("Photon energy (eV)")
         axes.set_ylabel("Raw intensity (a.u.)")
