@@ -15,7 +15,7 @@ from math import isfinite
 from pathlib import Path
 from time import perf_counter
 
-from PySide6.QtCore import QObject, Property, QSettings, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, Property, QSettings, QTimer, QUrl, Qt, Signal, Slot
 
 from ui_qt.feature_registry import FEATURES
 from ui_qt.quick.peak_application import PeakApplicationMixin
@@ -75,6 +75,9 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         self._drr_background_bridge = None
         self._drr_background_recipe = None
         self._drr_restore_pending = False
+        self._drr_background_required = False
+        self._drr_background_notice = ""
+        self._drr_background_auto_open_sequence = None
         self._background_applications = {}
         self._background_open = False
         self._background_token = 0
@@ -127,7 +130,9 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         self._plot_timer = QTimer(self)
         self._plot_timer.setSingleShot(True)
         self._plot_timer.timeout.connect(self._rebuild_plot)
-        self.requestFinished.connect(self._finish_request)
+        # Even an already-complete Future must wait until _submit's caller has
+        # registered its selection token or pending background transaction.
+        self.requestFinished.connect(self._finish_request, Qt.ConnectionType.QueuedConnection)
         self._pl_init()
         self._shell_init()
 
@@ -154,12 +159,16 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
                     resultText=self._result, logText="\n".join(self._log),
                     sourceSummary=self._source_summary(),
                     backgroundSummary=self._background_summary(),
+                    backgroundRequired=self._workflow == "drr" and self._drr_background_required,
                     bnBusy=self._workflow == "drr" and self._bn_controller is not None and self._bn_controller.running,
                     canConfigureBackground=self._workflow == "drr" and bool(self._sources) and
                         all(Path(name).suffix.lower() == ".csv" for name in self._sources) and not self._busy,
                     processingGroups=self._pl_parameter_groups(self._processing_groups()) if self._workflow == "drr" else [],
                     parameterGroups=self._pl_parameter_groups(self._parameter_groups()) if self._workflow == "pl" else [],
-                    workspaceMessage=("" if self._cube is not None else f"Select {feature.label} measurement files to display the heatmap and spectrum.")
+                    workspaceMessage=(("Preparing DRR…" if self._busy else
+                        "Measurements selected. Choose a background to calculate and display DRR.")
+                        if self._workflow == "drr" and self._drr_background_required else
+                        "" if self._cube is not None else f"Select {feature.label} measurement files to display the heatmap and spectrum.")
                     if available else "" if self._workflow in {"slides", "tools"} else f"{feature.label} is not available in this development preview yet.",
                     inspectionVisible=available and self._cube is not None,
                     spectrumVisible=self._values["spectrumVisible"],
@@ -247,6 +256,8 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         return self._background_token
 
     def _background_summary(self):
+        if self._drr_background_required:
+            return "Background: awaiting selection"
         if self._drr_products is not None and self._drr_products.request.background_mode == "imported":
             return "Imported map · no background division"
         if self._drr_background_recipe is not None:
@@ -364,7 +375,8 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
                 if self._drr_processing["backgroundMode"] == "external" else
                 BackgroundDraft(kind="self", which="first" if self._drr_processing["backgroundMode"] == "self-first" else "last", auto_bn_compare=self._automatic_bn_enabled()))
             self._drr_background_bridge.open(context, current,
-                raw_snapshot=self._drr_products.raw_snapshot if self._drr_products is not None else None)
+                raw_snapshot=self._drr_products.raw_snapshot if self._drr_products is not None else None,
+                initial_error=self._drr_background_notice if self._drr_background_required else "")
             self._drr_background_bridge.restore_comparison(self._bn_payload or
                 (current.calibration["payload"] if current.calibration is not None else None))
             self._background_open = True
@@ -376,6 +388,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
 
     @Slot()
     def cancelDrrBackground(self):
+        self._drr_background_auto_open_sequence = None
         self._cancel_background_application()
         if self._drr_background_bridge is not None and self._background_open:
             self._drr_background_bridge.invoke("cancel")
@@ -387,7 +400,9 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
                 self._load_cancellation.cancel()
             self._background_applications.clear()
             self._busy = False
-            self._message("Background application cancelled; the previous result was retained.")
+            self._message("Background application cancelled; choose a background when ready."
+                          if self._drr_background_required else
+                          "Background application cancelled; the previous result was retained.")
 
     def _close_background_dialog(self):
         if self._background_applications:
@@ -806,7 +821,8 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             if keep_background:
                 self._load_fixed_background(previous_recipe)
             else:
-                self._load_drr(restore_background=True)
+                self._drr_background_required = all(Path(name).suffix.lower() == ".csv" for name in paths)
+                self._load_drr(restore_background=True, auto_open_background=True)
 
     def _load_fixed_background(self, previous_recipe):
         from dataclasses import replace
@@ -861,9 +877,11 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         paths = tuple(str(_local_path(value).resolve()) for value in values)
         if not paths:
             return
+        self.cancelDrrBackground()
         self._drr_backgrounds = paths
         self._drr_background_recipe = None
         self._drr_restore_pending = False
+        self._drr_background_required = False
         self._drr_processing["backgroundMode"] = "external"
         self._load_drr()
         self._publish()
@@ -881,11 +899,16 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             restore_files=self._drr_display.memory_preferences["files"],
             restore_centers=self._drr_display.memory_preferences["centers"])
 
-    def _load_drr(self, *, reprocess=False, restore_background=False):
+    def _load_drr(self, *, reprocess=False, restore_background=False, auto_open_background=False):
         if not self._sources and self._drr_products is None:
             self._publish()
             return
         restore_background = restore_background or self._drr_restore_pending
+        if self._drr_background_required and not restore_background:
+            self._publish()
+            return
+        if restore_background and self._background_open:
+            self.cancelDrrBackground()
         self._drr_restore_pending = restore_background
         recipe = self._drr_background_recipe
         if recipe is not None and recipe.fixed:
@@ -933,11 +956,34 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
                 if restore_background:
                     from ui_qt.quick.drr_background_restore import restore_saved_background
                     captured = restore_saved_background(request, auto_bn_compare=automatic_bn)
+                    if (all(Path(name).suffix.lower() == ".csv" for name in captured.files)
+                            and captured.background_recipe is None):
+                        cancellation.check()
+                        return None
                 result = process_drr(source, captured, input_signatures=signatures,
                     background_references=references, raw_snapshot=raw_snapshot) if source is not None else load_drr(captured)
                 cancellation.check()
                 return result
         self._submit("load-drr-selection" if restore_background else "load-drr", load)
+        self._drr_background_auto_open_sequence = self._sequence if auto_open_background else None
+
+    def _require_drr_background(self, message="", *, retry_restore=False):
+        """Keep selected measurements separate from a committed scientific result."""
+        self._drr_background_required = True
+        self._drr_background_notice = message
+        self._drr_restore_pending = retry_restore
+        self._drr_products = self._drr_export_state = None
+        self._drr_background_recipe = None
+        self._drr_backgrounds = ()
+        self._drr_processing.update(backgroundMode="self-last", backgroundFrame="last")
+        self._source = self._cube = None
+        self._export_valid = False
+        self._result = ""
+        self._bn_payload = None
+        self._drr_display.sync_cube(None)
+        self._drr_display.set_memory_status("Choose a background before restoring display settings.", available=False)
+        self._clear_plot()
+        self._message(message or "Measurements selected. Choose a background, then Apply to display DRR.")
 
     def _clear_plot(self):
         self._plot_timer.stop()
@@ -955,6 +1001,8 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
     def _clear_files(self, *, keep_background=None):
         # Clearing the measurement selection is also a way to change groups.
         # Only an explicit background reset (or a non-CSV load) releases Keep.
+        if self._workflow == "drr":
+            self.cancelDrrBackground()
         if keep_background is None:
             recipe = self._drr_background_recipe
             keep_background = self._workflow == "drr" and recipe is not None and recipe.fixed
@@ -968,7 +1016,10 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         self._export_valid = False
         if self._workflow == "drr":
             self._drr_restore_pending = False
-            if self._drr_background_recipe is not None and not keep_background:
+            self._drr_background_required = False
+            self._drr_background_notice = ""
+            self._drr_background_auto_open_sequence = None
+            if not keep_background:
                 self._drr_background_recipe = None
                 self._drr_backgrounds = ()
                 self._drr_processing["backgroundMode"] = "self-last"
@@ -1009,6 +1060,14 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             self._sync_source_catalog()
             return
         self._busy = False
+        if kind == "load-drr-selection" and (error or result is None) and self._drr_background_required:
+            auto_open = sequence == self._drr_background_auto_open_sequence
+            self._drr_background_auto_open_sequence = None
+            self._require_drr_background(error, retry_restore=bool(error))
+            self.operationCompleted.emit("resolve-drr-background", elapsed * 1000)
+            if auto_open:
+                self.openDrrBackground()
+            return
         if kind == "load-drr-fixed" and not error:
             prepared, result = result
         if kind in {"load-drr-background", "load-drr-fixed"}:
@@ -1021,6 +1080,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
                 self._drr_background_recipe = recipe
                 self._drr_backgrounds = recipe.files
                 self._drr_restore_pending = False
+                self._drr_background_required = False
                 self._drr_processing.update(backgroundMode=result.request.background_mode, backgroundFrame=recipe.which)
                 if from_dialog:
                     self._drr_background_bridge.application_finished()
@@ -1042,6 +1102,9 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             self._source_catalog.recordLoaded(self._workflow, self._folder, list(self._sources))
             self._message(f"Loaded {self._source.name} in {elapsed:.3f} s.")
         elif kind in {"load-drr", "load-drr-selection"}:
+            self._drr_background_required = False
+            self._drr_background_notice = ""
+            self._drr_background_auto_open_sequence = None
             if kind == "load-drr-selection":
                 # A saved choice is adopted only after its exact references
                 # successfully load. Reading history must not activate stores.
@@ -1374,11 +1437,16 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         elif action == "clear-files":
             self._clear_files()
         elif action == "clear-background" and self._workflow == "drr":
-            self._drr_backgrounds = ()
-            self._drr_background_recipe = None
-            self._drr_restore_pending = False
-            self._drr_processing["backgroundMode"] = "self-last"
-            self._load_drr()
+            if self._sources and any(Path(name).suffix.lower() != ".csv" for name in self._sources):
+                return
+            self.cancelDrrBackground()
+            self._cancel_bn_check()
+            self._sequence += 1
+            if self._load_cancellation is not None:
+                self._load_cancellation.cancel()
+            self._busy = False
+            self._require_drr_background()
+            self._drr_background_required = bool(self._sources)
         elif action in {"toggle-results", "toggle-log"}:
             name = "_results_visible" if action == "toggle-results" else "_log_visible"
             setattr(self, name, not getattr(self, name))

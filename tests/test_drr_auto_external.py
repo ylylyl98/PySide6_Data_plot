@@ -130,7 +130,9 @@ class TimedBnIntegrationTests(unittest.TestCase):
                          [(self.backgrounds[0],)] * 9 + [(self.backgrounds[1],)] * 6)
 
 
-class AutoExternalTests(unittest.TestCase):
+class _AutoExternalFixture:
+    """Shared source setup without inheriting the core test methods in UI tests."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -148,6 +150,8 @@ class AutoExternalTests(unittest.TestCase):
         from core.drr_auto_external import resolve_auto_external
         return resolve_auto_external(self.root, discover_drr_sources(self.root), [self.measurement])
 
+
+class AutoExternalTests(_AutoExternalFixture, unittest.TestCase):
     def test_selects_recommendation_even_without_unique_high_confidence_match(self):
         self.write('other_REF_760nm_background.csv')
         os.utime(self.root / 'other_REF_760nm_background.csv', (1000, 1000))
@@ -330,7 +334,7 @@ class AppliedPnExternalTests(unittest.TestCase):
         self.assertEqual(result.assignments[0].baseline_files, ("Pback.csv",))
 
 
-class AutoExternalUiTests(AutoExternalTests):
+class AutoExternalUiTests(_AutoExternalFixture, unittest.TestCase):
     def setUp(self):
         super().setUp()
         from PySide6.QtCore import QSettings

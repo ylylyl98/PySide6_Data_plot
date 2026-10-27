@@ -113,38 +113,39 @@ class IndependentShrinkageTests(unittest.TestCase):
             np.testing.assert_array_equal(result.applied_background, result.original_background)
 
     def test_postfit_strength_uses_geometric_denominator_not_scaled_parameter_fit(self):
+        # Both contracts read the same deterministic fit; evaluate it once.
         inputs = independent_input(nonuniform=True)
         result = evaluate(inputs)
-        self.assert_contract(result)
-        expected = {'original'} | {family+suffix for family in ('local_shift', 'local_shift_gain')
-                                   for suffix in ('_s25', '_s50', '_s75', '')}
-        self.assertEqual(set(result.candidate_backgrounds), expected)
-        background = inputs['background']
-        for family in ('local_shift', 'local_shift_gain'):
-            full = result.candidate_backgrounds[family]
-            self.assertGreater(np.max(abs(np.log(full/background))), 1e-6)
-            for suffix, strength in (('s25', .25), ('s50', .5), ('s75', .75)):
-                name = family+'_'+suffix
-                actual = result.candidate_backgrounds[name]
-                expected = background*np.exp(strength*np.log(full/background))
-                np.testing.assert_allclose(actual, expected, rtol=3e-14, atol=0)
-                parameters = result.report['candidates'][name]['parameters']
-                self.assertEqual(parameters['correction_strength'], strength)
-                self.assertEqual(parameters['family'], family)
-                self.assertEqual(parameters['unshrunk_parameters']['shift_pixel'],
-                                 result.report['candidates'][family]['parameters']['shift_pixel'])
+        with self.subTest(contract='geometric_denominator_not_scaled_parameter_fit'):
+            self.assert_contract(result)
+            expected = {'original'} | {family+suffix for family in ('local_shift', 'local_shift_gain')
+                                       for suffix in ('_s25', '_s50', '_s75', '')}
+            self.assertEqual(set(result.candidate_backgrounds), expected)
+            background = inputs['background']
+            for family in ('local_shift', 'local_shift_gain'):
+                full = result.candidate_backgrounds[family]
+                self.assertGreater(np.max(abs(np.log(full/background))), 1e-6)
+                for suffix, strength in (('s25', .25), ('s50', .5), ('s75', .75)):
+                    name = family+'_'+suffix
+                    actual = result.candidate_backgrounds[name]
+                    expected = background*np.exp(strength*np.log(full/background))
+                    np.testing.assert_allclose(actual, expected, rtol=3e-14, atol=0)
+                    parameters = result.report['candidates'][name]['parameters']
+                    self.assertEqual(parameters['correction_strength'], strength)
+                    self.assertEqual(parameters['family'], family)
+                    self.assertEqual(parameters['unshrunk_parameters']['shift_pixel'],
+                                     result.report['candidates'][family]['parameters']['shift_pixel'])
 
-    def test_alpha_does_not_cancel_from_fixed_family_influence_screen(self):
-        result = evaluate(independent_input(nonuniform=True))
-        for family in ('local_shift', 'local_shift_gain'):
-            candidates = result.report['candidates']
-            full = candidates[family]['training_influence_audit']['screening']
-            low = candidates[family+'_s25']['training_influence_audit']['screening']
-            # A pseudoinverse of the shrunk output Jacobian would incorrectly
-            # restore the full absorption response and make these ~equal.
-            self.assertGreater(full['max_d2_error_fraction'], .05)
-            self.assertLess(low['max_d2_error_fraction'], .36*full['max_d2_error_fraction'])
-            self.assertGreater(low['max_d2_error_fraction'], .15*full['max_d2_error_fraction'])
+        with self.subTest(contract='alpha_does_not_cancel_from_fixed_family_influence_screen'):
+            for family in ('local_shift', 'local_shift_gain'):
+                candidates = result.report['candidates']
+                full = candidates[family]['training_influence_audit']['screening']
+                low = candidates[family+'_s25']['training_influence_audit']['screening']
+                # A pseudoinverse of the shrunk output Jacobian would incorrectly
+                # restore the full absorption response and make these ~equal.
+                self.assertGreater(full['max_d2_error_fraction'], .05)
+                self.assertLess(low['max_d2_error_fraction'], .36*full['max_d2_error_fraction'])
+                self.assertGreater(low['max_d2_error_fraction'], .15*full['max_d2_error_fraction'])
 
     def test_unseen_shapes_use_complete_selection_and_actual_nonuniform_sg(self):
         clean = wide_input(nonuniform=True)

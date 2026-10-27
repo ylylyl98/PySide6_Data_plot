@@ -50,7 +50,7 @@ def _run_isolated():
 
     sys.meta_path.insert(0, NoWidgetImports())
     from PySide6.QtCore import QCoreApplication, QEvent, QObject, QPointF, QSettings, Qt, QUrl, qInstallMessageHandler
-    from PySide6.QtGui import QFont, QFontDatabase, QGuiApplication, QImage, QMouseEvent
+    from PySide6.QtGui import QFont, QFontDatabase, QGuiApplication, QHoverEvent, QImage, QMouseEvent
     from PySide6.QtQuickControls2 import QQuickStyle
     from ui_qt.quick.application_bridge import QuickApplicationBridge
 
@@ -173,6 +173,9 @@ def _run_isolated():
             source = self.write_drr_csv()
             self.bridge.selectFiles([QUrl.fromLocalFile(str(source))])
             drain_until(lambda: not self.bridge._pending and not self.bridge.snapshot["busy"])
+            from tests.quick_drr_helpers import apply_self_background
+            if self.bridge.snapshot["backgroundRequired"]:
+                apply_self_background(self.bridge, drain_until)
             self.wait_for_plot()
             self.assertTrue(self.bridge.snapshot["canConfigureBackground"])
             window, _ = self.make_native_window()
@@ -197,7 +200,7 @@ def _run_isolated():
             self.assertTrue(background.snapshot["flags"]["fixed"])
             self.assertEqual(background.draft.files, (external.name,))
             before = self.bridge._cube
-            self.assertIsNone(self.bridge._drr_background_recipe)
+            self.assertEqual(self.bridge._drr_background_recipe.mode, "Self (last frame)")
             background.invoke("apply")
             self.assertIs(self.bridge._cube, before)
             drain_until(lambda: not background.snapshot["busy"] and not self.bridge._pending)
@@ -255,7 +258,7 @@ def _run_isolated():
             self.assertIn("synthetic trial failed", background.snapshot["error"])
             self.assertIs(self.bridge._cube, before)
             self.assertIs(self.bridge._drr_products, products)
-            self.assertIsNone(self.bridge._drr_background_recipe)
+            self.assertIs(self.bridge._drr_background_recipe, products.request.background_recipe)
             self.assertTrue(self.bridge.snapshot["canExport"])
             self.assertTrue(dialog.isVisible())
             started, release = threading.Event(), threading.Event()
@@ -277,7 +280,7 @@ def _run_isolated():
                     release.set()
                     drain_until(lambda: not self.bridge._pending)
             self.assertIs(self.bridge._cube, before)
-            self.assertIsNone(self.bridge._drr_background_recipe)
+            self.assertIs(self.bridge._drr_background_recipe, products.request.background_recipe)
             self.assertEqual({key: self.settings.value(key) for key in self.settings.allKeys()}, settings_before)
             token = self.bridge.backgroundDialogToken
             dialog.close()
@@ -369,6 +372,68 @@ def _run_isolated():
                 path.mkdir(parents=True, exist_ok=True)
                 settle()
                 self.assertTrue(window.grabWindow().save(str(path / name)))
+
+        def hover_axis(self, window, surface, axis, x, y):
+            canvas = surface.canvas
+            physical_x, physical_y = axis.transData.transform((x, y))
+            point = QPointF(physical_x / canvas.device_pixel_ratio,
+                (canvas.figure.bbox.height - physical_y) / canvas.device_pixel_ratio)
+            event = QHoverEvent(QEvent.Type.HoverMove, point, point, point, Qt.KeyboardModifier.NoModifier)
+            motion = []
+            callback = canvas.mpl_connect("motion_notify_event", motion.append)
+            try:
+                surface.hoverMoveEvent(event)
+            finally:
+                canvas.mpl_disconnect(callback)
+            self.assertEqual(len(motion), 1)
+            self.assertIs(motion[0].inaxes, axis)
+            self.assertAlmostEqual(motion[0].xdata, x)
+            self.assertAlmostEqual(motion[0].ydata, y)
+            expected = axis.format_coord(motion[0].xdata, motion[0].ydata)
+            readout = self.qml_item(window, "app_cursor_coordinates")
+            self.assertEqual(canvas.backend.cursorText, expected)
+            self.assertEqual(readout.property("text"), expected)
+            self.assertTrue(readout.isVisible())
+            return readout
+
+        def test_cursor_coordinates_follow_plot_without_replot_or_state_changes(self):
+            self.load_dat()
+            window, surface = self.make_native_window()
+            drain_until(lambda: surface.presentedGeneration == self.bridge._canvas.frame_generation
+                and surface.presentedGeneration > 0 and not self.bridge._plot_timer.isActive()
+                and not self.bridge._canvas.backend._timer.isActive())
+            canvas = self.bridge._canvas
+            before = (canvas.draw_count, canvas.blit_count, canvas.frame_generation,
+                self.bridge._source, id(self.bridge._cube), self.bridge._values["gate"], self.bridge.snapshot["logText"])
+            for axis, x, y in ((self.bridge._maps[0][0], 2., 0.),
+                               (self.bridge._spectra[0][0], 2.3, 4.)):
+                readout = self.hover_axis(window, surface, axis, x, y)
+                self.assertLessEqual(readout.property("contentWidth"), readout.width())
+            self.assertEqual((canvas.draw_count, canvas.blit_count, canvas.frame_generation,
+                self.bridge._source, id(self.bridge._cube), self.bridge._values["gate"], self.bridge.snapshot["logText"]), before)
+            self.capture_native(window, "cursor-pl-light.png")
+            self.bridge.invoke("appearance-dark")
+            self.wait_for_plot()
+            self.hover_axis(window, surface, self.bridge._maps[0][0], 2., 0.)
+            self.capture_native(window, "cursor-pl-dark.png")
+            self.load_drr_dat()
+            drain_until(lambda: surface.presentedGeneration == self.bridge._canvas.frame_generation
+                and surface.presentedGeneration > 0 and not self.bridge._canvas.backend._timer.isActive())
+            self.assertEqual(canvas.backend.cursorText, "", "A retained PL canvas must not retain its old cursor")
+            self.assertEqual(self.bridge.plotBackend.cursorText, "")
+            readout = self.hover_axis(window, surface, self.bridge._maps[0][0], 2.2, 1.)
+            drr_canvas = self.bridge._canvas
+            self.bridge.selectWorkflow("pl")
+            self.wait_for_plot()
+            settle()
+            self.assertEqual(drr_canvas.backend.cursorText, "")
+            self.assertEqual(canvas.backend.cursorText, "")
+            self.assertEqual(readout.property("text"), "x: —   y: —")
+            self.hover_axis(window, surface, self.bridge._maps[0][0], 2.3, 1.)
+            self.bridge.invoke("clear-files")
+            settle()
+            self.assertEqual(canvas.backend.cursorText, "")
+            self.assertEqual(readout.property("text"), "x: —   y: —")
 
         def test_file_picker_can_be_cancelled_during_opening_without_widgets(self):
             from PySide6.QtCore import QMetaObject
@@ -677,6 +742,9 @@ def _run_isolated():
                         and not child._plot_timer.isActive())
             self.assertIsNone(default_surface.property("backend"))
             self.assertIs(self.bridge.plotBackend, child.plotBackend)
+            axis = next(axis for axis in child._canvas.figure.axes if axis.get_visible())
+            x, y = axis.transData.inverted().transform(axis.bbox.get_points().mean(axis=0))
+            self.hover_axis(window, surface, axis, x, y)
             self.assertTrue(self.qml_item(window, "quick_shg_workspace").property("visible"))
             self.assertEqual(self.qml_item(window, "app_export").property("text"), "Save XLSX + settings")
             self.assertTrue(self.bridge.snapshot["canExport"])
@@ -1522,6 +1590,9 @@ def _run_isolated():
             def select_measurement(path):
                 self.bridge.sourceCatalogBridge.selectionAccepted.emit("drr", [str(path)])
                 drain_until(lambda: not self.bridge.snapshot["busy"] and not self.bridge._pending, timeout=45)
+                if self.bridge.snapshot["backgroundRequired"]:
+                    from tests.quick_drr_helpers import apply_self_background
+                    apply_self_background(self.bridge, drain_until)
                 self.assertEqual(self.bridge._source, path.resolve(), self.bridge.snapshot["status"])
                 self.assertTrue(self.bridge.snapshot["canExport"])
                 self.wait_for_plot()

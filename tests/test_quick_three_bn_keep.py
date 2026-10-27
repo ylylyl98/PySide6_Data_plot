@@ -209,7 +209,11 @@ Basic.ApplicationWindow {
             self.assertEqual(catalog.snapshot["selected"], [str(path) for path in paths])
             self.click(self.find("source_catalog_load"))
             self.idle()
-            self.assertTrue(self.bridge.snapshot["canExport"], self.bridge.snapshot["status"])
+            self.assertTrue(self.bridge.snapshot["canExport"] or self.bridge.snapshot["backgroundRequired"],
+                            self.bridge.snapshot["status"])
+            if self.bridge.snapshot["backgroundRequired"]:
+                self.assertTrue(self.bridge._background_open)
+                self.assertIsNone(self.bridge._drr_products)
 
         def open_background(self, *, matched=False):
             self.bridge.openDrrBackground()
@@ -333,7 +337,10 @@ Basic.ApplicationWindow {
             self.idle()
             self.assertIsNone(self.bridge._drr_background_recipe)
             self.assertEqual(self.bridge._drr_backgrounds, ())
-            self.assertEqual(self.bridge._drr_products.request.background_mode, "self-last")
+            self.assertIsNone(self.bridge._drr_products)
+            self.assertTrue(self.bridge.snapshot["backgroundRequired"])
+            self.assertFalse(self.bridge.snapshot["canExport"])
+            self.assertFalse(self.bridge._background_open)
 
         def test_matched_homogeneous_keep_after_matching_three_candidates(self):
             self.open_background(matched=True)

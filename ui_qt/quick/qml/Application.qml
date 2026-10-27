@@ -575,18 +575,31 @@ Controls.ApplicationWindow {
                             colors: window.colors
                             state: window.state
                         }
-                        Text {
-                            objectName: "app_workspace_message"
-                            anchors.fill: parent
-                            anchors.margins: 28
+                        ColumnLayout {
+                            anchors.centerIn: parent
+                            width: Math.max(0, parent.width - 56)
+                            spacing: 12
                             visible: !!window.state.workspaceMessage || workspaceLoader.status === Loader.Error
-                            text: workspaceLoader.status === Loader.Error ? "The native workspace could not be loaded."
-                                                                        : window.state.workspaceMessage || ""
-                            color: window.colors.muted
-                            wrapMode: Text.WordWrap
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
-                            Accessible.name: text
+                            Text {
+                                objectName: "app_workspace_message"
+                                Layout.fillWidth: true
+                                text: workspaceLoader.status === Loader.Error ? "The native workspace could not be loaded."
+                                                                            : window.state.workspaceMessage || ""
+                                color: window.colors.muted
+                                wrapMode: Text.WordWrap
+                                horizontalAlignment: Text.AlignHCenter
+                                Accessible.name: text
+                            }
+                            AppButton {
+                                objectName: "app_drr_choose_background"
+                                Layout.alignment: Qt.AlignHCenter
+                                visible: window.state.backgroundRequired === true
+                                enabled: window.state.canConfigureBackground === true
+                                colors: window.colors
+                                primary: true
+                                text: "Choose background…"
+                                onClicked: window.appBridge.openDrrBackground()
+                            }
                         }
                     }
                 }
@@ -633,6 +646,22 @@ Controls.ApplicationWindow {
                 indeterminate: window.state.progress === undefined || window.state.progress < 0
                 value: window.state.progress === undefined ? 0 : window.state.progress
                 Accessible.name: "Operation progress"
+            }
+            Text {
+                id: cursorCoordinates
+                objectName: "app_cursor_coordinates"
+                readonly property var plotBackend: window.appBridge.plotBackend
+                Layout.preferredWidth: window.compact ? 180 : 270
+                visible: window.plotWorkflow && plotBackend !== null
+                text: plotBackend && plotBackend.cursorText ? plotBackend.cursorText : "x: —   y: —"
+                color: window.colors.muted
+                horizontalAlignment: Text.AlignRight
+                elide: Text.ElideRight
+                Accessible.role: Accessible.StaticText
+                Accessible.name: "Plot cursor coordinates: " + text
+                Basic.ToolTip.visible: coordinateHover.hovered
+                Basic.ToolTip.text: text
+                HoverHandler { id: coordinateHover }
             }
             AppButton { objectName: "app_cancel_operation"; colors: window.colors; text: "Cancel"; visible: window.state.busy === true && window.state.cancellable === true; description: "Cancel the running operation"; onClicked: window.invoke("cancel") }
             AppButton { objectName: "app_update_available"; colors: window.colors; text: window.state.updateText || "Update available"; visible: window.state.updateAvailable === true; description: "View the available application update"; onClicked: window.invoke("show-update") }

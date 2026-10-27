@@ -201,6 +201,9 @@ def _run_isolated():
             surface = self.make_surface(canvas, 320, 200)
             canvas.set_logical_size(320, 200, 2)
             canvas.draw()
+            draw_count, generation = canvas.draw_count, canvas.frame_generation
+            cursor_updates = []
+            canvas.backend.cursorTextChanged.connect(lambda: cursor_updates.append(canvas.backend.cursorText))
             received = []
             gui_events = []
             def record(event):
@@ -219,8 +222,13 @@ def _run_isolated():
             surface.mouseDoubleClickEvent(mouse(QEvent.Type.MouseButtonDblClick))
             hover = QHoverEvent(QEvent.Type.HoverMove, point, point, point, Qt.KeyboardModifier.NoModifier)
             surface.hoverMoveEvent(hover)
+            self.assertEqual(canvas.backend.cursorText, axes.format_coord(2.5, 7.0))
+            self.assertEqual(cursor_updates, [axes.format_coord(2.5, 7.0)],
+                             "Repeated mouse/hover coordinates must not republish the same text")
             surface.hoverEnterEvent(hover)
             surface.hoverLeaveEvent(hover)
+            self.assertEqual(canvas.backend.cursorText, "")
+            self.assertEqual(cursor_updates[-1], "")
             wheel = QWheelEvent(point, point, QPoint(), QPoint(0, 120), Qt.MouseButton.NoButton,
                                 ctrl, Qt.ScrollPhase.NoScrollPhase, False)
             surface.wheelEvent(wheel)
@@ -237,6 +245,54 @@ def _run_isolated():
             self.assertEqual(received[-1].step, 1)
             self.assertEqual(received[-1].button, "up")
             self.assertIs(gui_events[0], press)
+            self.assertEqual(canvas.draw_count, draw_count, "Reading coordinates must not redraw artists")
+            self.assertEqual(canvas.frame_generation, generation, "Reading coordinates must not publish image frames")
+            self.assertFalse(canvas.backend._timer.isActive())
+
+        def test_cursor_uses_data_axes_and_clears_on_view_lifecycle_changes(self):
+            canvas, axes = self.make_canvas()
+            axes.set_xscale("log")
+            axes.set_yscale("log")
+            axes.set_xlim(1, 1000)
+            axes.set_ylim(100, .1)
+            surface = self.make_surface(canvas)
+            canvas.set_logical_size(320, 240, 2)
+            canvas.draw()
+
+            def hover_at(x=10, y=1):
+                physical_x, physical_y = axes.transData.transform((x, y))
+                point = QPointF(physical_x / canvas.device_pixel_ratio,
+                    (canvas.figure.bbox.height - physical_y) / canvas.device_pixel_ratio)
+                event = QHoverEvent(QEvent.Type.HoverMove, point, point, point, Qt.KeyboardModifier.NoModifier)
+                surface.hoverMoveEvent(event)
+                self.assertEqual(canvas.backend.cursorText, axes.format_coord(x, y))
+
+            hover_at()
+            margin = QPointF(1, 1)
+            surface.hoverMoveEvent(QHoverEvent(QEvent.Type.HoverMove, margin, margin, margin, Qt.KeyboardModifier.NoModifier))
+            self.assertEqual(canvas.backend.cursorText, "", "Figure margins have no data coordinates")
+            hover_at()
+            canvas.draw()
+            self.assertEqual(canvas.backend.cursorText, "", "A new view must not retain coordinates from its old transform")
+            hover_at()
+            canvas.set_logical_size(400, 240, 2)
+            self.assertEqual(canvas.backend.cursorText, "")
+            settle()
+            hover_at()
+            surface.setVisible(False)
+            self.assertEqual(canvas.backend.cursorText, "", "Hidden workflow plots must clear their reading")
+            surface.setVisible(True)
+            hover_at()
+            surface.set_canvas(None)
+            self.assertEqual(canvas.backend.cursorText, "")
+            replacement, _ = self.make_canvas()
+            surface.set_canvas(replacement)
+            self.assertEqual(replacement.backend.cursorText, "")
+            surface.set_canvas(canvas)
+            hover_at()
+            canvas.close()
+            self.assertEqual(canvas.backend.cursorText, "")
+            self.assertIsNone(surface.backend)
 
         def test_key_events_match_matplotlib_shortcut_conventions(self):
             canvas, axes = self.make_canvas()

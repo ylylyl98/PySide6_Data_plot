@@ -91,7 +91,7 @@ Rectangle {
             Text {
                 objectName: "drr_background_summary"
                 Layout.fillWidth: true
-                text: root.state.backgroundSummary || "Background: Self (last frame)"
+                text: root.state.backgroundSummary || "Background: awaiting selection"
                 color: root.colors.muted
                 wrapMode: Text.Wrap
                 font.pointSize: 8

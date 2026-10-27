@@ -120,6 +120,9 @@ def _isolated():
             self.assertTrue(bridge.drrDisplayBridge.setChoice("yaxis.left", 3))
             bridge.selectFiles([QUrl.fromLocalFile(str(self.root/name)) for name in self.files])
             wait(lambda: not bridge._pending and not bridge.snapshot["busy"])
+            if bridge.snapshot["backgroundRequired"]:
+                from tests.quick_drr_helpers import apply_self_background
+                apply_self_background(bridge, wait)
             self.assertTrue(bridge.snapshot["canExport"], bridge.snapshot["status"])
             return bridge
 

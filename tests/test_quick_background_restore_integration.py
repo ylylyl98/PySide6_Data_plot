@@ -24,6 +24,7 @@ class QuickBackgroundRestoreIntegrationTests(unittest.TestCase):
 
 def _isolated():
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from concurrent.futures import Future
     from threading import Event
     import time
     from unittest.mock import patch
@@ -35,6 +36,7 @@ def _isolated():
     from ui_qt.quick.application_bridge import QuickApplicationBridge
     from ui_qt.quick.drr_background_restore import restore_saved_background
     from ui_qt.quick.drr_workflow import export_drr
+    from tests.quick_drr_helpers import apply_self_background
 
     application = QGuiApplication([])
 
@@ -94,7 +96,8 @@ def _isolated():
         def select(self, bridge, path):
             bridge.selectFiles([QUrl.fromLocalFile(str(path))])
             self.idle(bridge)
-            self.assertTrue(bridge.snapshot["canExport"], bridge.snapshot["status"])
+            self.assertTrue(bridge.snapshot["canExport"] or bridge.snapshot["backgroundRequired"],
+                            bridge.snapshot["status"])
 
         def apply(self, bridge, reference, *, kind=6, fixed=False):
             bridge.openDrrBackground()
@@ -200,6 +203,11 @@ def _isolated():
             self.assertIsNone(bridge._cube)
             self.assertIn("background", bridge.snapshot["status"].casefold())
             self.assertIn("restore", bridge.snapshot["status"].casefold())
+            self.assertTrue(bridge.snapshot["backgroundRequired"])
+            self.assertTrue(bridge._background_open)
+            self.assertIn("restore", bridge.drrBackgroundBridge.snapshot["error"].casefold())
+            self.assertFalse(bridge.drrBackgroundBridge.snapshot["busy"])
+            self.assertTrue(bridge.drrBackgroundBridge.snapshot["applyEnabled"])
 
         def test_reload_retries_failed_saved_history_until_reference_is_restored(self):
             self.save(self.bn, kind=0)
@@ -208,6 +216,9 @@ def _isolated():
             bridge = self.bridge()
             self.load_processed_csv(bridge)
             self.assertFalse(bridge.snapshot["canExport"])
+            bridge.cancelDrrBackground()
+            opened = []
+            bridge.backgroundDialogRequested.connect(lambda: opened.append(True))
             bridge.invoke("reload")
             self.idle(bridge)
             self.assertFalse(bridge.snapshot["canExport"])
@@ -217,6 +228,7 @@ def _isolated():
             bridge.invoke("reload")
             self.idle(bridge)
             self.assert_external(bridge, self.custom, expected)
+            self.assertEqual(opened, [], "Reload must not automatically reopen background settings")
 
         def test_manual_self_after_failed_history_is_retained_on_reload(self):
             self.save(self.bn, kind=0)
@@ -261,18 +273,108 @@ def _isolated():
                     bridge.selectFiles([QUrl.fromLocalFile(str(self.source))])
                     until(started.is_set)
                     bridge.selectFiles([QUrl.fromLocalFile(str(self.other))])
-                    until(lambda: bridge._source == self.other and not bridge.snapshot["busy"])
-                    products = bridge._drr_products
+                    until(lambda: bridge.snapshot["backgroundRequired"] and not bridge.snapshot["busy"])
                 finally:
                     release.set()
                 self.idle(bridge)
-            self.assertIs(bridge._drr_products, products)
+            self.assertIsNone(bridge._drr_products)
+            self.assertIsNone(bridge._drr_background_recipe)
+            self.assertEqual(bridge._sources, (str(self.other),))
+            self.assertEqual(bridge.drrBackgroundBridge.context.measurements, (self.other.name,))
+            products = apply_self_background(bridge, until)
             self.assertEqual(products.request.files, (str(self.other),))
             self.assertEqual(products.request.background_mode, "self-last")
-            self.assertIsNone(bridge._drr_background_recipe)
             expected = load_drr_self_cube(str(self.root), (str(self.other),),
                 use_first_frame=False, y_axis=products.request.y_axis)
             np.testing.assert_array_equal(products.raw.Z, expected.Z)
+
+        def test_new_csv_waits_for_explicit_background_and_opens_once(self):
+            from ui_qt.quick import drr_workflow
+            bridge = self.bridge()
+            opened = []
+            bridge.backgroundDialogRequested.connect(lambda: opened.append(True))
+            with patch.object(drr_workflow, "load_drr", wraps=drr_workflow.load_drr) as load, \
+                    patch.object(drr_workflow, "process_drr", wraps=drr_workflow.process_drr) as process:
+                self.select(bridge, self.source)
+                self.assertEqual(opened, [True])
+                self.assertTrue(bridge._background_open)
+                self.assertTrue(bridge.snapshot["backgroundRequired"])
+                self.assertFalse(bridge.snapshot["canExport"])
+                self.assertFalse(bridge.snapshot["canAnalyzePeaks"])
+                self.assertFalse(bridge.snapshot["derivativeAvailable"])
+                self.assertIsNone(bridge._cube)
+                self.assertIsNone(bridge._drr_products)
+                background = bridge.drrBackgroundBridge
+                self.assertEqual(background.draft.which, "last")
+                background.setChoice("frame", 0)
+                background.setChoice("frame", 1)
+                load.assert_not_called()
+                process.assert_not_called()
+                bridge.cancelDrrBackground()
+                for action in ("reload", "workflow-roundtrip"):
+                    with self.subTest(action=action):
+                        if action == "reload":
+                            bridge.invoke(action)
+                        else:
+                            bridge.selectWorkflow("pl")
+                            bridge.selectWorkflow("drr")
+                        self.idle(bridge)
+                        self.assertTrue(bridge.snapshot["backgroundRequired"])
+                        self.assertFalse(bridge.snapshot["canExport"])
+                        self.assertFalse(bridge._background_open)
+                        self.assertEqual(opened, [True])
+                        load.assert_not_called()
+                        process.assert_not_called()
+                products = apply_self_background(bridge, until, frame=0)
+                self.assertEqual(load.call_count, 1)
+                self.assertEqual(process.call_count, 1)
+                self.assertFalse(bridge.snapshot["backgroundRequired"])
+                self.assertEqual(products.request.background_mode, "self-first")
+                expected = load_drr_self_cube(str(self.root), (str(self.source),),
+                    use_first_frame=True, y_axis=products.request.y_axis)
+                np.testing.assert_array_equal(products.raw.Z, expected.Z)
+                dialog_count = len(opened)
+                bridge.invoke("clear-background")
+                self.idle(bridge)
+                self.assertTrue(bridge.snapshot["backgroundRequired"])
+                self.assertIsNone(bridge._drr_products)
+                self.assertIsNone(bridge._cube)
+                self.assertFalse(bridge.snapshot["canExport"])
+                self.assertEqual(len(opened), dialog_count)
+                bridge.invoke("reload")
+                self.idle(bridge)
+                self.assertEqual(load.call_count, 1)
+                self.assertEqual(process.call_count, 1)
+                products = apply_self_background(bridge, until, frame=1)
+                self.assertEqual(load.call_count, 2)
+                self.assertEqual(process.call_count, 2)
+                self.assertEqual(products.request.background_mode, "self-last")
+                expected = load_drr_self_cube(str(self.root), (str(self.source),),
+                    use_first_frame=False, y_axis=products.request.y_axis)
+                np.testing.assert_array_equal(products.raw.Z, expected.Z)
+                # A fast cache hit can finish before add_done_callback is
+                # registered. Delivery must still wait for owner bookkeeping.
+                def completed(operation):
+                    future = Future()
+                    try:
+                        future.set_result(operation())
+                    except Exception as exc:
+                        future.set_exception(exc)
+                    return future
+                with self.subTest(completion="already-completed-future"), \
+                        patch.object(bridge._executor, "submit", side_effect=completed):
+                    dialog_count = len(opened)
+                    self.select(bridge, self.other)
+                    self.assertTrue(bridge.snapshot["backgroundRequired"])
+                    self.assertTrue(bridge._background_open)
+                    self.assertEqual(len(opened), dialog_count + 1)
+                    self.assertEqual(load.call_count, 2)
+                    products = apply_self_background(bridge, until)
+                    self.assertEqual(load.call_count, 3)
+                    self.assertEqual(process.call_count, 3)
+                    self.assertIs(products.request.background_recipe, bridge._drr_background_recipe)
+                    self.assertFalse(bridge.snapshot["backgroundRequired"])
+                    self.assertEqual(products.request.files, (str(self.other),))
 
     result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Cases))
     print("QUICK_BACKGROUND_RESTORE_INTEGRATION_CASES=" + str(result.testsRun))

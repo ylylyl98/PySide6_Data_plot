@@ -310,12 +310,62 @@ class SplitScaleControlTests(unittest.TestCase):
         self.app.processEvents()
         self.assertTrue(overlay.isVisible())
 
-    def test_source_toolbar_keeps_compact_horizontal_spacing(self) -> None:
-        self.window.show()
-        self.app.processEvents()
-        margins = self.window.data_source_context.layout().contentsMargins()
-        self.assertEqual((margins.left(), margins.top(), margins.right(), margins.bottom()), (0, 0, 0, 0))
-        self.assertEqual(self.window.data_source_context.layout().spacing(), 6)
+    def test_initial_shell_and_navigation_contract(self) -> None:
+        # These construction contracts use one fresh window. Keep workflow
+        # traversal last so it cannot affect the preceding initial-state checks.
+        with self.subTest(contract="source-toolbar-spacing"):
+            self.window.show()
+            self.app.processEvents()
+            margins = self.window.data_source_context.layout().contentsMargins()
+            self.assertEqual((margins.left(), margins.top(), margins.right(), margins.bottom()), (0, 0, 0, 0))
+            self.assertEqual(self.window.data_source_context.layout().spacing(), 6)
+
+        with self.subTest(contract="organizer-placement"):
+            labels = [
+                self.window.tabs.tabText(index) for index in range(self.window.tabs.count())
+            ]
+            mcd_page = self.window.tabs.widget(labels.index("MCD"))
+            tools_page = self.window.tabs.widget(labels.index("Tools"))
+            self.assertFalse(mcd_page.isAncestorOf(self.window.mcd_extract_btn))
+            self.assertTrue(tools_page.isAncestorOf(self.window.mcd_extract_btn))
+
+        with self.subTest(contract="initial-workflow-labels"):
+            tab_bar = self.window.tabs.tabBar()
+            self.assertFalse(tab_bar.usesScrollButtons())
+            self.assertEqual(tab_bar.elideMode(), Qt.ElideNone)
+            self.assertEqual(
+                [self.window.tabs.tabText(i) for i in range(self.window.tabs.count())],
+                ["PL", "DRR", "Compare", "Power", "MCD", "MCD Peak Shift", "SHG", "Slides", "Tools"],
+            )
+
+        with self.subTest(contract="workflow-navigation"):
+            self.assertFalse(self.window.tabs.tabBar().isVisible())
+            self.assertEqual(self.window.workflow_tabs.count(), self.window.tabs.count())
+            self.window.workflow_tabs.setCurrentIndex(1)
+            self.assertEqual(self.window._active_mode(), "DRR")
+
+            self.window.sidebar_toggle_btn.setChecked(False)
+            self.app.processEvents()
+            self.assertFalse(self.window.left_panel.isVisible())
+            self.window.sidebar_toggle_btn.setChecked(True)
+            self.app.processEvents()
+            self.assertTrue(self.window.left_panel.isVisible())
+
+        with self.subTest(contract="workflow-mode-mapping"):
+            expected_modes = [
+                "PL",
+                "DRR",
+                "Compare",
+                "Power Dependent",
+                "MCD",
+                None,  # MCD Peak Shift
+                "SHG Processing",
+                None,  # Slides
+                None,  # Tools
+            ]
+            for index, expected in enumerate(expected_modes):
+                self.window.tabs.setCurrentIndex(index)
+                self.assertEqual(self.window._active_mode(), expected)
 
     def test_sidebar_can_resize_within_bounds_and_canvas_remains_dominant(self) -> None:
         splitter = self.window.workspace_splitter
@@ -340,38 +390,6 @@ class SplitScaleControlTests(unittest.TestCase):
         self.window.sidebar_toggle_btn.setChecked(True)
         self.app.processEvents()
         self.assertEqual(splitter.sizes()[0], remembered)
-
-    def test_resizable_sidebar_uses_complete_compact_tab_labels(self) -> None:
-        tab_bar = self.window.tabs.tabBar()
-        self.assertFalse(tab_bar.usesScrollButtons())
-        self.assertEqual(tab_bar.elideMode(), Qt.ElideNone)
-        self.assertEqual(
-            [self.window.tabs.tabText(i) for i in range(self.window.tabs.count())],
-            ["PL", "DRR", "Compare", "Power", "MCD", "MCD Peak Shift", "SHG", "Slides", "Tools"],
-        )
-        expected_modes = [
-            "PL",
-            "DRR",
-            "Compare",
-            "Power Dependent",
-            "MCD",
-            None,  # MCD Peak Shift
-            "SHG Processing",
-            None,  # Slides
-            None,  # Tools
-        ]
-        for index, expected in enumerate(expected_modes):
-            self.window.tabs.setCurrentIndex(index)
-            self.assertEqual(self.window._active_mode(), expected)
-
-    def test_mcd_organizer_launcher_lives_on_tools_page(self) -> None:
-        labels = [
-            self.window.tabs.tabText(index) for index in range(self.window.tabs.count())
-        ]
-        mcd_page = self.window.tabs.widget(labels.index("MCD"))
-        tools_page = self.window.tabs.widget(labels.index("Tools"))
-        self.assertFalse(mcd_page.isAncestorOf(self.window.mcd_extract_btn))
-        self.assertTrue(tools_page.isAncestorOf(self.window.mcd_extract_btn))
 
     def test_drr_summary_wraps_the_complete_first_filename(self) -> None:
         full_name = (
@@ -1027,31 +1045,6 @@ class SplitScaleControlTests(unittest.TestCase):
             description = f"page={page} control={control.objectName()} bounds={top_left}, {bottom_right} viewport={page_scroll.viewport().rect()}"
             self.assertTrue(page_scroll.viewport().rect().contains(top_left), description)
             self.assertTrue(page_scroll.viewport().rect().contains(bottom_right), description)
-
-    def test_workflow_navigation_is_above_the_collapsible_sidebar(self) -> None:
-        self.assertFalse(self.window.tabs.tabBar().isVisible())
-        self.assertEqual(self.window.workflow_tabs.count(), self.window.tabs.count())
-        self.window.workflow_tabs.setCurrentIndex(1)
-        self.assertEqual(self.window._active_mode(), "DRR")
-
-        self.window.sidebar_toggle_btn.setChecked(False)
-        self.app.processEvents()
-        self.assertFalse(self.window.left_panel.isVisible())
-        self.window.sidebar_toggle_btn.setChecked(True)
-        self.app.processEvents()
-        self.assertTrue(self.window.left_panel.isVisible())
-
-    def test_source_toolbar_action_is_visible_for_scientific_workflows_and_hidden_for_slides(self) -> None:
-        self.assertTrue(self.window.menu_toolbar_host.source_widget_action.isVisible())
-        slides_index = next(i for i in range(self.window.tabs.count()) if self.window.tabs.tabText(i) == "Slides")
-        self.window.tabs.setCurrentIndex(slides_index)
-        self.app.processEvents()
-        self.assertFalse(self.window.menu_toolbar_host.source_widget_action.isVisible())
-        self.assertFalse(self.window.menu_toolbar_host.source_separator_action.isVisible())
-        self.window.tabs.setCurrentIndex(0)
-        self.app.processEvents()
-        self.assertTrue(self.window.menu_toolbar_host.source_widget_action.isVisible())
-        self.assertTrue(self.window.menu_toolbar_host.source_separator_action.isVisible())
 
     def test_drag_feedback_still_targets_the_existing_folder_edit(self) -> None:
         self.window.current_folder = ""

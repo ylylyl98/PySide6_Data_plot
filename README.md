@@ -156,6 +156,16 @@ generation and selection, BN comparison, fitted backgrounds, composite editing,
 and raw previews. Applying a draft trial-loads the full result before committing
 its background association; failed or cancelled applications retain the previous
 result. Exports retain per-measurement provenance and actual fitted denominators.
+Opening new CSV measurements first checks for a saved background. Without one,
+the background settings open automatically and no provisional Self plot is
+calculated. Cancel leaves the selected measurements waiting for a background;
+use **Choose background…** to continue. Reload, returning to DRR, and clearing
+the background do not silently apply Self or repeatedly open the window.
+Missing or conflicting saved references are reported and can be selected again;
+Reload can retry a failed saved-reference restoration. Valid saved references,
+explicit Keep backgrounds, and precomputed DAT/XLSX maps still load directly.
+The basic background settings do not initialize preview canvases or fitting
+algorithms; advanced previews load those components when used.
 The optional automatic BN comparison runs in a cancellable worker after loading.
 It retains explicit original-BN choices and activates a validated candidate only
 after a successful trial load. Changed SG settings revalidate managed candidates;
@@ -165,7 +175,9 @@ settings without repeating the comparison.
 Use **Background…** to choose the reference type and manage its files together.
 Sources use one tab row in this order: **Self, BN, P, N, P + N, Fitted**. There is
 no separate External tab or duplicated source dropdown. Each source shows its
-own files; Self offers first/last frames only. New BN/P/N/P + N references
+own files; Self offers adjacent **First frame / Last frame** buttons, with Last
+selected for a new draft. Changing the frame only edits the draft; **Apply**
+calculates the result. New BN/P/N/P + N references
 default to averaging all frames within each file, then averaging files with equal
 weight. The page shows the current frame policy; **Advanced tools… > Reference
 frames** retains explicit first/last-frame overrides without silently changing
@@ -371,6 +383,10 @@ image path. Their complete measured arrays and cell boundaries remain intact;
 analysis, cursor values, and saved figures use the original meshes. Log axes,
 custom clipping/effects, and styled mesh edges keep the ordinary renderer.
 Color-only edits retain existing PL/DRR/Compare/Power axes and navigation.
+The main window's bottom status bar shows the mouse coordinates over the active
+plot, using that axis's formatting for linear, log and polar views. Leaving the
+axes, changing plots or clearing data removes the old reading. Hovering updates
+only the coordinate text, without selecting a spectrum, logging or redrawing.
 
 Peak Analysis reuses spectrum artists when changing rows and preserves the heatmap.
 The following benchmark compares the previous spectrum-rebuild/blit path and the
@@ -880,7 +896,7 @@ To build the installer locally, install NSIS and run:
 To test packaging on GitHub without publishing a release, open **Actions**,
 select **Windows Build**, and choose **Run workflow**. On a branch, the default
 `test_scope: quick` runs the same **Fast PR checks** workflow alongside
-packaging. Choose `full` to run the complete test suite in four parallel
+packaging. Choose `full` to run the complete test suite in twelve parallel
 shards. Any tag ref always uses `full`, even when `quick` is
 selected; missing or unrecognized scope values also use `full`.
 
@@ -899,13 +915,18 @@ git push origin v1.0.0
 ```
 
 GitHub Actions first verifies that the tag matches `app_version.py`, then runs
-the complete test suite in four parallel shards while building the Windows
+the complete test suite in twelve parallel shards while building the Windows
 application and installer. A tag must also point to a commit contained in
 `main`. Only after the build and the combined test-report verification succeed
 does the workflow attach
 `DPTK-v1.0.0-Windows-x64.zip`, `DPTK-Setup-v1.0.0-Windows-x64.exe`, and
 `SHA256SUMS.txt` to the corresponding GitHub Release.
 Generated `build/` and `dist/` content stays local and is not committed.
+
+Full builds request twelve test runners alongside one packaging runner. Other
+workflows share the account's concurrency allowance, so queued test jobs can
+extend the total run time. Each discovered test still runs exactly once and all
+twelve shard reports must pass verification before publishing.
 
 The release test plan is generated from actual `unittest` discovery, so newly
 added tests are included automatically. Repeated discovery of the same test ID
@@ -916,14 +937,26 @@ instead of silently changing the test behavior. Modules run in separate
 processes to isolate Qt object lifetimes and module state; the eight expensive
 fitted-BN modules are split into individual tests. Shard balancing uses measured
 Windows CI execution-unit durations from `scripts/release_test_timings.json`,
-including process startup. Hints are keyed by module or full test ID and apply
-only when the test-module source and exact test-ID set still match; source
-fingerprints normalize Git's LF/CRLF checkout differences. New or changed units
-fall back to explicit estimates. The file
+including process startup. Hints are keyed by module or full test ID and count
+as measurements only when the test-module source and exact test-ID set still
+match; source fingerprints normalize Git's LF/CRLF checkout differences.
+Changed units use the larger of the normal fallback and their previous measured
+duration as an explicitly labelled historical estimate, so editing a slow test
+does not suddenly schedule it as a short task. New units use normal estimates.
+The file
 records the source run and commit; it is optional for local fixture repositories.
 These weights affect placement only, not coverage, pass/fail criteria, or a
 promised runtime. Execution still checks byte-exact test sources and complete
 results. Existing skip and expected-failure rules are retained.
+
+Keep test fixtures in helpers or mixins without `test_*` methods: inheriting an
+existing `TestCase` also reruns its tests under the subclass. Related shell
+checks can share one window inside named `subTest` blocks; stateful scenarios
+should retain fresh fixtures. When scientific checks use the same deterministic
+input and only inspect the result, combine those checks to avoid recomputing an
+expensive fit while retaining every numerical assertion. Refresh scheduling
+weights from successful complete release reports before reducing distinct
+regression coverage just to lower the test count.
 
 Each shard uploads its test outcomes, timings and process logs as a
 `release-test-shard-*` artifact, including on test failure where the runner is
@@ -935,7 +968,7 @@ with `test_scope: full` runs these same checks without creating a Release.
 To inspect the complete assignment without executing tests:
 
 ```powershell
-.venv\Scripts\python.exe scripts/run_release_tests.py plan --output build/release-tests/plan.json --shards 4
+.venv\Scripts\python.exe scripts/run_release_tests.py plan --output build/release-tests/plan.json --shards 12
 ```
 
 ## Architecture
@@ -2202,7 +2235,7 @@ validation → Run workflow** on the relevant branch. Its eight numerical test
 modules run in separate jobs, with up to four jobs in parallel. All existing
 numerical assertions and feature-protection thresholds are retained. This
 manual workflow is separate from the ordinary BN assignment PR gate; the
-Windows release workflow runs the full test suite in four parallel shards for
+Windows release workflow runs the full test suite in twelve parallel shards for
 tag refs and manual `test_scope: full` builds, alongside packaging. Publishing
 still requires a tag push, a successful build, and successful verification of
 every full-suite shard report.

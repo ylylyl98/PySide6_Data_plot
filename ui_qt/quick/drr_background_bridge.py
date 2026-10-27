@@ -24,6 +24,7 @@ _GENERATORS = ("saved", "reconstruction", "assisted", "pn-only")
 
 class DrrBackgroundBridge(QObject):
     snapshotChanged = Signal()
+    plotBackendChanged = Signal()
     fileSelectionRequested = Signal()
     requestFiles = Signal(str, bool)
     requestSave = Signal(str, str)
@@ -80,20 +81,17 @@ class DrrBackgroundBridge(QObject):
         self._invalid_numbers = set()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="quick-drr-background")
         self._finished.connect(self._complete, Qt.ConnectionType.QueuedConnection)
-        from matplotlib.figure import Figure
-        from ui_qt.quick.plot_surface import QuickFigureCanvas
-        self.canvas = QuickFigureCanvas(Figure(figsize=(7, 4), dpi=100, layout="constrained"))
-        from matplotlib.backend_bases import NavigationToolbar2
-        self._navigation = NavigationToolbar2(self.canvas)
+        self.canvas = None
+        self._navigation = None
         self._raw_heatmap = None
         self._raw_gate_blitter = None
         self._raw_preview_key = None
         self._raw_spectrum_axis = self._raw_spectrum_line = self._raw_gate_line = None
-        self._plot_click = self.canvas.mpl_connect("button_press_event", self._canvas_click)
+        self._plot_click = None
         self._span = None
         self._numbers = dict(gate=0, spline_intervals=10, smoothing=.001, polynomial_degree=3,
                              periodic_components=3, regionLow=1.56, regionHigh=1.64, maxGapMeV=60.)
-        from core.drr_bn_calibration import BnCalibrationSettings
+        from core.drr_bn_settings import BnCalibrationSettings
         bn = asdict(BnCalibrationSettings())
         for key in ("train_region", "validation_region", "core_region"):
             self._numbers["bn." + key + ".low"], self._numbers["bn." + key + ".high"] = bn[key]
@@ -117,9 +115,20 @@ class DrrBackgroundBridge(QObject):
     def snapshot(self):
         return deepcopy(self._snapshot)
 
-    @Property(QObject, constant=True)
+    @Property(QObject, notify=plotBackendChanged)
     def plotBackend(self):
-        return self.canvas.backend
+        return self.canvas.backend if self.canvas is not None else None
+
+    def _ensure_canvas(self):
+        if self.canvas is not None:
+            return
+        from matplotlib.figure import Figure
+        from matplotlib.backend_bases import NavigationToolbar2
+        from ui_qt.quick.plot_surface import QuickFigureCanvas
+        self.canvas = QuickFigureCanvas(Figure(figsize=(7, 4), dpi=100, layout="constrained"))
+        self._navigation = NavigationToolbar2(self.canvas)
+        self._plot_click = self.canvas.mpl_connect("button_press_event", self._canvas_click)
+        self.plotBackendChanged.emit()
 
     @Property(QObject, constant=True)
     def fileSelectionBridge(self):
@@ -193,19 +202,19 @@ class DrrBackgroundBridge(QObject):
     def draft(self):
         return self._draft
 
-    def open(self, context, current=None, *, raw_snapshot=None, catalog=()):
+    def open(self, context, current=None, *, raw_snapshot=None, catalog=(), initial_error=""):
         if not isinstance(context, BackgroundContext):
             raise TypeError("BackgroundContext is required.")
         self.cancel()
-        had_raw_preview = self._raw_preview is not None
         self._raw_preview, self._raw_preview_key = None, None
         self._texts["rawSource"] = ""
         self._raw_role, self._raw_scope = "measurement", "single"
         self._numbers["gate"] = 0
-        if self._navigation.mode.name == "PAN":
+        if self._navigation is not None and self._navigation.mode.name == "PAN":
             self._navigation.pan()
-        elif self._navigation.mode.name == "ZOOM":
+        elif self._navigation is not None and self._navigation.mode.name == "ZOOM":
             self._navigation.zoom()
+        self._clear_preview_artists()
         self._context, self._raw_snapshot, self._catalog = context, raw_snapshot, tuple(catalog)
         self._catalog_loaded, self._pn_catalog = False, ()
         if current is not None:
@@ -220,7 +229,7 @@ class DrrBackgroundBridge(QObject):
         self._source_methods = {self._draft.kind: self._method}
         self._flags.update(fixed=self._draft.fixed, auto_bn_compare=self._draft.auto_bn_compare,
                            allow_stale=self._draft.allow_stale, acknowledged=False)
-        self._page, self._opened, self._error = "settings", True, ""
+        self._page, self._opened, self._error = "settings", True, initial_error
         self._version = self._draft.version
         self._versions = (self._version,) if self._version is not None else ()
         self._document, self._undo = None, []
@@ -233,8 +242,6 @@ class DrrBackgroundBridge(QObject):
             self._pn_files = {"P": tuple(self._version.pair.p_files), "N": tuple(self._version.pair.n_files)}
         self._set_fit_recipe(self._draft.fitted_result or {})
         self._status = f"{len(context.measurements)} measurements. Browse references directly, or load the P/N catalog when needed."
-        if had_raw_preview:
-            self._draw_preview()
         self._refresh()
 
     def _templates(self):
@@ -269,7 +276,7 @@ class DrrBackgroundBridge(QObject):
             candidate = {resolve_source_path(context.folder, payload["csv_path"])} if payload.get("csv_path") else set()
             if not (current == original and which == source["baseline_which"] or current == candidate):
                 return False
-            from core.drr_bn_calibration import BnCalibrationSettings
+            from core.drr_bn_settings import BnCalibrationSettings
             values = {**asdict(BnCalibrationSettings()), **config}
             for key in ("train_region", "validation_region", "core_region"):
                 self._numbers["bn."+key+".low"], self._numbers["bn."+key+".high"] = values[key]
@@ -285,7 +292,7 @@ class DrrBackgroundBridge(QObject):
             return False
 
     def _set_fit_recipe(self, recipe):
-        from core.drr_fitted_background import BackgroundFitSettings, settings_for_group
+        from core.drr_fitted_settings import BackgroundFitSettings, settings_for_group
         if recipe and self._context:
             # Older saved recipes may carry per-file masks. The scientific
             # group fitter merges them before fitting one raw average.
@@ -298,7 +305,7 @@ class DrrBackgroundBridge(QObject):
         self._fit_method = mapping["method"]
 
     def _fit_recipe(self):
-        from core.drr_fitted_background import BackgroundFitSettings
+        from core.drr_fitted_settings import BackgroundFitSettings
         return asdict(BackgroundFitSettings(protected_regions=parse_regions(self._texts["regions"]),
             spline_intervals=int(self._numbers["spline_intervals"]), smoothing=self._numbers["smoothing"],
             method=self._fit_method, polynomial_degree=int(self._numbers["polynomial_degree"]),
@@ -375,7 +382,7 @@ class DrrBackgroundBridge(QObject):
             hasDocument=self._document is not None, hasFit=self._fit_reference is not None,
             hasPreview=(self._page == "fit" and self._fit_raw is not None or self._page == "bn" and self._bn_payload is not None
                         or self._page == "raw" and self._raw_preview is not None or self._page in {"pn", "composite"} and self._document is not None),
-            plotTool=str(self._navigation.mode),
+            plotTool=str(self._navigation.mode) if self._navigation is not None else "",
             canUndo=bool(self._undo), canUseVersion=self._version is not None,
             canCalibrate=self._draft.kind == "bn" and bool(self._draft.files),
             canFix=can_fix,
@@ -929,7 +936,7 @@ class DrrBackgroundBridge(QObject):
                 self._preview_raw()
             elif action.startswith("plot:"):
                 mode = action.split(":", 1)[1]
-                if mode in {"pan", "zoom", "home", "back", "forward"}:
+                if self._navigation is not None and mode in {"pan", "zoom", "home", "back", "forward"}:
                     getattr(self._navigation, mode)()
             elif action == "apply":
                 if self._invalid_numbers:
@@ -1205,13 +1212,15 @@ class DrrBackgroundBridge(QObject):
     def _raw_sources(self):
         if not self._context:
             return []
-        snapshot = self._make_raw_snapshot()
-        return list(snapshot.measurements if self._raw_role == "measurement" else snapshot.backgrounds)
-
-    def _make_raw_snapshot(self):
-        from core.drr_raw_preview import RawSnapshot
         if self._raw_snapshot is not None:
-            return self._raw_snapshot
+            return list(self._raw_snapshot.measurements if self._raw_role == "measurement" else self._raw_snapshot.backgrounds)
+        if self._raw_role == "measurement":
+            return list(self._context.measurements)
+        return list(dict.fromkeys(source for item in self._raw_assignments() for source in
+            (item.baseline_source_files if item.baseline_mode == "External" else (item.measurement_file,))))
+
+    def _raw_assignments(self):
+        """Describe draft references without importing any intensity loader."""
         from core.drr_sources import DrrMeasurementAssignment
         draft = self._draft
         plan = draft.bn_plan or draft.pn_plan
@@ -1220,7 +1229,15 @@ class DrrBackgroundBridge(QObject):
             mode = ("Self (first frame)" if draft.which == "first" else "Self (last frame)") if draft.kind == "self" else "External"
             if mode != "External" or draft.files:
                 assignments = tuple(DrrMeasurementAssignment(name, mode, draft.files if mode == "External" else (), draft.which, regions=draft.regions) for name in self._context.measurements)
-        return RawSnapshot(self._context.folder, self._context.measurements, tuple(assignments), self._context.y_axis,
+        return tuple(assignments)
+
+    def _make_raw_snapshot(self):
+        if self._raw_snapshot is not None:
+            return self._raw_snapshot
+        from core.drr_raw_preview import RawSnapshot
+        draft = self._draft
+        plan = draft.bn_plan or draft.pn_plan
+        return RawSnapshot(self._context.folder, self._context.measurements, self._raw_assignments(), self._context.y_axis,
                            "fitted_raw_average" if draft.kind == "fitted" else "heterogeneous" if plan else "common")
 
     def _preview_raw(self):
@@ -1235,9 +1252,31 @@ class DrrBackgroundBridge(QObject):
             self._draw_preview()
         self._run(lambda token: load_preview(snapshot, role, scope, source=name), complete, "Loading original intensity without DRR or derivative processing…")
 
+    def _clear_preview_artists(self):
+        """Release the previous context without creating or drawing a canvas."""
+        if self._raw_gate_blitter:
+            self._raw_gate_blitter.disconnect()
+        self._raw_gate_blitter = None
+        self._raw_preview_key = None
+        self._raw_heatmap = self._raw_gate_line = None
+        self._raw_spectrum_axis = self._raw_spectrum_line = None
+        if self._span:
+            self._span.disconnect_events()
+            self._span = None
+        if self.canvas is not None:
+            self.canvas.backend._timer.stop()
+            self.canvas.backend.set_cursor_text("")
+            self.canvas.figure.clear()
+            self._navigation.update()
+
     def _draw_preview(self, *, alternate=None):
-        if self._closed:
+        has_preview = (self._page == "fit" and self._fit_raw is not None
+            or self._page == "bn" and self._bn_payload is not None
+            or self._page == "raw" and self._raw_preview is not None
+            or self._page in {"pn", "composite"} and self._document is not None)
+        if self._closed or not has_preview:
             return
+        self._ensure_canvas()
         if (self._page == "raw" and self._raw_preview is not None
                 and self._raw_preview_key is self._raw_preview and self._raw_gate_blitter is not None):
             cube=self._raw_preview.cube;gate=int(np.clip(self._numbers["gate"],0,len(cube.gate)-1))
@@ -1248,18 +1287,8 @@ class DrrBackgroundBridge(QObject):
             if self._raw_gate_line is not None:self._raw_gate_line.set_ydata([cube.gate[gate]]*2)
             if not self._raw_gate_blitter.draw():self.canvas.draw_idle()
             return
-        from core.drr_composite_background import compose_background
-        if self._raw_gate_blitter:self._raw_gate_blitter.disconnect()
-        self._raw_gate_blitter = None
-        self._raw_preview_key = None
-        self._raw_spectrum_axis = self._raw_spectrum_line = None
-        if self._span:
-            self._span.disconnect_events()
-            self._span = None
+        self._clear_preview_artists()
         figure = self.canvas.figure
-        figure.clear()
-        self._raw_heatmap = None
-        self._raw_gate_line = None
         axes = figure.add_subplot(111)
         axes.set_xlabel("Photon energy (eV)")
         axes.set_ylabel("Raw intensity (a.u.)")
@@ -1355,6 +1384,7 @@ class DrrBackgroundBridge(QObject):
             self._raw_spectrum_axis=axes
             axes.set_title(f"{cube.gate_label}: {cube.gate[gate]:g}")
         elif self._document is not None and self._page in {"pn", "composite"}:
+            from core.drr_composite_background import compose_background
             energy, intensity, boundaries = compose_background(self._document)
             for source in self._document.sources:
                 if source.key != self._document.default_source:
@@ -1396,10 +1426,12 @@ class DrrBackgroundBridge(QObject):
             if self._span:
                 self._span.disconnect_events()
             if self._raw_gate_blitter:self._raw_gate_blitter.disconnect()
-            self.canvas.mpl_disconnect(self._plot_click)
+            if self.canvas is not None:
+                self.canvas.mpl_disconnect(self._plot_click)
             self._executor.shutdown(wait=False, cancel_futures=True)
             if self._file_selection_bridge is not None:
                 self._file_selection_bridge.close()
             if self._inline_selection_bridge is not None:
                 self._inline_selection_bridge.close()
-            self.canvas.close()
+            if self.canvas is not None:
+                self.canvas.close()

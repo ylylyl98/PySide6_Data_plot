@@ -121,8 +121,12 @@ def _run_isolated():
                 f"catalog={self.catalog.snapshot}")
 
         def wait_load(self, expected=None):
-            self.wait(lambda: not self.bridge._pending and not self.bridge.snapshot["busy"])
+            self.wait(lambda: not self.bridge._pending and not self.bridge.snapshot["busy"]
+                and (self.bridge.drrBackgroundBridge is None or not self.bridge.drrBackgroundBridge.snapshot["busy"]))
             if expected is not None:
+                if self.bridge._workflow == "drr" and self.bridge.snapshot["backgroundRequired"]:
+                    from tests.quick_drr_helpers import apply_self_background
+                    apply_self_background(self.bridge, self.wait)
                 self.assertEqual(self.bridge._source, expected, self.bridge.snapshot["status"])
                 self.assertTrue(self.bridge.snapshot["canExport"], self.bridge.snapshot["status"])
 
@@ -219,6 +223,10 @@ def _run_isolated():
                     with patch(target, side_effect=ValueError("Synthetic measurement failed")):
                         self.catalog.invoke("accept")
                         self.wait_load()
+                        if workflow == "drr":
+                            self.assertTrue(self.bridge.snapshot["backgroundRequired"])
+                            self.bridge.drrBackgroundBridge.invoke("apply")
+                            self.wait_load()
                     self.assertIn("Synthetic measurement failed", self.bridge.snapshot["status"])
                     self.assertFalse(self.bridge.snapshot["canExport"])
                     self.assert_bookmark(second)
@@ -249,6 +257,10 @@ def _run_isolated():
                     with patch(target, side_effect=delayed):
                         try:
                             self.catalog.invoke("accept")
+                            if workflow == "drr":
+                                self.wait_load()
+                                self.assertTrue(self.bridge.snapshot["backgroundRequired"])
+                                self.bridge.drrBackgroundBridge.invoke("apply")
                             self.wait(entered.is_set)
                             sequence = self.bridge._sequence
                             cancellation = self.bridge._load_cancellation
@@ -257,6 +269,9 @@ def _run_isolated():
                             # sequence guard must reject even this valid cube.
                             with patch.object(cancellation, "check", return_value=None):
                                 self.bridge.invoke("clear-files")
+                                if workflow == "drr":
+                                    self.assertFalse(self.bridge._background_open)
+                                    self.assertFalse(self.bridge.drrBackgroundBridge.snapshot["busy"])
                                 release.set()
                                 self.wait_load()
                         finally:

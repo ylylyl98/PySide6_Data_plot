@@ -26,6 +26,7 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtTest import QTest
 
 from ui_qt.quick.drr_workflow import DrrRequest, export_drr, load_drr, process_drr
+from tests.quick_drr_helpers import apply_self_background
 
 
 class QuickDrrWorkflowTests(unittest.TestCase):
@@ -120,6 +121,8 @@ class QuickDrrWorkflowTests(unittest.TestCase):
         bridge = bridge or self.bridge()
         bridge.selectFiles([QUrl.fromLocalFile(str(source))])
         self.wait(lambda: not bridge.snapshot["busy"] and not bridge._pending)
+        if bridge.snapshot["backgroundRequired"]:
+            apply_self_background(bridge, self.wait)
         self.wait_plot(bridge)
         self.assertTrue(bridge.snapshot["canExport"], bridge.snapshot["status"])
         return bridge
@@ -505,16 +508,19 @@ class QuickDrrWorkflowTests(unittest.TestCase):
         writer.assert_not_called()
 
     def test_native_bridge_failed_new_source_clears_exportable_old_data(self):
-        bridge = self.bridge()
         source = self.csv()
-        bridge.selectFiles([QUrl.fromLocalFile(str(source))])
-        self.wait(lambda: not bridge.snapshot["busy"] and not bridge._pending)
+        bridge = self.load_native(source)
         self.assertTrue(bridge.snapshot["canExport"])
         invalid = self.root / "invalid.csv"
         invalid.write_text("malformed\n", encoding="utf-8")
         bridge.selectFiles([QUrl.fromLocalFile(str(invalid))])
         self.assertFalse(bridge.snapshot["canExport"])
         self.wait(lambda: not bridge.snapshot["busy"] and not bridge._pending)
+        self.assertTrue(bridge.snapshot["backgroundRequired"])
+        background = bridge.drrBackgroundBridge
+        background.invoke("apply")
+        self.wait(lambda: not background.snapshot["busy"] and not bridge._pending)
+        self.assertTrue(background.snapshot["error"])
         self.assertFalse(bridge.snapshot["canExport"])
         self.assertIsNone(bridge._drr_products)
         with patch("ui_qt.quick.drr_workflow.export_drr") as writer:
@@ -526,12 +532,15 @@ class QuickDrrWorkflowTests(unittest.TestCase):
         source = self.csv()
         entered, release = Event(), Event()
         original = load_drr
-        def delayed(request):
+        def delayed(request, **kwargs):
             entered.set()
             release.wait(5)
-            return original(request)
+            return original(request, **kwargs)
+        bridge.selectFiles([QUrl.fromLocalFile(str(source))])
+        self.wait(lambda: not bridge.snapshot["busy"] and not bridge._pending)
+        self.assertTrue(bridge.snapshot["backgroundRequired"])
         with patch("ui_qt.quick.drr_workflow.load_drr", side_effect=delayed):
-            bridge.selectFiles([QUrl.fromLocalFile(str(source))])
+            bridge.drrBackgroundBridge.invoke("apply")
             self.wait(entered.is_set)
             sequence = bridge._sequence
             bridge.invoke("export")
@@ -561,9 +570,7 @@ class QuickDrrWorkflowTests(unittest.TestCase):
 
     def test_native_pair_plot_and_gate_linecuts_use_each_exact_scientific_product(self):
         from core.processing import nearest_gate_spectrum
-        bridge = self.bridge()
-        bridge.selectFiles([QUrl.fromLocalFile(str(self.csv()))])
-        self.wait(lambda: not bridge.snapshot["busy"] and not bridge._pending)
+        bridge = self.load_native(self.csv())
         bridge.setParameter("drrView", "pair")
         self.wait(lambda: bridge._canvas is not None and len(bridge._maps) == 2
                   and bridge._canvas.frame_generation > 0 and not bridge._plot_timer.isActive()
