@@ -47,7 +47,7 @@ def _isolated():
     class Cases(unittest.TestCase):
         def setUp(self):
             self.temporary=TemporaryDirectory();self.addCleanup(self.temporary.cleanup)
-            self.root=Path(self.temporary.name);self.energy=np.linspace(1.5,1.9,201)
+            self.root=Path(self.temporary.name).resolve();self.energy=np.linspace(1.5,1.9,201)
             self.source=self.root/"mcd"/"synthetic_MCD.csv";self.source.parent.mkdir()
             self.write_source(self.source)
             self.settings=QSettings(str(self.root/"test.ini"),QSettings.Format.IniFormat)
@@ -262,6 +262,7 @@ def _isolated():
             import hashlib
             from ui_qt.quick.mcd_workflow import history_settings_key
             with TemporaryDirectory() as external:
+                external = str(Path(external).resolve())
                 self.load();self.bridge.setParameter("center",1.731);self.bridge.setParameter("width",9.);self.wait()
                 self.bridge.openFiles("output-folder",[external]);self.bridge.invoke("export");self.wait()
                 expected_key="mcd/history_roots/"+hashlib.sha256(str(self.root.resolve()).casefold().encode("utf-8")).hexdigest()

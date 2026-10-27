@@ -460,6 +460,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             self._log_export_paths(key, paths)
         if key != self._workflow:
             return
+        self._catalog_child_busy = bool(state.get("busy", False))
         self._folder = state.get("sourcePath", self._folder)
         self._remember_folder(self._folder)
         paired = self._child_side_by_side(state)
@@ -552,6 +553,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
                 child.invoke("refresh-catalog")
 
     def _publish(self):
+        self._sync_source_catalog()
         self._sync_peak_sources()
         self._sync_maintenance_context()
         if not self._closed and not self._publish_timer.isActive():
@@ -588,6 +590,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             self._slides_controls_restore = None
         self._busy = False
         self._workflow = key
+        self._catalog_child_busy = False
         state = self._workflow_states.get(key)
         self._cube, self._source, self._sources = None, None, ()
         self._export_valid = False
@@ -992,6 +995,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         prepared = self._background_applications.pop(sequence, None)
         if self._closed or sequence != self._sequence:
             self._maintenance_export_contexts.pop(sequence, None)
+            self._sync_source_catalog()
             return
         self._busy = False
         if kind == "load-drr-fixed" and not error:

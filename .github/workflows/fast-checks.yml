@@ -45,6 +45,7 @@ jobs:
           tests.test_quick_source_catalog_status
           tests.test_quick_catalog_refresh_regression
           tests.test_quick_catalog_clear_reopen
+          tests.test_quick_catalog_idle_integration
           tests.test_quick_catalog_reopen_position
           tests.test_quick_catalog_load_bookmark
           tests.test_quick_catalog_summary

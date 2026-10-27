@@ -27,6 +27,7 @@ def _run_isolated():
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import json
     import time
+    from threading import Event
     from unittest.mock import patch
     from PySide6.QtCore import QCoreApplication, QSettings
     from ui_qt.quick import source_catalog
@@ -165,6 +166,60 @@ def _run_isolated():
             with patch.object(sources, "inspect_csv_gate", side_effect=AssertionError("reopened source contents")):
                 self.open()
                 self.assertEqual(len(self.bridge._catalog["sources"]), 1)
+
+        def test_live_acquisition_persists_a_provisional_list_before_inventory_validation(self):
+            # A changing acquisition cannot produce a certified raw/history
+            # snapshot. Its last display list must still survive restarting.
+            inspect = sources.inspect_csv_gate
+            def append_during_inspection(*args, **kwargs):
+                result = inspect(*args, **kwargs)
+                with self.measurement.open("a", encoding="utf-8") as stream:
+                    stream.write("2,3,4\n")
+                return result
+            with patch.object(sources, "inspect_csv_gate", side_effect=append_during_inspection):
+                self.open()
+            from core.source_catalog_cache import SourceCatalogCache
+            inventory_cache = self.base / "quick-source-catalog" / "inventory"
+            raw = SourceCatalogCache(str(self.root), "DRR-raw-v3-composite", cache_root=inventory_cache)
+            self.assertIsNone(raw.read(), "An acquisition changed while its raw snapshot was being built")
+            self.bridge.close()
+            self.bridge = source_catalog.SourceCatalogBridge(settings=QSettings(
+                str(self.base / "settings.ini"), QSettings.IniFormat))
+            self.addCleanup(self.bridge.close)
+            entered, release = Event(), Event()
+            self.addCleanup(release.set)
+            inventory = self.bridge._source_inventory
+            def delayed_inventory(*args, **kwargs):
+                entered.set()
+                if not release.wait(8):raise AssertionError("Initial inventory was not released")
+                return inventory(*args, **kwargs)
+            with patch.object(self.bridge, "_source_inventory", side_effect=delayed_inventory):
+                self.bridge.open("drr", str(self.root), [], False)
+                wait(lambda: entered.is_set() and self.bridge.filesModel.rowCount() > 0)
+                self.assertIn(str(self.measurement), {row["id"] for row in self.bridge.filesModel.rows})
+                self.assertTrue(self.bridge.snapshot["busy"])
+                self.assertFalse(self.bridge._catalog_validated)
+                self.assertFalse(self.bridge.snapshot["canAddGroup"])
+                self.assertEqual(self.bridge._catalog["sources"], ())
+                release.set()
+                wait(lambda: not self.bridge.snapshot["busy"])
+            self.assertTrue(self.bridge._catalog_validated)
+
+        def test_hidden_folder_preparation_completes_without_changing_selection(self):
+            messages = []
+            self.bridge.statusMessage.connect(messages.append)
+            self.bridge.prepare("drr", str(self.root))
+            wait(lambda: self.bridge._catalog_validated and not self.bridge.snapshot["busy"])
+            generation = self.bridge._generation
+            self.assertFalse(self.bridge._dialog_open)
+            self.assertEqual(messages, [])
+            self.bridge.selectFile(str(self.measurement), True)
+            self.bridge.prepare("drr", str(self.root))
+            self.assertEqual(self.bridge.snapshot["selected"], [str(self.measurement)])
+            self.bridge.open("drr", str(self.root), [str(self.measurement)], False)
+            settle(.5)
+            self.assertEqual(self.bridge._generation, generation)
+            self.assertTrue(self.bridge._catalog_validated)
 
         def test_manual_refresh_bypasses_pending_acquisition_settling(self):
             self.open()

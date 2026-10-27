@@ -93,7 +93,7 @@ def _run_isolated():
             self.addCleanup(lambda: self.assertEqual(qml_errors[qml_start:], [], "QML runtime or binding error"))
             self.temporary = TemporaryDirectory(prefix="quick-bridge-case-")
             self.addCleanup(self.temporary.cleanup)
-            self.root = Path(self.temporary.name)
+            self.root = Path(self.temporary.name).resolve()
             self.settings = QSettings(str(self.root / "settings.ini"), QSettings.Format.IniFormat)
             self.bridge = QuickApplicationBridge(settings=self.settings)
             self.addCleanup(self.bridge.close)

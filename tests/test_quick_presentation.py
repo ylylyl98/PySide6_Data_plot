@@ -45,7 +45,7 @@ class QuickPresentationTests(unittest.TestCase):
 
     def setUp(self):
         self.temporary = TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.settings = QSettings(str(self.root / "settings.ini"), QSettings.IniFormat)
         self.patches = [patch.object(slides, "powerpoint_integration_available", return_value=(False, "Live integration is unavailable in this test.")),
                         patch.object(slides, "powerpoint_presentation_is_open", return_value=False)]

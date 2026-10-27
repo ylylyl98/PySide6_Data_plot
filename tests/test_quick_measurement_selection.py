@@ -44,7 +44,7 @@ class QuickMeasurementSelectionTests(unittest.TestCase):
     def setUp(self):
         self.temporary = TemporaryDirectory(prefix="quick-measurement-selection-")
         self.addCleanup(self.temporary.cleanup)
-        self.base = Path(self.temporary.name)
+        self.base = Path(self.temporary.name).resolve()
         self.root = self.base / "experiment"
         self.raw = self.root / "Initial Data" / "REF"
         self.raw.mkdir(parents=True)
@@ -235,8 +235,9 @@ class QuickMeasurementSelectionTests(unittest.TestCase):
                 self.assertFalse(bridge._cancel.cancelled)
                 self.assertTrue(bridge.snapshot["busy"])
             finally:
-                bridge.invoke("cancel")
                 release.set()
+                # Owner teardown cancels an inspection paused for the accepted load.
+                bridge.close()
                 if bridge._future:
                     bridge._future.result(timeout=15)
                 self.app.processEvents()
@@ -300,8 +301,9 @@ class QuickMeasurementSelectionTests(unittest.TestCase):
                 self.assertFalse(bridge._cancel.cancelled)
                 self.assertTrue(bridge.snapshot["busy"])
             finally:
-                bridge.invoke("cancel")
                 release.set()
+                # Owner teardown cancels an inspection paused for the accepted load.
+                bridge.close()
                 if bridge._future:
                     bridge._future.result(timeout=15)
                 self.app.processEvents()

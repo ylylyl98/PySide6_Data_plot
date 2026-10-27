@@ -128,6 +128,63 @@ def _isolated():
             self.assertEqual(self.background.draft.files, (self.portable(self.bn[0]),))
             self.assertEqual(self.applied, [])
 
+        def test_reference_inventory_ignores_saved_history_and_non_csv_files(self):
+            saved = self.root / "Processed Data" / "DRR"
+            saved.mkdir(parents=True)
+            (saved / "unrelated.metadata.json").write_text("{}", encoding="utf-8")
+            (saved / "unrelated.dat").write_text("saved result", encoding="utf-8")
+            (self.raw / "unrelated.dat").write_text("saved matrix", encoding="utf-8")
+            with patch("ui_qt.quick.source_catalog._saved_drr_inventory",
+                       side_effect=AssertionError("Reference picker inspected saved processing history")):
+                inventory = self.catalog._source_inventory(str(self.root), "drr")
+                self.open_catalog()
+            self.assertEqual({row[0] for row in inventory},
+                {self.portable(path) for path in (*self.bn, self.p, self.n, self.measurement)})
+            self.assertTrue(all(row[0].endswith(".csv") for row in inventory))
+
+        def test_reopening_standalone_and_inline_reuses_catalog_without_rescanning(self):
+            for inline in (False, True):
+                with self.subTest(inline=inline):
+                    chooser = BackgroundSourceCatalogBridge(settings=self.settings, inline=inline)
+                    self.addCleanup(chooser.close)
+                    open_selection = chooser.open_inline_selection if inline else chooser.open_selection
+                    with patch.object(chooser, "_scan_catalog", wraps=chooser._scan_catalog) as scan:
+                        # Normalize the experiment root before constructing
+                        # canonical identities or comparing a retained scope.
+                        open_selection(str(self.root / "Initial Data" / ".."), "bn", [str(self.bn[0])])
+                        self.wait(lambda: not chooser.snapshot["busy"])
+                        self.assertFalse(chooser.snapshot["error"])
+                        self.assertEqual(scan.call_count, 1)
+                        self.assertEqual({row["id"] for row in chooser.filesModel.rows},
+                                         {str(path) for path in self.bn})
+                        chooser.selectFile(str(self.bn[1]), True)
+                        chooser.invoke("cancel")
+                        with patch.object(chooser, "_source_inventory", wraps=chooser._source_inventory) as probe:
+                            open_selection(str(self.root), "p", [str(self.p)])
+                            self.assertFalse(chooser.snapshot["busy"])
+                            self.assertEqual(chooser.snapshot["selected"], [str(self.p)])
+                            self.assertEqual({row["id"] for row in chooser.filesModel.rows}, {str(self.p)})
+                            self.wait(lambda: probe.call_count > 0 and not chooser._watch_probe_running)
+                        self.assertEqual(scan.call_count, 1)
+                        self.assertEqual(chooser.snapshot["folder"], str(self.root.resolve()))
+                    chooser.invoke("cancel")
+
+        def test_include_all_catalog_is_not_reused_for_default_reference_scope(self):
+            outside = self.csv("outside_Pbackground.csv", folder=self.root / "Initial Data" / "PL")
+            chooser = BackgroundSourceCatalogBridge(settings=self.settings, inline=True)
+            self.addCleanup(chooser.close)
+            chooser.open_inline_selection(str(self.root), "p", [])
+            self.wait(lambda: not chooser.snapshot["busy"])
+            self.assertNotIn(str(outside), {row["id"] for row in chooser.filesModel.rows})
+            chooser.setParameter("includeAll", True)
+            self.wait(lambda: not chooser.snapshot["busy"])
+            self.assertIn(str(outside), {row["id"] for row in chooser.filesModel.rows})
+            with patch.object(chooser, "_scan_catalog", wraps=chooser._scan_catalog) as scan:
+                chooser.open_inline_selection(str(self.root), "p", [])
+                self.wait(lambda: not chooser.snapshot["busy"])
+                self.assertEqual(scan.call_count, 1)
+            self.assertNotIn(str(outside), {row["id"] for row in chooser.filesModel.rows})
+
         def test_cancel_discards_edits_and_accept_replaces_only_current_kind_draft(self):
             self.open_catalog()
             self.catalog.selectFile(str(self.bn[0]), False)

@@ -35,7 +35,7 @@ class QuickDrrWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.temporary = TemporaryDirectory(prefix="quick-drr-")
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         environment = dict(MPLCONFIGDIR=str(self.root / "matplotlib"),
                            XDG_CACHE_HOME=str(self.root / "cache"),
                            XDG_CONFIG_HOME=str(self.root / "config"),

@@ -58,7 +58,7 @@ def _isolated():
         def setUp(self):
             self.temporary = TemporaryDirectory()
             self.addCleanup(self.temporary.cleanup)
-            self.root = Path(self.temporary.name)
+            self.root = Path(self.temporary.name).resolve()
             self.folder = self.root / "measurements"
             self.folder.mkdir()
             self.names = tuple(f"YZ383_p2n1_9T_1.67KREF_730nmc_0p3sx10_RotIn94deg_BNbackground_repeat_{index:02}.csv" for index in range(8))

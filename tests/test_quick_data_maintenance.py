@@ -20,7 +20,7 @@ class MaintenanceTests(unittest.TestCase):
     def setUp(self):
         self.temporary = TemporaryDirectory(prefix="quick-maintenance-fixture-")
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.working = self.root / "sample with spaces.csv"
         self.working.write_bytes(b"original scientific measurement")
         self.canonical = self.root / "Initial Data" / self.working.name
@@ -193,7 +193,7 @@ def _run_isolated():
             time.sleep(.003)
         raise AssertionError("Timed out waiting for maintenance worker")
     with TemporaryDirectory(prefix="quick-maintenance-bridge-") as temporary:
-        root = Path(temporary)
+        root = Path(temporary).resolve()
         settings = QSettings(str(root / "isolated.ini"), QSettings.Format.IniFormat)
         settings.setValue("unrelated/preserved", "keep")
         source, output = root / "sample.csv", root / "result.png"

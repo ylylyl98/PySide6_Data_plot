@@ -18,12 +18,12 @@ class SettingsStorageTests(unittest.TestCase):
             def format(self):return QSettings.Format.NativeFormat
             def fileName(self):raise AssertionError("Native registry filename must not be read as a path")
         with TemporaryDirectory() as temporary:
-            target=Path(temporary)/"app-data"
+            target=Path(temporary).resolve()/"app-data"
             with patch("ui_qt.quick.settings_storage.QStandardPaths.writableLocation",return_value=str(target)) as writable:
                 self.assertEqual(settings_storage_dir(NativeSettings()),target.resolve())
             with patch.dict(os.environ,LOCALAPPDATA=temporary):
                 for kind,title in (("peak","Peak Analysis"),("drr","DRR Analysis")):
-                    expected=Path(temporary)/"DPTK"/title/"workspace.npz"
+                    expected=Path(temporary).resolve()/"DPTK"/title/"workspace.npz"
                     self.assertEqual(analysis_session_path(NativeSettings(),kind),expected.resolve())
                     self.assertEqual(analysis_session_path(None,kind),expected.resolve())
             self.assertFalse(target.exists(),"Resolving a storage path must not create directories")
@@ -35,7 +35,7 @@ class SettingsStorageTests(unittest.TestCase):
             def format(self):return QSettings.Format.IniFormat
             def fileName(self):return self.path
         with TemporaryDirectory() as temporary:
-            path=Path(temporary)/"isolated"/"quick.ini"
+            path=Path(temporary).resolve()/"isolated"/"quick.ini"
             with patch("ui_qt.quick.settings_storage.QStandardPaths.writableLocation",side_effect=AssertionError("INI must remain isolated")):
                 self.assertEqual(settings_storage_dir(IniSettings(str(path))),path.parent.resolve())
                 for kind,subdir in (("peak","peak-analysis"),("drr","drr-analysis")):
@@ -49,7 +49,7 @@ class SettingsStorageTests(unittest.TestCase):
             def value(self,key,default=None):return {"ui/appearance":"dark"}.get(key,default)
             def setValue(self,*args):raise AssertionError("Parent native settings must not be written")
         with TemporaryDirectory() as temporary:
-            root=Path(temporary)/"application-data"
+            root=Path(temporary).resolve()/"application-data"
             with patch("ui_qt.quick.settings_storage.QStandardPaths.writableLocation",return_value=str(root)):
                 destination=child_settings_file(NativeSettings(),"mcd-organizer")
             self.assertEqual(destination,root/"mcd-organizer"/"quick.ini")
@@ -119,7 +119,7 @@ class SettingsStorageTests(unittest.TestCase):
         ''')
         for module in ("run_peak_analysis_quick","run_drr_analysis_quick"):
             with self.subTest(module=module),TemporaryDirectory() as temporary:
-                root=Path(temporary)
+                root=Path(temporary).resolve()
                 for title in ("Peak Analysis","DRR Analysis"):
                     production=root/"DPTK"/title/"workspace.npz"
                     production.parent.mkdir(parents=True)

@@ -44,7 +44,7 @@ def _isolated():
         app.processEvents()
     class Cases(unittest.TestCase):
         def setUp(self):
-            self.temporary=TemporaryDirectory();self.addCleanup(self.temporary.cleanup);self.root=Path(self.temporary.name)
+            self.temporary=TemporaryDirectory();self.addCleanup(self.temporary.cleanup);self.root=Path(self.temporary.name).resolve()
             self.source=self.root/"mcd"/"sample.csv";self.source.parent.mkdir();self.energy=np.linspace(1.6,1.8,151)
             self.write_source();self.settings=QSettings(str(self.root/"settings.ini"),QSettings.Format.IniFormat)
             self.bridge=McdPeakBridge(settings=self.settings);self.addCleanup(self.bridge.close)

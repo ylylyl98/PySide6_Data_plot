@@ -15,9 +15,9 @@ class _CatalogCancellation(LoadCancellation):
     """Keep partial inspection work while an explicitly chosen file loads.
 
     Pause between files instead of discarding the inspection or holding a CSV
-    open while hidden. Ordinary cancellation checks never wait for a resume.
+    open during a foreground load. Ordinary cancellation checks never wait for a resume.
     A process-pool batch already dispatched may finish, but no further files
-    are dispatched until the picker reopens. Cancellation always releases it.
+    are dispatched until the load finishes. Cancellation always releases it.
     """
     def __init__(self):
         super().__init__()
@@ -141,7 +141,7 @@ def scan_catalog(folder,workflow,*,include_all=False,cache_path=None,cancellatio
         if workflow=="pl" and not _uncached and cache_path is not None:
             from core.source_catalog_cache import SourceCatalogCache
             cache=SourceCatalogCache(str(root),workflow+"-"+str(int(include_all)),cache_root=Path(cache_path).parent/"inventory")
-            return cache.refresh(lambda:scan_catalog(root,workflow,include_all=include_all,cache_path=cache_path,cancellation=cancellation,_uncached=True),force=force)
+            return cache.refresh(lambda:scan_catalog(root,workflow,include_all=include_all,cache_path=cache_path,cancellation=cancellation,_uncached=True),force=force,publish_cached=publish_cached)
         if workflow=="pl":
             from core.pl_sources import list_pl_source_files,classify_pl_source,discover_pl_processing_status
             paths=list_pl_source_files(str(root));ambiguous=set()
@@ -215,6 +215,7 @@ class SourceCatalogBridge(QObject):
         self._preserve_catalog=False
         self._indexed_catalog=None;self._lookup={};self._counts={status:0 for status in ("new","processed","unknown")}
         self._busy,self._closed,self._generation=False,False,0
+        self._dialog_open=self._foreground_busy=self._prepare_pending=False
         self._status,self._error="Choose an experiment folder.",""
         self._cancel=None;self._future=None
         self._scan_scope=None
@@ -232,6 +233,8 @@ class SourceCatalogBridge(QObject):
         self._watch_signature=None
         self._watch_candidate=None;self._watch_candidate_since=0.
         self._watch_settle_ms=3000
+        self._prepare_timer=QTimer(self);self._prepare_timer.setSingleShot(True);self._prepare_timer.setInterval(150)
+        self._prepare_timer.timeout.connect(self._prepare_refresh)
 
     @Property(QObject,constant=True)
     def groupsModel(self):return self._groups
@@ -250,19 +253,58 @@ class SourceCatalogBridge(QObject):
     @Slot(str,str,"QVariantList",bool)
     def open(self,workflow,folder,selected,saved_only=False):
         if self._configure(workflow,folder,selected,saved_only,restore_position=True):
+            self._dialog_open=True
+            self._prepare_pending=False;self._prepare_timer.stop()
             self._watch_active=True
             scope=(self._workflow,self._folder,self._include_all)
             # Opening a picker changes selection, not its source inventory.
             # Reuse an ongoing inspection or the last validated list; a small
             # asynchronous inventory probe catches changes while it was hidden.
             if self._busy and self._scan_scope==scope:
-                self._cancel.resume()
+                if not self._foreground_busy:self._cancel.resume()
                 return
             if self._catalog_validated:
                 self._sync_watches()
                 if not self._watch_probe_running and not self._watch_timer.isActive():
                     self._watch_timer.start(0)
             else:self.refresh()
+
+    @Slot(str,str)
+    def prepare(self,workflow,folder):
+        """Warm the active folder without opening or changing a picker draft."""
+        if self._closed or workflow not in {"pl","drr"} or not folder:return
+        folder=str(Path(folder).resolve())
+        if (workflow,folder)!=(self._workflow,self._folder):
+            self._dialog_open=False
+            if not self._configure(workflow,folder,[],False):return
+        self._watch_active=True
+        self._sync_watches()
+        if self._busy:return
+        if self._catalog_validated:
+            if not self._watch_probe_running and not self._watch_timer.isActive():self._watch_timer.start(350)
+        elif not self._prepare_pending:
+            self._prepare_pending=True
+            self._prepare_timer.start()
+
+    def _prepare_refresh(self):
+        if self._closed or not self._prepare_pending or self._foreground_busy:return
+        self._prepare_pending=False
+        if not self._busy:self.refresh()
+
+    @Slot(bool)
+    def setForegroundBusy(self,busy):
+        """Yield source inspection while an explicitly requested load runs."""
+        busy=bool(busy)
+        if self._closed or busy==self._foreground_busy:return
+        self._foreground_busy=busy
+        if self._foreground_busy:
+            self._watch_timer.stop();self._cancel_watch_check()
+            self._refresh_pending=True
+        if self._cancel:
+            if self._foreground_busy:self._cancel.pause()
+            else:self._cancel.resume()
+        if not self._foreground_busy and self._prepare_pending:self._prepare_timer.start(0)
+        elif not self._foreground_busy and self._refresh_pending and self._watch_active:self._watch_timer.start(0)
 
     def _configure(self,workflow,folder,selected,saved_only=False,*,restore_position=False):
         if self._closed or workflow not in {"pl","drr"}:return
@@ -283,6 +325,9 @@ class SourceCatalogBridge(QObject):
                 self._selected_group=""
         self._reopen_group_pending=bool(restore_position and workflow=="drr" and not saved_only and self._focused)
         if changed:
+            self._prepare_timer.stop();self._prepare_pending=False
+            if self._cancel:self._cancel.cancel()
+            self._generation+=1;self._busy=False;self._scan_scope=None
             self._stop_watches()
             self._selected_group="";self._catalog=dict(files=[],groups=[],sources=());self._catalog_validated=False
             self._watch_signature=None
@@ -317,6 +362,24 @@ class SourceCatalogBridge(QObject):
     def _source_inventory(self,folder,workflow,include_all=False):
         return _catalog_inventory(folder,workflow,include_all)
 
+    def _display_cache(self,folder,workflow,include_all,cache_path):
+        from core.source_catalog_cache import SourceCatalogCache
+        # This snapshot is a display aid, never a validated inventory or source
+        # inspection. A live acquisition can prevent the certified raw/history
+        # caches from being written for hours; its last list is still useful.
+        namespace=f"quick-picker-display-v1-{type(self).__name__}-{workflow}-{int(include_all)}"
+        return SourceCatalogCache(folder,namespace,cache_root=Path(cache_path).parent/"inventory",
+            inventory_provider=lambda:[])
+
+    @staticmethod
+    def _display_snapshot(result):
+        if not isinstance(result,dict) or not isinstance(result.get("files"),list) or not isinstance(result.get("groups"),list):return None
+        required={"id","source","name","kind","status","saved","modified","processedAt","background","detail"}
+        if not all(isinstance(row,dict) and required<=row.keys() for row in result["files"]):return None
+        required={"id","name","session","members","modified","background","kind","processedCount","count","complete","detail"}
+        if not all(isinstance(row,dict) and required<=row.keys() for row in result["groups"]):return None
+        return dict(files=result["files"],groups=result["groups"],sources=())
+
     @Slot()
     @Slot(bool)
     def refresh(self,force=False):
@@ -324,6 +387,8 @@ class SourceCatalogBridge(QObject):
         from hashlib import sha256
         if self._cancel:self._cancel.cancel()
         cancellation=self._cancel=_CatalogCancellation()
+        if self._foreground_busy:cancellation.pause()
+        self._prepare_timer.stop();self._prepare_pending=False
         self._generation+=1;generation=self._generation
         self._watch_timer.stop();self._refresh_pending=False
         self._cancel_watch_check()
@@ -340,13 +405,22 @@ class SourceCatalogBridge(QObject):
             inventory=None
             try:
                 from core.load_cancellation import load_scope,check_load_checkpoint
+                preview=lambda value:self._previewed.emit(generation,value) if not self._closed and generation==self._generation else None
                 with load_scope(cancellation):
+                    check_load_checkpoint()
+                    display_cache=self._display_cache(folder,workflow,include_all,cache)
+                    cached=self._display_snapshot(display_cache.read())
+                    if cached is not None:preview(cached)
+                    # Capture the pre-scan signature after the optimistic list
+                    # was published. A change during inspection must still be
+                    # found by the post-scan watch probe.
                     inventory=self._source_inventory(folder,workflow,include_all)
                     check_load_checkpoint()
-                preview=lambda value:self._previewed.emit(generation,value) if not self._closed and generation==self._generation else None
                 result=self._scan_catalog(folder,workflow,include_all=include_all,cache_path=cache,cancellation=cancellation,force=bool(force),
                     publish_cached=preview,publish_inventory=preview)
                 cancellation.checkpoint()
+                snapshot=self._display_snapshot(result)
+                if snapshot is not None:display_cache.refresh(lambda:snapshot,force=True)
                 error=""
             except Exception as failure:result,error=None,"" if cancellation.cancelled else str(failure)
             if not self._closed and generation==self._generation:
@@ -359,7 +433,9 @@ class SourceCatalogBridge(QObject):
         self._status="Source inventory is available; checking acquisition grids and processing history…"
         # A saved-results-only or filename-only preview is useful on a cold
         # open. It must not replace a validated list during a warm refresh.
-        if self._preserve_catalog:self.snapshotChanged.emit()
+        saved_preview=result["files"] and all(row["saved"] for row in result["files"])
+        have_raw=any(not row["saved"] for row in self._catalog["files"])
+        if self._preserve_catalog or saved_preview and have_raw:self.snapshotChanged.emit()
         else:
             self._catalog=result;self._catalog_validated=False
             self._refresh_models()
@@ -375,7 +451,9 @@ class SourceCatalogBridge(QObject):
         if result is not None:self._catalog=result;self._catalog_validated=True;self._watch_signature=inventory
         if result is not None:self._sync_watches()
         self._status=error or f"{len(self._catalog['files'])} files · {len(self._catalog['groups'])} acquisition groups"
-        self._refresh_models();self.statusMessage.emit(self._status);self.operationCompleted.emit("catalog",elapsed)
+        self._refresh_models()
+        if self._dialog_open:self.statusMessage.emit(self._status)
+        self.operationCompleted.emit("catalog",elapsed)
         # A file may have changed while the first scan had no directory watches
         # yet. Recheck its inventory without re-entering the visible busy state.
         self._refresh_pending=False
@@ -410,7 +488,7 @@ class SourceCatalogBridge(QObject):
 
     def _watch_refresh(self):
         if self._closed or not self._watch_active:return
-        if self._busy or self._watch_probe_running:
+        if self._busy or self._foreground_busy or self._watch_probe_running:
             self._refresh_pending=True
             return
         from core.load_cancellation import LoadCancellation
@@ -554,14 +632,12 @@ class SourceCatalogBridge(QObject):
                 scope=(self._workflow,self._folder,all(Path(path).suffix.casefold()==".dat" for path in paths))
                 target=self._focused if self._focused in paths else paths[-1]
                 self._pending_load_position=(scope,paths,target)
-                self._stop_watches()
-                if self._busy and self._cancel:self._cancel.pause()
+                self._dialog_open=False
+                self.setForegroundBusy(True)
                 self.selectionAccepted.emit(self._workflow,list(self._selected))
             return
         elif action=="cancel":
-            self._stop_watches()
-            if self._cancel:self._cancel.cancel()
-            self._generation+=1;self._busy=False
+            self._dialog_open=False
         self._refresh_models()
 
     def next_unprocessed(self,completed):
@@ -574,6 +650,7 @@ class SourceCatalogBridge(QObject):
     def close(self):
         if self._closed:return
         self._closed=True;self._generation+=1;self._busy=False;self._refresh_pending=False
+        self._prepare_timer.stop();self._prepare_pending=False
         self._stop_watches()
         if self._cancel:self._cancel.cancel()
         # A cancelled inventory can still be unwinding an atomic cache write.

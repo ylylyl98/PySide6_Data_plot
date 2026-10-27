@@ -205,9 +205,11 @@ def _run_isolated():
                     self.assertTrue(self.catalog._catalog_validated)
                     self.assertEqual(self.catalog.snapshot["selected"], [])
 
-        def test_cancel_and_close_release_paused_preview_workers(self):
+        def test_cancel_retains_paused_preview_and_close_releases_it(self):
             for action in ("cancel", "close"):
                 with self.subTest(action=action):
+                    with self.measurement.open("a", encoding="utf-8") as stream:
+                        stream.write("2,3,4,5\n")
                     self.catalog = RecordingCatalog(settings=self.settings)
                     self.addCleanup(self.catalog.close)
                     self.addCleanup(self.catalog.release.set)
@@ -215,17 +217,23 @@ def _run_isolated():
                         future = self.catalog._future
                         if action == "close":
                             self.catalog.close()
+                            future.result(timeout=5)
+                            self.assertTrue(cancellation.cancelled)
+                            self.assertFalse(self.catalog.snapshot["busy"])
+                            self.assertFalse(self.catalog._catalog_validated)
                         else:
                             self.catalog.invoke("cancel")
-                        future.result(timeout=5)
-                        self.assertTrue(cancellation.cancelled)
-                        self.assertFalse(self.catalog.snapshot["busy"])
-                        self.assertFalse(self.catalog._catalog_validated)
+                            self.assertFalse(cancellation.cancelled)
+                            self.assertTrue(self.catalog.snapshot["busy"])
+                            self.catalog.setForegroundBusy(False)
+                            self.wait(lambda: not self.catalog.snapshot["busy"])
+                            self.assertTrue(self.catalog._catalog_validated)
 
         def test_manual_refresh_releases_and_replaces_a_paused_preview(self):
             with self.accepted_preview() as (cancellation, _):
                 previous = self.catalog._future
                 self.catalog.invoke("refresh")
+                self.catalog.setForegroundBusy(False)
                 self.wait(lambda: not self.catalog.snapshot["busy"])
                 self.assertTrue(cancellation.cancelled)
                 self.assertTrue(previous.done())
@@ -258,6 +266,7 @@ def _run_isolated():
                     reader.join(timeout=2)
                 self.assertEqual(errors, [])
                 self.catalog.open("drr", str(self.root), [], False)
+                self.catalog.setForegroundBusy(False)
                 self.wait(lambda: not self.catalog.snapshot["busy"])
                 self.assertTrue(self.catalog._catalog_validated)
 
@@ -340,6 +349,7 @@ def _run_isolated():
                 self.wait(entered.is_set)
                 self.catalog.invoke("accept")
                 self.catalog.open("drr", str(self.root), [], False)
+                self.catalog.setForegroundBusy(False)
                 release.set()
                 self.wait(lambda: len(calls) >= 2 and not self.catalog._watch_probe_running)
                 self.observe(.5)
@@ -348,7 +358,7 @@ def _run_isolated():
             self.assertIsNone(self.catalog._watch_candidate)
             self.assertFalse(self.catalog.snapshot["busy"])
 
-        def test_cancelled_inflight_result_cannot_publish_and_reopen_scans_again(self):
+        def test_dismissed_inflight_inspection_finishes_and_reopens_without_rescan(self):
             self.catalog.pause_next = True
             completed = []
             self.catalog.operationCompleted.connect(lambda *args: completed.append(args))
@@ -356,15 +366,15 @@ def _run_isolated():
             self.wait(self.catalog.entered.is_set)
             cancelled = self.catalog._cancel
             self.catalog.invoke("cancel")
-            self.assertTrue(cancelled.cancelled)
-            self.assertFalse(self.catalog.snapshot["busy"])
+            self.assertFalse(cancelled.cancelled)
+            self.assertTrue(self.catalog.snapshot["busy"])
             self.catalog.release.set()
             self.catalog._future.result(timeout=15)
             self.observe(.1)
-            self.assertEqual(completed, [])
-            self.assertFalse(self.catalog._catalog_validated)
+            self.assertEqual(len(completed), 1)
+            self.assertTrue(self.catalog._catalog_validated)
             self.open_catalog()
-            self.assertEqual(len(self.catalog.scans), 2)
+            self.assertEqual(len(self.catalog.scans), 1)
             self.assertTrue(self.catalog._catalog_validated)
 
         def test_main_clear_discards_pending_automatic_next_intent(self):

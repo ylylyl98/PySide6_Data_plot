@@ -78,7 +78,7 @@ def isolated():
             self.addCleanup(lambda: self.assertEqual(qml_errors[start_qml:], [], "QML runtime error"))
             self.temporary = TemporaryDirectory(prefix="quick-drr-analysis-case-")
             self.addCleanup(self.temporary.cleanup)
-            self.root = Path(self.temporary.name)
+            self.root = Path(self.temporary.name).resolve()
             self.bridge = DrrAnalysisBridge(settings=QSettings(str(self.root/"settings.ini"), QSettings.IniFormat),
                 session_path=self.root/"workspace.npz", start_folder=str(self.root))
             self.addCleanup(self.dispose)

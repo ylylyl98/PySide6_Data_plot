@@ -59,6 +59,8 @@ class PlApplicationMixin:
         self._source_catalog.dialogRequested.connect(lambda purpose,multiple:self.fileDialogRequested.emit(purpose,multiple))
         self._source_catalog.statusMessage.connect(self._message)
         self._source_catalog.operationCompleted.connect(self._pl_catalog_finished)
+        self._catalog_prepare_scope=None
+        self._catalog_child_busy=False
         try:
             width=float(self.settings.value("export/png_width_scale",2.))
             if not isfinite(width) or not 1<=width<=3:width=2.
@@ -82,6 +84,18 @@ class PlApplicationMixin:
     def _pl_catalog_accepted(self,workflow,files):
         if workflow!=self._workflow:self.selectWorkflow(workflow)
         self.selectFiles([QUrl.fromLocalFile(str(path)) for path in files])
+
+    def _sync_source_catalog(self):
+        """Prepare the active folder while idle, yielding to foreground work."""
+        if self._closed:return
+        # A canceled request can still be closing CSV/cache handles. Keep the
+        # catalog paused until its completion signal removes that request.
+        self._source_catalog.setForegroundBusy(bool(self._busy or self._pending or self._catalog_child_busy))
+        if self._workflow in {"pl","drr"} and self._folder:
+            scope=(self._workflow,self._folder)
+            if scope!=self._catalog_prepare_scope:
+                self._catalog_prepare_scope=scope
+                self._source_catalog.prepare(*scope)
 
     def _pl_open_catalog(self,saved=False):
         if self._workflow not in {"pl","drr"}:return False

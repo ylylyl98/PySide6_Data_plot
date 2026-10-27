@@ -52,7 +52,7 @@ def _isolated():
         def setUp(self):
             self.temporary = TemporaryDirectory(prefix="quick-background-restore-case-")
             self.addCleanup(self.temporary.cleanup)
-            self.root = Path(self.temporary.name)
+            self.root = Path(self.temporary.name).resolve()
             self.source = self.write("sample_REF_730nmc_TG_rep01.csv")
             self.other = self.write("another_REF_740nmc_TG_rep01.csv", offset=7)
             self.bn = self.write("chosen_BNbackground.csv", offset=40, constant=True)

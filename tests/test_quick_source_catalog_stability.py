@@ -213,19 +213,22 @@ def _isolated():
             self.assertEqual(resets, [])
             self.assertEqual(self.catalog.snapshot["selected"], [str(self.measurement)])
 
-        def test_cancel_accept_and_close_stop_automatic_refresh_and_reopen_resumes_it(self):
+        def test_hidden_picker_stays_fresh_and_foreground_load_pauses_it(self):
+            messages = []
+            self.catalog.statusMessage.connect(messages.append)
             self.catalog.invoke("cancel")
             added = self.csv("sample_730nmc_TG_rep02.csv")
-            self.assert_settled(1)
-            self.open_catalog()
+            self.wait(lambda: len(self.completed) == 2 and not self.catalog.snapshot["busy"])
+            self.assert_settled(2)
+            self.assertEqual(messages, [], "A hidden catalog must not overwrite the main task status")
+            self.catalog.open("drr", str(self.root), [], False)
             self.assert_settled(2)
             self.assertIn(str(added), {row["id"] for row in self.catalog.filesModel.rows})
             self.catalog.selectFile(str(self.measurement), True)
             self.catalog.invoke("accept")
             self.csv("sample_730nmc_TG_rep03.csv")
             self.assert_settled(2)
-            # Explicit requests still work after a dialog is dismissed.
-            self.catalog.invoke("refresh")
+            self.catalog.setForegroundBusy(False)
             self.wait(lambda: len(self.completed) == 3 and not self.catalog.snapshot["busy"])
             self.assert_settled(3)
             self.catalog.open("drr", str(self.root), [], False)

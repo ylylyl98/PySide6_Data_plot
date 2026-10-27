@@ -50,6 +50,8 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
     def open_selection(self, folder, kind, selected, *, role="background"):
         if kind not in _LABELS or role not in {"background", "P", "N"}:
             raise ValueError("Choose a supported background source kind and role.")
+        root = Path(folder).resolve()
+        reuse_catalog = self._can_reuse_catalog(root)
         self._stop_selection()
         self._selection_token += 1
         self._selection_open = True
@@ -58,18 +60,16 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
         self._source_kind, self._role = kind, role
         self._query, self._show_all_files, self._include_all = "", False, False
         self._selected_group, self._focused = "", ""
-        root = Path(folder).resolve()
         selected = [self._local_path(value, root) for value in selected]
         if self._configure("drr", str(root), selected, False):
-            self._watch_active = True
-            self.refresh()
+            self._resume_selection_catalog(reuse_catalog)
 
     def open_inline_selection(self, folder, kind, selected):
         """Rebind the draft editor, reusing validated same-folder metadata."""
         if not self._inline_selection or kind not in _LABELS:
             raise ValueError("Choose a supported inline background source kind.")
         root = Path(folder).resolve()
-        reuse_catalog = self._folder == str(root) and self._catalog_validated
+        reuse_catalog = self._can_reuse_catalog(root)
         self._stop_selection()
         self._selection_open, self._editing_enabled = True, True
         self._selection_touched = False
@@ -78,13 +78,19 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
         self._selected_group, self._focused = "", ""
         selected = [self._local_path(value, root) for value in selected]
         self._configure("drr", str(root), selected, False)
+        self._resume_selection_catalog(reuse_catalog)
+
+    def _can_reuse_catalog(self, root):
+        return self._folder == str(root) and self._catalog_validated and not self._include_all
+
+    def _resume_selection_catalog(self, reuse_catalog):
         self._watch_active = True
         if reuse_catalog:
             # The cancelled scan token belongs to the previous editor session.
             # A lightweight watch check should use the retained inventory.
             self._cancel = None
             self._sync_watches()
-            self._watch_timer.start()
+            self._watch_timer.start(0)
         else:
             self.refresh()
 
@@ -112,7 +118,7 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
         return str((path if path.is_absolute() else root / path).resolve())
 
     def _scan_catalog(self, folder, workflow, *, include_all=False, cancellation=None, **options):
-        from core.drr_sources import drr_source_paths, portable_source_name
+        from core.drr_sources import drr_source_paths
         from core.drr_measured_bn import is_measured_bn_name
         from core.drr_pn_pairing import detect_pn_role
         from core.load_cancellation import load_scope
@@ -128,11 +134,18 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
                     stat = path.stat()
                 except OSError:
                     continue
-                name = portable_source_name(root, path)
+                # The inventory already supplies absolute paths below a
+                # resolved root. Resolve each file once for aliases, then use
+                # that identity for both its id and its portable name.
+                identity = path.resolve()
+                try:
+                    name = identity.relative_to(root).as_posix()
+                except ValueError:
+                    name = str(identity)
                 label = "BN" if is_measured_bn_name(path.name) else detect_pn_role(path.name) or "CSV"
                 modified = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
                 relative_parent = str(Path(name).parent).replace("\\", "/")
-                rows.append(dict(id=str(path.resolve()), source=name,
+                rows.append(dict(id=str(identity), source=name,
                                  name=path.name, kind=label, status="", saved=False,
                                  modified=stat.st_mtime, size=stat.st_size, processedAt="",
                                  background=label != "CSV",
@@ -140,6 +153,23 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
                                  detail=f"File modified: {modified}\n{stat.st_size:,} bytes · Filename selection; validate when applying"))
             return dict(files=sorted(rows, key=lambda row: (-row["modified"], row["source"].casefold())),
                         groups=[], sources=())
+
+    def _source_inventory(self, folder, workflow, include_all=False):
+        """Reference choices depend on CSV metadata, not saved DRR history."""
+        from core.drr_sources import drr_source_paths
+        from core.load_cancellation import check_load_cancelled
+        root = Path(folder).resolve()
+        rows = []
+        for path in drr_source_paths(root, include_all=include_all):
+            check_load_cancelled()
+            if path.suffix.casefold() != ".csv":
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            rows.append([path.relative_to(root).as_posix(), stat.st_size, stat.st_mtime_ns])
+        return sorted(rows)
 
     def _matches_kind(self, row):
         kind = self._role.lower() if self._role in {"P", "N"} else self._source_kind

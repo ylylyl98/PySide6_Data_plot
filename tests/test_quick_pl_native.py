@@ -61,7 +61,7 @@ def isolated():
             self.addCleanup(lambda:self.assertEqual(errors[e:],[]))
             self.addCleanup(lambda:self.assertEqual(qml[q:],[]))
             self.tmp=TemporaryDirectory(prefix="quick-pl-case-");self.addCleanup(self.tmp.cleanup)
-            self.root=Path(self.tmp.name)
+            self.root=Path(self.tmp.name).resolve()
             self.bridge=QuickApplicationBridge(settings=QSettings(str(self.root/"settings.ini"),QSettings.IniFormat))
             self.bridge.setParameter("pl.autoNext",False)
             self.addCleanup(self.bridge.close)

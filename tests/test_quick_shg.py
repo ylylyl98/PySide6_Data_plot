@@ -75,7 +75,7 @@ def _run_isolated():
             self.addCleanup(lambda: self.assertEqual(qml_errors[qml_start:], [], "QML runtime error"))
             self.temporary = TemporaryDirectory(prefix="quick-shg-case-")
             self.addCleanup(self.temporary.cleanup)
-            self.root = Path(self.temporary.name)
+            self.root = Path(self.temporary.name).resolve()
             self.settings = QSettings(str(self.root / "isolated.ini"), QSettings.Format.IniFormat)
             self.settings.setValue("unrelated/preserved", 123)
             self.bridge = ShgBridge(settings=self.settings)

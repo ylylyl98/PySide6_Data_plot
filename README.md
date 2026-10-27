@@ -219,6 +219,12 @@ superseded, including results returned by parallel workers. A later inventory
 preview reuses Vtg/Vbg/Vbias and frame summaries for unchanged files; only new
 or changed files need inspection. Unchanged refreshes also avoid rewriting the
 per-file inspection cache.
+Selecting or restoring a PL/DRR experiment folder prepares the list in the
+background before the picker opens. A lightweight display snapshot is retained
+even while acquisition prevents the full catalog from being certified. Reopening
+can show that snapshot before inventory checks; it does not enable unchecked
+group/repeat actions. Foreground measurement loads pause inspection and resume it
+after completion or cancellation cleanup.
 The picker has a title-bar close button and a **Close** action; both, and Escape,
 leave the loaded measurement unchanged. **Selection actions** groups the optional
 whole-group/repeat additions, while **Clear all** sits beside the chosen-file list.
@@ -236,7 +242,9 @@ writes do not keep the picker loading. During acquisition, automatic checks wait
 until the source inventory has stayed unchanged for three seconds; lightweight
 probes keep the current rows and selection usable while frames are appended.
 **Refresh** still checks immediately. A failed directory probe preserves the
-validated list instead of starting another scan. Closing the picker stops watching.
+validated list instead of starting another scan. Closing the measurement picker
+keeps its directory watches and pending inspection active. Hidden refreshes do
+not replace the main window's load/export status.
 Gate summaries combine set/measured channels only when their complete cached
 traces are identical; real differences stay separate. Equal frame-count endpoints
 appear once (for example, **541 frames** instead of **(541, 541) frames**).
@@ -386,8 +394,11 @@ The **Controls** button (or **Ctrl+B**) hides the resizable parameter sidebar
 when the plot needs more width. **View → Appearance** switches between system,
 light, dark and high-contrast themes and remembers the choice.
 PL and DRR use a draggable divider with a default **70% heatmap / 30% spectrum**
-allocation. The spectrum can be hidden and restored; its title sits inside the
-plot. Parameters start in a narrower sidebar. Side-by-side views automatically
+allocation. **Hide spectrum / Show spectrum** stays in the footer at the bottom
+right, outside the plot axes. Spectrum Y limits follow the current visible curves
+and X range in PL/DRR, Compare, Power, MCD and MCD Peak. Manual Y zoom is retained;
+**Home** restores automatic fitting. The spectrum title sits inside the plot.
+Parameters start in a narrower sidebar. Side-by-side views automatically
 hide only the far-left workflow rail, keeping the parameter controls available;
 the header still provides workflow selection and a navigation toggle.
 The compact command bars leave more room for plots at small window sizes.
