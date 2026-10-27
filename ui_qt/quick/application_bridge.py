@@ -615,6 +615,9 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         if key == "drr":
             self._ensure_drr_display()
             self._drr_display.setActive(True)
+            # Apply deferred edits after restoring the DRR context, so their
+            # signals and the retained dirty state share one scheduled rebuild.
+            self._drr_display._flush_changes()
         elif key in {"cmp", "shg", "mcd", "mcd_peak_shift", "power"}:
             self._ensure_workflow_bridge(key)
         elif key == "slides":

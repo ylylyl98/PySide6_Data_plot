@@ -320,6 +320,9 @@ def _run_isolated():
         def test_pending_drr_display_step_survives_leaving_before_debounce(self):
             contexts = self.load_pair()
             display = self.bridge.drrDisplayBridge
+            # Keep the debounce pending across both switches regardless of
+            # machine speed; dispatch its callback explicitly after the draw.
+            display._debounce.setInterval(60_000)
             before = len(self.bridge.rebuilds)
             self.assertTrue(display.stepNumber("axis.xmin", 1))
             self.assertTrue(display._pending)
@@ -330,8 +333,12 @@ def _run_isolated():
             self.assertEqual(len(self.bridge.rebuilds), before)
             self.bridge.selectWorkflow("drr")
             self.idle_plot()
+            display._flush_changes()
+            self.idle_plot()
             self.settle()
             self.assertEqual(self.bridge.rebuilds[before:], ["drr"])
+            self.assertFalse(display._pending)
+            self.assertFalse(display._debounce.isActive())
             self.assertAlmostEqual(self.bridge._maps[0][0].get_xlim()[0], requested)
 
         def test_theme_changed_away_redraws_each_loaded_workflow_once(self):
