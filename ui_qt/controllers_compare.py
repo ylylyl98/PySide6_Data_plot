@@ -10,7 +10,8 @@ import numpy as np
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QListWidgetItem, QComboBox, QDoubleSpinBox, QToolButton
+from PySide6.QtWidgets import (QListWidgetItem, QComboBox, QToolButton)
+from ui_qt.common import QDoubleSpinBox
 
 from core import data_io
 from core.compare_history import compare_history_for_selection

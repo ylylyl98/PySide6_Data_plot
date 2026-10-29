@@ -1,7 +1,8 @@
 """Shared, remembered PNG layout and wide-export multiplier."""
 from dataclasses import replace
 
-from PySide6.QtWidgets import QComboBox, QDoubleSpinBox
+from PySide6.QtWidgets import (QComboBox)
+from ui_qt.common import QDoubleSpinBox
 
 from core.png_geometry import widened_figsize
 

@@ -82,11 +82,22 @@ def export_pl(path,cube,params,context):
     request=context.get("request")
     extra=dict(native_pl_axis=dict(y_axis=getattr(request,"y_axis","auto"),dat_choice=getattr(request,"dat_choice","original"),
         dat_label=getattr(request,"dat_label",""),dat_unit=getattr(request,"dat_unit","")))
+    display = context.get("display_state")
+    if display is not None:
+        from core.pl_display_settings import source_context, validate_snapshot
+        identity = source_context(folder, path, cube, request)
+        display = validate_snapshot({**display, **identity})
+        if display is None:
+            raise ValueError("The PL display settings are invalid; review the ranges before saving.")
+        extra.update(pl_display=display, pl_display_save_pending=True)
     paths=export_pl_pngs_and_dat(str(folder),path.name,cube_linear=cube,cube_log=cube,
-        params_linear=params["linear"],params_log=params["log"],include_pair=False,
+        params_linear=params["linear"],params_log=params["log"],include_pair=False,include_original_png=True,
         processed_name=str(Path("Processed Data")/"PL"),
         metadata_input_files=(("measurement",relative),),metadata_extra=extra)
     verify_signatures(signatures)
+    if display is not None:
+        from core.pl_display_settings import publish_snapshot
+        publish_snapshot(folder, path, display, paths["dat"])
     return paths
 
 
@@ -97,45 +108,83 @@ def y_axis_spec(choice, a=1., b=-1., c=0.):
     return "auto"
 
 
-def refresh_bank(cube, bounds, bank, *, force=False):
-    """Refresh every unlocked bound independently, including split regions."""
-    from core.processing import compute_auto_limits
-    from core.plotting import resolve_split_boundary
+def refresh_bank(cube, bounds, bank, *, force=False, geometry=None, regions=None):
+    """Refresh ROI statistics without changing explicit locks or geometry.
+
+    ``geometry`` is shared by the two native PL color banks. The legacy
+    split/splitX representation remains accepted for older callers.
+    ``force`` bypasses the ROI cache; it never releases a fixed endpoint.
+    """
+    import numpy as np
+    from types import SimpleNamespace
+    from core.color_limits import ColorRequest, calculate_bounds
     values = dict(bank)
     values["fixed"] = dict(bank.get("fixed",{}))
     roi = tuple(bounds)
-    if not force and tuple(bank.get("roi",())) == roi:return values
+    count = int(geometry["count"]) if geometry else (2 if bank.get("split") else 1)
+    cuts = tuple(geometry[key] for key in ("x0", "x1")[:count-1]) if geometry else ((bank["splitX"],) if count > 1 else ())
+    signature = (*roi, count, *cuts)
+    if not force and tuple(bank.get("roi",())) == signature:return values
     fixed = values["fixed"]
-    def update(names,xlim):
-        if xlim[0] >= xlim[1]:return
-        try: limits = compute_auto_limits(cube,log_scale=values["log"],xlim=tuple(xlim),ylim=tuple(bounds[2:]))
-        except ValueError:return
+    sides = ("left", "right") if count == 2 else ("left", "middle", "right")
+    selected = (None, *sides) if regions is None else tuple(regions)
+    for side in selected:
+        if side is not None and (count == 1 or side not in sides):
+            continue
+        names = ("vmin", "vmax") if side is None else (side+"Min", side+"Max")
+        selected_cube = cube
+        if side is not None:
+            # Canonical boundaries may lie outside this file or its viewport.
+            # Slice by physical cell boundaries rather than snapping an
+            # off-data boundary to an arbitrary interior column.
+            index = sides.index(side)
+            energy = np.asarray(cube.energy)
+            lower = cuts[index-1] if index else -np.inf
+            upper = cuts[index] if index < len(cuts) else np.inf
+            mask = (energy >= lower) & (energy < upper)
+            selected_cube = SimpleNamespace(energy=energy[mask], gate=cube.gate, Z=np.asarray(cube.Z)[:,mask])
+        request = ColorRequest(tuple(bounds[:2]), tuple(bounds[2:]), (), None,
+                               bool(values["log"]), False, "robust", False)
+        try: limits = calculate_bounds((selected_cube,), request)
+        except (ValueError, IndexError):continue
+        if limits is None:continue
         candidate = dict(values)
-        for key,field in zip(names,("vmin","vmax")):
-            if force or not fixed.get(key,False):candidate[key] = getattr(limits,field)
-        if candidate[names[0]] < candidate[names[1]]:values.update({key:candidate[key] for key in names})
-    update(("vmin","vmax"),bounds[:2])
-    if values.get("split"):
-        low,high = bounds[:2]
-        boundary = values["splitX"]
-        if not low < boundary < high and not fixed.get("splitX",False):boundary = (low+high)/2
-        try: _,boundary = resolve_split_boundary(cube.energy,boundary)
-        except ValueError: pass
-        values["splitX"] = float(boundary)
-        update(("leftMin","leftMax"),(low,min(boundary,high)))
-        update(("rightMin","rightMax"),(max(low,boundary),high))
-    values["roi"] = list(roi)
+        for key,value in zip(names,limits):
+            if not fixed.get(key,False):candidate[key] = value
+        if candidate[names[0]] >= candidate[names[1]]:
+            # A single fixed endpoint must not prevent its unfixed peer from
+            # following Auto, nor may Auto move that fixed endpoint.
+            low, high = names
+            pad = max(abs(candidate[low])*.01, abs(candidate[high])*.01, 1e-12)
+            if not fixed.get(high,False):candidate[high] = candidate[low]+pad
+            elif not fixed.get(low,False):
+                candidate[low] = candidate[high]/1.01 if values["log"] else candidate[high]-pad
+        if candidate[names[0]] < candidate[names[1]] and (not values["log"] or candidate[names[0]] > 0):
+            values.update({key:candidate[key] for key in names})
+    values["roi"] = list(signature)
     return values
 
 
-def heatmap_params(base,bank):
+def heatmap_params(base,bank,*,geometry=None):
+    """Project canonical regions onto the viewport, retaining their colors."""
     from core.plotting import SplitColorScale
-    split = None
-    if bank.get("split"):
-        split = SplitColorScale(bank["splitX"],bank["leftMin"],bank["leftMax"],bank["rightMin"],bank["rightMax"],bank.get("showBoundary",True))
-        low,high = sorted(base.xlim)
-        if high <= split.split_x:return replace(base,vmin=split.left_vmin,vmax=split.left_vmax,split_scale=None)
-        if low >= split.split_x:return replace(base,vmin=split.right_vmin,vmax=split.right_vmax,split_scale=None)
+    count = int(geometry["count"]) if geometry else (2 if bank.get("split") else 1)
+    if count == 1:
+        return replace(base,vmin=bank["vmin"],vmax=bank["vmax"],log_scale=bank["log"],split_scale=None)
+    cuts = tuple(geometry[key] for key in ("x0", "x1")[:count-1]) if geometry else (bank["splitX"],)
+    sides = ("left", "right") if count == 2 else ("left", "middle", "right")
+    low, high = sorted(base.xlim)
+    if geometry and "_dataX" in geometry:
+        low, high = max(low,geometry["_dataX"][0]), min(high,geometry["_dataX"][1])
+    active = tuple(sorted({cut for cut in cuts if low < cut < high}))
+    indices = (sum(cut <= low for cut in cuts), *(sum(cut <= boundary for cut in cuts) for boundary in active))
+    pairs = tuple((bank[sides[index]+"Min"],bank[sides[index]+"Max"]) for index in indices)
+    if not active:
+        return replace(base,vmin=pairs[0][0],vmax=pairs[0][1],log_scale=bank["log"],split_scale=None)
+    split = SplitColorScale(active[0],*pairs[0],*pairs[-1],
+                            geometry.get("showBoundary",True) if geometry else bank.get("showBoundary",True),
+                            active[1] if len(active)==2 else None,
+                            pairs[1][0] if len(active)==2 else None,pairs[1][1] if len(active)==2 else None)
     return replace(base,vmin=bank["vmin"],vmax=bank["vmax"],log_scale=bank["log"],split_scale=split)
 
 

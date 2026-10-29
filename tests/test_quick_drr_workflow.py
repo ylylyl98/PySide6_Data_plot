@@ -257,6 +257,25 @@ class QuickDrrWorkflowTests(unittest.TestCase):
                 self.assertEqual(processing["savgol_window_y"], 7)
                 self.assertEqual(processing["y_derivative_coordinate"], cube.gate_label)
 
+    def test_second_only_export_includes_raw_with_derivative_ranges_and_own_colors(self):
+        products = load_drr(self.request([self.csv()]))
+        raw_params = replace(self.params(products.raw), cmap="plasma", vmin=-.4, vmax=.3)
+        second_params = replace(self.params(products.second), xlim=(1.835, 1.925),
+                                ylim=(-1., 1.2), cmap="viridis", vmin=-10., vmax=10.)
+        original_raw_ranges = raw_params.xlim, raw_params.ylim
+        with patch("core.export._save_heatmap_png", side_effect=lambda path, *_args, **_kwargs: Path(path).write_bytes(b"test png")):
+            outputs = export_drr(products, folder=str(self.root), raw_params=raw_params,
+                                 second_params=second_params, view="second")
+        self.assertEqual(set(outputs), {"raw_png", "raw_dat", "second_png", "second_dat"})
+        for name, params in (("raw", raw_params), ("second", second_params)):
+            metadata = json.loads(outputs[name + "_dat"].with_suffix(".metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["plot"]["xlim"], list(second_params.xlim))
+            self.assertEqual(metadata["plot"]["ylim"], list(second_params.ylim))
+            self.assertEqual(metadata["plot"]["cmap"], params.cmap)
+            self.assertEqual(metadata["plot"]["vmin"], params.vmin)
+            self.assertEqual(metadata["plot"]["vmax"], params.vmax)
+        self.assertEqual((raw_params.xlim, raw_params.ylim), original_raw_ranges)
+
     def test_transient_unknown_gate_profile_is_rechecked_for_next_fixed_group(self):
         from core import drr_sources
         from ui_qt.quick import drr_background_workflow as background
@@ -501,11 +520,12 @@ class QuickDrrWorkflowTests(unittest.TestCase):
 
     def test_missing_raw_plot_parameters_fail_before_any_pair_output(self):
         products = load_drr(self.request([self.csv()]))
-        with patch("core.export.export_drr_png_and_dat") as writer:
-            with self.assertRaisesRegex(ValueError, "raw|parameters"):
-                export_drr(products, folder=str(self.root), raw_params=None,
-                           second_params=self.params(products.second), view="pair")
-        writer.assert_not_called()
+        for view in ("pair", "second"):
+            with self.subTest(view=view), patch("core.export.export_drr_png_and_dat") as writer:
+                with self.assertRaisesRegex(ValueError, "raw|parameters"):
+                    export_drr(products, folder=str(self.root), raw_params=None,
+                               second_params=self.params(products.second), view=view)
+                writer.assert_not_called()
 
     def test_native_bridge_failed_new_source_clears_exportable_old_data(self):
         source = self.csv()
@@ -568,6 +588,48 @@ class QuickDrrWorkflowTests(unittest.TestCase):
         self.assertTrue(products.input_signatures)
         self.assertTrue(bridge.snapshot["canExport"])
 
+    def test_plot_product_switch_selects_corresponding_display_tab(self):
+        from PySide6.QtCore import QEvent, QObject
+        from PySide6.QtQml import QQmlComponent, QQmlEngine
+        bridge = self.load_native(self.csv())
+        state = bridge._drr_display
+        engine = QQmlEngine()
+        component = QQmlComponent(engine, QUrl.fromLocalFile(str(
+            Path(__file__).resolve().parents[1] / "ui_qt/quick/qml/Display.qml")))
+        panel = component.createWithInitialProperties(dict(bridge=state))
+        self.assertIsNotNone(panel, str(component.errors()))
+        panel.setParent(engine)
+        def dispose_display(component=component):
+            # Keep both the component context and engine alive through cleanup.
+            from shiboken6 import isValid
+            if isValid(panel):
+                panel.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.DeferredDelete)
+            engine.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.DeferredDelete)
+        self.addCleanup(dispose_display)
+        tabs = panel.findChild(QObject, "drr_color_tabs")
+        self.assertIsNotNone(tabs)
+        for view, expected in (("second", 1), ("pair", 1), ("raw", 0), ("pair", 0), ("second", 1)):
+            with self.subTest(view=view, tab=expected):
+                bridge.setParameter("drrView", view)
+                self.wait_plot(bridge)
+                self.assertEqual(bridge.snapshot["drrView"], view)
+                self.assertEqual(state.snapshot["colorProduct"], expected)
+                self.assertEqual(tabs.property("currentIndex"), expected)
+        # Editing the other color bank remains independent of the plotted view.
+        state.setChoice("colorProduct", 0)
+        self.assertEqual(bridge.snapshot["drrView"], "second")
+        bridge.setParameter("drrView", "second")
+        self.assertEqual(state.snapshot["colorProduct"], 1)
+        # An unavailable product cannot change either the plot or its tab.
+        bridge.setParameter("drrView", "raw")
+        self.wait_plot(bridge)
+        bridge._drr_products = replace(bridge._drr_products, second=None, second_error="Unavailable derivative")
+        bridge.setParameter("drrView", "second")
+        self.assertEqual(bridge.snapshot["drrView"], "raw")
+        self.assertEqual(state.snapshot["colorProduct"], 0)
+
     def test_native_pair_plot_and_gate_linecuts_use_each_exact_scientific_product(self):
         from core.processing import nearest_gate_spectrum
         bridge = self.load_native(self.csv())
@@ -591,6 +653,73 @@ class QuickDrrWorkflowTests(unittest.TestCase):
         bridge.setParameter("drrView", "second")
         self.wait(lambda: len(bridge._maps) == 1 and not bridge._plot_timer.isActive())
         self.assertIs(bridge._plot_cubes[0], bridge._drr_products.second)
+
+    def test_native_second_only_background_export_saves_both_products_at_visible_ranges(self):
+        from core import export as export_core
+        from core.loader import load_dat
+        from PIL import Image
+
+        bridge = self.load_native(self.csv())
+        bridge.setParameter("drrView", "second")
+        self.tweak_saved_display(bridge)
+        self.wait_plot(bridge)
+        products = bridge._drr_products
+        self.assertEqual(len(bridge._maps), 1)
+        self.assertIs(bridge._plot_cubes[0], products.second)
+        axis = bridge._maps[0][0]
+        viewport = dict(xlim=[1.835, 1.925], ylim=[-1., 1.2])
+        axis.set_xlim(*viewport["xlim"])
+        axis.set_ylim(*viewport["ylim"])
+        bridge.setParameter("export.pngLayout", "wide")
+        bridge.setParameter("export.pngWidth", 1.5)
+
+        entered, release = Event(), Event()
+        original_writer = export_core._save_heatmap_png
+        def paused_writer(*args, **kwargs):
+            entered.set()
+            release.wait(10)
+            return original_writer(*args, **kwargs)
+        with patch.object(export_core, "_save_heatmap_png", side_effect=paused_writer):
+            bridge.invoke("export")
+            try:
+                self.wait(entered.is_set)
+                self.assertTrue(bridge.snapshot["busy"])
+                self.assertEqual(bridge.snapshot["drrView"], "second")
+                self.assertEqual(len(bridge._maps), 1)
+            finally:
+                release.set()
+            self.wait(lambda: not bridge.snapshot["busy"] and not bridge._pending)
+        self.assertIn("Export completed", bridge.snapshot["status"])
+        directory = self.root / "Processed Data" / "DRR"
+        pngs, dats = list(directory.glob("*.png")), list(directory.glob("*.dat"))
+        self.assertEqual(len(pngs), 4)
+        self.assertEqual(len(dats), 2)
+        for path in pngs:
+            with Image.open(path) as png:
+                self.assertEqual(png.size, (1800, 930) if path.stem.endswith("_1.5x") else (1200, 930))
+        for path in dats:
+            metadata = json.loads(path.with_suffix(".metadata.json").read_text(encoding="utf-8"))
+            expected = products.second if metadata["processing"].get("derivative_order") == 2 else products.raw
+            restored = load_dat(path)
+            np.testing.assert_allclose(restored.energy, expected.energy)
+            np.testing.assert_allclose(restored.gate, expected.gate)
+            np.testing.assert_allclose(restored.Z, expected.Z, rtol=1e-9, atol=1e-10)
+            self.assertEqual(metadata["plot"]["xlim"], viewport["xlim"])
+            self.assertEqual(metadata["plot"]["ylim"], viewport["ylim"])
+            self.assertEqual(metadata["ui_state"]["viewport"], viewport)
+            self.assertNotIn("display_save_pending", metadata)
+            for figure in metadata["figures"].values():
+                self.assertEqual(figure["plot"]["xlim"], viewport["xlim"])
+                self.assertEqual(figure["plot"]["ylim"], viewport["ylim"])
+            if expected is products.raw:
+                self.assertEqual(metadata["plot"]["cmap"], "plasma")
+                self.assertEqual(metadata["plot"]["vmin"], -.4)
+                self.assertEqual(metadata["plot"]["vmax"], .3)
+        self.assertEqual(bridge.snapshot["drrView"], "second")
+        self.assertEqual(len(bridge._maps), 1)
+        self.assertIs(bridge._plot_cubes[0], products.second)
+        np.testing.assert_allclose(axis.get_xlim(), viewport["xlim"])
+        np.testing.assert_allclose(axis.get_ylim(), viewport["ylim"])
 
     def test_native_saved_display_roundtrip_restores_file_fixes_colors_and_exported_viewport(self):
         from core.drr_display_settings import INDEX_NAME, find_candidates, source_key

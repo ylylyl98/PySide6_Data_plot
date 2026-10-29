@@ -39,6 +39,8 @@ jobs:
           python -m unittest -v
           tests.test_application_models
           tests.test_quick_application_shell
+          tests.test_quick_numeric_format
+          tests.test_number_presentation
           tests.test_quick_selection_contrast
           tests.test_quick_source_catalog_actions
           tests.test_quick_source_catalog_stability
@@ -63,6 +65,10 @@ jobs:
           tests.test_quick_settings_storage
           tests.test_frozen_quick_check
           tests.test_quick_pl_native
+          tests.test_pl_display_state
+          tests.test_pl_display_settings
+          tests.test_quick_pl_display
+          tests.test_quick_pl_display_export
           tests.test_quick_application_bridge
           tests.test_quick_file_dialogs
           tests.test_quick_measurement_selection
@@ -117,6 +123,8 @@ jobs:
           tests.test_drr_display_bridge
           tests.test_drr_quick_display
           tests.test_quick_display_packaging
+          tests.test_numeric_inputs
+          tests.test_compact_spinbox
 
   quick-checks:
     name: quick-checks

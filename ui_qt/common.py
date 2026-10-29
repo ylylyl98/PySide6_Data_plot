@@ -25,14 +25,13 @@ from PySide6.QtWidgets import (
     QApplication,
     QAbstractSpinBox,
     QComboBox as _QComboBox,
-    QDoubleSpinBox as _QDoubleSpinBox,
     QListWidget,
-    QSpinBox as _QSpinBox,
     QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QWidget,
 )
+from ui_qt.numeric_inputs import NumericDoubleSpinBox, NumericSpinBox
 
 from core.application_models import ExportOptions, LoadOptions, LoadedState
 
@@ -62,7 +61,7 @@ UI_METRICS = {
 }
 
 
-class QDoubleSpinBox(_QDoubleSpinBox):
+class QDoubleSpinBox(NumericDoubleSpinBox):
     """Commit typed numbers on Return/focus loss and ignore wheel scrolling."""
 
     def __init__(self, *args, **kwargs):
@@ -73,7 +72,7 @@ class QDoubleSpinBox(_QDoubleSpinBox):
         event.ignore()
 
 
-class QSpinBox(_QSpinBox):
+class QSpinBox(NumericSpinBox):
     """Commit typed numbers on Return/focus loss and ignore wheel scrolling."""
 
     def __init__(self, *args, **kwargs):

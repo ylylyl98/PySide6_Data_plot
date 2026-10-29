@@ -5,7 +5,8 @@ from collections import Counter
 import numpy as np
 from matplotlib.figure import Figure
 from matplotlib import colormaps
-from PySide6.QtWidgets import QWidget,QVBoxLayout,QFormLayout,QToolButton,QDoubleSpinBox,QSpinBox,QComboBox,QCheckBox
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QFormLayout, QToolButton, QComboBox, QCheckBox)
+from ui_qt.common import QDoubleSpinBox, QSpinBox
 from core.drr_comparison_groups import parse_condition
 from core.drr_p2p_metrics import METRICS,metric_values,quantity_metrics
 

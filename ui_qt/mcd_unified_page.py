@@ -22,7 +22,6 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QHBoxLayout,
-    QInputDialog,
     QLayout,
     QLabel,
     QListWidget,
@@ -280,6 +279,7 @@ class McdUnifiedView(QWidget):
         self.spectra_b_spin = QDoubleSpinBox(self.candidate_bar)
         self.spectra_b_spin.setRange(-1e6, 1e6)
         self.spectra_b_spin.setDecimals(5)
+        self.spectra_b_spin.display_precision = 3
         self.spectra_b_spin.setSuffix(" T")
         self.spectra_b_spin.setFixedWidth(92)
         self.spectra_b_spin.valueChanged.connect(self._set_b_from_value)
@@ -755,12 +755,38 @@ class McdUnifiedView(QWidget):
             self._draw_feature_overlay()
 
     def _add_manual_candidate_dialog(self) -> None:
-        center, accepted = QInputDialog.getDouble(
-            self, "Manual feature center", "Center energy (eV):",
-            float(self.state.window_center_ev), -1e6, 1e6, 6,
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Manual feature center")
+        layout = QVBoxLayout(dialog)
+        label = QLabel("Center energy (eV):")
+        spin = QDoubleSpinBox(dialog)
+        spin.setObjectName("mcd_manual_center")
+        spin.setDecimals(6)
+        spin.display_precision = 6
+        spin.setRange(-1e6, 1e6)
+        spin.setValue(float(self.state.window_center_ev))
+        label.setBuddy(spin)
+        layout.addWidget(label)
+        layout.addWidget(spin)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dialog)
+        def accept_center():
+            if spin.hasAcceptableInput():
+                spin.interpretText()
+                dialog.accept()
+
+        buttons.accepted.connect(accept_center)
+        buttons.rejected.connect(dialog.reject)
+        spin.lineEdit().textChanged.connect(
+            lambda _text: buttons.button(QDialogButtonBox.Ok).setEnabled(spin.hasAcceptableInput())
         )
-        if not accepted:
+        buttons.button(QDialogButtonBox.Ok).setEnabled(spin.hasAcceptableInput())
+        layout.addWidget(buttons)
+        spin.setFocus()
+        if dialog.exec() != QDialog.Accepted:
+            dialog.deleteLater()
             return
+        center = spin.value()
+        dialog.deleteLater()
         self._manual_candidate_number += 1
         item = {
             "id": f"manual-{self._manual_candidate_number}",
@@ -2111,6 +2137,7 @@ class McdUnifiedControls(QWidget):
         self.manual_reference_spin = QDoubleSpinBox(advanced)
         self.manual_reference_spin.setRange(-1e6, 1e6)
         self.manual_reference_spin.setDecimals(6)
+        self.manual_reference_spin.display_precision = 6
         self.manual_reference_spin.setEnabled(False)
         self.reference_mode_combo.currentIndexChanged.connect(
             lambda index: self.manual_reference_spin.setEnabled(index == 1)

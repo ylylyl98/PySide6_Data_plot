@@ -147,6 +147,18 @@ Independent analysis windows and background settings follow the same appearance.
 PL includes a searchable source/history catalog, saved DAT selection, independent
 linear/log split color scales, fixed ranges, axis derivation/custom DAT labels,
 single-spectrum peak detection/Lorentz fitting, and separate PNG/DAT exports.
+Its native Display page keeps X/Y Min/Max, individual Fix controls and Auto
+actions together. Auto retains every fixed endpoint. Linear/Log tabs select
+the plot and color controls; Side by side retains both plots while a tab selects
+the controls to edit. New PL displays default to `turbo`; saved custom colormaps
+take precedence. Regions selects one, two or three energy regions with shared
+boundaries and independent Linear/Log color limits. Numeric edits do not enable
+Fix implicitly. Invalid drafts show an error and block switching color tabs until
+corrected or cancelled with Escape.
+Successful PL saves retain exact-file display settings in the experiment folder
+and export metadata. Explicit manual locks survive file changes and restarts;
+restoring a file does not turn its locks into global preferences. Zooming retains
+the physical region boundaries and displays only their visible intersections.
 First-save auto-next preserves its existing processing-history behavior. DRR
 reuses the **same approved `Display.qml` page**, with Data pinned above
 Display/Processing, independent regional colors, Auto/Fix, native CSV
@@ -343,8 +355,14 @@ In the native PL/DRR toolbar, **PNG 1.0× / Wide PNG** and its width multiplier
 sit directly beside **Save PNG + DAT**. The multiplier defaults to 2×, accepts
 1–3×. The selected PNG mode and multiplier are shared export preferences and
 stay selected across measurements, group changes, PL/DRR tabs and app restarts.
-A fresh settings profile starts in PNG 1.0× mode. DRR Wide PNG
-saves both original and wider images for each selected product, sharing its DAT.
+A fresh settings profile starts in PNG 1.0× mode. PL and DRR Wide PNG
+save both original and wider images for each product. PL saves four PNGs
+(Linear/Log at both widths) sharing one full-grid DAT. At PNG 1.0×, it saves
+only the two original-width PNGs. DRR shares one DAT per product.
+When only the DRR derivative (D2E) is displayed, **Save PNG + DAT** also saves
+the DRR map in the background. Both products use the displayed D2E X/Y ranges,
+including toolbar zoom, while retaining their own color scales. The display
+stays on D2E; each DAT retains its full numerical grid.
 
 For an isolated rendered-frame check and timing report:
 
@@ -454,16 +472,35 @@ colors. **Processing** contains derivative/SG settings and single-spectrum fits;
 Y-window controls appear only for the mixed derivative.
 
 In Display → Colors, the **ΔR/R** and **Derivative** tabs select which color
-controls to edit without changing the plotted view. Each product retains its own color map and limits;
-region count and X boundaries are shared. Auto changes the selected product's
-unfixed limits. Minimum and maximum editors are side by side, with their Fix
+controls to edit without changing the plotted view. Each product retains its own color map and limits.
+Selecting **ΔR/R** or **Derivative** in the plot controls also selects its matching
+Display color tab. **Side by side** keeps the currently selected color tab.
+Region count and X boundaries are shared. Auto changes the selected product's
+unfixed limits. Minimum and maximum editors are side by side (stacked in a narrow sidebar), with their Fix
 controls beside their labels. **More display settings** contains the right Y axis,
 scale/clip options and display-memory preferences. Hidden controls retain their
 values for plotting and paired exports.
 
-DRR range editors show up to four significant digits when idle, using scientific
-notation for small values. Focusing an editor reveals its full configured
-precision. Formatting does not change the stored limits, calculations or exports.
+Numeric inputs accept decimal and scientific notation, including `1e3`, `1e-6`
+and `-2.5e4`, subject to each field's range and existing storage precision.
+Integer fields accept scientific notation only when its result is an integer.
+Native Quick inputs use the following idle display limits and omit trailing zeros:
+
+| Input | Idle display precision |
+| --- | --- |
+| Energy ranges and boundaries (eV) | 4 decimal places |
+| Peak fitting/manual centers (eV) | 6 decimal places |
+| Voltage and magnetic field | 3 decimal places; small tolerances 4 |
+| Temperature, wavelength (nm), angles | 2 decimal places |
+| Widths/distances (meV) | 3 decimal places |
+| Intensity, color limits, power, ratios and coefficients | 5 significant digits |
+| Counts, orders and indices | Integers |
+
+Small nonzero values below `1e-3` and magnitudes from `1e6` use scientific
+notation. Focusing an editor reveals its full configured precision; typing a
+more precise value remains supported. Formatting does not change the stored
+limits, calculations or exports. Legacy Widgets inputs also use compact idle
+text while retaining their existing storage precision and specialized DRR formats.
 Color-limit arrows use approximately 0.5% of their own min/max span, rounded to
 a 1/2/5 step (for example, −100 to 100 steps by 1; −0.01 to 0.01 by 0.0001).
 Each product and each color region adapts independently, including after Auto

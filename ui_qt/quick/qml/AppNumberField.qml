@@ -2,6 +2,7 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import QtQuick.Controls.Basic as Basic
+import "NumericFormat.js" as NumericFormat
 
 Item {
     id: editor
@@ -23,18 +24,17 @@ Item {
     FontMetrics { id: metrics; font: input.font }
 
     function idleText(value) {
-        let digits = descriptor.displayDigits === undefined ? 6 : descriptor.displayDigits
-        return String(Number(Number(value).toPrecision(Math.max(1, Math.min(15, digits)))))
+        return NumericFormat.display(value, descriptor)
     }
     function refreshText() {
         if (!dirty && !committing)
-            input.text = input.activeFocus ? String(numericValue) : idleText(numericValue)
+            input.text = input.activeFocus ? NumericFormat.exact(numericValue) : idleText(numericValue)
     }
     function resetDraft() { dirty = false; invalid = false; refreshText() }
     function parsedDraft() {
-        let text = input.text.trim()
-        let number = Number(text)
-        if (!text.length || !isFinite(number) || number < lower || number > upper) return undefined
+        let number = NumericFormat.parse(input.text)
+        if (number === undefined || number < lower || number > upper
+            || (NumericFormat.policy(descriptor).integer && number !== Math.trunc(number))) return undefined
         return number
     }
     function commit() {
@@ -55,11 +55,21 @@ Item {
         if (descriptor.readOnly) return
         let draft = dirty ? parsedDraft() : numericValue
         if (draft === undefined) { invalid = true; return }
-        input.text = String(Math.max(lower, Math.min(upper, draft + direction * step)))
-        dirty = true
-        commit()
+        let number = Math.max(lower, Math.min(upper, draft + direction * step))
+        if (!isFinite(number) || (NumericFormat.policy(descriptor).integer && number !== Math.trunc(number))) {
+            invalid = true
+            return
+        }
+        dirty = false
+        invalid = false
+        committing = true
+        if (number !== numericValue) bridge.setParameter(descriptor.key, number)
+        committing = false
+        // Do not parse the shortened presentation back into the stored number.
+        input.text = idleText(number)
     }
     onNumericValueChanged: refreshText()
+    onDescriptorChanged: refreshText()
     Component.onCompleted: refreshText()
 
     Rectangle {
@@ -99,7 +109,7 @@ Item {
         Keys.onEscapePressed: editor.resetDraft()
         Basic.ToolTip.visible: hovered && !activeFocus
         Basic.ToolTip.text: editor.invalid ? "Enter a number between " + editor.lower + " and " + editor.upper
-                                         : String(editor.numericValue) + (editor.descriptor.description ? "\n" + editor.descriptor.description : "")
+                                         : NumericFormat.exact(editor.numericValue) + (editor.descriptor.description ? "\n" + editor.descriptor.description : "")
     }
     Column {
         id: steps

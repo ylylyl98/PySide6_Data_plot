@@ -120,6 +120,7 @@ def isolated():
             self.bridge.setParameter("pl.bank.splitX",1.8)
             self.bridge.setParameter("pl.bank.leftMin",.8)
             self.bridge.setParameter("pl.bank.leftMax",5.5);self.idle()
+            self.bridge.setParameter("pl.fixed.leftMax",True)
             linear=deepcopy(self.bridge._pl_banks["linear"])
             self.bridge.setParameter("scale","log");self.idle()
             self.bridge.setParameter("vmin",1.)
@@ -167,7 +168,8 @@ def isolated():
             path=self.csv(gain=1.)
             self.load(path)
             original=self.bridge._pl_banks["linear"]["vmax"]
-            self.bridge.setParameter("vmin",.5);self.idle()
+            self.bridge.setParameter("vmin",.5)
+            self.bridge.setParameter("pl.fixed.vmin",True);self.idle()
             self.csv(gain=10.)
             self.load(path)
             bank=self.bridge._pl_banks["linear"]
@@ -192,8 +194,10 @@ def isolated():
             xmin,xmax=self.bridge._values["xmin"]+.01,self.bridge._values["xmax"]-.01
             self.bridge.setParameter("xmin",xmin);self.bridge.setParameter("xmax",xmax)
             self.bridge.setParameter("vmin",.5);self.bridge.setParameter("vmax",5.)
+            self.bridge.setParameter("pl.fixed.vmin",True);self.bridge.setParameter("pl.fixed.vmax",True)
             self.bridge.setParameter("scale","log")
             self.bridge.setParameter("vmin",.25);self.bridge.setParameter("vmax",8.)
+            self.bridge.setParameter("pl.fixed.vmin",True);self.bridge.setParameter("pl.fixed.vmax",True)
             self.bridge.setParameter("pl.bank.split",True)
             self.bridge.setParameter("sideBySide",True)
             self.bridge.setParameter("cmap","plasma");self.idle()
@@ -210,13 +214,14 @@ def isolated():
         def test_advanced_coefficient_changes_refresh_y_view(self):
             self.load(self.csv(tg_offset=100.))
             self.bridge.setParameter("pl.yAxis","Advanced…");self.idle()
+            self.assertEqual(self.bridge._pl_values["yAxis"],"Advanced…")
             self.assert_y_view((100.,104.),100.)
             self.bridge.setParameter("ymin",100.5);self.bridge.setParameter("ymax",103.5);self.idle()
             for key,value,bounds,gate in (("a",2.,(200.,212.),200.),("b",3.,(200.,228.),200.),("c",-250.,(-50.,-22.),-22.)):
                 with self.subTest(coefficient=key):
                     self.bridge.setParameter("pl."+key,value);self.idle()
                     self.assert_y_view(bounds,gate)
-        def test_changed_y_coordinates_preserve_each_fixed_bound(self):
+        def test_changed_y_derivation_does_not_reuse_incompatible_fixed_bounds(self):
             path=self.csv(tg_offset=100.)
             for fixed in (("ymin",),("ymax",),("ymin","ymax")):
                 with self.subTest(fixed=fixed):
@@ -225,8 +230,8 @@ def isolated():
                     self.bridge.setParameter("ymin",-10.);self.bridge.setParameter("ymax",120.)
                     for field in fixed:self.bridge.setParameter("pl.fixed."+field,True)
                     self.bridge.setParameter("pl.yAxis","BG");self.idle()
-                    self.assert_y_view((-10. if "ymin" in fixed else 0.,120. if "ymax" in fixed else 4.),0.)
-                    self.assertEqual({field for field in ("ymin","ymax") if self.bridge._pl_axis_fixed[field]},set(fixed))
+                    self.assert_y_view((0.,4.),0.)
+                    self.assertFalse(any(self.bridge._pl_axis_fixed[field] for field in ("ymin","ymax")))
         def test_unchanged_coordinates_restore_each_file_view(self):
             first=self.csv("first_PL_TG.csv",tg_offset=100.)
             second=self.csv("second_PL_TG.csv",tg_offset=100.)

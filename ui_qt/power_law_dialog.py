@@ -1,7 +1,8 @@
 """Choose spectral peaks and independently adjustable power-law intervals."""
 import numpy as np
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox,
-    QPushButton, QTableWidget, QHeaderView, QDoubleSpinBox, QDialogButtonBox)
+    QPushButton, QTableWidget, QHeaderView, QDialogButtonBox)
+from ui_qt.common import QDoubleSpinBox
 from matplotlib.figure import Figure
 from ui_qt.matplotlib_theme import QtFontFigureCanvasQTAgg as FigureCanvasQTAgg
 from matplotlib.widgets import SpanSelector
@@ -53,6 +54,7 @@ class PowerLawDialog(QDialog):
             for value in ((state['lower'], state['upper']) if state else defaults):
                 spin = QDoubleSpinBox()
                 spin.setDecimals(10)
+                spin.display_significant_digits = 5
                 spin.setRange(1e-10, 1e15)
                 spin.setValue(value)
                 spin.setKeyboardTracking(False)

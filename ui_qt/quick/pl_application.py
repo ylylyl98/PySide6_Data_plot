@@ -11,7 +11,7 @@ from dataclasses import replace
 from math import isfinite
 from pathlib import Path
 
-from PySide6.QtCore import QObject,QTimer,QUrl,Signal,Slot
+from PySide6.QtCore import QObject,QTimer,QUrl,Signal,Slot,Property
 
 
 class _SpectrumTask(QObject):
@@ -70,6 +70,10 @@ class PlApplicationMixin:
         self._pl_values=dict(yAxis="Auto / Default",a=1.,b=-1.,c=0.,datChoice="original",datLabel="",datUnit="",
             clip=False,autoNext=str(self.settings.value("pl/auto_load_next",True)).lower() in {"true","1","yes","on"},
             pngLayout=layout,pngWidth=width)
+        from ui_qt.quick.pl_display_state import PlDisplayState
+        self._pl_display = PlDisplayState(settings=self.settings, parent=self)
+        self._pl_display.parameterChanged.connect(self._pl_display_changed)
+        self._pl_display.errorChanged.connect(self._pl_display_error)
         self._pl_axis_fixed={key:False for key in ("xmin","xmax","ymin","ymax")}
         self._pl_banks={};self._pl_file_views={};self._pl_active_source=None;self._pl_active_coordinates={};self._pl_loading_request=None;self._pl_last_values={}
         self._pl_export_context=None;self._pl_auto_next_pending=None
@@ -80,6 +84,7 @@ class PlApplicationMixin:
         self._manual_fit_token=None
         self._pl_range_timer=QTimer(self);self._pl_range_timer.setSingleShot(True);self._pl_range_timer.setInterval(160)
         self._pl_range_timer.timeout.connect(self._pl_apply_view)
+        self._pl_sync_scales()
 
     def _pl_catalog_accepted(self,workflow,files):
         if workflow!=self._workflow:self.selectWorkflow(workflow)
@@ -118,77 +123,106 @@ class PlApplicationMixin:
     def _pl_source_hashes(self):
         return {signature[0]:signature[-1] for signature in getattr(self._cube,"_quick_pl_signatures",()) if len(signature)>2}
 
+    @Property(QObject, constant=True)
+    def plDisplayBridge(self):
+        return self._pl_display
+
+    def _pl_axis_context(self):
+        request = self._pl_loading_request
+        return dict(y_axis=getattr(request, "y_axis", "auto"),
+                    dat_choice=getattr(request, "dat_choice", "original"),
+                    dat_label=getattr(request, "dat_label", ""),
+                    dat_unit=getattr(request, "dat_unit", ""))
+
+    def _pl_adopt_axis_request(self, request):
+        """Reflect the loaded recipe, including a restored file/manual Y axis."""
+        if request is None:
+            return
+        self._pl_loading_request = request
+        names = {"auto": "Auto / Default", "tg": "TG", "bg": "BG", "bias": "Bias",
+                 "doping": "Doping (V)", "efield": "Efield (V)",
+                 "linear:1,1,0": "TG+BG", "linear:1,-1,0": "TG-BG"}
+        axis = request.y_axis
+        from ui_qt.quick.pl_workflow import y_axis_spec
+        current_axis = y_axis_spec(self._pl_values["yAxis"], *(self._pl_values[key] for key in ("a", "b", "c")))
+        if axis == current_axis:
+            # Keep the editable Advanced mode when its coefficients happen
+            # to match a named preset; only adopt a different loaded recipe.
+            pass
+        elif axis in names:
+            self._pl_values["yAxis"] = names[axis]
+        elif axis.startswith("linear:"):
+            self._pl_values["yAxis"] = "Advanced…"
+            self._pl_values.update(zip(("a", "b", "c"), map(float, axis[7:].split(","))))
+        self._pl_values.update(datChoice=request.dat_choice, datLabel=request.dat_label, datUnit=request.dat_unit)
+
     def _pl_loaded(self,cube):
-        """Call after the shell initializes the new cube and numeric ranges."""
-        if self._workflow!="pl":return cube
-        from hashlib import sha256
-        import numpy as np
-        # Compare coordinates once per load, without hashing the intensity map
-        # or doing axis-sized work while panning and remembering the viewport.
-        coordinates={key:sha256(np.ascontiguousarray(axis,dtype=float)).digest()
-            for key,axis in (("x",cube.energy),("y",cube.gate))}
-        source=str(self._source or "")
+        """Initialize the one PL display owner; shell fields are projections."""
+        if self._workflow != "pl":
+            return cube
         self._manual_invalidate(clear=True)
-        self._pl_active_source=source
-        self._pl_active_coordinates=coordinates
-        saved=self._pl_file_views.get(source) if source else None
-        if saved:
-            values=deepcopy(saved["values"])
-            for axis in ("x","y"):
-                if saved.get("coordinates",{}).get(axis)==coordinates[axis]:continue
-                for key in (axis+"min",axis+"max"):
-                    if self._pl_axis_fixed[key]:values[key]=self._pl_last_values.get(key,values[key])
-                    else:values.pop(key,None)
-                # A gate value from the old derivation selects a different
-                # spectrum; retain the new cube's default nearest-zero gate.
-                if axis=="y":values.pop("gate",None)
-            self._values.update(values)
-            self._pl_banks=deepcopy(saved["banks"])
-            # A saved viewport belongs to the file, but its automatic limits
-            # belong to the previous cube revision. Refresh unlocked fields
-            # even when the reloaded acquisition has identical axes.
-            for bank in self._pl_banks.values():bank["roi"]=[]
-            self._pl_refresh_banks()
-        else:
-            old=self._pl_banks
-            for key,fixed in self._pl_axis_fixed.items():
-                if fixed and key in self._pl_last_values:self._values[key]=self._pl_last_values[key]
-            banks={}
-            bounds=[self._values[key] for key in ("xmin","xmax","ymin","ymax")]
-            for scale in ("linear","log"):
-                previous=old.get(scale,{})
-                bank=dict(log=scale=="log",vmin=0.,vmax=1.,split=False,splitX=sum(bounds[:2])/2,
-                    leftMin=0.,leftMax=1.,rightMin=0.,rightMax=1.,showBoundary=True,fixed={},roi=[])
-                bank.update({key:deepcopy(value) for key,value in previous.items() if key in {"fixed","split","showBoundary"}})
-                for key,fixed in bank["fixed"].items():
-                    if fixed and key in previous:bank[key]=previous[key]
-                from ui_qt.quick.pl_workflow import refresh_bank
-                banks[scale]=refresh_bank(cube,bounds,bank)
-            self._pl_banks=banks
+        self._pl_adopt_axis_request(getattr(cube, "_quick_pl_request", None))
+        source = str(self._source or "")
+        self._pl_active_source = source
+        saved = self._pl_file_views.get(source) or getattr(cube, "_quick_pl_display_snapshot", None)
+        self._pl_display.sync_cube(cube, saved=saved, axis_context=self._pl_axis_context())
         self._pl_sync_scales()
         self._pl_remember()
         return cube
 
     def _pl_sync_scales(self):
-        for scale,bank in self._pl_banks.items():self._scales[scale]=dict(vmin=bank["vmin"],vmax=bank["vmax"])
+        if self._workflow != "pl":
+            return
+        state = self._pl_display
+        self._values.update({key: value for key, value in state.values.items() if key in self._values})
+        self._pl_values["clip"] = state.values["clip"]
+        self._pl_axis_fixed = deepcopy(state.axis_fixed)
+        self._pl_banks = deepcopy(state.banks)
+        geometry = state.geometry
+        for scale, bank in self._pl_banks.items():
+            # Read-only compatibility projections for existing consumers.
+            bank.update(split=geometry["count"] > 1, splitX=geometry["x0"],
+                        showBoundary=geometry["showBoundary"])
+            self._scales[scale] = dict(vmin=bank["vmin"], vmax=bank["vmax"])
 
     def _pl_remember(self):
-        if self._workflow=="pl":self._pl_last_values={key:self._values[key] for key in ("xmin","xmax","ymin","ymax")}
-        if self._workflow=="pl" and self._pl_active_source:
-            self._pl_file_views[self._pl_active_source]=dict(values={key:deepcopy(self._values[key]) for key in ("xmin","xmax","ymin","ymax","gate","scale","sideBySide","cmap")},banks=deepcopy(self._pl_banks),coordinates=self._pl_active_coordinates)
+        if self._workflow == "pl" and self._pl_active_source:
+            self._pl_file_views[self._pl_active_source] = self._pl_display.capture_state()
 
-    def _pl_refresh_banks(self,*,force=False):
-        if self._workflow!="pl" or self._cube is None:return
-        from ui_qt.quick.pl_workflow import refresh_bank
-        bounds=[self._values[key] for key in ("xmin","xmax","ymin","ymax")]
-        for scale,bank in self._pl_banks.items():self._pl_banks[scale]=refresh_bank(self._cube,bounds,bank,force=force)
-        self._pl_sync_scales();self._pl_remember()
+    def _pl_refresh_banks(self, *, force=False):
+        if self._workflow == "pl" and self._cube is not None:
+            self._pl_display.refresh_auto(force=force)
+            self._pl_sync_scales()
+            self._pl_remember()
 
-    def _pl_params(self,scale,base):
-        if self._workflow!="pl" or scale not in self._pl_banks:return base
-        from ui_qt.quick.pl_workflow import heatmap_params
-        self._pl_refresh_banks()
-        return replace(heatmap_params(base,self._pl_banks[scale]),clip_outliers=self._pl_values["clip"])
+    def _pl_params(self, scale, base):
+        return self._pl_display.heatmap_params(base, scale) if self._workflow == "pl" else base
+
+    def _pl_display_error(self):
+        if self._workflow == "pl" and self._pl_display.error:
+            self._message(self._pl_display.error)
+
+    def _pl_display_changed(self, key, value):
+        if self._closed or self._workflow != "pl":
+            return
+        previous_pair = self._values["sideBySide"]
+        self._pl_sync_scales()
+        if previous_pair != self._values["sideBySide"]:
+            if self._values["sideBySide"]:
+                self._rail_restore, self._rail_visible = self._rail_visible, False
+            elif self._rail_restore is not None:
+                self._rail_visible, self._rail_restore = self._rail_restore, None
+        self._manual_task.invalidate()
+        self._pl_remember()
+        if key == "gate":
+            self._update_gate()
+            self._pl_draw_overlays()
+        elif key == "viewport":
+            self._pl_range_timer.start()
+        elif not key.startswith("fix.") and (key != "scale" or not self._values["sideBySide"]):
+            colors_only = key in {"cmap", "clip"} or key.startswith(("linear.", "log.", "auto.linear", "auto.log"))
+            self._schedule_plot(colors_only=colors_only)
+        self._publish()
 
     def _pl_set_parameter(self,key,value):
         if self._workflow not in {"pl","drr"}:return False
@@ -228,51 +262,13 @@ class PlApplicationMixin:
             if name=="product":state.update(cube=None,row=None,indices=[],fit=None,status="")
             self._pl_draw_overlays();self._publish();return True
         if self._workflow!="pl":return False
-        if key in {"scale","sideBySide","cmap","gate"}:return False
-        if key in {"xmin","xmax","ymin","ymax","vmin","vmax"}:
-            # Root still validates/owns its public numeric fields. This hook
-            # consumes the PL fields only to preserve bank and Fix semantics.
-            try:number=float(value)
-            except (TypeError,ValueError):self._message("Enter a finite number.");return True
-            if not isfinite(number):self._message("Enter a finite number.");return True
-            if key in {"vmin","vmax"}:
-                bank=self._pl_banks.get(self._values["scale"])
-                if bank is None:return True
-                candidate={**bank,key:number}
-                if candidate["vmin"]>=candidate["vmax"] or candidate["log"] and candidate["vmin"]<=0:
-                    self._message("Color limits must increase; log limits must be positive.");return True
-                bank[key]=number;bank["fixed"][key]=True
-                self._pl_sync_scales()
-            else:
-                candidate={**self._values,key:number}
-                if candidate["xmin"]>=candidate["xmax"] or candidate["ymin"]>=candidate["ymax"]:
-                    self._message("Axis minimum must be less than maximum.");return True
-                self._values[key]=number
-            self._manual_task.invalidate()
-            if key=="gate":self._update_gate();self._pl_draw_overlays()
-            else:self._pl_refresh_banks();self._schedule_plot(colors_only=key in {"vmin","vmax"})
-            self._pl_remember();self._publish();return True
+        if (key in {"scale", "sideBySide", "cmap", "gate", "xmin", "xmax", "ymin", "ymax", "vmin", "vmax", "pl.clip"}
+                or key.startswith(("pl.fixed.", "pl.bank."))):
+            self._pl_display.set_parameter(key, value)
+            return True
         if not key.startswith("pl."):return False
         name=key[3:]
-        if name.startswith("fixed."):
-            field=name[6:]
-            if field in self._pl_axis_fixed:self._pl_axis_fixed[field]=bool(value)
-            elif self._values["scale"] in self._pl_banks:self._pl_banks[self._values["scale"]]["fixed"][field]=bool(value)
-        elif name.startswith("bank."):
-            field=name[5:];bank=self._pl_banks.get(self._values["scale"])
-            if bank is None or field not in bank:return True
-            if isinstance(bank[field],bool):bank[field]=bool(value)
-            else:
-                try:number=float(value)
-                except (TypeError,ValueError):return True
-                if not isfinite(number):return True
-                candidate={**bank,field:number}
-                for low,high in (("leftMin","leftMax"),("rightMin","rightMax")):
-                    if candidate[low]>=candidate[high] or candidate["log"] and candidate[low]<=0:
-                        self._message("Split color limits must increase and log bounds must be positive.");return True
-                bank[field]=number;bank["fixed"][field]=True
-            if field in {"split","splitX"}:bank["roi"]=[];self._pl_refresh_banks()
-        elif name in self._pl_values:
+        if name in self._pl_values:
             previous=self._pl_values[name]
             try:
                 value=bool(value) if isinstance(previous,bool) else float(value) if isinstance(previous,float) else str(value)
@@ -298,23 +294,18 @@ class PlApplicationMixin:
                 state["fit"]=None;state["status"]="";self._pl_draw_overlays();self._publish()
             return True
         if self._workflow!="pl":return False
-        if action in {"auto-colors","pl-auto-color","pl-auto-left","pl-auto-right","pl-auto-x","pl-auto-y","auto-axes"}:
-            if self._cube is None:return True
-            if action in {"pl-auto-x","auto-axes"}:
-                for key,value in (("xmin",float(self._cube.energy.min())),("xmax",float(self._cube.energy.max()))):
-                    if not self._pl_axis_fixed[key]:self._values[key]=value
-            if action in {"pl-auto-y","auto-axes"}:
-                for key,value in (("ymin",float(self._cube.gate.min())),("ymax",float(self._cube.gate.max()))):
-                    if not self._pl_axis_fixed[key]:self._values[key]=value
-            bank=self._pl_banks.get(self._values["scale"])
-            if bank:
-                if action in {"auto-colors","pl-auto-color"}:
-                    for field in ("vmin","vmax"):bank["fixed"][field]=False
-                elif action in {"pl-auto-left","pl-auto-right"}:
-                    side="left" if action.endswith("left") else "right"
-                    for field in (side+"Min",side+"Max"):bank["fixed"][field]=False
-                bank["roi"]=[]
-            self._pl_refresh_banks();self._schedule_plot();self._publish();return True
+        actions = {"auto-colors": "auto." + self._values["scale"],
+                   "pl-auto-color": "auto." + self._values["scale"],
+                   "pl-auto-x": "auto.x", "pl-auto-y": "auto.y"}
+        for side in ("left", "middle", "right"):
+            actions["pl-auto-" + side] = "auto." + self._values["scale"] + "." + side
+        if action == "auto-axes":
+            self._pl_display.invoke("auto.x")
+            self._pl_display.invoke("auto.y")
+            return True
+        if action in actions:
+            self._pl_display.invoke(actions[action])
+            return True
         return False
 
     def _manual_cube(self):
@@ -438,12 +429,13 @@ class PlApplicationMixin:
         self._pl_draw_overlays();self._publish();return True
 
     def _pl_view_changed(self,axis):
-        if self._workflow!="pl" or self._closed:return
-        bounds=[*sorted(axis.get_xlim()),*sorted(axis.get_ylim())]
-        current=[self._values[key] for key in ("xmin","xmax","ymin","ymax")]
-        if bounds!=current:
-            self._values.update(dict(zip(("xmin","xmax","ymin","ymax"),bounds)))
-            self._manual_task.invalidate();self._pl_range_timer.start();self._pl_remember();self._publish()
+        if self._workflow != "pl" or self._closed:
+            return
+        self._pl_display.view_changed(tuple(sorted(axis.get_xlim())), tuple(sorted(axis.get_ylim())))
+        self._pl_sync_scales()
+        self._pl_range_timer.start()
+        self._pl_remember()
+        self._publish()
 
     def _pl_apply_view(self):
         if self._closed or self._workflow!="pl":return
@@ -463,7 +455,8 @@ class PlApplicationMixin:
         width=self._png_export_width()
         params={key:replace(value,png_width_scale=width) for key,value in params.items()}
         request=self._pl_loading_request
-        context=dict(path=str(path),folder=self._folder,request=request,wasProcessed=True)
+        context=dict(path=str(path),folder=self._folder,request=request,wasProcessed=True,
+                     display_state=self._pl_display.capture_state())
         self._pl_export_context=context
         return lambda:export_pl(path,cube,params,context)
 
@@ -494,18 +487,7 @@ class PlApplicationMixin:
             axes=[choice("pl.datChoice","DAT Y axis",values["datChoice"],[(value,value) for value in ("original","Y","Doping","Electric field","Gate voltage","Custom")]),
                 dict(key="pl.datLabel",type="text",label="Custom DAT Y label",value=values["datLabel"]),dict(key="pl.datUnit",type="text",label="DAT Y unit",value=values["datUnit"])] if is_dat else [choice("pl.yAxis","Y-axis derivation",values["yAxis"],axis_options)]
             if values["yAxis"]=="Advanced…" and not is_dat:axes += [number("pl."+key,label,values[key]) for key,label in (("a","a (TG)"),("b","b (BG)"),("c","Offset"))]
-            axes += [flag("pl.fixed."+key,"Fix "+key,self._pl_axis_fixed[key]) for key in self._pl_axis_fixed]
-            axes += [action("pl-auto-x","Auto X"),action("pl-auto-y","Auto Y")]
-            groups.append(dict(key="plAxisOptions",title="Axis derivation / fixed ranges",advanced=True,fields=axes))
-            bank=self._pl_banks.get(self._values["scale"])
-            if bank:
-                fields=[flag("pl.clip","Clip outliers",values["clip"]),flag("pl.fixed.vmin","Fix color min",bank["fixed"].get("vmin",False)),flag("pl.fixed.vmax","Fix color max",bank["fixed"].get("vmax",False)),
-                    flag("pl.bank.split","Separate left / right color scales",bank["split"]),number("pl.bank.splitX","Split Energy (eV)",bank["splitX"]),flag("pl.fixed.splitX","Fix split boundary",bank["fixed"].get("splitX",False)),
-                    flag("pl.bank.showBoundary","Show split boundary",bank["showBoundary"])]
-                for key,label in (("leftMin","Left color min"),("leftMax","Left color max"),("rightMin","Right color min"),("rightMax","Right color max")):
-                    fields += [number("pl.bank."+key,label,bank[key]),flag("pl.fixed."+key,"Fix "+label.lower(),bank["fixed"].get(key,False))]
-                fields += [action("pl-auto-left","Auto left"),action("pl-auto-right","Auto right")]
-                groups.append(dict(key="plNormalization",title="Independent "+self._values["scale"]+" color scale",advanced=True,fields=fields))
+            groups.append(dict(key="plAxisOptions",title="Axis derivation",advanced=True,fields=axes))
             groups.append(dict(key="plExportOptions",title="Save options",advanced=True,fields=[flag("pl.autoNext","Auto-load next new file after first Save",values["autoNext"])]))
         if self._workflow in {"pl","drr"}:
             state=self._manual_states[self._workflow]
@@ -518,4 +500,5 @@ class PlApplicationMixin:
         return groups
 
     def _pl_close(self):
+        self._pl_display.close()
         self._pl_range_timer.stop();self._manual_task.close();self._source_catalog.close()

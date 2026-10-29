@@ -2,7 +2,8 @@
 from pathlib import Path
 import csv
 import numpy as np
-from PySide6.QtWidgets import QWidget,QVBoxLayout,QFormLayout,QHBoxLayout,QPushButton,QLabel,QFileDialog,QSpinBox
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QFormLayout, QHBoxLayout, QPushButton, QLabel, QFileDialog)
+from ui_qt.common import QSpinBox
 from matplotlib.figure import Figure
 from ui_qt.compact_spinbox import CompactDoubleSpinBox
 from ui_qt.matplotlib_theme import ThemeAwareFigureCanvasQTAgg

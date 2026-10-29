@@ -450,7 +450,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
 
     @Property(QUrl, notify=parameterUrlChanged)
     def parameterUrl(self):
-        name = {"drr": "DrrParameters.qml", "cmp": "CompareParameters.qml", "shg": "ShgParameters.qml",
+        name = {"pl": "PlParameters.qml", "drr": "DrrParameters.qml", "cmp": "CompareParameters.qml", "shg": "ShgParameters.qml",
                 "mcd": "McdParameters.qml", "mcd_peak_shift": "McdPeakParameters.qml", "power": "PowerParameters.qml"}.get(self._workflow)
         return QUrl.fromLocalFile(str(Path(__file__).with_name("qml") / name)) if name else QUrl()
 
@@ -607,6 +607,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         self._child_paired = False
         if self._drr_display is not None:
             self._drr_display.setActive(key == "drr")
+        self._pl_display.setActive(key == "pl")
         self._retain_workflow_plot()
         if self._workflow in {"slides", "tools"} and self._slides_controls_restore is not None:
             self._controls_visible = self._slides_controls_restore
@@ -633,6 +634,8 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             # Apply deferred edits after restoring the DRR context, so their
             # signals and the retained dirty state share one scheduled rebuild.
             self._drr_display._flush_changes()
+        elif key == "pl":
+            self._pl_sync_scales()
         elif key in {"cmp", "shg", "mcd", "mcd_peak_shift", "power"}:
             self._ensure_workflow_bridge(key)
         elif key == "slides":
@@ -784,10 +787,23 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         self._folder = self._pl_folder_for_path(path)
         self._export_valid = False
         request = self._pl_load_request(path)
+        folder = self._folder
+        restore_axis = str(path) != self._pl_active_source
+        manual_axis = self._pl_display.manual_axis_context if restore_axis else None
         def load():
+            from dataclasses import replace
             from ui_qt.quick.pl_workflow import load_pl_source
+            from core.pl_display_settings import find_snapshot
             with load_scope(cancellation):
-                result = load_pl_source(request)
+                captured = request
+                if restore_axis:
+                    prior = find_snapshot(folder, path)
+                    context = manual_axis or (prior or {}).get("axis_context")
+                    if context:
+                        captured = replace(request, **{key: context[key] for key in
+                            ("y_axis", "dat_choice", "dat_label", "dat_unit") if key in context})
+                result = load_pl_source(captured)
+                result._quick_pl_display_snapshot = find_snapshot(folder, path, result, captured)
                 cancellation.check()
                 return path, result
         self._submit("load", load)
@@ -1014,6 +1030,8 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         self._busy = False
         self._source, self._sources, self._cube = None, (), None
         self._export_valid = False
+        if self._workflow == "pl":
+            self._pl_display.clear_cube()
         if self._workflow == "drr":
             self._drr_restore_pending = False
             self._drr_background_required = False
@@ -1151,7 +1169,6 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
                             ymin=float(np.min(cube.gate)), ymax=float(np.max(cube.gate)),
                             gate=float(cube.gate[np.argmin(np.abs(cube.gate))]))
         if self._workflow == "pl":
-            self._auto_colors()
             self._pl_loaded(cube)
         else:
             self._ensure_drr_display()
@@ -1293,6 +1310,8 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
                 self._drr_restore_pending = False
             self._drr_processing[key] = value
             if key == "drrView":
+                if value in {"raw", "second"}:
+                    self._drr_display.setChoice("colorProduct", 0 if value == "raw" else 1)
                 self.setParameter("sideBySide", value == "pair")
                 self._schedule_plot()
             else:

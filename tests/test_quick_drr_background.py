@@ -67,8 +67,8 @@ def _isolated():
     import time
     from unittest.mock import patch
     import numpy as np
-    from PySide6.QtCore import QPointF, QSettings, QUrl
-    from PySide6.QtGui import QFont, QFontDatabase, QGuiApplication
+    from PySide6.QtCore import QEvent, QPointF, QSettings, Qt, QUrl
+    from PySide6.QtGui import QFont, QFontDatabase, QGuiApplication, QKeyEvent
     from PySide6.QtQml import QQmlComponent, QQmlEngine
     from PySide6.QtQuick import QQuickItem, QQuickWindow
     from core.drr_composite_background import compose_background, load_composite_source, CompositeBackground, assign_region, save_composite_background, read_composite_background
@@ -496,6 +496,36 @@ def _isolated():
             window.resize(700, 600)
             self.bridge.invoke("page:fit")
             settle(40)
+            smoothing = item.findChild(QQuickItem, "drr_background_editor_smoothing")
+            intervals = item.findChild(QQuickItem, "drr_background_editor_spline_intervals")
+            def key(code, text="", modifier=Qt.NoModifier):
+                for event in (QEvent.KeyPress, QEvent.KeyRelease):
+                    app.sendEvent(window, QKeyEvent(event, code, modifier, text))
+            def type_number(field, text):
+                field.forceActiveFocus()
+                key(Qt.Key_A, modifier=Qt.ControlModifier)
+                for char in text:
+                    key(0, char)
+                key(Qt.Key_Return, "\r")
+                settle()
+            type_number(smoothing, "1.23456789e-6")
+            self.assertEqual(self.bridge.snapshot["numbers"]["smoothing"], 1.23456789e-6)
+            intervals.forceActiveFocus()
+            settle()
+            self.assertEqual(smoothing.property("text"), "1.2346e-6")
+            smoothing.forceActiveFocus()
+            self.assertEqual(smoothing.property("text"), "0.00000123456789")
+            type_number(smoothing, "1e")
+            self.assertTrue(smoothing.property("invalid"))
+            self.assertEqual(self.bridge.snapshot["numbers"]["smoothing"], 1.23456789e-6)
+            key(Qt.Key_Escape)
+            self.assertFalse(smoothing.property("invalid"))
+            type_number(intervals, "1.5e1")
+            self.assertEqual(self.bridge.snapshot["numbers"]["spline_intervals"], 15)
+            type_number(intervals, "1.55e1")
+            self.assertTrue(intervals.property("invalid"))
+            self.assertEqual(self.bridge.snapshot["numbers"]["spline_intervals"], 15)
+            key(Qt.Key_Escape)
             plot = item.findChild(QQuickItem, "drr_background_plot")
             self.assertGreaterEqual(plot.height(), 125)
             for name in ("drr_background_tools", "drr_background_page_settings", "drr_background_cancel", "drr_background_apply"):

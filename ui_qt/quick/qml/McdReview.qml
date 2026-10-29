@@ -70,9 +70,9 @@ Basic.Popup {
                                 function setParameter(key, value) { dialog.bridge.editProtection(region.index, key === "low" ? value : region.record.low, key === "high" ? value : region.record.high, region.record.enabled) }
                             }
                             Basic.CheckBox { checked: region.record.enabled; text: String(region.index + 1); onToggled: dialog.bridge.editProtection(region.index, region.record.low, region.record.high, checked) }
-                            NumberInput { Layout.fillWidth: true; descriptor: ({key: "low", value: region.record.low, decimals: 8, step: .001}); bridge: regionBridge }
+                            NumberInput { Layout.fillWidth: true; descriptor: ({key: "low", value: region.record.low, decimals: 8, displayDecimals: 4, step: .001}); bridge: regionBridge }
                             Text { text: "to"; color: dialog.colors.muted }
-                            NumberInput { Layout.fillWidth: true; descriptor: ({key: "high", value: region.record.high, decimals: 8, step: .001}); bridge: regionBridge }
+                            NumberInput { Layout.fillWidth: true; descriptor: ({key: "high", value: region.record.high, decimals: 8, displayDecimals: 4, step: .001}); bridge: regionBridge }
                             AppButton { colors: dialog.colors; compact: true; text: "Remove"; onClicked: dialog.bridge.removeProtection(region.index) }
                         }
                     }
@@ -80,9 +80,9 @@ Basic.Popup {
             }
             RowLayout {
                 QtObject { id: addBridge; function setParameter(key, value) { if (key === "low") dialog.protectionLow = value; else dialog.protectionHigh = value } }
-                NumberInput { Layout.fillWidth: true; descriptor: ({key: "low", value: dialog.protectionLow, decimals: 8, step: .001}); bridge: addBridge }
+                NumberInput { Layout.fillWidth: true; descriptor: ({key: "low", value: dialog.protectionLow, decimals: 8, displayDecimals: 4, step: .001}); bridge: addBridge }
                 Text { text: "to"; color: dialog.colors.muted }
-                NumberInput { Layout.fillWidth: true; descriptor: ({key: "high", value: dialog.protectionHigh, decimals: 8, step: .001}); bridge: addBridge }
+                NumberInput { Layout.fillWidth: true; descriptor: ({key: "high", value: dialog.protectionHigh, decimals: 8, displayDecimals: 4, step: .001}); bridge: addBridge }
                 AppButton { colors: dialog.colors; compact: true; text: "Add region"; onClicked: dialog.bridge.addProtection(dialog.protectionLow, dialog.protectionHigh) }
             }
             Note { text: dialog.state.reviewSummary || ""; maximumLineCount: 5; elide: Text.ElideRight }
