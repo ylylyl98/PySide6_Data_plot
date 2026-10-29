@@ -688,7 +688,10 @@ class QuickDrrWorkflowTests(unittest.TestCase):
                 self.assertEqual(len(bridge._maps), 1)
             finally:
                 release.set()
-            self.wait(lambda: not bridge.snapshot["busy"] and not bridge._pending)
+            # This writes four full-resolution PNGs (both products, original
+            # and wide), twice the work of the single-product export below.
+            # Hosted Windows runners can exceed the usual 30-second bound.
+            self.wait(lambda: not bridge.snapshot["busy"] and not bridge._pending, timeout=90)
         self.assertIn("Export completed", bridge.snapshot["status"])
         directory = self.root / "Processed Data" / "DRR"
         pngs, dats = list(directory.glob("*.png")), list(directory.glob("*.dat"))
