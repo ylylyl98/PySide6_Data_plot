@@ -12,7 +12,7 @@ comparison, power dependence, MCD, SHG, peak analysis, and PowerPoint slide buil
 · [Report an issue](https://github.com/ylylyl98/PySide6_Data_plot/issues)
 
 [![Fast PR checks](https://github.com/ylylyl98/PySide6_Data_plot/actions/workflows/fast-checks.yml/badge.svg)](https://github.com/ylylyl98/PySide6_Data_plot/actions/workflows/fast-checks.yml)
-[![Windows Build](https://github.com/ylylyl98/PySide6_Data_plot/actions/workflows/build-windows-release.yml/badge.svg)](https://github.com/ylylyl98/PySide6_Data_plot/actions/workflows/build-windows-release.yml)
+· [Windows build history](https://github.com/ylylyl98/PySide6_Data_plot/actions/workflows/build-windows-release.yml)
 
 ## Contents
 

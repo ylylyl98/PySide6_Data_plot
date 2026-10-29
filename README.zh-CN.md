@@ -11,7 +11,7 @@ PowerPoint 幻灯片制作，可同时保存图片、数值结果及处理元数
 · [反馈问题](https://github.com/ylylyl98/PySide6_Data_plot/issues)
 
 [![Fast PR checks](https://github.com/ylylyl98/PySide6_Data_plot/actions/workflows/fast-checks.yml/badge.svg)](https://github.com/ylylyl98/PySide6_Data_plot/actions/workflows/fast-checks.yml)
-[![Windows Build](https://github.com/ylylyl98/PySide6_Data_plot/actions/workflows/build-windows-release.yml/badge.svg)](https://github.com/ylylyl98/PySide6_Data_plot/actions/workflows/build-windows-release.yml)
+· [Windows 构建记录](https://github.com/ylylyl98/PySide6_Data_plot/actions/workflows/build-windows-release.yml)
 
 ## 目录
 
