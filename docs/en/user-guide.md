@@ -48,7 +48,7 @@ Small nonzero values below `1e-3` and magnitudes from `1e6` use scientific notat
 
 Color-limit arrows use approximately 0.5% of that minimum/maximum span, rounded to a 1/2/5 step: −100…100 steps by 1; −0.01…0.01 by 0.0001. Each product/region adapts independently after Auto or view restoration. Steps respect numeric resolution; equal bounds use their magnitude, or 0.01 when both are zero. Typed input commits at the editor's configured precision.
 
-Mouse-wheel scrolling moves panels and lists without changing dropdowns, numbers, sliders, dials or active tabs. Click or use the keyboard to edit. MCD spin boxes allow **Ctrl+wheel** when focused.
+Mouse-wheel scrolling moves panels and lists without changing dropdowns, numbers, sliders, dials or active tabs. Click or use the keyboard to edit.
 
 ## Finding and loading measurements
 
