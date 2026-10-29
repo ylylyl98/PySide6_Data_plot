@@ -4,6 +4,7 @@ import QtQuick
 import QtQuick.Controls.Basic as Basic
 import QtQuick.Layouts
 import Dptk 1.0
+import "NumericFormat.js" as NumericFormat
 
 Rectangle {
     id: root
@@ -179,6 +180,12 @@ Rectangle {
         property bool numeric: false
         property string placeholder: ""
         readonly property string value: String((numeric ? root.state.numbers : root.state.texts)?.[field] ?? "")
+        readonly property var numberDescriptor: ({key: field, label: label,
+            decimals: ["spline_intervals", "polynomial_degree", "periodic_components", "gate"].indexOf(field) >= 0 ? 0 : undefined})
+        function refreshText() {
+            if (!input.dirty && !input.invalid)
+                input.text = !numeric || input.activeFocus ? value : NumericFormat.display(Number(value), numberDescriptor)
+        }
         Layout.fillWidth: true
         spacing: 3
         Note { text: editor.label }
@@ -199,22 +206,37 @@ Rectangle {
             enabled: !root.state.busy
             objectName: "drr_background_editor_" + editor.field
             Accessible.name: editor.label
-            text: editor.value
+            Component.onCompleted: editor.refreshText()
             onTextEdited: dirty = true
             onEditingFinished: {
                 if (!dirty) return
-                let value = Number(text)
-                invalid = editor.numeric && (!text.trim().length || !isFinite(value))
+                let value = NumericFormat.parse(text)
+                invalid = editor.numeric && (value === undefined ||
+                    (editor.numberDescriptor.decimals === 0 && !Number.isInteger(value)))
                 root.invalidField(editor.field, invalid)
                 if (invalid) return
                 dirty = false
                 if (editor.numeric) root.bridge.setNumber(editor.field, value)
                 else root.bridge.setText(editor.field, text)
+                invalid = (root.state.invalidNumberFields || []).indexOf(editor.field) >= 0
+                editor.refreshText()
             }
+            onActiveFocusChanged: editor.refreshText()
+            Keys.onEscapePressed: {
+                dirty = false
+                invalid = false
+                root.invalidField(editor.field, false)
+                if (editor.numeric && (root.state.invalidNumberFields || []).indexOf(editor.field) >= 0)
+                    root.bridge.setNumber(editor.field, Number(editor.value))
+                editor.refreshText()
+                selectAll()
+            }
+            Basic.ToolTip.visible: hovered && editor.numeric
+            Basic.ToolTip.text: editor.value + "\nScientific notation is accepted (for example, 1e3)."
             background: Rectangle { radius: 4; color: root.colors.control; border.width: input.activeFocus ? 2 : 1; border.color: input.invalid || (root.state.invalidNumberFields || []).indexOf(editor.field) >= 0 ? root.colors.error : input.activeFocus ? root.colors.focus : root.colors.border }
             Connections {
                 target: editor
-                function onValueChanged() { if (!input.dirty && !input.activeFocus) input.text = editor.value }
+                function onValueChanged() { editor.refreshText() }
             }
         }
     }

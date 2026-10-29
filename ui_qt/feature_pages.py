@@ -1497,6 +1497,7 @@ class FeatureTabsMixin:
             "Ctrl+click a B field on the colormap to select its nearest pair."
         )
         self.mcd_window_center_spin = QDoubleSpinBox(); self.mcd_window_center_spin.setRange(0.0, 10.0); self.mcd_window_center_spin.setDecimals(6)
+        self.mcd_window_center_spin.display_precision = 6
         self.mcd_window_center_spin.setToolTip("Center energy. You can also drag the highlighted band on the MCD map to move this value.")
         self.mcd_window_width_spin = QDoubleSpinBox(); self.mcd_window_width_spin.setRange(0.01, 1000); self.mcd_window_width_spin.setDecimals(3); self.mcd_window_width_spin.setValue(5.0); self.mcd_window_width_spin.setSuffix(" meV")
         self.mcd_window_width_spin.setToolTip("Fixed energy-window width. Dragging the map band moves its center and never changes this width.")
@@ -3194,6 +3195,7 @@ class FeatureTabsMixin:
         def wavelength_spin(value: float) -> QDoubleSpinBox:
             spin = QDoubleSpinBox()
             spin.setDecimals(4)
+            spin.display_precision = 2
             spin.setRange(0.0, 5000.0)
             spin.setSingleStep(0.1)
             spin.setValue(value)
@@ -3281,10 +3283,12 @@ class FeatureTabsMixin:
         angle_form.setSpacing(6)
         self.shg_angle_scale_spin = QDoubleSpinBox()
         self.shg_angle_scale_spin.setDecimals(6)
+        self.shg_angle_scale_spin.display_significant_digits = 5
         self.shg_angle_scale_spin.setRange(-1.0e6, 1.0e6)
         self.shg_angle_scale_spin.setValue(1.0)
         self.shg_angle_offset_spin = QDoubleSpinBox()
         self.shg_angle_offset_spin.setDecimals(6)
+        self.shg_angle_offset_spin.display_precision = 2
         self.shg_angle_offset_spin.setRange(-1.0e6, 1.0e6)
         self.shg_angle_offset_spin.setValue(0.0)
         for spin in (self.shg_angle_scale_spin, self.shg_angle_offset_spin):
@@ -3297,6 +3301,7 @@ class FeatureTabsMixin:
         self.shg_include_failed_chk = QCheckBox("Include move/acquisition failures")
         self.shg_angle_cursor_spin = QDoubleSpinBox()
         self.shg_angle_cursor_spin.setDecimals(6)
+        self.shg_angle_cursor_spin.display_precision = 2
         self.shg_angle_cursor_spin.setRange(-1.0e9, 1.0e9)
         self.shg_angle_cursor_spin.setSingleStep(1.0)
         angle_form.addRow("Scale", self.shg_angle_scale_spin)
@@ -3320,6 +3325,7 @@ class FeatureTabsMixin:
         self.shg_fit_max_spin = QDoubleSpinBox()
         for spin, value in ((self.shg_fit_min_spin, 0.0), (self.shg_fit_max_spin, 180.0)):
             spin.setDecimals(4)
+            spin.display_precision = 2
             spin.setRange(-1.0e6, 1.0e6)
             spin.setValue(value)
         fit_range_row = QWidget()

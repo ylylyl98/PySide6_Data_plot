@@ -14,7 +14,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
-    QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -29,6 +28,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from ui_qt.common import QDoubleSpinBox
 
 from core.mcd_extract import (
     BRANCHES,
@@ -314,6 +314,7 @@ class McdExtractDialog(QDialog):
         spin = QDoubleSpinBox()
         spin.setRange(minimum, maximum)
         spin.setDecimals(decimals)
+        spin.display_precision = {' V': 3, ' K': 2, ' eV': 4, ' meV': 3}.get(suffix, 4)
         spin.setValue(value)
         spin.setSuffix(suffix)
         spin.setKeyboardTracking(False)

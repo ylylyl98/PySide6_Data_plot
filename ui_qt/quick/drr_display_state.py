@@ -580,6 +580,7 @@ class DrrDisplayState(QObject):
 
     @Slot()
     def refresh(self):
+        from ui_qt.quick.number_presentation import display_text
         count = self._choices["regionCount"] + 1
         locale = QLocale()
         state = dict(numbers={}, flags={}, choices={}, actions={}, texts={},
@@ -588,10 +589,11 @@ class DrrDisplayState(QObject):
         for key, value in self._numbers.items():
             limit = 1e6 if key.startswith("yaxis.") else 1e12
             state["numbers"][key] = dict(key=key, value=value,
-                text=locale.toString(value, "g", 4 if not key.startswith("yaxis.") else 12),
+                text=display_text(value, key, locale),
                 editText=locale.toString(value, "f", self._decimals(key)),
                 minimum=-limit, maximum=limit, decimals=self._decimals(key), step=self._step(key),
-                enabled=self._enabled_number(key), visible=self._visible(key), tooltip="",
+                enabled=self._enabled_number(key), visible=self._visible(key),
+                tooltip="Value: " + locale.toString(value, "g", 16) + "\nScientific notation is accepted (for example, 1e3).",
                 accessibleName=key, fixKey="fix." + key if "fix." + key in self._flags else "",
                 error=self._errors.get(key, ""))
         flag_labels = {"boundary.show": "Show boundary", "log": "Log Scale", "clip": "Clip Outliers", "zero": "Center Zero"}

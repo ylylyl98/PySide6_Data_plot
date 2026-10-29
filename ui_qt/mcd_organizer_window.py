@@ -12,9 +12,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
-    QSpinBox,
     QComboBox,
-    QDoubleSpinBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -35,6 +33,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from ui_qt.common import QSpinBox, QDoubleSpinBox
 
 from core.mcd_extract import (
     BRANCHES,

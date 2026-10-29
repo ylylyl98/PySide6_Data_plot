@@ -6,8 +6,9 @@ import json
 import numpy as np
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
-    QLabel, QLineEdit, QMessageBox, QSizePolicy, QVBoxLayout, QDoubleSpinBox, QPushButton, QScrollArea, QWidget,
+    QLabel, QLineEdit, QMessageBox, QSizePolicy, QVBoxLayout, QPushButton, QScrollArea, QWidget,
 )
+from ui_qt.common import QDoubleSpinBox
 from ui_qt.matplotlib_theme import QtFontFigureCanvasQTAgg as FigureCanvasQTAgg
 from matplotlib.figure import Figure
 

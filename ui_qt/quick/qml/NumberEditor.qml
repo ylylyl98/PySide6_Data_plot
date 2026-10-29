@@ -12,6 +12,7 @@ ColumnLayout {
     property bool dirty: false
     property string localError: ""
     property bool committing: false
+    property bool compactAfterStep: false
     property bool componentReady: false
     readonly property string errorText: localError || (dirty ? "" : descriptor.error || "")
     readonly property alias textField: input
@@ -24,7 +25,7 @@ ColumnLayout {
 
     function refreshText() {
         if (!dirty && !localError && !committing)
-            input.text = input.activeFocus ? String(descriptor.editText || descriptor.text || "")
+            input.text = input.activeFocus && !compactAfterStep ? String(descriptor.editText || descriptor.text || "")
                                           : String(descriptor.text || "")
     }
 
@@ -47,6 +48,7 @@ ColumnLayout {
     function cancelDraft() {
         dirty = false
         localError = ""
+        compactAfterStep = false
         bridge.setEditing(fieldKey, false)
         // The unchanged canonical value clears backend validation feedback
         // without emitting a numeric or finish operation.
@@ -70,6 +72,7 @@ ColumnLayout {
         if (accepted) {
             dirty = false
             localError = ""
+            compactAfterStep = true
             refreshText()
         } else {
             localError = descriptor.error || "Enter a valid value before stepping."
@@ -129,11 +132,13 @@ ColumnLayout {
             Accessible.name: control.accessibleLabel || control.descriptor.accessibleName || control.fieldKey
             Accessible.description: control.errorText || (control.dirty ? "Pending value. Press Enter or leave this field to apply; Escape cancels." : control.descriptor.tooltip || "")
             onTextEdited: {
+                control.compactAfterStep = false
                 control.dirty = true
                 control.localError = ""
                 control.bridge.setEditing(control.fieldKey, true)
             }
             onActiveFocusChanged: {
+                control.compactAfterStep = false
                 if (activeFocus) {
                     control.bridge.setEditing(control.fieldKey, control.dirty)
                     control.refreshText()

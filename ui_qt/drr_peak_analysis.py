@@ -8,7 +8,7 @@ import numpy as np
 from PySide6.QtCore import QObject, Qt
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QFormLayout, QHBoxLayout, QPushButton, QComboBox,
-    QDoubleSpinBox, QLabel, QCheckBox, QTableWidget, QTableWidgetItem,
+    QLabel, QCheckBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView,
 )
 

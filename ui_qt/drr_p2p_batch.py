@@ -1,7 +1,8 @@
 """Common-window P2P comparison with source-map and spectrum inspection."""
 import csv
 import numpy as np
-from PySide6.QtWidgets import QCheckBox,QComboBox,QPushButton,QHBoxLayout,QWidget,QVBoxLayout,QLabel,QToolButton,QGroupBox,QFormLayout,QSizePolicy,QSpinBox
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QPushButton, QHBoxLayout, QWidget, QVBoxLayout, QLabel, QToolButton, QGroupBox, QFormLayout, QSizePolicy)
+from ui_qt.common import QSpinBox
 from PySide6.QtCore import QTimer
 from ui_qt.compact_spinbox import CompactDoubleSpinBox
 from matplotlib.widgets import SpanSelector

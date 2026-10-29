@@ -12,8 +12,9 @@ import numpy as np
 from PySide6.QtCore import Qt, QThreadPool, QTimer
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QListWidget, QListWidgetItem, QAbstractItemView, QSplitter,
-    QScrollArea, QLabel, QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox,
+    QScrollArea, QLabel, QComboBox, QCheckBox,
     QFileDialog, QDialog, QDialogButtonBox, QFormLayout, QToolButton, QMessageBox, QSizePolicy, QProgressBar, QLineEdit, QTableWidgetItem, QHeaderView, QTabWidget, QStackedWidget)
+from ui_qt.common import QSpinBox
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 from ui_qt.matplotlib_theme import ThemeAwareFigureCanvasQTAgg as FigureCanvasQTAgg

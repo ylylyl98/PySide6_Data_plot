@@ -39,6 +39,15 @@ class QuickHeatmapStyleTests(unittest.TestCase):
         self.assertTrue(all(image.cmap.name == "magma" for image in render.images))
         np.testing.assert_array_equal(np.concatenate([image.get_array() for image in render.images], axis=1), self.cube.Z)
 
+    def test_small_positive_log_limits_match_inputs_in_render_and_recolor(self):
+        self.params.log_scale = True
+        self.params.vmin, self.params.vmax = 1e-16, 1e-14
+        render = plot_heatmap(self.axis, self.cube, self.params)
+        self.assertEqual(render.primary.get_clim(), (1e-16, 1e-14))
+        self.params.vmin, self.params.vmax = 2e-17, 3e-15
+        update_heatmap_colors(render, self.cube, self.params)
+        self.assertEqual(render.primary.get_clim(), (2e-17, 3e-15))
+
     def test_vp_range_crossing_zero_keeps_compact_colorbar_endpoints(self):
         self.params.center_zero = True
         self.params.vmin, self.params.vmax = -.8, .9

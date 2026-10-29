@@ -664,21 +664,37 @@ def export_pl_pngs_and_dat(
     params_linear: HeatmapParams,
     params_log: HeatmapParams,
     include_pair: bool = False,
+    include_original_png: bool = False,
     processed_name: str = DEFAULT_PROCESSED,
     metadata_input_files: Iterable[tuple[str, str]] = (),
     metadata_extra: dict | None = None,
 ) -> Dict[str, Path]:
     out_dir = ensure_processed_dir(folder, processed_name)
+    selected_params = {"linear": params_linear, "log": params_log}
+    wide_suffixes = tuple(f"_{name}_{float(params.png_width_scale)}x.png"
+                         for name, params in selected_params.items()
+                         if include_original_png and params.png_width_scale > 1.0)
     safe = _unique_result_stem(
         out_dir,
         f"{Path(file_name).stem}_PL",
-        ("_linear.dat", "_linear.metadata.json", "_linear.png", "_log.png", "_side_by_side.png"),
+        ("_linear.dat", "_linear.metadata.json", "_linear.png", "_log.png", "_side_by_side.png", *wide_suffixes),
     )
 
     png_linear = out_dir / f"{safe}_linear.png"
     png_log = out_dir / f"{safe}_log.png"
-    _save_heatmap_png(png_linear, cube_linear, params_linear, drr=False)
-    _save_heatmap_png(png_log, cube_log, params_log, drr=False)
+    original_params = {name: replace(params, png_width_scale=1.0)
+                       if include_original_png and params.png_width_scale > 1 else params
+                       for name, params in selected_params.items()}
+    _save_heatmap_png(png_linear, cube_linear, original_params["linear"], drr=False)
+    _save_heatmap_png(png_log, cube_log, original_params["log"], drr=False)
+    wide_paths = {}
+    if include_original_png:
+        for name, cube in (("linear", cube_linear), ("log", cube_log)):
+            params = selected_params[name]
+            if params.png_width_scale > 1.0:
+                wide_path = out_dir / f"{safe}_{name}_{float(params.png_width_scale)}x.png"
+                _save_heatmap_png(wide_path, cube, params, drr=False)
+                wide_paths[f"png_{name}_wide"] = wide_path
 
     dat_path = Path(
         save_as_dat(
@@ -693,7 +709,7 @@ def export_pl_pngs_and_dat(
             energy_unit="eV",
         )
     )
-    paths = {"png_linear": png_linear, "png_log": png_log, "dat": dat_path}
+    paths = {"png_linear": png_linear, "png_log": png_log, "dat": dat_path, **wide_paths}
     if include_pair:
         # Reuse the exact standalone panels, including their export typography.
         from PIL import Image
@@ -714,13 +730,18 @@ def export_pl_pngs_and_dat(
             "y_axis_unit": getattr(cube_linear, "gate_unit", ""),
             "y_axis_semantic": getattr(cube_linear, "y_axis_semantic", ""),
         },
-        plot={"linear": params_linear, "log": params_log},
+        plot=original_params,
         outputs=paths.values(),
-        extra=metadata_extra,
+        extra={**(metadata_extra or {}), "figures": {
+            **{path.name: {"plot": original_params[name], "data_file": dat_path.name}
+               for name, path in (("linear", png_linear), ("log", png_log))},
+            **{path.name: {"plot": selected_params[key.removeprefix("png_").removesuffix("_wide")],
+                          "data_file": dat_path.name} for key, path in wide_paths.items()}}},
         output_manifest=(
             ("data", dat_path),
             ("figure_linear", png_linear),
             ("figure_log", png_log),
+            *((key.replace("png_", "figure_", 1), path) for key, path in wide_paths.items()),
             *((('figure_side_by_side', paths['png_pair']),) if include_pair else ()),
         ),
     )

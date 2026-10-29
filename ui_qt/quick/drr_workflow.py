@@ -181,14 +181,17 @@ def export_drr(products: DrrProducts, *, folder, raw_params, second_params, view
     inputs = tuple(("measurement", name) for name in request.files) + tuple(
         ("background", name) for name in request.backgrounds if request.background_mode == "external")
     outputs = {}
-    selections = ("raw", "second") if view == "pair" else (view,)
     if view not in {"raw", "second", "pair"}:
         raise ValueError("Choose raw, second, or pair for DRR export.")
+    # A derivative-only display still saves its underlying DRR product.
+    selections = ("raw",) if view == "raw" else ("raw", "second")
     if "second" in selections and (products.second is None or second_params is None):
         raise ValueError(products.second_error or "The derivative is not available.")
     for name in selections:
         _validate_drr_pair_product(products.raw if name == "raw" else products.second,
             raw_params if name == "raw" else second_params, label=name)
+    if view == "second":
+        raw_params = replace(raw_params, xlim=second_params.xlim, ylim=second_params.ylim)
     background_metadata = {}
     if request.background_recipe is not None:
         from core.drr_sources import portable_source_name, resolve_source_path

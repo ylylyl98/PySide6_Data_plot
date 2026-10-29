@@ -138,6 +138,7 @@ Rectangle {
                                     label: "Peak " + (peakRow.index + 1) + " " + modelData.title,
                                     value: peakRow.modelData[modelData.key], min: modelData.key === "width" || modelData.key === "height" ? 0.000001 : -10000,
                                     max: modelData.key === "height" ? 1e15 : 10000, decimals: 7, step: modelData.key === "center" ? 0.001 : 0.1,
+                                    displayDecimals: modelData.key === "height" ? undefined : modelData.key === "width" ? 3 : 6,
                                     enabled: !page.state.busy})
                             }
                         }

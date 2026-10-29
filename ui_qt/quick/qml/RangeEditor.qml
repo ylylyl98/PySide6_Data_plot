@@ -37,9 +37,11 @@ ColumnLayout {
             onClicked: control.bridge.invoke(control.autoAction)
         }
     }
-    RowLayout {
+    GridLayout {
         Layout.fillWidth: true
-        spacing: 10
+        columns: control.width < 250 ? 1 : 2
+        columnSpacing: 10
+        rowSpacing: 6
         ColumnLayout {
             Layout.fillWidth: true
             Layout.preferredWidth: 1

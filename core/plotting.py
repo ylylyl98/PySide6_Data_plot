@@ -158,8 +158,11 @@ def downsample_cube_for_display(cube: DataCube, *, max_points: int = 250_000) ->
 
 def _norm_from_params(z: np.ndarray, params: HeatmapParams):
     if params.log_scale:
-        vmin = max(float(params.vmin), 1e-12)
-        vmax = max(float(params.vmax), vmin * 1.01)
+        vmin, vmax = float(params.vmin), float(params.vmax)
+        if not np.isfinite(vmin) or vmin <= 0:
+            vmin = 1e-12
+        if not np.isfinite(vmax) or vmax <= vmin:
+            vmax = vmin * 1.01
         return LogNorm(vmin=vmin, vmax=vmax, clip=True)
     if params.center_zero and params.vmin < 0 < params.vmax:
         return TwoSlopeNorm(vmin=params.vmin, vcenter=0.0, vmax=params.vmax)

@@ -8,8 +8,9 @@ from datetime import datetime
 from pathlib import Path
 import numpy as np
 from PySide6.QtWidgets import (QDialog,QVBoxLayout,QHBoxLayout,QLabel,QTableWidget,
-    QTableWidgetItem,QComboBox,QDoubleSpinBox,QCheckBox,QPushButton,QTabWidget,
+    QTableWidgetItem,QComboBox,QCheckBox,QPushButton,QTabWidget,
     QWidget,QPlainTextEdit,QMessageBox,QFileDialog,QAbstractItemView,QToolTip)
+from ui_qt.common import QDoubleSpinBox
 from PySide6.QtGui import QCursor
 from matplotlib.figure import Figure
 from core.theta_comparison import compare_theta
@@ -230,8 +231,10 @@ class ThetaComparisonDialog(QDialog):
         controls.addWidget(self.mapping)
         row=QHBoxLayout()
         self.halfwidth=QDoubleSpinBox();self.halfwidth.setRange(.0001,1000);self.halfwidth.setDecimals(4);self.halfwidth.setValue(.2)
+        self.halfwidth.display_precision = 3
         self.t_min=QDoubleSpinBox();self.t_max=QDoubleSpinBox()
         for spin in (self.t_min,self.t_max): spin.setRange(0,100000);spin.setDecimals(4)
+        for spin in (self.t_min,self.t_max): spin.display_precision = 2
         self.t_max.setValue(1000)
         for label,spin in [('Common ±B (T)',self.halfwidth),('T min (K)',self.t_min),('T max (K)',self.t_max)]:
             row.addWidget(QLabel(label));row.addWidget(spin)

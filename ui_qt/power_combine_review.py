@@ -2,7 +2,8 @@
 from pathlib import Path
 import numpy as np
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QLabel, QComboBox,
-    QDoubleSpinBox, QLineEdit, QCheckBox, QTableWidget, QHeaderView, QDialogButtonBox, QPushButton, QSizePolicy)
+    QLineEdit, QCheckBox, QTableWidget, QHeaderView, QDialogButtonBox, QPushButton, QSizePolicy)
+from ui_qt.common import QDoubleSpinBox
 from matplotlib.figure import Figure
 from ui_qt.matplotlib_theme import QtFontFigureCanvasQTAgg as FigureCanvasQTAgg
 from core.power_combine import combine_many_power_sweeps

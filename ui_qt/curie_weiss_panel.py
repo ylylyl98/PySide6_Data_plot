@@ -11,9 +11,10 @@ from pathlib import Path
 import numpy as np
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-                               QLabel, QComboBox, QDoubleSpinBox, QPushButton,
+                               QLabel, QComboBox, QPushButton,
                                QPlainTextEdit, QScrollArea, QFileDialog, QMessageBox, QSizePolicy,
                                QCheckBox, QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView)
+from ui_qt.common import QDoubleSpinBox
 
 
 class CurieWeissPanel(QWidget):
@@ -60,6 +61,7 @@ class CurieWeissPanel(QWidget):
             spin.setRange(0, 100000)
             spin.setDecimals(4)
             spin.setSuffix(' K')
+            spin.display_precision = 2
             spin.setKeyboardTracking(False)
         self.t_max.setValue(1000)
         self.field_refit_chk = QCheckBox('Refit slopes from MCD–B')
@@ -68,6 +70,7 @@ class CurieWeissPanel(QWidget):
         self.b_halfwidth = QDoubleSpinBox()
         self.b_halfwidth.setRange(.0001, 1000)
         self.b_halfwidth.setDecimals(4)
+        self.b_halfwidth.display_precision = 3
         self.b_halfwidth.setSingleStep(.05)
         self.b_halfwidth.setValue(.2)
         self.b_halfwidth.setPrefix('± ')
@@ -98,6 +101,7 @@ class CurieWeissPanel(QWidget):
             spin.setDecimals(4)
             spin.setSingleStep(.05)
             spin.setSuffix(' T')
+            spin.display_precision = 3
             spin.setValue(value)
             spin.setKeyboardTracking(False)
             spin.setEnabled(False)
@@ -113,6 +117,7 @@ class CurieWeissPanel(QWidget):
         self.background_spin = QDoubleSpinBox()
         self.background_spin.setRange(-1e6, 1e6)
         self.background_spin.setDecimals(8)
+        self.background_spin.display_significant_digits = 5
         self.background_spin.setSingleStep(.001)
         self.background_spin.setKeyboardTracking(False)
         self.background_spin.setEnabled(False)

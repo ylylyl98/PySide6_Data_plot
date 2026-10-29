@@ -950,7 +950,7 @@ class DrrAnalysisBridge(DrrAnalysisPlotMixin, QObject):
         # A stable descriptor schema preserves QML editor instances and drafts.
         def number(key, label, value, **extra):
             integer = isinstance(value,int) and not isinstance(value,bool)
-            return dict(key=key, type="number", label=label, value=value, min=-1e9, max=1e9, step=1 if integer else .001, displayDigits=8, **extra)
+            return dict(key=key, type="number", label=label, value=value, min=-1e9, max=1e9, step=1 if integer else .001, integer=integer, **extra)
         def flag(key, label, value): return dict(key=key, type="flag", label=label, value=value)
         def choice(key, label, value, options): return dict(key=key, type="choice", label=label, value=value, options=[dict(value=v, label=l) for v, l in options])
         def action(key, label): return dict(key=key, type="action", label=label, enabled=not self._closing)

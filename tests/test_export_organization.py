@@ -83,6 +83,20 @@ class ExportOrganizationTests(unittest.TestCase):
             self.assertEqual(pl["dat"].stem, "sample_PL_linear")
             self.assertEqual(drr["dat"].stem, "sample_PL_linear")
 
+    def test_pl_wide_only_existing_image_reserves_its_result_stem(self) -> None:
+        from dataclasses import replace
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "Processed Data" / "PL"
+            directory.mkdir(parents=True)
+            prior = directory / "sample_PL_linear_1.5x.png"
+            prior.write_bytes(b"existing wide image")
+            params = replace(self.params, png_width_scale=1.5)
+            with patch("core.export._save_heatmap_png", side_effect=lambda path, *_args, **_kwargs: Path(path).write_bytes(b"new image")):
+                outputs = export_pl_pngs_and_dat(tmp, "sample.csv", cube_linear=self.cube, cube_log=self.cube,
+                    params_linear=params, params_log=params, processed_name="Processed Data/PL", include_original_png=True)
+            self.assertEqual(prior.read_bytes(), b"existing wide image")
+            self.assertEqual(outputs["png_linear_wide"].name, "sample_PL_01_linear_1.5x.png")
+
     def test_dat_import_works_from_workflow_folder_without_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "Processed Data" / "Compare" / "sample.dat"

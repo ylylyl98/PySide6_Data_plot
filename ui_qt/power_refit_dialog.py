@@ -3,9 +3,10 @@
 import numpy as np
 from PySide6.QtCore import Slot
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
+    QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QHeaderView, QLabel, QPushButton, QTableWidget, QVBoxLayout,
 )
+from ui_qt.common import QDoubleSpinBox
 from ui_qt.matplotlib_theme import QtFontFigureCanvasQTAgg as FigureCanvasQTAgg
 from matplotlib.figure import Figure
 
@@ -85,6 +86,9 @@ class PowerRefitDialog(QDialog):
             for col, value in enumerate((center, width * 1000, max(height, 1e-9), lo, hi)):
                 spin = QDoubleSpinBox()
                 spin.setDecimals(7 if col in (0, 3, 4) else 5)
+                spin.display_precision = 6 if col in (0, 3, 4) else 3
+                if col == 2:
+                    spin.display_significant_digits = 5
                 spin.setRange(-10000 if col in (0, 3, 4) else .000001, 10000 if col in (0, 3, 4) else 1e15)
                 spin.setKeyboardTracking(False)
                 spin.setValue(float(value))
