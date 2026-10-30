@@ -61,7 +61,7 @@ class CompactSpinTests(unittest.TestCase):
                     self.assertEqual(upper.value(),2.01)
                     self.assertEqual(changes,[2.01])
                     QTest.keyClick(upper,Qt.Key_Down)
-                    self.assertEqual(upper.value(),2.)
+                    self.assertAlmostEqual(upper.value(),2.,places=12)
         finally:host.close()
 
     def test_significant_display_preserves_small_values_through_focus_and_steps(self):
@@ -80,7 +80,7 @@ class CompactSpinTests(unittest.TestCase):
                     spin.setValue(value);changes.clear()
                     self.assertEqual(spin.text(),text)
                     spin.setFocus();app.processEvents()
-                    self.assertEqual(spin.text(),f'{value:.8f}')
+                    self.assertEqual(spin.text(),text)
                     other.setFocus();app.processEvents()
                     self.assertEqual(spin.value(),value)
                     self.assertEqual(spin.text(),text)

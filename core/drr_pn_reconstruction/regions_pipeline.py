@@ -1,7 +1,8 @@
 """Rebuild sample-supported region selection from this run's source fit.
 
 No saved model, mask, background, angle label, or BN is read here. Historical
-stage names document the adopted recipe. Two training repeats are required;
+stage names document the adopted recipe. The legacy path requires two training repeats;
+the explicit single-measurement path uses one;
 the historical 101-gate case is not an arbitrary-data quality guarantee.
 """
 from __future__ import annotations
@@ -14,10 +15,11 @@ from .source_runtime import cancellation_scope, check_cancelled
 
 
 def prepare_regions(energy, pn_mean, pn_frames, train_samples, *, source_result,
-                    cancelled=None, progress=None):
+                    cancelled=None, progress=None, single_measurement=False):
     """Return ``full``, ``halves`` baselines and traceable selection ``stages``.
 
-    ``train_samples`` is exactly two training repeats, shape (2, gates, energy).
+    ``train_samples`` has shape (2, gates, energy) in the legacy path or
+    (1, gates, energy) when ``single_measurement`` is true.
     At least three gate rows are required; the IO layer validates coordinates.
     Full F/q from ``source_result`` is applied to first/last PN halves. Source
     classification and weights are estimated once from the full training data;
@@ -82,7 +84,12 @@ def prepare_regions(energy, pn_mean, pn_frames, train_samples, *, source_result,
         save("v36", control, {"family": "piecewise_old_sources",
              "V34_source_update_used": False, "source_stage": "current v32"})
         start("v45")
-        classifier, classifier_diag = classify(e, pn, train_samples, baseline=source,
+        if single_measurement:
+            from .regions_single_classifier import classify_single
+            classifier_fn = classify_single
+        else:
+            classifier_fn = classify
+        classifier, classifier_diag = classifier_fn(e, pn, train_samples, baseline=source,
             control=control, half_aligned_sources=np.concatenate((a[None], half_a), axis=0))
         save("v45", classifier, classifier_diag)
         start("v50")
@@ -122,4 +129,4 @@ def prepare_regions(energy, pn_mean, pn_frames, train_samples, *, source_result,
             "resolved_regions": region_diag,
             "excursion_selection": decisions,
             "half_semantics": "Current full F/q/state/weights held fixed; each half has its own C/A and intensity reference.",
-            "applicability": "Two complete training repeats with at least three gate rows are required; rendering also verifies its prescribed regional geometry."}}
+            "applicability": ("One measurement with at least three gate rows; cross-measurement drift is not assessed." if single_measurement else "Two complete training repeats with at least three gate rows are required; rendering also verifies its prescribed regional geometry.")}}

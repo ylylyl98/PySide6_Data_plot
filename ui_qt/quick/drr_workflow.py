@@ -9,6 +9,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 
+_MODE_LABELS = {"self-first": "DR/R Self First", "self-last": "DR/R Self",
+                "external": "DR/R External", "fitted": "DR/R Fitted", "imported": "DR/R Imported"}
+
+
 @dataclass(frozen=True)
 class DrrRequest:
     files: tuple[str, ...]
@@ -172,12 +176,35 @@ def load_drr(request: DrrRequest, *, prepared_background=None) -> DrrProducts:
         background_references=references, raw_snapshot=raw_snapshot), history_candidates=candidates)
 
 
+def _export_mode_label(request):
+    """Use the applied recipe's role in filenames, retaining numerical metadata."""
+    mode = _MODE_LABELS[request.background_mode]
+    if request.background_mode != "external":
+        return mode
+    recipe = request.background_recipe
+    draft = getattr(recipe, "draft", None)
+    kind = getattr(draft, "kind", "")
+    tag = {"p": "P", "n": "N", "pn": "PN", "bn": "BN"}.get(kind)
+    if tag is None:
+        return mode
+    assignments = tuple(getattr(recipe, "assignments", ()))
+    if any(item.baseline_mode != "External" for item in assignments):
+        return mode
+    if kind == "pn" and assignments:
+        first = assignments[0]
+        reference = (first.baseline_files, first.baseline_which, first.regions)
+        if any((item.baseline_files, item.baseline_which, item.regions) != reference for item in assignments[1:]):
+            tag = "PN-Match"
+    return "DR/R " + tag
+
+
 def export_drr(products: DrrProducts, *, folder, raw_params, second_params, view, display_state=None):
     from core.export import build_drr_export_base, export_drr_png_and_dat, _validate_drr_pair_product
     request = products.request
     if not products.input_signatures or _input_signatures(request) != products.input_signatures:
         raise ValueError("A measurement/background changed since loading. Reload before exporting.")
-    mode = {"self-first": "DR/R Self First", "self-last": "DR/R Self", "external": "DR/R External", "fitted": "DR/R Fitted", "imported": "DR/R Imported"}[request.background_mode]
+    mode = _MODE_LABELS[request.background_mode]
+    filename_mode = _export_mode_label(request)
     inputs = tuple(("measurement", name) for name in request.files) + tuple(
         ("background", name) for name in request.backgrounds if request.background_mode == "external")
     outputs = {}
@@ -209,6 +236,28 @@ def export_drr(products: DrrProducts, *, folder, raw_params, second_params, view
             selection_method="explicit_per_measurement", numerical_path=numerical_path,
             average_method=("per-file dR/R, align to first measurement grid without extrapolation, then nanmean"
                             if numerical_path == "heterogeneous" else "per-file dR/R, then nanmean"))
+        if recipe.draft is not None:
+            from core.drr_match_conditions import normalize_relaxed_conditions
+            draft = recipe.draft
+            background_metadata["background_kind"] = draft.kind
+            plan = draft.bn_plan or draft.pn_plan
+            matched = draft.assignment_method == "matched" or plan is not None
+            if matched and draft.kind in {"bn", "p", "n", "pn"}:
+                pool = draft.bn_candidates if draft.kind == "bn" else draft.pn_candidates
+                historical_review = draft.saved_matching_review if plan is None and draft.saved_assignments else None
+                review = historical_review or dict(warnings=list(getattr(plan, "warnings", ())),
+                    warnings_acknowledged=bool(draft.bn_warnings_acknowledged if draft.kind == "bn"
+                                              else draft.pn_warnings_acknowledged))
+                background_metadata["background_matching_policy"] = dict(
+                    schema_version=1, method="matched", kind=draft.kind,
+                    relaxed_conditions=list(normalize_relaxed_conditions(draft.relaxed_conditions)),
+                    candidate_files=list(pool) if pool is not None else None,
+                    ranking="strict_before_relaxed_v1",
+                    warnings=list(review["warnings"]), warnings_acknowledged=review["warnings_acknowledged"],
+                    review_source="saved_exact_group" if historical_review is not None else "current_group")
+                if review.get("pn_batch") is not None:
+                    from copy import deepcopy
+                    background_metadata["background_matching_policy"]["pn_batch"] = deepcopy(review["pn_batch"])
         if products.background_references:
             from core.drr_fitted_background import export_references, reference_matches_files
             if len(products.background_references) != 1 or not reference_matches_files(products.background_references[0], context.measurements):
@@ -226,13 +275,13 @@ def export_drr(products: DrrProducts, *, folder, raw_params, second_params, view
             raise ValueError(products.second_error or "The derivative is not available.")
         derivative = request.raw_derivative if name == "raw" else request.second_derivative
         used_window = products.raw_window if name == "raw" else products.second_window
-        base = build_drr_export_base(request.files[0], len(request.files), mode,
+        base = build_drr_export_base(request.files[0], len(request.files), filename_mode,
             derivative if isinstance(derivative, int) else None, used_window,
             request.polyorder, "More correct (regrid)")
         if isinstance(derivative, tuple):
             from core.drr_mixed_derivative import effective_window
             used_y = effective_window(derivative[1], len(cube.gate), request.polyorder)
-            base += f"_dXdY_W{used_window}_Y{used_y}_O{request.polyorder}"
+            base += "_dXdY"
         processing = dict(background_mode=request.background_mode,
             mode=mode, baseline_selection={"self-first": "Self (first frame)",
                 "self-last": "Self (last frame)", "external": "External", "fitted": "Fitted (sample)", "imported": "Imported map"}[request.background_mode],

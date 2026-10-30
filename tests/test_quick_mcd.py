@@ -37,6 +37,8 @@ def _isolated():
     from ui_qt.quick.mcd_workflow import McdRequest,load_mcd,window_snapshot,fingerprints,input_paths,export_snapshot,export_mcd
 
     app=QGuiApplication([]);register_plot_surface()
+    from ui_qt.typography import install_application_font
+    install_application_font(app)
     colors=dict(surface="#f3f5f8",control="#ffffff",text="#20242b",muted="#606978",border="#c6cbd3",accent="#0067c0",hover="#edf1f6",pressed="#e0e7ef",error="#b42318",disabled="#939aa5",selectedText="#ffffff",inset="#e9edf2",divider="#dce1e8",borderHover="#aeb7c4",borderDisabled="#dce1e8",controlDisabled="#edf0f4",focus="#20242b",accentText="#0067c0",selected="#e6f0fa",selectedBorder="#b4d6fa",errorSurface="#fdf1f0")
 
     def settle(milliseconds=15):
@@ -88,6 +90,7 @@ def _isolated():
             self.assertEqual(products.angles,(0.,90.))
             self.assertEqual(len(products.signatures),2)
             self.assertTrue(products.candidates)
+            self.assertEqual(set(products.result._quick_mcd_auto_limits),set(products.result.maps))
 
         def test_native_state_loads_defaults_and_exposes_every_scientific_control(self):
             self.load();state=self.bridge.snapshot
@@ -421,6 +424,20 @@ def _isolated():
             self.assertIsNotNone(pane,"\n".join(error.toString() for error in pane_component.errors()))
             window=QQuickWindow();window.resize(1440,780);pane.setParentItem(window.contentItem());pane.setWidth(240);pane.setHeight(780)
             item.setParentItem(window.contentItem());item.setX(240);item.setWidth(1200);item.setHeight(780);window.show()
+            settle(80)
+            recommendations=item.findChild(QObject,"mcd_peak_center_recommendations")
+            self.assertIsNotNone(recommendations)
+            self.assertTrue(recommendations.property("visible"))
+            centers=self.bridge.snapshot["recommendedCenters"]
+            self.assertTrue(centers)
+            button=next((child for child in recommendations.childItems()
+                         if child.objectName()=="mcd_recommended_center_"+centers[-1]["id"]),None)
+            self.assertIsNotNone(button)
+            self.bridge.setParameter("candidateFilter","Spectrum")
+            self.assertEqual([row["id"] for row in self.bridge.snapshot["recommendedCenters"]],[row["id"] for row in centers])
+            button.clicked.emit();self.wait()
+            self.assertEqual(self.bridge._values["center"],centers[-1]["energy_ev"])
+            self.assertEqual(self.bridge._values["candidateFilter"],"Spectrum")
             surface=item.findChild(QObject,"mcd_plot_surface");self.assertIsNotNone(surface)
             def plot_ready(axes):
                 canvas=self.bridge._canvas

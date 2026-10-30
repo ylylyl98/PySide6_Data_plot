@@ -106,6 +106,7 @@ class DrrAnalysisBridge(DrrAnalysisPlotMixin, QObject):
         self._appearance.changed.connect(self._appearance_changed)
         self._publish_timer = self._timer(0, self.snapshotChanged.emit)
         self._plot_timer = self._timer(0, self._render)
+        self._row_timer = self._timer(0, self._refresh_selected_row)
         self._filter_timer = self._timer(160, self._queue_filter)
         self._p2p_timer = self._timer(250, self._run_p2p)
         self._autosave_timer = self._timer(800, self._autosave)
@@ -659,7 +660,7 @@ class DrrAnalysisBridge(DrrAnalysisPlotMixin, QObject):
         if key == "tab":
             if self._values[key] not in (0, 1): raise ValueError("Unknown analysis page.")
             if value and self._ensure_p2p() and self.p2p["pending"] and not self.p2p["records"]: self._p2p_timer.start()
-        if key == "gate": self._refresh_linecuts(); self._publish(changed=True); return
+        if key == "gate": self._row_timer.start(); self._publish(changed=True); return
         if key == "colorLock" and not value: self._locked_colors.clear()
         self._publish(changed=key not in {"seedPick", "resultDrag", "showCatalog"}, plot=key in {"tab", "display", "showPeaks", "colorLock"})
 
@@ -715,9 +716,15 @@ class DrrAnalysisBridge(DrrAnalysisPlotMixin, QObject):
             self._p2p_generation += 1
             self._p2p_timer.start()
         if name == "row":
-            self._refresh_p2p_inspection()
+            self._row_timer.start()
             self._publish(changed=True)
         else: self._publish(changed=True, plot=True)
+
+    def _refresh_selected_row(self):
+        if self._values["tab"] == 1:
+            self._refresh_p2p_inspection()
+        else:
+            self._refresh_linecuts()
 
     @Slot(str)
     def invoke(self, action):
@@ -940,7 +947,7 @@ class DrrAnalysisBridge(DrrAnalysisPlotMixin, QObject):
     def close(self):
         if self._closed: return
         self._closed = True
-        for timer in (self._publish_timer, self._plot_timer, self._filter_timer, self._p2p_timer, self._autosave_timer): timer.stop()
+        for timer in (self._publish_timer, self._plot_timer, self._row_timer, self._filter_timer, self._p2p_timer, self._autosave_timer): timer.stop()
         for cancellation in self._cancel.values(): cancellation.cancel()
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._appearance.close()

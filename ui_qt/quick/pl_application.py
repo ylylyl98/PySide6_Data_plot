@@ -216,7 +216,6 @@ class PlApplicationMixin:
         self._pl_remember()
         if key == "gate":
             self._update_gate()
-            self._pl_draw_overlays()
         elif key == "viewport":
             self._pl_range_timer.start()
         elif not key.startswith("fix.") and (key != "scale" or not self._values["sideBySide"]):

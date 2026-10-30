@@ -14,8 +14,14 @@ Rectangle {
     readonly property var referenceFiles: state.method === "matched" ? (state.selectedCandidates || []) : (state.files || [])
     property var invalidFields: ({})
     property bool showReport: false
+    property bool showMatchDetails: false
+    property bool pnExternalFiles: false
+    property bool pnManagedViewRequested: false
+    property string pnContextKey: ""
     readonly property bool advancedPage: state.page !== "settings"
-    readonly property bool inlineReferencesVisible: !advancedPage && ["bn", "p", "n", "pn", "custom"].indexOf(state.kind) >= 0
+    readonly property bool pnSimpleVisible: !advancedPage && state.kind === "pn" && !pnExternalFiles
+        && (state.pnExternalReferenceActive !== true || pnManagedViewRequested)
+    readonly property bool inlineReferencesVisible: !advancedPage && !pnSimpleVisible && ["bn", "p", "n", "pn", "custom"].indexOf(state.kind) >= 0
     readonly property bool hasReport: !!state.texts?.report?.length
     readonly property bool previewPaneVisible: advancedPage || (showReport && hasReport)
     readonly property var sourceTypes: [
@@ -31,7 +37,7 @@ Rectangle {
         : state.kind === "custom" ? "Current custom reference"
         : (sourceTypes.find(source => source.key === state.kind)?.title || "Current") + " background"
     readonly property var toolPages: [
-        {key: "pn", title: "P / N drafts and saved versions"},
+        {key: "pn", title: "P+N advanced generation"},
         {key: "fit", title: "Fit sample background"},
         {key: "composite", title: "Build composite"},
         {key: "bn", title: "Compare BN references"},
@@ -52,9 +58,66 @@ Rectangle {
     Component.onCompleted: bridge.setInlineSelectionVisible(inlineReferencesVisible && visible)
     Component.onDestruction: if (bridge) bridge.setInlineSelectionVisible(false)
 
+    Basic.Popup {
+        id: conditionPopup
+        objectName: "drr_matching_conditions_popup"
+        parent: root
+        x: Math.max(8, (root.width - width) / 2)
+        y: Math.max(8, (root.height - height) / 2)
+        width: Math.min(500, root.width - 16)
+        height: Math.min(540, root.height - 16)
+        modal: true
+        focus: true
+        closePolicy: Basic.Popup.CloseOnEscape | Basic.Popup.CloseOnPressOutside
+        padding: 14
+        background: Rectangle { color: root.colors.surface; border.color: root.colors.border; radius: 6 }
+        contentItem: ColumnLayout {
+            spacing: 6
+            Heading { text: "Matching conditions" }
+            Note { text: "Strict by default. Check only fields whose measurement and background values may differ. Differences still require review." }
+            Basic.ScrollView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                contentWidth: availableWidth
+                ColumnLayout {
+                    width: conditionPopup.availableWidth - 8
+                    spacing: 2
+                    Repeater {
+                        model: root.state.matchingConditions || []
+                        delegate: Basic.CheckBox {
+                            required property var modelData
+                            objectName: "drr_matching_allow_" + modelData.key
+                            text: "Allow " + modelData.label + " differences"
+                            checked: modelData.relaxed
+                            enabled: !root.state.busy || root.state.matching
+                            Accessible.name: text
+                            onClicked: root.bridge.setRelaxedCondition(modelData.key, checked)
+                            contentItem: Text {
+                                text: parent.text
+                                color: root.colors.text
+                                leftPadding: parent.indicator.width + parent.spacing
+                                verticalAlignment: Text.AlignVCenter
+                                wrapMode: Text.Wrap
+                            }
+                        }
+                    }
+                }
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                AppButton { colors: root.colors; text: "Reset strict"; objectName: "drr_matching_reset_strict"; onClicked: root.bridge.resetMatchingConditions() }
+                Item { Layout.fillWidth: true }
+                AppButton { colors: root.colors; text: "Done"; onClicked: conditionPopup.close() }
+            }
+        }
+    }
+
     function activateSource(index) {
         let source = sourceTypes[index]
         if (!source || state.busy || invalid) return
+        pnExternalFiles = false
+        pnManagedViewRequested = false
         // A repeated selection must not invalidate an existing BN preview.
         if (state.kind !== source.key) bridge.setChoice("kind", source.choice)
         if (state.page !== "settings") bridge.invoke("page:settings")
@@ -184,7 +247,7 @@ Rectangle {
             decimals: ["spline_intervals", "polynomial_degree", "periodic_components", "gate"].indexOf(field) >= 0 ? 0 : undefined})
         function refreshText() {
             if (!input.dirty && !input.invalid)
-                input.text = !numeric || input.activeFocus ? value : NumericFormat.display(Number(value), numberDescriptor)
+                input.text = numeric ? NumericFormat.display(Number(value), numberDescriptor) : value
         }
         Layout.fillWidth: true
         spacing: 3
@@ -287,22 +350,65 @@ Rectangle {
                     }
                 }
             }
-            Note {
-                id: frameSummary
-                objectName: "drr_background_frame_summary"
-                visible: root.inlineReferencesVisible
-                text: root.state.choices?.frame?.current === 2
-                    ? "Average all frames · Equal file weight"
-                    : (root.state.choices?.frame?.items[root.state.choices.frame.current] || "") + " · Equal file weight"
-                Accessible.name: text
-                Basic.ToolTip.visible: frameHover.hovered
-                Basic.ToolTip.text: (root.state.choices?.frame?.current === 2
-                    ? "All frames are averaged within each file, then files receive equal weight. This does not match frames by gate condition. "
-                    : "Use the selected first or last frame from each file, then weight files equally. ")
-                    + "Change special frame settings in Advanced tools > Reference frames."
-                HoverHandler { id: frameHover }
+            RowLayout {
+                id: assignmentModes
+                objectName: "drr_background_choice_method"
+                Layout.fillWidth: true
+                Layout.columnSpan: root.width >= 680 ? 2 : 1
+                visible: ["bn", "p", "n", "pn"].indexOf(root.state.kind) >= 0
+                spacing: 6
+                function selectMode(index, focus) {
+                    if (root.state.busy || root.invalid) return
+                    index = Math.max(0, Math.min(1, index))
+                    root.bridge.setChoice("method", index)
+                    if (focus) modeButtons.itemAt(index).forceActiveFocus(Qt.TabFocusReason)
+                }
+                Note {
+                    Layout.fillWidth: false
+                    id: frameSummary
+                    objectName: "drr_background_frame_summary"
+                    visible: root.inlineReferencesVisible
+                    text: root.state.method === "matched"
+                        ? (root.state.choices?.frame?.current === 2 ? "Average frames per reference" : (root.state.choices?.frame?.items[root.state.choices.frame.current] || "") + " per reference")
+                        : root.state.choices?.frame?.current === 2
+                        ? "Average all frames · Equal file weight"
+                        : (root.state.choices?.frame?.items[root.state.choices.frame.current] || "") + " · Equal file weight"
+                    Accessible.name: text
+                    Basic.ToolTip.visible: frameHover.hovered
+                    Basic.ToolTip.text: root.state.method === "matched"
+                        ? "Frame selection is applied within each assigned reference; candidate files are not averaged together. Change frames in Advanced tools > Reference frames."
+                        : (root.state.choices?.frame?.current === 2
+                        ? "All frames are averaged within each file, then files receive equal weight. This does not match frames by gate condition. "
+                        : "Use the selected first or last frame from each file, then weight files equally. ")
+                        + "Change special frame settings in Advanced tools > Reference frames."
+                    HoverHandler { id: frameHover }
+                }
+                Repeater {
+                    id: modeButtons
+                    model: ["Common reference · average files", "Match each measurement · recommended"]
+                    delegate: AppButton {
+                        required property int index
+                        required property string modelData
+                        objectName: "drr_background_assignment_" + (index === 0 ? "common" : "matched")
+                        colors: root.colors
+                        text: modelData
+                        description: index === 0 ? "Average selected backgrounds for the whole group." : "Match compatible candidates by acquisition time for each measurement."
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: 1
+                        checkable: true
+                        autoExclusive: true
+                        checked: root.state.method === (index === 0 ? "common" : "matched")
+                        enabled: !root.state.busy && !root.invalid
+                        Accessible.role: Accessible.RadioButton
+                        Accessible.name: modelData
+                        onClicked: assignmentModes.selectMode(index, false)
+                        Keys.priority: Keys.BeforeItem
+                        Keys.onLeftPressed: assignmentModes.selectMode(index - 1, true)
+                        Keys.onRightPressed: assignmentModes.selectMode(index + 1, true)
+                    }
+                }
             }
-            Choice { field: "method"; inlineLabel: true; label: "Use files"; visible: ["bn", "p", "n", "pn"].indexOf(root.state.kind) >= 0 }
+            Note { visible: root.state.recommendMatching === true; text: "Several backgrounds selected: choose how to use them above. For time-based per-measurement suggestions, choose Match each measurement." }
         }
         Loader {
             Layout.fillWidth: true
@@ -337,14 +443,27 @@ Rectangle {
                 id: optionsContent
                 width: settingsOptions.availableWidth - 8
                 spacing: 5
+                Note { visible: ["bn", "p", "n", "pn"].indexOf(root.state.kind) >= 0; text: root.state.method === "matched" ? "Selected files are candidates, not averaged. Each measurement gets a compatible time-based suggestion." : "All measurements share one reference. Multiple selected files are averaged with equal file weight." }
                 Note { text: "The current custom reference is retained until you apply a new draft."; visible: root.state.kind === "custom" }
                 Note { text: "Restored each measurement's saved background. Changing the file selection replaces this mapping."; visible: root.state.hasSavedAssignments === true }
                 Note { text: "Match group uses the experiment's BN candidates. Select files above to set an explicit candidate pool."; visible: root.state.method === "matched" && root.state.candidatePoolAutomatic }
                 RowLayout {
                     Layout.fillWidth: true
                     visible: root.state.method === "matched"
-                    Action { command: "match"; text: "Match group"; primary: true }
-                    Note { text: "All measurements remain in the average. Review the mapping before applying." }
+                    AppButton { colors: root.colors; text: "Matching conditions…"; objectName: "drr_matching_conditions"; onClicked: conditionPopup.open() }
+                    Note { text: root.state.matchingConditionsSummary || "Strict conditions" }
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    visible: root.state.method === "matched"
+                    Action { command: "match"; text: "Rematch group"; primary: true }
+                    Note { text: root.state.matching ? root.state.status : (root.state.matchSummary || "Select candidates to prepare matches.") + " Review every mapping before applying." }
+                    AppButton {
+                        colors: root.colors
+                        compact: true
+                        text: root.showMatchDetails ? "Hide match details" : "Show match details"
+                        onClicked: root.showMatchDetails = !root.showMatchDetails
+                    }
                 }
                 Repeater {
                     model: root.state.mappings || []
@@ -352,7 +471,14 @@ Rectangle {
                         id: mapping
                         required property var modelData
                         Layout.fillWidth: true
-                        Note { text: mapping.modelData.measurement + " → " + mapping.modelData.background + "\n" + mapping.modelData.detail }
+                        Note { text: mapping.modelData.measurement + " → " + mapping.modelData.background }
+                        Note {
+                            visible: !!mapping.modelData.timeSourceLabel
+                            text: "Time gap: " + mapping.modelData.timeGapLabel + " · " + mapping.modelData.timeSourceLabel
+                                + (mapping.modelData.reviewRequired ? " · Needs review" : "")
+                        }
+                        Note { visible: root.showMatchDetails; text: mapping.modelData.detail }
+                        Note { visible: mapping.modelData.overrideNeedsVerification; text: "BN candidate pool: compatibility is checked when selected." }
                         AppComboBox {
                             colors: root.colors
                             Layout.fillWidth: true
@@ -365,8 +491,7 @@ Rectangle {
                         }
                     }
                 }
-                Note { text: (root.state.warnings || []).join("\n"); visible: text.length > 0 }
-                Flag { field: "acknowledged"; text: "I reviewed the matching warnings"; visible: (root.state.warnings || []).length > 0 }
+                Note { text: root.showMatchDetails ? (root.state.warnings || []).join("\n") : (root.state.warnings || []).length + " matching warnings. Show match details to review."; visible: (root.state.warnings || []).length > 0 }
                 Action { command: "page:fit"; text: "Fit / view sample background…"; visible: root.state.kind === "fitted" }
                 Note { text: "Self uses the selected first or last frame in the loaded data, before ratio and derivative processing."; visible: root.state.kind === "self" }
             }
@@ -433,6 +558,13 @@ Rectangle {
             Item { Layout.fillWidth: true }
             Action { command: "page:settings"; text: "Back to background"; visible: root.advancedPage }
             AppButton {
+                colors: root.colors
+                compact: true
+                text: "Back to P+N"
+                visible: !root.advancedPage && root.state.kind === "pn" && !root.pnSimpleVisible
+                onClicked: { root.pnExternalFiles = false; root.pnManagedViewRequested = true }
+            }
+            AppButton {
                 objectName: "drr_background_diagnostics"
                 colors: root.colors
                 compact: true
@@ -487,9 +619,21 @@ Rectangle {
         Loader {
             Layout.fillWidth: true
             Layout.fillHeight: true
-            active: !root.advancedPage
+            active: !root.advancedPage && !root.pnSimpleVisible
             visible: active
             sourceComponent: SettingsPage {}
+        }
+        Loader {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            active: root.pnSimpleVisible
+            visible: active
+            sourceComponent: DrrPnWorkflow {
+                bridge: root.bridge
+                colors: root.colors
+                onChooseFilesRequested: { root.pnExternalFiles = true; root.pnManagedViewRequested = false }
+                onMatchingConditionsRequested: conditionPopup.open()
+            }
         }
         Basic.SplitView {
             visible: root.advancedPage
@@ -530,11 +674,13 @@ Rectangle {
                             }
                         }
                         Choice { field: "generation"; label: "P/N method" }
-                        Choice { field: "pFrame"; label: "P frames" }
-                        Choice { field: "nFrame"; label: "N frames" }
-                        Note { text: "Reconstruction uses all frames and exactly two explicitly selected training repeats. Other measurements remain checks. Generated drafts are not scientifically accepted automatically." }
+                        Choice { field: "pFrame"; label: "P frames"; visible: root.state.choices?.generation?.current !== 1 }
+                        Choice { field: "nFrame"; label: "N frames"; visible: root.state.choices?.generation?.current !== 1 }
+                        Note { visible: root.state.choices?.generation?.current === 1; text: root.state.pnBatchActive ? "Reconstruction uses all acquired frames. Training measurements are prepared within each local assignment. Return to the main background page to review and apply the complete mapping." : "Reconstruction uses all acquired frames. Training measurements are prepared from the current group; other measurements remain checks." }
+                        Flag { field: "manual_training"; text: "Choose training repeats manually"; visible: root.state.choices?.generation?.current === 1 && !root.state.pnBatchActive }
+                        Note { text: root.state.pnTrainingSummary || "" }
                         Repeater {
-                            model: root.state.training || []
+                            model: root.state.flags?.manual_training && root.state.choices?.generation?.current === 1 && !root.state.pnBatchActive ? (root.state.training || []) : []
                             delegate: Basic.CheckBox {
                                 required property var modelData
                                 Layout.fillWidth: true
@@ -700,20 +846,29 @@ Rectangle {
                 }
             }
         }
-        Basic.ProgressBar { Layout.fillWidth: true; indeterminate: true; visible: root.state.busy }
+        Flag { field: "acknowledged"; text: "I reviewed the matching warnings"; visible: !root.pnSimpleVisible && (root.state.warnings || []).length > 0 }
+        Basic.ProgressBar { Layout.fillWidth: true; indeterminate: true; visible: root.state.busy || root.state.matching }
         Note { visible: !root.inlineReferencesVisible || root.state.busy || !!root.state.error; text: root.state.error || root.state.status || ""; color: root.state.error ? root.colors.error : root.colors.muted; maximumLineCount: 4; elide: Text.ElideRight }
         RowLayout {
             Layout.fillWidth: true
-            Note { text: root.invalid ? "Correct the highlighted numeric draft before continuing." : "Previews and saved drafts leave the applied background unchanged." }
-            Action { command: "cancel-task"; text: "Stop task"; visible: root.state.busy; enabled: true }
+            Note { text: root.invalid ? "Correct the highlighted numeric draft before continuing." : root.pnSimpleVisible ? "Generated versions are saved in history. Apply to current group updates the main result." : "Previews and saved drafts leave the applied background unchanged." }
+            Action { command: "cancel-task"; text: "Stop task"; visible: root.state.busy || root.state.matching; enabled: true }
             Action { command: "cancel"; text: "Close"; description: "Close without applying this background draft"; enabled: true }
-            Action { command: "apply"; text: "Apply background"; primary: true; enabled: root.state.applyEnabled && !root.invalid; objectName: "drr_background_apply" }
+            Action { command: root.pnSimpleVisible ? "pn-apply" : "apply"; text: root.pnSimpleVisible ? "Apply to current group" : root.state.method === "matched" ? "Apply matched backgrounds" : "Apply background"; primary: true; enabled: (root.pnSimpleVisible ? root.state.pnCanApply === true : root.state.applyEnabled) && !root.invalid; objectName: "drr_background_apply" }
         }
     }
     Loader { id: fileSelectionLoader; anchors.fill: parent }
     Binding { target: fileSelectionLoader.item; property: "colors"; value: root.colors; when: fileSelectionLoader.item !== null }
     Connections {
         target: root.bridge
+        function onSnapshotChanged() {
+            let key = root.bridge.snapshot.pnContextKey || ""
+            if (key !== root.pnContextKey) {
+                root.pnContextKey = key
+                root.pnExternalFiles = false
+                root.pnManagedViewRequested = false
+            }
+        }
         function onFileSelectionRequested() {
             if (!fileSelectionLoader.item)
                 fileSelectionLoader.setSource(Qt.resolvedUrl("SourceCatalog.qml"), {bridge: root.bridge.fileSelectionBridge, colors: root.colors})

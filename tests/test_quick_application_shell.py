@@ -324,7 +324,8 @@ class QuickApplicationShellTests(unittest.TestCase):
         maximum = self.parameter_item(pane, "app_parameter_xmax")
         self.bridge.calls.clear()
         minimum.forceActiveFocus()
-        self.assertEqual(minimum.property("text"), "1.23456789012345")
+        self.assertEqual(minimum.property("text"), "1.2346")
+        self.assertEqual(self.bridge.snapshot["parameterGroups"][1]["fields"][0]["value"], 1.23456789012345)
         QTest.keyClick(window, Qt.Key_Tab)
         self.assertTrue(maximum.hasActiveFocus())
         QTest.qWait(10)
@@ -355,7 +356,7 @@ class QuickApplicationShellTests(unittest.TestCase):
         self.assertFalse(any(call[0] == "parameter" for call in self.bridge.calls))
         self.assertTrue(minimum.parentItem().property("invalid"))
         QTest.keyClick(window, Qt.Key_Escape)
-        self.assertEqual(minimum.property("text"), draft)
+        self.assertEqual(minimum.property("text"), "1.2346")
         self.assertEqual(self.warnings, [])
 
     def test_advanced_expansion_and_text_drafts_survive_descriptor_updates(self):

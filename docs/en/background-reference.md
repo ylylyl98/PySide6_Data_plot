@@ -27,7 +27,7 @@ Historical evaluation statements about V64/V66, YZ383, 49-degree/94-degree scans
 <a id="workflow"></a>
 ## Background workflow and processing order
 
-The default native interface opens **Background…**. Its source tabs are **Self, BN, P, N, P + N, Fitted**; External is the processing category for selected reference files, not an additional source tab. **Advanced tools…** opens source-specific tools, and **Back to background** returns to the source draft. **Apply background** validates and loads the draft before publishing the result; **Close** retains the applied reference. In the Qt Widgets compatibility dialogs, the corresponding labels include **Background settings…**, **Advanced**, **Apply**, **Fixed current background**, **Use background**, and **Use in settings**. The protocol descriptions below retain Widgets labels where relevant; controls such as **Group BN**, **Assign to selected**, and the detailed advanced inspectors belong to their documented Widgets workflow and are not a promise that the native panel exposes every control. In native settings, **Use files** offers **Same files for all measurements** and **Match files to each measurement**. Saving a draft never substitutes for applying it.
+The default native interface opens **Background…**. Its source tabs are **Self, BN, P, N, P + N, Fitted**; External is the processing category for selected reference files, not an additional source tab. **Advanced tools…** opens source-specific tools, and **Back to background** returns to the source draft. **Apply background** validates and loads the draft before publishing the result; **Close** retains the applied reference. In the Qt Widgets compatibility dialogs, the corresponding labels include **Background settings…**, **Advanced**, **Apply**, **Fixed current background**, **Use background**, and **Use in settings**. The protocol descriptions below retain Widgets labels where relevant; controls such as **Group BN**, **Assign to selected**, and the detailed advanced inspectors belong to their documented Widgets workflow and are not a promise that the native panel exposes every control. Saving a draft never substitutes for applying it.
 
 Self offers **First frame / Last frame**, with Last selected for a new draft. Changing the choice edits only the draft. New BN/P/N/P + N references default to averaging all frames within each file, then averaging files with equal weight. **Advanced tools… → Reference frames** retains explicit first/last-frame overrides. Different gate conditions do not make interchangeable repeated frames; background validation still applies. A saved P/N composite is a **Saved composite · single-frame background**; its output frame selector does not reselect original P/N source frames, whose choices are recorded separately.
 
@@ -43,22 +43,28 @@ For example, nine measurements corrected by one BN and six by another contribute
 
 Opening new CSV measurements first checks for a saved background. Without one, background settings open and no provisional Self plot is calculated. Cancel leaves the selection waiting; **Choose background…** resumes. Reload, returning to DRR, and clearing the background do not silently select Self or repeatedly reopen settings. Missing/conflicting saved references are reported; Reload can retry restoration. Valid saved references, explicitly kept backgrounds, and precomputed DAT/XLSX maps load directly. Basic settings defer preview canvases and fitting imports until needed.
 
-Loading processed raw CSVs through **Load CSV** or the measurement picker restores the latest export recipe for that exact selection: frame choices, member assignments, regional references, and fitted settings. An explicitly kept common background has priority; ordinary reloads retain later manual edits. Restoration runs on the load worker. Missing/incompatible saved references stop loading for review instead of falling back to Self. An explicit P/N candidate pool retains its selected files on group changes and prepares new matches; saved exports do not replace that pool. A frozen saved composite is reused after integrity/native-grid checks without regeneration or requiring unchanged original P/N inputs.
+Loading processed raw CSVs through **Load CSV** or the measurement picker restores the latest export recipe for that exact selection: frame choices, member assignments, regional references, and fitted settings. An explicitly kept common background has priority; ordinary reloads retain later manual edits. Restoration runs on the load worker. Missing/incompatible saved references stop loading for review instead of falling back to Self. Within the same experiment, an explicit candidate pool and matching strategy are retained across group changes, while the old plan and review acknowledgement are discarded and matching runs again; saved exports do not replace that pool. Clearing the background or changing experiments clears the pool. A frozen saved composite is reused after integrity/native-grid checks without regeneration or requiring unchanged original P/N inputs.
 
 **Keep background across groups** retains a common reference across failed/superseded CSV loads and validates it against each new group. Automatic BN comparison can still produce a review while Keep is enabled but cannot automatically replace that reference. Heterogeneous BN assignments and group-specific calibrated BN cannot be fixed. Without an explicit Keep choice or exact saved recipe, the chosen source-type policy governs group changes; new BN mappings await review.
 
 <a id="external"></a>
 ## External references and assignment
 
-Native settings show available files and selected references side by side for BN/P/N/P + N. **Use files** chooses a common reference or per-measurement matching. Source-tab changes retain each source's files and assignment method. Search edits only that source draft; **Show all CSV files** and **Browse files…** permit other files without adding another source type. Clicking/double-clicking a candidate adds it and its checkbox toggles selection. Double-click, Delete, or **Remove** removes a selected entry; **Clear all** also removes hidden/out-of-view references. P/N generation has independent single-role pickers with **Use selected** and **Close**.
+In native Quick, first select a measurement group, then choose P, N or BN. The **Common reference** and **Match each measurement (recommended)** choices are always visible. A new multi-file selection requires an explicit choice of method; an existing recipe is not changed just by selecting files. Native settings show available files and selected references side by side for BN/P/N/P + N. Source-tab changes retain each source's files and assignment method. Search edits only that source draft; **Show all CSV files** and **Browse files…** permit other files without adding another source type. Clicking/double-clicking a candidate adds it and its checkbox toggles selection. Double-click, Delete, or **Remove** removes a selected entry; **Clear all** also removes hidden/out-of-view references. P/N generation has independent single-role pickers with **Use selected** and **Close**.
 
-File lists enumerate filenames/timestamps without inspecting CSV grids or processing history; selection changes do not rescan the folder. **Load catalog** in the P/N tool explicitly loads acquisition details and saved versions. File pickers start in the requesting workflow's folder and discard stale filenames from previous dialogs.
+File lists enumerate filenames/timestamps without inspecting CSV grids or processing history; selection changes do not rescan the folder. The native P/N page loads saved history in the background; acquisition details can be loaded separately. File pickers start in the requesting workflow's folder and discard stale filenames from previous dialogs.
 
 P-only and N-only references are used directly. Candidate ordering prioritizes matching known acquisition conditions, including rotation, with newest-file-first ties. Same-angle candidates without known conflicts are expanded first; other conditions and unknown angles remain labelled and available. Full filenames wrap, and search/asynchronous catalog refresh preserve selected paths. Browse imports are validated only on Apply. The older Widgets inline selector uses one searchable list without the measurement picker's group/files/chosen panes or Add/OK steps: common BN is single-select, direct P/N allows repeated-file checkboxes.
 
 ### Matching a selected P/N pool
 
-P/N starts with **Match selected background files**. Choose **P only**,
+For P, N or BN in native Quick, select **Match each measurement (recommended)** and choose the candidate pool. Candidate-pool changes are combined over 300 ms before matching runs in the background. Review the result for each measurement, including its background, time gap, time source and any review warning, then use **Apply matched backgrounds**. Unresolved measurements must be resolved and warnings acknowledged. Verified capture-run and experiment identities together with compatible conditions and grids permit a P/N batch consistency check: disagreement between individual suggestions and joint timing is flagged without forcing a common background or dropping measurements. Timing consistency does not establish spectral quality. **Common reference** is a separate choice, and keeping a common background fixed remains independent of the matching strategy.
+
+In native matched mode, **Matching conditions…** lists acquisition fields with an **Allow** control for each. Matching is strict by default; select only fields whose known differences may be accepted, or use **Reset strict** to clear the allowances. Role, constant-gate and native spectral-grid requirements cannot be relaxed. Candidates with no known condition differences rank before relaxed candidates, then unknown conditions and timing are considered. Allowed differences show the measurement and background values and require review. Changing the policy cancels the previous match and clears its mapping and acknowledgement before rematching. P/N and BN mappings allow per-measurement manual overrides; BN overrides are revalidated on a worker before publication.
+
+Export metadata records the selected policy, differences and manual assignment reasons in `background_matching_policy` and the measurement assignments. Reopening an exact saved group restores its policy and actual assignments without inferring a new mapping. A group change within the same experiment retains the candidate pool and policy, but requires a new match and review rather than transferring the old approval.
+
+In the Qt Widgets workflow, P/N starts with **Match selected background files**. Choose **P only**,
 **N only** or **P+N composite**, then choose the background files to make
 available for this group. Matching uses only that selected candidate pool;
 an empty pool waits for file selection instead of searching the experiment.
@@ -81,7 +87,7 @@ exact measurement group's saved recipe can be restored later.
 <a id="bn"></a>
 ## Measured BN matching and group comparison
 
-In BN, **Match BN by batch** automatically matches acquisition batches;
+In the Qt Widgets workflow, **Match BN by batch** automatically matches acquisition batches;
 **One BN for all** selects a common reference explicitly.
 **Choose BN manually…** beside the match summary opens that selection directly,
 including when matching finds no result. Its inline list contains measured BN files
@@ -317,17 +323,17 @@ again. Original measurement and BN CSVs are never overwritten.
 <a id="pn-workflow"></a>
 ## P/N selection, versions, and saved backgrounds
 
-**P + N → Advanced tools… → P / N drafts and saved versions…** (Widgets: **Background settings → P/N → P+N composite**) opens the P/N workspace
-for generation and saved versions. Combination and X-range editing are
-available separately under **Advanced tools… → Build composite…** (Widgets: **Background settings → Advanced → Edit background**).
-The P/N page has **P back** and **N back** tabs. Each lists raw CSV
-files from newest to oldest by **file modification time**, not acquisition
-time. Click a row to select or replace that side; the selected P and N remain
-visible below the tabs. The reconstruction protocol takes one original CSV
-per side. Each source's frames are reduced independently, never mixed into
-ordinary baseline-file averaging.
+The native **P + N** page offers creation and saved versions. Select a measurement group first, then original CSV files in the P and N selectors. One file per side retains single-pair reconstruction: review the automatically selected training files; Advanced allows an explicit override. A group containing one sample measurement uses that file and displays **Single measurement draft**. With two selected repeats both are used; with more, the default chooses repeats 1 and 3 when their numbering is known, retaining the others as checks. The existing input validation still applies. Reconstruction uses all frames of each original source independently. **Generate** saves a version in history and opens its preview without applying it. Select **Apply to current group** once to verify and apply the preview; no separate Use in settings step is needed.
 
-The catalog uses known acquisition conditions and the native spectral grid
+**Multiple raw P/N candidates:** selecting multiple files on either side automatically prepares per-measurement assignments. Counts need not match; no separate matching mode or prior manual generation is required. The summary shows measurement, pair and reconstruction-task counts. **Review assignments** expands each measurement's pair, source-to-measurement gaps, P/N mutual gap and warnings. Change a row's compatible pair directly; long lists initially show the top 25 plus the current choice, with an option to show all. **Matching conditions…** permits explicit per-field relaxation while strict candidates remain first. Roles, native grids and reconstruction frame requirements remain mandatory. After compatibility tiers, pairs rank by their worst source-to-measurement gap, then their mutual gap. Complete acquisition timing takes precedence; incomplete logs use filesystem modification-time proxies with warnings. Equal or unavailable timing remains unresolved for explicit selection.
+
+Training is prepared per local segment. Only verified capture batches with compatible sample conditions and gate grids, the same pair and consecutive timing combine; the first two measurements in acquisition order train and the others check. A selected background capture between measurements or a gap over one day splits segments. The one-day boundary is a review rule, not a physical stability certificate; unselected acquisition events are not assessed. Without verified batch evidence, each measurement uses its own **Single measurement draft**. Training files are never borrowed from unrelated groups and separate backgrounds are not averaged.
+
+**Generate required backgrounds** generates or exactly reuses each segment's saved result by raw P/N, training inputs, settings and implementation identity. Switch previews to inspect each result. After reviewing and acknowledging assignment warnings, **Apply to current group** commits the entire mapping once. Failure or cancellation retains saved drafts and the previous application, without partially applying the new mapping. Pair, candidate, policy or group changes invalidate the old preview. Exports retain candidate pools, per-file pairs, timing evidence, training segments and versions; reopening restores historical mappings and provenance without granting a new matching acknowledgement.
+
+Saved history loads in the background without **Load catalog**. Select a saved version to preview and apply it directly. A changed or missing original requires explicit use of the saved snapshot; invalid versions cannot be applied. Only an explicitly applied, fresh version for the unchanged current group is preselected. A shared P/N pair alone does not select a historical version for a new group. The generic saved-composite file matching workflow remains available. Qt Widgets retains **Background settings → P/N → P+N composite** and its existing labels.
+
+The P/N source selectors list raw CSV files by **file modification time**, not acquisition time.The catalog uses known acquisition conditions and the native spectral grid
 to identify files for the current measurement group, including arbitrary
 angles. Select P and N yourself in their respective tabs. After choosing one
 side, the other tab shows each file's time difference from that selection to
@@ -336,19 +342,16 @@ File suffixes such as `_001` and `_002` do not bind pairs. Changing one side
 preserves your selection on the other side. Time proximity is a selection
 aid, not confirmation of acquisition completion or scientific suitability.
 Unknown conditions and conflicts remain available in the selection details.
-**Advanced** contains manual file browsing, frame reduction, generation mode,
-training-file overrides, import, full history, and forced regeneration.
+**Advanced** retains manual file browsing, experimental generation modes, training-file overrides, feature-protection ranges, import and forced regeneration. Manual interval combination remains available separately under **Advanced tools… → Build composite…**.
 
 The default follows the current measurement group. An unchanged group with
-an explicitly applied, fresh version restores that version in **Use saved
-background** mode. A new group starts in **P/N reconstruction draft** mode;
+an explicitly applied, fresh version restores that version. A new group starts with the creation workflow;
 sharing a P/N pair with an earlier group does not select its old V66. Saved
 versions remain available through explicit history selection. Saved-version
 times are displayed in the computer's system local time; stored timestamps
 retain their original timezone information. An explicitly
 used draft remains restorable as that same draft; freshness and restoration
-do not mean scientific acceptance. To reuse a reviewed V66, explicitly
-select its saved version and click **Use background**; generation is unnecessary.
+do not mean scientific acceptance. To reuse a reviewed V66, select its saved version and apply it to the current group; generation is unnecessary.
 
 If no saved result exists, **Import saved…** accepts an existing composite
 CSV with its metadata. Automatic generation remains experimental and starts
@@ -364,8 +367,7 @@ this does not certify suitability or silently generate a replacement.
 This window shows the P and N source curves and the saved background, plus
 generation and version controls. It does not duplicate the main view's
 ΔR/R and d²E maps or compute measurement maps while browsing backgrounds.
-Choose **Use in settings**, then **Apply**, and inspect both complete maps in the main DRR
-view using its processing and display controls.
+After **Apply to current group**, inspect both complete maps in the main DRR view using its processing and display controls.
 An incompatible native spectral grid blocks application. Applying records the
 measurement association and selects one generated CSV in External. The
 chosen group-change strategy determines whether that common reference is
@@ -685,7 +687,7 @@ clears the previous regional report before loading the next one.
 <a id="pn-app"></a>
 ## Raw reconstruction in the app and caching
 
-The app adapter freezes the raw P/N files, two resolved training
+The app adapter freezes the raw P/N files, resolved training
 measurements, complete-grid settings and implementation identity. Other
 selected measurements are checks and do not enter fitting. In **P+N composite**,
 select one matched original CSV in each P/N tab, then click **Generate**.
@@ -695,8 +697,23 @@ a group of two uses both. Unnumbered filenames retain the selected order.
 The summary shows the chosen files, with full paths in its tooltip.
 **Advanced → Choose sample repeats manually** enables an optional override.
 This selection does not scan other groups, rank peaks or change fitting;
-identical inputs reuse the same saved result. Fewer than two distinct raw
-repeats require selecting a measurement group with at least two repeats.
+identical inputs reuse the same saved result. A single selected measurement
+automatically uses the separately versioned `conditioned_single` method.
+
+**Single measurement draft** uses the complete gate scan of one real file,
+without duplicating it into two repeats. It requires at least three strictly
+ordered gate rows and 21 energy points, matching native spectral grids,
+positive finite intensities and equal even P/N frame counts of at least four.
+Classification uses consistency across three gate groups, gate dispersion,
+and conditional P/N half-frame differences. These are conditional evidence,
+not estimates of cross-measurement drift or independent sample repeatability.
+The output uses the conditioned parent without the bounded texture correction
+that requires two sample repeats. Fixed sample resonances can still imitate
+background texture; review dR/R, d2E and feature neighborhoods in the main view.
+Reports, cache identity and saved versions record the single-measurement
+method and its limits. Numerical success does not establish scientific
+validation. Insufficient or unsupported inputs produce an explicit error;
+generation does not silently substitute another method.
 The current raw protocol requires **All frames** for P and N, matching native grids,
 matching sample gate rows, and equal even P/N frame counts of at least four.
 Exclusive-source corrections whose fixed supports conflict with opposite
@@ -706,7 +723,7 @@ background are retained at the source-selection stage; subsequent rendering
 and optional texture correction still follow their separate rules. The
 report records the deferred regions and reasons; generation remains a draft.
 Successful generation saves and previews a draft. It does not apply the
-background; **Use background** is the separate explicit action. The
+background; native **Apply to current group** (Widgets: **Use background**) is the separate explicit action. The
 progress area below the workspace shows completed stages, the current
 operation and elapsed time, with **Cancel generation** available while busy.
 Stage durations vary; this is not a remaining-time estimate. Completion is

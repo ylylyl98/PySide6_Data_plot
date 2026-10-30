@@ -6,7 +6,6 @@ The GUI owns the Agg figure; Quick receives its immutable image frames.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from copy import deepcopy
 from math import isfinite
 from pathlib import Path
 from time import perf_counter
@@ -171,7 +170,9 @@ class CompareBridge(QObject):
         current = len(active) >= 2 and all(key in self._cubes and loaded.get(key) == self._assignments[key] for key in active)
         return dict(workflow="cmp", title="Compare", status=self._status, error=self._error, busy=self._busy,
             catalogBusy=self._catalog_busy or self._grouping_pending, progress=-1 if self._busy else 0, sourcePath=self._folder,
-            assignments=dict(self._assignments), sourceGroups=deepcopy(self._groups), selectedGroup=self._selected_group,
+            assignments=dict(self._assignments), sourceGroups=[dict(group, sources=list(group["sources"]),
+                mapping=dict(group["mapping"]), duplicates={key:list(names) for key,names in group["duplicates"].items()})
+                for group in self._groups], selectedGroup=self._selected_group,
             visibleChannels=self._active_keys(), view=self._values["view"], plotTool=self._plot_tool,
             sideBySide=bool(self._derived) and self._values["view"] == "intensity" and len(self._derived) > 1,
             parameterGroups=self._parameter_groups(), inspectionVisible=bool(self._derived) and not self._error,

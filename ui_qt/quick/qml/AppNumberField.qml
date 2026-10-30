@@ -28,7 +28,7 @@ Item {
     }
     function refreshText() {
         if (!dirty && !committing)
-            input.text = input.activeFocus ? NumericFormat.exact(numericValue) : idleText(numericValue)
+            input.text = idleText(numericValue)
     }
     function resetDraft() { dirty = false; invalid = false; refreshText() }
     function parsedDraft() {
@@ -49,7 +49,7 @@ Item {
             bridge.setParameter(descriptor.key, number)
             committing = false
         }
-        if (!input.activeFocus) refreshText()
+        refreshText()
     }
     function nudge(direction) {
         if (descriptor.readOnly) return

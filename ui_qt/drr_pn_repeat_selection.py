@@ -31,10 +31,11 @@ class TrainingRepeatSelection:
     training_files: tuple[str, ...] = ()
     check_files: tuple[str, ...] = ()
     reason: str = ""
+    single_measurement: bool = False
 
     @property
     def usable(self) -> bool:
-        return len(self.training_files) == 2
+        return len(self.training_files) == 2 or self.single_measurement and len(self.training_files) == 1
 
 
 def _identity(folder: str | Path, name: str | Path) -> str:
@@ -58,6 +59,7 @@ def choose_training_repeats(
     *,
     catalog: Sequence[DrrSource] = (),
     excluded_files: Sequence[str | Path] = (),
+    allow_single: bool = False,
 ) -> TrainingRepeatSelection:
     """Choose sorted repeats 1 and 3, or both when exactly two are selected.
 
@@ -77,7 +79,7 @@ def choose_training_repeats(
     def problem(reason: str) -> TrainingRepeatSelection:
         return TrainingRepeatSelection(check_files=names, reason=reason)
 
-    if len(names) < 2 or any(not name.strip() for name in names):
+    if len(names) < (1 if allow_single else 2) or any(not name.strip() for name in names):
         return problem("Select at least two distinct raw measurement repeats.")
     try:
         identities = tuple(_identity(folder, name) for name in names)
@@ -102,6 +104,10 @@ def choose_training_repeats(
             for source in sources
         ):
             return problem("Select raw measurement repeats; backgrounds and saved composites cannot be training samples.")
+
+    if len(names) == 1:
+        return TrainingRepeatSelection(training_files=names, single_measurement=True,
+            reason="Single measurement draft: uses gate-group stability and P/N half-frame evidence. Between-measurement repeatability unavailable.")
 
     repeats = tuple(_repeat(name) for name in names)
     if len({repeat[0] for repeat in repeats if repeat is not None}) > 1:

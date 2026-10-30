@@ -105,6 +105,36 @@ def isolated():
             self.assertIsNot(b._maps[0][0],old)
             np.testing.assert_allclose(b._maps[0][0]._dptk_quick_render[0].primary.get_array(),other.Z)
 
+        def test_gate_autoscale_repaints_spectrum_without_redrawing_heatmap(self):
+            for workflow in ("pl", "drr"):
+                with self.subTest(workflow=workflow):
+                    b=self.bridge
+                    if workflow=="drr":self.drr()
+                    values=self.z*np.linspace(1.,100.,len(self.gate))[:,None]
+                    cube=DataCube(self.energy,self.gate,values,"Gate (V)","Changing spectrum amplitude","Intensity")
+                    b.set_cube(cube);self.idle()
+                    draws=b._canvas.draw_count
+                    blits=b._canvas.blit_count
+                    b.setParameter("gate",float(self.gate[-1]));self.idle()
+                    self.assertEqual(b._canvas.draw_count,draws,"Gate/Y-tick changes redrew the whole heatmap")
+                    self.assertEqual(b._canvas.blit_count,blits+1,"One gate edit painted the frame twice")
+                    np.testing.assert_array_equal(b._spectra[0][1].get_ydata(),values[-1])
+                    partial=np.asarray(b._canvas.buffer_rgba()).copy()
+                    b._canvas.draw()
+                    np.testing.assert_array_equal(np.asarray(b._canvas.buffer_rgba()),partial)
+
+        def test_color_partial_frame_matches_full_redraw_pixels(self):
+            for workflow in ("pl", "drr"):
+                with self.subTest(workflow=workflow):
+                    b=self.bridge
+                    if workflow=="drr":self.drr()
+                    if workflow=="pl":b.setParameter("vmax",1.5)
+                    else:b._drr_display.setNumber("raw.vmax","0.6")
+                    self.idle()
+                    partial=np.asarray(b._canvas.buffer_rgba()).copy()
+                    b._canvas.draw()
+                    np.testing.assert_array_equal(np.asarray(b._canvas.buffer_rgba()),partial)
+
         def test_export_lock_defers_full_frame_and_gate_without_blocking_events(self):
             b=self.bridge;held=threading.Event();release=threading.Event();expired=[]
             def worker():

@@ -220,13 +220,10 @@ Basic.ApplicationWindow {
             self.background = self.bridge.drrBackgroundBridge
             self.wait(lambda: not self.background.snapshot["busy"])
             self.click(self.find("drr_background_source_bn"))
-            if matched:
-                combo = self.find("drr_background_choice_method")
-                combo.forceActiveFocus(Qt.TabFocusReason)
-                QTest.keyClick(self.window, Qt.Key_Down)
-                QTest.keyClick(self.window, Qt.Key_Return)
-                QTest.qWait(25)
-                self.assertEqual(self.background.snapshot["method"], "matched")
+            # The current picker uses explicit Common/Matched radio buttons;
+            # merely selecting BN is no longer an assignment decision.
+            self.click(self.find("drr_background_assignment_" + ("matched" if matched else "common")))
+            self.assertEqual(self.background.snapshot["method"], "matched" if matched else "common")
             self.catalog = self.background.inlineFileSelectionBridge
             self.wait(lambda: self.catalog.snapshot["selectionOpen"] and not self.catalog.snapshot["busy"])
 
@@ -342,7 +339,7 @@ Basic.ApplicationWindow {
             self.assertFalse(self.bridge.snapshot["canExport"])
             self.assertFalse(self.bridge._background_open)
 
-        def test_matched_homogeneous_keep_after_matching_three_candidates(self):
+        def test_matched_disables_keep_until_common_reference_is_chosen(self):
             self.open_background(matched=True)
             self.choose_references()
             self.click(self.find("drr_background_match"))
@@ -359,8 +356,21 @@ Basic.ApplicationWindow {
                 QTest.qWait(25)
                 self.click(self.find("drr_background_flag_acknowledged"))
                 self.assertTrue(self.background.snapshot["flags"]["acknowledged"])
-            self.keep()
             chosen = tuple(self.root / name for name in plan.rows[0].assignment.baseline_files)
+            # Matching remains a per-measurement policy even when its current
+            # suggestions coincide. Keeping a reference requires an explicit
+            # switch to Common and selection of that shared reference.
+            self.assertFalse(self.background.snapshot["canFix"])
+            self.assertFalse(self.find("drr_background_flag_fixed").isEnabled())
+            self.click(self.find("drr_background_assignment_common"))
+            self.wait(lambda: not self.catalog.snapshot["busy"])
+            if self.catalog.snapshot["selected"]:
+                self.click(self.find("drr_background_inline_clear"))
+            for path in chosen:
+                self.click(self.expose("drr_background_available_" + path.name,
+                    "drr_background_available_files", self.catalog.filesModel, path))
+            self.assertEqual(self.catalog.snapshot["selected"], [str(path) for path in chosen])
+            self.keep()
             self.apply_and_switch(chosen)
 
     result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Cases))

@@ -12,6 +12,7 @@ import math
 from pathlib import Path
 
 from core.drr_baseline_candidates import spectral_grids_match
+from core.drr_match_conditions import normalize_relaxed_conditions
 from core.drr_composite_background import (
     composite_metadata_path, is_composite_background, read_composite_background,
 )
@@ -28,6 +29,15 @@ from core.provenance import _digest_signature, sha256_file
 
 _PLAN = object()
 _CONFIRMATION = object()
+_BATCH_CONFLICT_WARNING = ('Verified capture batch: individual suggestions and joint timing lack '
+                           'an unambiguous consensus; review each assignment.')
+
+# (candidate name, (relaxed-difference tier, unknown count, time gap or unavailable))
+_BatchScore = tuple[str, tuple[int, int, float | None]]
+# (member names, per-member candidate scores)
+_BatchInput = tuple[tuple[str, ...], tuple[tuple[str, tuple[_BatchScore, ...]], ...]]
+# (member names, timing-consensus status, joint candidate gaps)
+_BatchResult = tuple[tuple[str, ...], str, tuple[tuple[str, float], ...]]
 
 
 def _check(cancelled=None):
@@ -71,6 +81,9 @@ class PnMatchPlan:
     directory_snapshot: tuple[tuple[str, tuple[int, ...] | None], ...] = ()
     signature: str = ''
     inventory_warnings: tuple[str, ...] = ()
+    relaxed_conditions: tuple[str, ...] = ()
+    batch_inputs: tuple[_BatchInput, ...] = ()
+    batches: tuple[_BatchResult, ...] = ()
     _verified: object = field(default=None, repr=False, compare=False)
 
     @property
@@ -115,11 +128,37 @@ def _signature(plan):
                    details=row.candidate_details, gap=row.time_gap_seconds, basis=row.timing_basis)
               for row in plan.rows], warnings=plan.warnings, snapshot=plan.snapshot,
         directories=plan.directory_snapshot, inventory_warnings=plan.inventory_warnings,
+        relaxed_conditions=plan.relaxed_conditions, batch_inputs=plan.batch_inputs, batches=plan.batches,
         resolution=plan.resolution.to_dict())
     return hashlib.sha256(json.dumps(payload, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
 
 def _finish(plan, rows):
+    rows = [replace(row, warnings=tuple(w for w in row.warnings if w != _BATCH_CONFLICT_WARNING)) for row in rows]
+    row_map = {row.measurement_file: row for row in rows}
+    batches = []
+    for members, scores in plan.batch_inputs:
+        score_map = {name: dict(values) for name, values in scores}
+        shared = set(score_map[members[0]])
+        for name in members[1:]:
+            shared.intersection_update(score_map[name])
+        # Preserve per-file condition priority before comparing joint timing.
+        shared = {candidate for candidate in shared if all(
+            score_map[name][candidate][:2] == min(score[:2] for score in score_map[name].values())
+            for name in members)}
+        gaps = sorted((sum(score_map[name][candidate][2] for name in members), candidate)
+                      for candidate in shared if all(score_map[name][candidate][2] is not None for name in members))
+        chosen = {row_map[name].baseline_file for name in members}
+        ambiguous = len(gaps) > 1 and math.isclose(gaps[0][0], gaps[1][0], abs_tol=1e-6, rel_tol=0)
+        conflict = ('' in chosen or len(chosen) != 1 or not gaps or ambiguous or next(iter(chosen)) != gaps[0][1])
+        # Consensus describes timing only; existing per-row review warnings remain.
+        status = 'conflict' if conflict else 'consensus'
+        batches.append((members, status, tuple((candidate, gap) for gap, candidate in gaps)))
+        if conflict:
+            for name in members:
+                row_map[name] = replace(row_map[name], warnings=(*row_map[name].warnings, _BATCH_CONFLICT_WARNING))
+    rows = [row_map[row.measurement_file] for row in rows]
+    plan = replace(plan, batches=tuple(batches))
     assignments = tuple(row.assignment for row in rows if row.assignment is not None)
     unresolved = tuple(row.measurement_file for row in rows if row.assignment is None)
     recipes = {(item.baseline_files, item.baseline_which) for item in assignments}
@@ -261,33 +300,40 @@ def _timing(root, sources, cancelled):
     """
     from core.drr_measured_bn import MeasuredBnMatcher
     if not sources:
-        return {}, '', ''
+        return {}, '', '', None
     clock = MeasuredBnMatcher(root, sources, (), cancelled=cancelled, include_capture_contexts=True)
     clock.capture_context(sources[0])
     timing = clock._timing
-    return timing.times, timing.basis, timing.error
+    return timing.times, timing.basis, timing.error, clock
 
 
-def _compatibility(measurement, candidate):
+def _compatibility(measurement, candidate, relaxed_conditions=()):
     if not spectral_grids_match(measurement, candidate.source):
         return None
-    unknown = set()
+    unknown, relaxed = set(), []
     for source in candidate.origins:
         differences, absent = _compare(measurement, source)
-        if differences:
+        if any(item.split(':', 1)[0] not in relaxed_conditions for item in differences):
             return None
+        relaxed.extend(f"Measurement {measurement.filename} / background {source.filename}: {item}" for item in differences)
         unknown.update(absent)
     for first in candidate.origins:
-        if any(_compare(first, other)[0] for other in candidate.origins):
-            return None
-    return unknown
+        for other in candidate.origins:
+            differences, _ = _compare(first, other)
+            if any(item.split(':', 1)[0] not in relaxed_conditions for item in differences):
+                return None
+            relaxed.extend(f"Background {first.filename} / background {other.filename}: {item}" for item in differences)
+    return unknown, tuple(dict.fromkeys(relaxed))
 
 
-def _rank(measurement, candidate, root, times, timing_basis, timing_error):
-    unknown = _compatibility(measurement, candidate)
-    if unknown is None:
+def _rank(measurement, candidate, root, times, timing_basis, timing_error, relaxed_conditions=()):
+    compatibility = _compatibility(measurement, candidate, relaxed_conditions)
+    if compatibility is None:
         return None
+    unknown, differences = compatibility
     warnings = list(candidate.warnings)
+    if differences:
+        warnings.append("Relaxed acquisition conditions; review differences: " + "; ".join(differences))
     if unknown:
         warnings.append('Unknown acquisition conditions: ' + ', '.join(sorted(unknown)) + '.')
     paths = [resolve_source_path(root, source.source) for source in candidate.timed_origins]
@@ -305,23 +351,27 @@ def _rank(measurement, candidate, root, times, timing_basis, timing_error):
         warnings.append(timing_error)
     if gap is not None and gap > 86400:
         warnings.append(f'Original source time gap {gap:g} s exceeds one day; review this assignment.')
-    evidence = 'Same ordered native spectral grid; no known acquisition-condition conflict'
+    evidence = ('Same ordered native spectral grid; relaxed acquisition-condition differences' if differences
+                else 'Same ordered native spectral grid; no known acquisition-condition conflict')
+    if differences:
+        evidence += '; ' + '; '.join(differences)
     if gap is not None:
         evidence += f'; original source time gap {gap:g} s ({basis})'
     else:
         evidence += '; original acquisition time unavailable'
     # The worst source distance prevents a nearby P from hiding a remote N.
-    score = (len(unknown), gap if gap is not None else math.inf)
+    score = (int(bool(differences)), len(unknown), gap if gap is not None else math.inf)
     return score, evidence, tuple(dict.fromkeys(warnings)), gap, basis
 
 
-def build_pn_match_plan(root, selected, *, kind, candidate_files=None, which='all', cancelled=None):
+def build_pn_match_plan(root, selected, *, kind, candidate_files=None, which='all', cancelled=None, relaxed_conditions=()):
     """Suggest existing backgrounds, retaining ambiguous rows for manual choice.
 
     Known condition, role and native-grid conflicts are never eligible. Unknown
     conditions remain warnings. Equal best evidence never selects by filename.
     """
     root = Path(root).resolve()
+    relaxed_conditions = normalize_relaxed_conditions(relaxed_conditions)
     if kind not in ('p', 'n', 'pn') or which not in ('first', 'last', 'all'):
         raise ValueError('Choose P only, N only or P+N, and a valid frame method.')
     selected = tuple(selected)
@@ -385,11 +435,12 @@ def build_pn_match_plan(root, selected, *, kind, candidate_files=None, which='al
         before.setdefault(path, signature)
     snapshot = _stats(paths)
     available = [candidate for candidate in available
-                 if any(_compatibility(measurement, candidate) is not None for measurement in measurements)]
+                 if any(_compatibility(measurement, candidate, relaxed_conditions) is not None for measurement in measurements)]
     all_sources = {source.source: source for source in (*measurements,
         *(source for candidate in available for source in candidate.timed_origins))}
-    times, timing_basis, timing_error = _timing(root, tuple(all_sources.values()), cancelled)
+    times, timing_basis, timing_error, clock = _timing(root, tuple(all_sources.values()), cancelled)
     rows = []
+    score_maps = {}
     by_name = {source.source: source for source in measurements}
     for name in selected:
         _check(cancelled)
@@ -398,18 +449,19 @@ def build_pn_match_plan(root, selected, *, kind, candidate_files=None, which='al
             continue
         ranked = []
         for candidate in available:
-            result = _rank(by_name[name], candidate, root, times, timing_basis, timing_error)
+            result = _rank(by_name[name], candidate, root, times, timing_basis, timing_error, relaxed_conditions)
             if result is not None:
                 ranked.append((result[0], candidate.name, *result[1:]))
         ranked.sort(key=lambda value: (value[0], value[1]))
+        score_maps[name] = tuple((item[1], (item[0][0], item[0][1], item[0][2] if math.isfinite(item[0][2]) else None)) for item in ranked)
         options = tuple(item[1] for item in ranked)
         details = tuple((item[1], item[2], item[3], item[4], item[5]) for item in ranked)
         if not ranked:
             rows.append(PnMatchRow(name, evidence='No compatible existing background for this measurement.'))
             continue
         best = ranked[0]
-        tied = len(ranked) > 1 and (best[0][0] == ranked[1][0][0]
-            and (best[0][1] == ranked[1][0][1] or math.isclose(best[0][1], ranked[1][0][1], abs_tol=1e-6, rel_tol=0)))
+        tied = len(ranked) > 1 and (best[0][:2] == ranked[1][0][:2]
+            and (best[0][2] == ranked[1][0][2] or math.isclose(best[0][2], ranked[1][0][2], abs_tol=1e-6, rel_tol=0)))
         if tied or timing_error:
             rows.append(PnMatchRow(name, evidence=('Acquisition timing needs review; choose a background explicitly.'
                 if timing_error else 'Equally suitable backgrounds; choose one explicitly.'),
@@ -417,12 +469,24 @@ def build_pn_match_plan(root, selected, *, kind, candidate_files=None, which='al
                 candidate_files=options, candidate_details=details))
             continue
         row_warnings = list(best[3])
-        if len(ranked) > 1 and best[0][0] == ranked[1][0][0] and ranked[1][0][1] - best[0][1] < 60:
+        if len(ranked) > 1 and best[0][:2] == ranked[1][0][:2] and ranked[1][0][2] - best[0][2] < 60:
             row_warnings.append('The next candidate is less than 60 s farther away; review the choice.')
         assignment = DrrMeasurementAssignment(name, 'External', (best[1],), which,
             selection_reason=f'P/N match ({kind}): ' + best[2])
         rows.append(PnMatchRow(name, assignment, best[2], tuple(row_warnings), options,
                                best[4], best[5], details))
+    groups = {}
+    if kind in ('p', 'n') and clock is not None:
+        from core.drr_bn_batches import _compatibility_key
+        for source in measurements:
+            _check(cancelled)
+            context = clock.capture_context(source)
+            if context.verified_run:
+                key = (context.run_id, context.experiment_id, _compatibility_key(source),
+                       extract_wavelength_center_nm(source.filename))
+                groups.setdefault(key, []).append(source.source)
+    batch_inputs = tuple((tuple(members), tuple((name, score_maps.get(name, ())) for name in members))
+                         for members in groups.values() if len(members) > 1)
     _check(cancelled)
     changed = (not _unchanged(tuple(before.items())) or not _unchanged(snapshot)
                or not _unchanged(directory_snapshot) or not _unchanged(timing_directories)
@@ -431,7 +495,7 @@ def build_pn_match_plan(root, selected, *, kind, candidate_files=None, which='al
         rows = [PnMatchRow(name, evidence='Inputs changed during matching; refresh and retry.') for name in selected]
     plan = PnMatchPlan(str(root), selected, kind, which, candidates, candidate_files is None, (),
         DrrBackgroundResolution(), snapshot=snapshot, directory_snapshot=_stats(directories),
-        inventory_warnings=tuple(dict.fromkeys(warnings)), _verified=_PLAN)
+        inventory_warnings=tuple(dict.fromkeys(warnings)), relaxed_conditions=relaxed_conditions, batch_inputs=batch_inputs, _verified=_PLAN)
     return _finish(plan, rows)
 
 

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import csv
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
 import os
 import tempfile
+from threading import RLock
 from typing import Any, Mapping
 
 import numpy as np
@@ -19,6 +21,28 @@ from core.mcd_valley_split import compute_valley_splitting
 
 HISTORY_DIR = Path("Processed Data") / "MCD Peak Shift"
 HISTORY_INDEX_NAME = ".peak_shift_history.json"
+_HISTORY_WRITE_LOCK = RLock()
+
+
+@contextmanager
+def peak_shift_history_lock(experiment_folder):
+    """Serialize index updates from native and compatibility export workers."""
+    with _HISTORY_WRITE_LOCK:
+        if not experiment_folder:
+            yield
+            return
+        root = Path(experiment_folder).expanduser().resolve() / HISTORY_DIR
+        root.mkdir(parents=True, exist_ok=True)
+        lock = root / (HISTORY_INDEX_NAME + ".lock")
+        try:
+            with lock.open("x"):
+                pass
+        except FileExistsError:
+            raise RuntimeError("Another MCD Peak Shift save is updating this experiment's history.") from None
+        try:
+            yield
+        finally:
+            lock.unlink(missing_ok=True)
 
 
 def source_descriptor(
@@ -65,6 +89,11 @@ def record_peak_shift_history(
     settings: Mapping[str, Any] | None = None,
 ) -> Path:
     """Write a CSV sidecar and, when possible, a small experiment index."""
+    with peak_shift_history_lock(experiment_folder):
+        return _record_peak_shift_history(csv_path, experiment_folder=experiment_folder, source=source, settings=settings)
+
+
+def _record_peak_shift_history(csv_path, *, experiment_folder, source, settings):
     csv_file = Path(csv_path).resolve()
     created = datetime.now(timezone.utc).isoformat()
     payload = {

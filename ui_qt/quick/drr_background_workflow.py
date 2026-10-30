@@ -57,6 +57,11 @@ class BackgroundDraft:
     pn_candidates: tuple[str, ...] | None = None
     pn_warnings_acknowledged: bool = False
     saved_assignments: tuple = ()
+    assignment_method: str = "common"
+    assignment_method_explicit: bool = False
+    relaxed_conditions: tuple[str, ...] = ()
+    saved_matching_review: dict | None = None
+    batch_result: object = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +76,26 @@ class BackgroundRecipe:
     auto_bn_compare: bool = False
     draft: BackgroundDraft | None = None
     context: BackgroundContext | None = None
+
+
+def matching_pool_draft(draft):
+    """Carry only an explicit matching strategy, never a previous group's proof."""
+    if (draft is None or draft.kind not in {"bn", "p", "n", "pn"} or draft.fixed
+            or draft.version is not None or draft.calibration is not None):
+        return None
+    plan = draft.bn_plan or draft.pn_plan
+    if draft.assignment_method != "matched" and plan is None:
+        return None
+    pool = draft.bn_candidates if draft.kind == "bn" else draft.pn_candidates
+    if pool is None and plan is not None:
+        pool = tuple(plan.candidate_files)
+    if pool is None and draft.kind != "bn":
+        pool = tuple(dict.fromkeys(name for item in draft.saved_assignments
+                                  for name in item.baseline_source_files))
+    candidates = {"bn_candidates" if draft.kind == "bn" else "pn_candidates": pool}
+    return BackgroundDraft(kind=draft.kind, which=draft.which,
+        auto_bn_compare=draft.auto_bn_compare, assignment_method="matched", assignment_method_explicit=True,
+        relaxed_conditions=draft.relaxed_conditions, **candidates)
 
 
 @dataclass(frozen=True)
@@ -103,8 +128,11 @@ def _signatures(context, draft, *, digest=False):
     """Include sidecars; native composites bind their frozen source snapshots."""
     from core.drr_composite_background import composite_metadata_path
     names = list(context.measurements) + list(draft.files)
-    names.extend(draft.bn_candidates or ())
-    names.extend(draft.pn_candidates or ())
+    if not draft.saved_assignments:
+        # A restored exact-group mapping depends on the references actually
+        # used, rather than unused candidates retained as historical context.
+        names.extend(draft.bn_candidates or ())
+        names.extend(draft.pn_candidates or ())
     if draft.calibration:
         names.extend(item["path"] for item in draft.calibration["payload"]["source_identity"]["baseline_files"])
     plan = draft.bn_plan or draft.pn_plan
@@ -124,6 +152,9 @@ def _signatures(context, draft, *, digest=False):
             paths.append(metadata)
         if ".drr_bn_calibration" in path.parts and path.with_suffix(".npz").is_file():
             paths.append(path.with_suffix(".npz"))
+    if draft.batch_result is not None:
+        from ui_qt.quick.drr_pn_batch_workflow import batch_dependency_paths
+        paths.extend(batch_dependency_paths(context, draft.batch_result))
     values = []
     for path in dict.fromkeys(paths):
         check_load_cancelled()
@@ -162,7 +193,7 @@ def _recipe(context, draft):
     if assignments:
         files = tuple(dict.fromkeys(name for item in assignments for name in item.baseline_source_files))
     common = not assignments or len({(item.baseline_mode, item.baseline_files, item.baseline_which, item.regions) for item in assignments}) == 1
-    fixed = (draft.fixed and mode == "External" and common and draft.calibration is None
+    fixed = (draft.fixed and draft.assignment_method != "matched" and mode == "External" and common and draft.calibration is None
         and all(item.baseline_mode == "External" for item in assignments))
     if not assignments and mode != "Fitted (sample)":
         assignments = tuple(DrrMeasurementAssignment(name, mode, files if mode == "External" else (), draft.which,
@@ -180,8 +211,28 @@ def prepare_application(context, draft):
         raise TypeError("A native background context and draft are required.")
     if draft.kind not in {"self", "bn", "p", "n", "pn", "custom", "fitted"} or draft.which not in {"first", "last", "all"}:
         raise ValueError("Unknown background source or frame method.")
+    if draft.assignment_method not in {"common", "matched"}:
+        raise ValueError("Choose a background assignment method.")
+    from core.drr_match_conditions import normalize_relaxed_conditions
+    relaxed = normalize_relaxed_conditions(draft.relaxed_conditions)
+    draft = replace(draft, relaxed_conditions=relaxed)
+    plan = draft.bn_plan or draft.pn_plan
+    if plan is not None and relaxed != normalize_relaxed_conditions(getattr(plan, "relaxed_conditions", ())):
+        raise ValueError("Matching conditions changed; match again and review the new assignments.")
+    if plan is None and not draft.saved_assignments:
+        # Common references and generated/calibrated backgrounds do not use the
+        # selectable matching policy. Keep it out of their applied provenance.
+        draft = replace(draft, relaxed_conditions=())
+    if (draft.assignment_method == "matched" and not
+            (draft.bn_plan or draft.pn_plan or draft.saved_assignments)):
+        raise ValueError("Wait for background matching and review every measurement before applying.")
     if draft.kind == "self" and draft.which == "all":
         raise ValueError("Self background requires the first or last frame.")
+    if draft.batch_result is not None:
+        from ui_qt.quick.drr_pn_batch_workflow import require_pn_batch_current
+        require_pn_batch_current(context, draft.batch_result)
+        if draft.saved_assignments != draft.batch_result.assignments:
+            raise ValueError('P/N batch assignments changed after review.')
     before = _signatures(context, draft, digest=True)
     verification = None
     gate_key, gate_assessment = None, None
@@ -287,6 +338,9 @@ def prepare_application(context, draft):
             _GATE_ASSESSMENTS.move_to_end(gate_key)
             while len(_GATE_ASSESSMENTS) > 32:
                 _GATE_ASSESSMENTS.popitem(last=False)
+    if draft.batch_result is not None:
+        from ui_qt.quick.drr_pn_batch_workflow import prepare_pn_batch_proof
+        verification = prepare_pn_batch_proof(context, draft.batch_result)
     return PreparedBackgroundApplication(context, draft, _recipe(context, draft), verification, after, _PREPARED)
 
 
@@ -301,6 +355,10 @@ def commit_application(prepared, *, current_context, settings):
     if prepared.context != current_context or not _unchanged(prepared.signatures):
         raise ValueError("Measurement context or background inputs changed; the previous background was retained.")
     draft, verification = prepared.draft, prepared.verification
+    if draft.batch_result is not None:
+        from ui_qt.quick.drr_pn_batch_workflow import pn_batch_proof_is_current
+        if not pn_batch_proof_is_current(current_context, draft.batch_result, verification):
+            raise ValueError("P/N batch inputs changed after validation; the previous background was retained.")
     if draft.bn_plan is not None:
         from core.drr_bn_matching import BnMatchCache
         try:
@@ -353,7 +411,9 @@ def prepare_fixed_application(old_recipe, new_context):
         raise ValueError("Heterogeneous per-measurement assignments cannot be fixed across groups.")
     files, which, regions = next(iter(recipes))
     draft = replace(old_recipe.draft, files=files, which=which, regions=regions, fixed=True,
-        bn_plan=None, pn_plan=None, saved_assignments=(), bn_candidates=None,
+        bn_plan=None, pn_plan=None, saved_assignments=(), bn_candidates=None, batch_result=None,
+        assignment_method="common",
+        relaxed_conditions=(),
         pn_candidates=files if old_recipe.draft.kind in {"p", "n", "pn"} else None,
         bn_warnings_acknowledged=False, pn_warnings_acknowledged=False)
     return prepare_application(new_context, draft)
@@ -434,7 +494,9 @@ def generate_pn(context, pair, *, mode="reconstruction", training_files=(), p_wh
         if p_which != "all" or n_which != "all":
             raise ValueError("P/N reconstruction uses all acquired frames in each original source.")
         request = prepare_reconstruction_request(context.folder, pair, context.measurements,
-            training_files=training_files, method="conditioned_bounded", feature_protection=feature_protection)
+            training_files=training_files,
+            method="conditioned_single" if len(context.measurements) == 1 else "conditioned_bounded",
+            feature_protection=feature_protection)
         function = lambda: generate_reconstruction_background(context.folder, pair, request=request,
             cancelled=cancelled, progress=progress, force_source_refit=force)
         key = request.key
@@ -545,9 +607,9 @@ def _reconstruction_import_dependencies(folder, path, settings, api, *, pair, p_
     from core.drr_pn_reconstruction.pipeline import (
         ALGORITHM_VERSION as original_version, GENERALIZED_ALGORITHM_VERSION,
         LOCAL_ALGORITHM_VERSION, CONDITIONED_ALGORITHM_VERSION,
-        CONDITIONED_BOUNDED_ALGORITHM_VERSION,
+        CONDITIONED_BOUNDED_ALGORITHM_VERSION, CONDITIONED_SINGLE_ALGORITHM_VERSION,
         PROTOCOL, GENERALIZED_PROTOCOL, LOCAL_PROTOCOL, CONDITIONED_PROTOCOL,
-        CONDITIONED_BOUNDED_PROTOCOL,
+        CONDITIONED_BOUNDED_PROTOCOL, CONDITIONED_SINGLE_PROTOCOL,
     )
     document = read_composite_background(path)
     source = next(s for s in document.sources if s.key == document.default_source)
@@ -556,24 +618,28 @@ def _reconstruction_import_dependencies(folder, path, settings, api, *, pair, p_
     protocols = {original_version: PROTOCOL, GENERALIZED_ALGORITHM_VERSION: GENERALIZED_PROTOCOL,
                  LOCAL_ALGORITHM_VERSION: LOCAL_PROTOCOL,
                  CONDITIONED_ALGORITHM_VERSION: CONDITIONED_PROTOCOL,
-                 CONDITIONED_BOUNDED_ALGORITHM_VERSION: CONDITIONED_BOUNDED_PROTOCOL}
+                 CONDITIONED_BOUNDED_ALGORITHM_VERSION: CONDITIONED_BOUNDED_PROTOCOL,
+                 CONDITIONED_SINGLE_ALGORITHM_VERSION: CONDITIONED_SINGLE_PROTOCOL}
     if method not in protocols:
         raise ValueError(f"Unsupported reconstruction algorithm: {method!r}. "
                          "It cannot be imported as a fresh reconstruction with this implementation.")
     if (p_which, n_which) != ("all", "all"):
         raise ValueError("Reconstruction import needs All frames for both sources.")
     expected = dict(protocols[method])
+    single = method == CONDITIONED_SINGLE_ALGORITHM_VERSION
+    training_count = 1 if single else 2
     analysis = settings.get("sample_analysis")
     if analysis is not None:
-        if len(analysis.get("training_files", [])) != 2:
-            raise ValueError("Reconstruction settings need the original two training-file roles.")
+        if len(analysis.get("training_files", [])) != training_count:
+            raise ValueError(f"Reconstruction settings need the original {training_count} training-file roles.")
         expected["sample_analysis"] = {
             "training_files": analysis.get("training_files", []),
             "subset": "all gates and full native energy", "y_axis": "auto",
-            "split_policy": "explicit-two-training-repeats; all other selected files check only"}
+            "split_policy": ("single-measurement gate-group evidence; independent sample repeatability unavailable"
+                if single else "explicit-two-training-repeats; all other selected files check only")}
     if settings.get("feature_protection"):
         from core.drr_pn_reconstruction.feature_protection import normalize_feature_protection
-        if method != CONDITIONED_BOUNDED_ALGORITHM_VERSION:
+        if method not in (CONDITIONED_BOUNDED_ALGORITHM_VERSION, CONDITIONED_SINGLE_ALGORITHM_VERSION):
             raise ValueError("Feature protection requires the conditioned bounded reconstruction method.")
         expected["feature_protection"] = normalize_feature_protection(settings["feature_protection"])
     if settings != expected or report.get("settings") != settings:
@@ -593,11 +659,11 @@ def _reconstruction_import_dependencies(folder, path, settings, api, *, pair, p_
                     or _file_digest(resolve_source_path(folder, selected[0])) != sources[0].get("sha256")):
                 raise ValueError("Reconstruction export does not match the selected original P/N roles.")
         return _assisted_import_dependencies(folder, path, settings, api)
-    if [row.get("role") for row in records] != ["P", "N", "training", "training"]:
-        raise ValueError("Reconstruction export needs the original P/N and two training-file roles.")
+    if [row.get("role") for row in records] != ["P", "N", *(["training"] * training_count)]:
+        raise ValueError(f"Reconstruction export needs the original P/N and {training_count} training-file roles.")
     paths = tuple(resolve_source_path(folder, row["path"]) for row in records)
     selected = tuple(resolve_source_path(folder, name) for name in (*pair.p_files, *pair.n_files))
-    if len(set(paths)) != 4 or paths[:2] != selected:
+    if len(set(paths)) != 2 + training_count or paths[:2] != selected:
         raise ValueError("Reconstruction export does not match the selected original P/N roles.")
     if analysis is not None and tuple(resolve_source_path(folder, name)
                                      for name in analysis.get("training_files", [])) != paths[2:]:

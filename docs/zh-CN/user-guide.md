@@ -251,9 +251,13 @@ Power 支持单个表头式扫描（`Power_uW`、可选 `stage_pos` 和数值波
 
 MCD 加载含数值 `B_T`、角度和波长列的 B 扫描 CSV，配对相反角度帧，扣可选分角度 dark/offset 光谱，并以各角度自身近零场参考归一化。在选定实际 B 下检查原始/校正配对光谱和 MCD 截线。来源、dark 参考及输出目录对话框职责不同；改输出目录保留来源选择。
 
+在 MCD 或 MCD Peak Shift 的 **Data → Select file…** 打开宽文件选择列表。长文件名完整换行，可搜索文件名或文件夹、筛选处理状态；确认或复制完整路径后，点击 **Open selected** 加载。**Browse files…** 将外部 CSV 暂存到同一选择器，取消不会切换当前数据。
+
 漂移选项包括全局增益、逐对 scale/offset，以及限制在非共振区间的稳健线性/二次光谱背景校正。新会话默认全局增益加逐对二次光谱基线。**Select protected regions** 打开反射图，拖动标记每个需保护共振；仅当前 MCD(B) 窗口及启用保护区被排除，足够宽的非保护区变成蓝色背景拟合带。增删、编辑、启停区域立即重算，再使用留出点比较线性/二次模型。手绘区域在重算及重开时保留。
 
 完整 B–能量图与截线共享能量窗口。处理设置短暂合并后自动重算，**Recalculate now** 可重试。MCD(B) 分别处理升/降场分支，提供有符号均值、按场符号的绝对均值及有符号积分。初始只显示 signed mean，也是主要 PNG/设置指标；幅值/积分作为可选诊断，CSV 保留全部列。紧凑导出包含图 PNG/DAT、MCD(B) PNG/CSV、配对诊断及可复现 JSON。
+
+普通 MCD 图上方的 **Peak center (eV)** 显示最多六个推荐积分中心。点击能量按钮即可更新 MCD(B) 积分窗口；Feature catalog 筛选为 Spectrum 或 History 时仍会显示这些推荐。未找到可靠中心时，可手动填写 **Center energy (eV)**。
 
 ### 已保存 MCD Extract / Compare
 
@@ -264,6 +268,8 @@ MCD 加载含数值 `B_T`、角度和波长列的 B 扫描 CSV，配对相反角
 ### MCD Peak Shift 与 Organizer
 
 MCD Peak Shift 直接复用已接受处理产品，不重新加载，支持原始/导数特征跟踪、实际磁场选择、场拟合、手动特征合并及 CSV/元数据导出。MCD Organizer 独立打开，提供已保存序列对比、能量分组、斜率、Curie-Weiss 拟合、场/温度范围扫描、批量 theta 和科学导出。Tools 提供独立 Organizer 入口。
+
+原生 Peak Shift 保存到 `Processed Data/MCD Peak Shift/<source>_PeakShift/`。相同峰定位、方法和结果身份再次保存时更新原 CSV 和元数据，其他分析并列保留。保存时间写入元数据，已有时间戳文件继续保留。
 
 ## Slides 幻灯片
 

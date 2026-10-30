@@ -144,6 +144,37 @@ class QuickPresentationTests(unittest.TestCase):
         self.bridge.clearQueue()
         self.assertEqual(self.bridge.snapshot["preview"]["images"], [])
 
+    def test_large_selection_updates_one_contiguous_range_and_keeps_hidden_order(self):
+        model = self.bridge.availableModel
+        rows = [dict(path=str(self.root/f"plot_{index:04}.png"), selected=False, name=f"plot_{index:04}.png")
+                for index in range(4000)]
+        model.replace(rows)
+        changes = []
+        model.dataChanged.connect(lambda first,last,roles: changes.append((first.row(),last.row())))
+        self.bridge.selectAll("available")
+        self.assertEqual(changes, [(0,3999)])
+        self.assertEqual(self.bridge.snapshot["lastSelectedIndex"],3999)
+        hidden_order = self.bridge._selected_available[:]
+        model.replace([dict(row) for row in rows[:2000]])
+        self.assertEqual(self.bridge.snapshot["lastSelectedIndex"],1999)
+        self.assertEqual(self.bridge.snapshot["selectedAvailableCount"],2000)
+        self.bridge.selectAvailableRow(0,Qt.ControlModifier.value)
+        self.assertEqual(self.bridge._selected_available,hidden_order[1:])
+        self.assertEqual(self.bridge.snapshot["selectedAvailableCount"],1999)
+
+    def test_mcd_summary_reuses_catalog_until_records_or_queue_change(self):
+        from core.presentation import PlotImage
+        path=self.root/"sample_MCD_Combo_map.png"
+        self.bridge._records=[PlotImage(path,path.name,"MCD",1.,"mcd_combo")]
+        self.bridge._queue=[str(path)]
+        with patch.object(self.bridge,"_calculate_mcd_status",wraps=self.bridge._calculate_mcd_status) as calculate:
+            self.assertIn("add its matching",self.bridge.snapshot["mcdStatus"])
+            self.bridge.snapshot
+            self.assertEqual(calculate.call_count,1)
+            self.bridge._records=[PlotImage(path,path.name,"PL",2.,"other")]
+            self.assertEqual(self.bridge.snapshot["mcdStatus"],"")
+            self.assertEqual(calculate.call_count,2)
+
     def test_actual_powerpoint_copy_append_deduplication_and_png_integrity(self):
         paths = [self.png(f"PL/run/plot_{index:02d}.png", index) for index in range(13)]
         png_hashes = [hashlib.sha256(path.read_bytes()).hexdigest() for path in paths]

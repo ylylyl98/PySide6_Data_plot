@@ -9,7 +9,7 @@ Rectangle {
     objectName: "quick_mcd_peak_workspace"
     required property var bridge
     required property var colors
-    readonly property var state: bridge ? bridge.snapshot : ({})
+    readonly property var state: bridge ? bridge.viewState : ({})
     color: colors.inset
     onColorsChanged: if (bridge) bridge.setPalette(colors)
     Component.onCompleted: if (bridge) bridge.setPalette(colors)
@@ -90,8 +90,9 @@ Rectangle {
         colors: page.colors
         hostWidth: page.width
         hostHeight: page.height
-        visible: !!page.state.sheet && page.state.sheet !== "peak-table" && page.state.sheet !== "valley-table"
+        visible: !!page.state.sheet && page.state.sheet !== "sources" && page.state.sheet !== "peak-table" && page.state.sheet !== "valley-table"
     }
+    McdSourceCatalog { bridge: page.bridge; colors: page.colors }
     Basic.Popup {
         id: table
         objectName: "mcd_peak_table_sheet"

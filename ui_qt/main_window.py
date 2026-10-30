@@ -11856,7 +11856,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     2, int(second_window), second_poly, options.drr_sg_mode_label,
                 )
                 if options.drr_second_y_window:
-                    second_base = second_base.replace('_d2E_W', '_dXdY_W').removesuffix('_Regrid') + f'_WY{options.drr_second_y_window}_LocalXY'
+                    second_base = second_base.removesuffix('_d2E') + '_dXdY'
                 raw_processing = {
                     **drr_processing, "derivative_order": None,
                     "savgol_window": int(options.drr_raw_sg_window or options.drr_sg_window),

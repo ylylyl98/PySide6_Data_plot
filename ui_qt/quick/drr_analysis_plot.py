@@ -395,6 +395,8 @@ class DrrAnalysisPlotMixin:
             bounds = record["bounds"]
             source_rows = np.flatnonzero((self.dataset.cube.gate>=bounds[2])&(self.dataset.cube.gate<=bounds[3]))
             self.setParameter("p2p.row", int(source_rows[chosen])+1)
+            self._row_timer.stop()
+            self._refresh_selected_row()
 
     def _navigate(self, action):
         if self._navigation is None: return

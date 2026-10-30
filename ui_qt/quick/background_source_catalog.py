@@ -24,6 +24,7 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
         self._editing_enabled = True
         self._source_kind = "bn"
         self._role = "background"
+        self._multiple = True
         self._show_all_files = False
         self._selection_open = False
         self._selection_touched = False
@@ -35,10 +36,11 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
     def snapshot(self):
         state = SourceCatalogBridge.snapshot.fget(self)
         label = self._role if self._role in {"P", "N"} else _LABELS[self._source_kind]
-        can_accept = len(self._selected) == 1 if self._role in {"P", "N"} else bool(self._selected)
+        can_accept = bool(self._selected) if self._multiple else len(self._selected) == 1
         can_accept = can_accept or not self._selected and self._selection_touched
         state.update(backgroundSelection=True, selectionTitle=f"Choose {label} references",
                      sourceKindLabel=label, acceptLabel="Use selected", showAllFiles=self._show_all_files,
+                     multipleSelection=self._multiple,
                      inlineSelection=self._inline_selection,
                      editEnabled=self._selection_open and self._editing_enabled,
                      selectionOpen=self._selection_open, selectionToken=self._selection_token,
@@ -47,7 +49,7 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
                      status="Listing reference files…" if self._busy else f"{len(self._files.rows)} files · {len(self._selected)} chosen")
         return state
 
-    def open_selection(self, folder, kind, selected, *, role="background"):
+    def open_selection(self, folder, kind, selected, *, role="background", multiple=False):
         if kind not in _LABELS or role not in {"background", "P", "N"}:
             raise ValueError("Choose a supported background source kind and role.")
         root = Path(folder).resolve()
@@ -58,9 +60,12 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
         self._editing_enabled = True
         self._selection_touched = False
         self._source_kind, self._role = kind, role
+        self._multiple = bool(multiple) or role == "background"
         self._query, self._show_all_files, self._include_all = "", False, False
         self._selected_group, self._focused = "", ""
         selected = [self._local_path(value, root) for value in selected]
+        if not self._multiple:
+            selected = selected[-1:]
         if self._configure("drr", str(root), selected, False):
             self._resume_selection_catalog(reuse_catalog)
 
@@ -74,6 +79,7 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
         self._selection_open, self._editing_enabled = True, True
         self._selection_touched = False
         self._source_kind, self._role = kind, "background"
+        self._multiple = True
         self._query, self._show_all_files, self._include_all = "", False, False
         self._selected_group, self._focused = "", ""
         selected = [self._local_path(value, root) for value in selected]
@@ -212,7 +218,7 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
         path = self._local_path(path, Path(self._folder))
         self._selection_touched = True
         if selected:
-            if self._role in {"P", "N"}:
+            if not self._multiple:
                 self._selected = [path]
                 self._explicit_selected = {path}
             elif path not in self._selected:
@@ -230,8 +236,8 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
         if not self._selection_open or not self._editing_enabled or not values:
             return
         paths = [self._local_path(value, Path(self._folder)) for value in values]
-        self._selected = paths[-1:] if self._role in {"P", "N"} else list(dict.fromkeys([*self._selected, *paths]))
-        self._explicit_selected.update(paths)
+        self._selected = list(dict.fromkeys([*self._selected, *paths])) if self._multiple else paths[-1:]
+        self._explicit_selected = set(self._selected)
         self._focused, self._selection_touched = paths[-1], True
         self._refresh_models()
         self.selectionEdited.emit(list(self._selected))
@@ -269,7 +275,7 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
             return
         if action == "browse":
             namespace = "inline-catalog" if self._inline_selection else "catalog"
-            self.dialogRequested.emit(f"{namespace}:{self._selection_token}", self._role not in {"P", "N"})
+            self.dialogRequested.emit(f"{namespace}:{self._selection_token}", self._multiple)
         elif action == "clear":
             self._selection_touched = True
             self._selected, self._explicit_selected = [], set()

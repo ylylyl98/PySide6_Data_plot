@@ -78,7 +78,21 @@ jobs:
           tests.test_drr_display_state
           tests.test_quick_drr_restart_ranges
           tests.test_quick_drr_workflow
+          tests.test_quick_drr_export_names
           tests.test_quick_drr_background
+          tests.test_quick_background_condition_provenance
+          tests.test_quick_background_matching_groups
+          tests.test_quick_drr_background_policy
+          tests.test_quick_drr_matching_conditions
+          tests.test_drr_pn_reconstruction_single
+          tests.test_drr_pn_single_measurement_app
+          tests.test_quick_pn_single_measurement
+          tests.test_quick_pn_simple_bridge
+          tests.test_quick_pn_simple_workflow
+          tests.test_quick_pn_simple_qml
+          tests.test_drr_pn_batch_plan
+          tests.test_quick_pn_batch_workflow
+          tests.test_quick_pn_batch_ui
           tests.test_quick_drr_background_selection
           tests.test_quick_drr_bn_automatic
           tests.test_quick_compare
@@ -94,6 +108,14 @@ jobs:
           tests.test_quick_drr_analysis
           tests.test_quick_mcd
           tests.test_quick_mcd_peak
+          tests.test_mcd_peak_save
+          tests.test_mcd_source_selection
+          tests.test_mcd_high_field_centers
+          tests.test_quick_mcd_responsiveness
+          tests.test_quick_mcd_peak_responsiveness
+          tests.test_quick_mcd_source_picker
+          tests.test_quick_power_shg_responsiveness
+          tests.test_quick_analysis_row_coalescing
           tests.test_quick_mcd_startup
           tests.test_quick_organizer
           tests.test_quick_shg
@@ -182,6 +204,7 @@ jobs:
           tests.test_drr_measured_bn
           tests.test_drr_bn_candidates
           tests.test_drr_bn_matching
+          tests.test_drr_bn_relaxed_conditions
           tests.test_drr_bn_batches
           tests.test_drr_bn_match_request
           tests.test_drr_bn_prepared_cache
@@ -198,6 +221,7 @@ jobs:
         run: >-
           python -m unittest -v
           tests.test_drr_pn_matching
+          tests.test_drr_pn_relaxed_conditions
           tests.test_drr_pn_matching_ui
           tests.test_drr_pn_settings_workflow
           tests.test_drr_pn_summary_labels

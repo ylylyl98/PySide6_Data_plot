@@ -19,7 +19,9 @@ import sys
 from threading import RLock
 
 from core.drr_baseline_candidates import parse_drr_acquisition_conditions, spectral_grids_match
-from core.drr_sources import DrrMeasurementAssignment, resolve_source_path
+from core.drr_sources import (DrrMeasurementAssignment, resolve_source_path,
+    extract_wavelength_center_nm, wavelength_centers_match)
+from core.drr_match_conditions import CONDITION_LABELS, normalize_relaxed_conditions
 from core.load_cancellation import LoadCancelled, check_load_cancelled
 from core.provenance import _digest_signature
 
@@ -52,6 +54,7 @@ class MeasuredBnMatch:
     runner_up_gap_seconds: float | None = None
     unknown_conditions: tuple[str, ...] = ()
     candidate_count: int = 0
+    relaxed_differences: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -242,15 +245,43 @@ def _stat(path):
     return signature[1], signature[0], signature
 
 
-def _conditions_match(measurement, candidate):
+def _condition_comparison(measurement, candidate, relaxed_conditions=()):
     first = parse_drr_acquisition_conditions(measurement.filename)
     second = parse_drr_acquisition_conditions(candidate.filename)
-    if any(getattr(first, key) is None or getattr(first, key) != getattr(second, key)
-           for key in ('sample', 'position')):
-        return False
-    # A known angle/setting cannot be matched to an unknown one. Both unknown
-    # remain explicitly unknown, rather than being counted as positive evidence.
-    return all(getattr(first, key) == getattr(second, key) for key in _CONDITIONS)
+    differences = []
+    unknown = []
+    for key in ('sample', 'position', *_CONDITIONS):
+        left, right = getattr(first, key), getattr(second, key)
+        if left is None or right is None:
+            unknown.append(key)
+        # Legacy matching rejects missing sample/position, and rejects a
+        # known value paired with an unknown setting. An explicit relaxation
+        # admits that uncertainty but counts it as a reviewable difference.
+        missing_identity = key in ('sample', 'position') and (left is None or right is None)
+        mismatch = left != right
+        if missing_identity or mismatch:
+            if key not in relaxed_conditions:
+                return None
+            left_text = 'unknown' if left is None else left
+            right_text = 'unknown' if right is None else right
+            differences.append(f'{CONDITION_LABELS[key]}: measurement {left_text}, background {right_text}')
+    left = getattr(measurement, 'wavelength_center_nm', None)
+    right = getattr(candidate, 'wavelength_center_nm', None)
+    if left is None:
+        left = extract_wavelength_center_nm(measurement.filename)
+    if right is None:
+        right = extract_wavelength_center_nm(candidate.filename)
+    # Legacy files without a named center remain eligible; the spectral grid
+    # is independently required to match for every candidate.
+    if left is not None and right is not None and not wavelength_centers_match(left, right):
+        if 'wavelength_center_nm' not in relaxed_conditions:
+            return None
+        differences.append(f'{CONDITION_LABELS["wavelength_center_nm"]}: measurement {left}, background {right}')
+    return tuple(differences), tuple(unknown)
+
+
+def _conditions_match(measurement, candidate):
+    return _condition_comparison(measurement, candidate) is not None
 
 
 class MeasuredBnMatcher:
@@ -264,12 +295,13 @@ class MeasuredBnMatcher:
     remain unresolved. Candidate suffix numbers never bind a measurement.
     """
 
-    def __init__(self, root, measurements, candidates, *, cancelled=None, include_capture_contexts=False):
+    def __init__(self, root, measurements, candidates, *, cancelled=None, include_capture_contexts=False, relaxed_conditions=()):
         self.root = Path(root).resolve()
         self.measurements = tuple(measurements)
         self.candidates = tuple(candidates)
         self.cancelled = cancelled
         self.include_capture_contexts = include_capture_contexts
+        self.relaxed_conditions = normalize_relaxed_conditions(relaxed_conditions)
         self._eligible = None
         self._timing = None
         self._paths = {}
@@ -311,7 +343,8 @@ class MeasuredBnMatcher:
             self._check()
             eligible[_key(self._path(measurement))] = tuple(
                 item for item in candidates
-                if _conditions_match(measurement, item) and spectral_grids_match(measurement, item))
+                if _condition_comparison(measurement, item, self.relaxed_conditions) is not None
+                and spectral_grids_match(measurement, item))
         self._eligible = eligible
 
     def _log_paths(self, paths):
@@ -449,11 +482,19 @@ class MeasuredBnMatcher:
         identity = _key(self._path(measurement))
         if identity not in self._timing.times:
             return ()
+        eligible = self._eligible.get(identity, ())
+        if self.relaxed_conditions and eligible:
+            best = min(self._condition_rank(measurement, item) for item in eligible)
+            eligible = tuple(item for item in eligible if self._condition_rank(measurement, item) == best)
         return tuple(sorted((MeasuredBnCandidateTime(
             item.source, abs(self._timing.times[_key(self._path(item))]-self._timing.times[identity]))
-            for item in self._eligible.get(identity, ())), key=lambda item: (item.time_gap_seconds, item.source)))
+            for item in eligible), key=lambda item: (item.time_gap_seconds, item.source)))
 
-    def match(self, measurement) -> MeasuredBnMatch:
+    def _condition_rank(self, measurement, item):
+        differences, unknown = _condition_comparison(measurement, item, self.relaxed_conditions)
+        return len(differences), len(unknown)
+
+    def match(self, measurement, *, preferred_source=None) -> MeasuredBnMatch:
         try:
             self._check()
             if self._eligible is None:
@@ -468,6 +509,13 @@ class MeasuredBnMatcher:
             self._check()
             if timing.error:
                 return MeasuredBnMatch(reason=timing.error, applicable=True)
+            if preferred_source is not None:
+                eligible = tuple(item for item in eligible if item.source == preferred_source)
+                if not eligible:
+                    return MeasuredBnMatch(reason='Manual BN is not an eligible candidate for this measurement.', applicable=True)
+            elif self.relaxed_conditions:
+                best_rank = min(self._condition_rank(measurement, item) for item in eligible)
+                eligible = tuple(item for item in eligible if self._condition_rank(measurement, item) == best_rank)
             ranked = sorted(((abs(timing.times[_key(self._path(item))]-timing.times[identity]), item)
                              for item in eligible), key=lambda pair: pair[0])
             distance, best = ranked[0]
@@ -475,8 +523,12 @@ class MeasuredBnMatcher:
                 return MeasuredBnMatch(reason='Equally near measured BN references; choose the reference explicitly.', applicable=True)
             basis = ('capture_started UTC (file acquisition start)' if timing.basis == 'capture_started_utc'
                      else 'file modification time proxy (incomplete capture logs)')
-            reason = (f'Nearest matching measured BN by {basis}; difference {distance:g} s; '
+            selection = 'Manual selection' if preferred_source is not None else 'Nearest matching measured BN'
+            reason = (f'{selection} by {basis}; difference {distance:g} s; '
                       'one CSV, all frames; timing does not establish optical stability')
+            differences = _condition_comparison(measurement, best, self.relaxed_conditions)[0]
+            if differences:
+                reason += '; Relaxed acquisition differences: ' + '; '.join(differences)
             first = parse_drr_acquisition_conditions(measurement.filename)
             second = parse_drr_acquisition_conditions(best.filename)
             unknown = tuple(key for key in _CONDITIONS
@@ -486,6 +538,7 @@ class MeasuredBnMatcher:
                 baseline_files=(best.source,), baseline_which='all', selection_reason=reason), reason, True,
                 timing_basis=timing.basis, time_gap_seconds=distance,
                 runner_up_gap_seconds=ranked[1][0]-distance if len(ranked) > 1 else None,
-                unknown_conditions=unknown, candidate_count=len(ranked))
+                unknown_conditions=unknown, candidate_count=len(ranked),
+                relaxed_differences=differences)
         except LoadCancelled:
             return MeasuredBnMatch(reason='Measured-BN matching cancelled.', applicable=True)
