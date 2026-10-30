@@ -73,11 +73,23 @@ processed-result storage.
 | DRR | `Processed Data/DRR/` | averaged or derivative DAT, metadata, PNG |
 | Compare | `Processed Data/Compare/` | channel DAT/PNG/metadata and VP results |
 | MCD | `Processed Data/MCD/<analysis package>/` | map DAT/PNG/metadata, MCD(B) CSV/PNG, diagnostics, settings |
+| MCD Peak Shift | `Processed Data/MCD Peak Shift/<source>_PeakShift/` | stable analysis CSV and metadata sidecar |
 | SHG | `Processed Data/SHG/<analysis package>/` | `shg.xlsx` with angular results and all-angle spectra, `analysis_settings.json` |
 | Power Dependence | `Processed Data/Power Dependence/<package>/` | KK/KKp/VP DAT, PNG, metadata |
 
-MCD package names use a readable source, energy, and window identity such as
-`<source>_MCD_E1.650000eV_W5meV`. SHG single analyses use bounded names such as
+MCD packages use `<source>_MCD/`; energy and width labels such as
+`E1.65000eV_W5meV` distinguish files within that directory. Native MCD Peak Shift
+uses `<source>_PeakShift/`. Its filenames identify channel, peak location,
+sweep direction, tracking method, spectrum source, result type and a short
+identity hash. Peak locations are rounded to six decimal places in eV; local
+fits use the locator rather than the fitted model center. The same identity
+updates the existing CSV/metadata pair; different centers, methods or result
+types coexist. Timestamps remain in metadata. Old timestamp-named exports and
+their history entries are retained. Custom roots follow the same convention:
+a selected `MCD Peak Shift` directory is used directly, `Processed Data` gains
+`MCD Peak Shift`, and other directories gain `Processed Data/MCD Peak Shift`.
+Long source names are shortened with a hash, and same-name sources with different
+paths use separate packages. SHG single analyses use bounded names such as
 `single_<short-source>_515nm_<identity>`; comparisons use
 `compare_<short-reference>_vs_<short-sample>_515nm_<identity>`. The identity
 is an eight-character source hash; repeated exports receive a numeric suffix.
@@ -139,8 +151,10 @@ processing, plot settings, outputs, and an output manifest. Workflow-specific
 fields record details such as DRR backgrounds, MCD windows, SHG fits, or Power
 pairing and alignment.
 
-Repeated exports do not silently overwrite earlier results. Simple result stems
-use collision-safe suffixes such as `_01`; complex MCD, SHG, and Power analyses
+MCD replaces results for the same source and center set; native Peak Shift
+updates the same analysis identity after staging the new CSV and metadata,
+with rollback on a failed publication. Simple result stems
+use collision-safe suffixes such as `_01`; SHG and Power analyses
 use collision-safe package directories. Associated DAT, PNG, and JSON files
 retain the same logical stem or package.
 

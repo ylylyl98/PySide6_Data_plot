@@ -60,6 +60,8 @@ class ShgBridge(QObject):
             showTable=False, spectrumPanel="raw", exportCsv=False, exportCleaned=False)
         self._sources, self._catalog, self._result_paths = {}, [], []
         self._products = self._requested = None
+        self._rows_products = None
+        self._rows_cache = ()
         self._sequence = self._catalog_sequence = 0
         self._cancellation = self._catalog_cancel = None
         self._pending = {}
@@ -836,7 +838,11 @@ class ShgBridge(QObject):
 
     def _rows(self, products):
         if products is None:
+            self._rows_products = None
+            self._rows_cache = ()
             return []
+        if products is self._rows_products:
+            return [dict(row) for row in self._rows_cache]
         output = []
         def number(value):
             return float(value) if isfinite(float(value)) else None
@@ -849,7 +855,9 @@ class ShgBridge(QObject):
                     uncertainty=number(result.area_uncertainty[index]), included=bool(result.included[index]),
                     fitIncluded=bool(fit.fit_mask[index]) if fit is not None else False,
                     cosmicPixels=int(result.cosmic_pixels_removed[index]), quality=str(result.quality_flags[index])))
-        return output
+        self._rows_products = products
+        self._rows_cache = tuple(output)
+        return [dict(row) for row in self._rows_cache]
 
     def _parameter_groups(self):
         from datetime import datetime

@@ -11,7 +11,7 @@ Basic.Popup {
     required property var colors
     property real hostWidth: 900
     property real hostHeight: 700
-    readonly property var state: bridge ? bridge.snapshot : ({})
+    readonly property var state: bridge ? bridge.viewState : ({})
     readonly property var values: state.values || ({})
     property real manualCenter: values.center || 0
     property real protectionLow: (values.center || 0) - .01
@@ -26,10 +26,10 @@ Basic.Popup {
     y: (hostHeight - height) / 2
     modal: true
     focus: true
-    visible: !!state.sheet
+    visible: !!state.sheet && state.sheet !== "sources"
     padding: 12
     closePolicy: Basic.Popup.CloseOnEscape
-    onClosed: if (bridge && state.sheet) bridge.invoke("close-sheet")
+    onClosed: if (bridge && state.sheet && state.sheet !== "sources") bridge.invoke("close-sheet")
     background: Rectangle { color: dialog.colors.surface; radius: 7; border.color: dialog.colors.border }
 
     component Action: AppButton {

@@ -11,17 +11,54 @@ from ui_qt.quick.spectrum_limits import fit_spectrum_y
 _COLORS=dict(pos="#1769aa",neg="#d1495b")
 
 
+def _display_sources(bridge):
+    result=bridge._products.result;values=bridge._values
+    key=(id(result),values["peakSource"])
+    if getattr(bridge,"_spectra_key",None)!=key:
+        bridge._spectra={channel:source_spectra(result,workflow.channel_source(values,channel)) for channel in _COLORS}
+        bridge._spectra_key=key
+        bridge._spectra_result=result
+        bridge._field_derivative_key=None
+        bridge._map_display_key=None
+        bridge._map_display={}
+    return bridge._spectra
+
+
+def _field_derivatives(bridge,energy):
+    key=(bridge._spectra_key,bridge._peak_field,bridge._values["derivativeWindow"])
+    if getattr(bridge,"_field_derivative_key",None)!=key:
+        bridge._field_derivatives={channel:second_derivative_map(energy,spectra[bridge._peak_field:bridge._peak_field+1],key[-1])
+                                  for channel,spectra in bridge._spectra.items()}
+        bridge._field_derivative_key=key
+    return bridge._field_derivatives
+
+
+def _display_map(bridge,channel,energy):
+    values=bridge._values
+    key=(bridge._spectra_key,bridge._branch,values["mapMode"],values["derivativeWindow"])
+    if getattr(bridge,"_map_display_key",None)!=key:
+        bridge._map_display_key=key;bridge._map_display={}
+    if channel not in bridge._map_display:
+        view=workflow.channel_view(bridge._products.result,channel)
+        indices=bridge._field_indices();order=np.argsort(view.pair_b[indices],kind="stable")
+        fields=view.pair_b[indices][order];data=bridge._spectra[channel][indices][order];grid=energy
+        if values["mapMode"]=="Second derivative":
+            grid,data,_=second_derivative_map(energy,data,values["derivativeWindow"]);data=-data
+        finite=data[np.isfinite(data)]
+        limits=(float(np.min(finite)),float(np.max(finite))) if finite.size else None
+        bridge._map_display[channel]=(grid,fields,data,limits)
+    return bridge._map_display[channel]
+
+
 def update_field(bridge, *, draw=True):
     if not bridge._canvas or not bridge._products:return
     result=bridge._products.result;values=bridge._values;index=bridge._peak_field;energy=np.sort(result.energy_ev)
-    cache_key=(id(result),values["peakSource"])
-    if getattr(bridge,"_spectra_key",None)!=cache_key:
-        bridge._spectra={channel:source_spectra(result,workflow.channel_source(values,channel)) for channel in _COLORS};bridge._spectra_key=cache_key
+    _display_sources(bridge)
     for channel,line in getattr(bridge,"_raw_lines",{}).items():
         spectrum=bridge._spectra[channel][index];line.set_data(energy,spectrum)
-    for channel,line in getattr(bridge,"_d2_lines",{}).items():
-        spectrum=bridge._spectra[channel][index]
-        grid,d2,_=second_derivative_map(energy,spectrum[None,:],values["derivativeWindow"]);line.set_data(grid,-d2[0])
+    if getattr(bridge,"_d2_lines",{}):
+        for channel,line in bridge._d2_lines.items():
+            grid,d2,_=_field_derivatives(bridge,energy)[channel];line.set_data(grid,-d2[0])
     for channel,line in getattr(bridge,"_field_cursors",{}).items():
         field=workflow.channel_view(result,channel).pair_b[index];line.set_ydata([field,field])
     cursor=getattr(bridge,"_result_cursor",None)
@@ -41,26 +78,36 @@ def update_field(bridge, *, draw=True):
 
 
 def _candidate_markers(bridge):
-    for artist in getattr(bridge,"_candidate_marks",()):artist.remove()
-    bridge._candidate_marks=[]
+    markers=getattr(bridge,"_candidate_marker_cache",{})
+    active=set()
     selected=bridge._peak_selected;values=bridge._values;result=bridge._products.result;energy=np.sort(result.energy_ev)
     methods={"Raw spectrum":bridge._locators} if values["trackerMethod"]=="Local mixed fit" else bridge._methods
     method="Raw spectrum" if values["trackerMethod"]=="Local mixed fit" else values["trackerMethod"]
+    fields={channel:workflow.channel_view(result,channel).pair_b[bridge._peak_field] for channel in _COLORS}
     for row in bridge._peak_catalog():
         key=row["key"];track=workflow.track_for(methods,method,key)
         if not track:continue
-        channel=key[0];field=workflow.channel_view(result,channel).pair_b[bridge._peak_field]
+        channel=key[0];field=fields[channel]
         point=next((point for point in track.points if point.status=="tracked" and point.energy_ev is not None and abs(point.field_t-field)<=1e-9),None)
         if point is None:continue
         spectrum=bridge._spectra[channel][bridge._peak_field]
         for name in ("spectra","derivative"):
             axis=bridge._axes.get(name)
             if axis is None:continue
-            if name=="derivative":grid,d2,_=second_derivative_map(energy,spectrum[None,:],values["derivativeWindow"]);y=float(np.interp(point.energy_ev,grid,-d2[0]))
+            if name=="derivative":grid,d2,_=_field_derivatives(bridge,energy)[channel];y=float(np.interp(point.energy_ev,grid,-d2[0]))
             else:y=float(np.interp(point.energy_ev,energy,spectrum))
-            mark=axis.plot([point.energy_ev],[y],"o" if key[3]=="peak" else "v",color=_COLORS[channel],ms=6 if tuple(key)==selected else 3,mec="white",zorder=8)[0]
-            bridge._candidate_marks.append(mark)
-            if tuple(key)==selected:bridge._candidate_marks.append(axis.axvline(point.energy_ev,color=_COLORS[channel],ls="--",lw=1.))
+            marker_key=(name,row["id"]);active.add(marker_key)
+            if marker_key not in markers:
+                mark=axis.plot([],[],"o" if key[3]=="peak" else "v",color=_COLORS[channel],mec="white",zorder=8)[0]
+                line=axis.axvline(point.energy_ev,color=_COLORS[channel],ls="--",lw=1.)
+                markers[marker_key]=(mark,line)
+            mark,line=markers[marker_key]
+            mark.set_data([point.energy_ev],[y]);mark.set_markersize(6 if tuple(key)==selected else 3)
+            mark.set_visible(True);line.set_xdata([point.energy_ev]*2);line.set_visible(tuple(key)==selected)
+    for key in set(markers)-active:
+        for artist in markers.pop(key):artist.remove()
+    bridge._candidate_marker_cache=markers
+    bridge._candidate_marks=[artist for pair in markers.values() for artist in pair]
 
 
 def render_peak(bridge):
@@ -69,7 +116,7 @@ def render_peak(bridge):
     bridge._ensure_plot();figure=bridge._canvas.figure
     if bridge._plot_blitter:bridge._plot_blitter.disconnect()
     figure.clear();bridge._axes={}
-    bridge._raw_lines={};bridge._d2_lines={};bridge._field_cursors={};bridge._manual_lines=[];bridge._candidate_marks=[];bridge._result_cursor=None
+    bridge._raw_lines={};bridge._d2_lines={};bridge._field_cursors={};bridge._manual_lines=[];bridge._candidate_marks=[];bridge._candidate_marker_cache={};bridge._result_cursor=None
     values=bridge._values;result=bridge._products.result;compact=bridge._compact
     maps=values["showPeakMaps"] or compact and values["peakPanel"]=="maps"
     panel=values["peakPanel"]
@@ -96,6 +143,7 @@ def render_peak(bridge):
     pad=28*figure.dpi/100/max(1,figure.bbox.height) if maps else 0.
     figure.get_layout_engine().set(rect=(0,0,1,1-min(.2,pad)))
     palette=bridge._palette;figure.set_facecolor(palette["inset"]);energy=np.sort(result.energy_ev)
+    _display_sources(bridge)
     for name,axis in bridge._axes.items():
         axis.set_facecolor(palette["inset"]);axis.grid(alpha=.15);axis.tick_params(labelsize=8,colors=palette["text"])
         axis.xaxis.label.set_color(palette["text"]);axis.yaxis.label.set_color(palette["text"]);axis.title.set_color(palette["text"])
@@ -111,12 +159,9 @@ def render_peak(bridge):
             manual=axis.axvline(values["manualCenter"],color="#d17a00",ls=":",lw=1.2,visible=False);bridge._manual_lines.append(manual)
         elif name in {"map","map-neg"}:
             channel="pos" if name=="map" else "neg";view=workflow.channel_view(result,channel)
-            spectra=source_spectra(result,workflow.channel_source(values,channel));indices=bridge._field_indices();order=np.argsort(view.pair_b[indices],kind="stable");fields=view.pair_b[indices][order]
-            data=spectra[indices][order];grid=energy
-            if values["mapMode"]=="Second derivative":grid,data,_=second_derivative_map(energy,data,values["derivativeWindow"]);data=-data
-            finite=data[np.isfinite(data)]
-            if fields.size and finite.size:
-                low,high=float(np.min(finite)),float(np.max(finite))
+            grid,fields,data,limits=_display_map(bridge,channel,energy)
+            if fields.size and limits is not None:
+                low,high=limits
                 if low==high:high=low+max(abs(low)*1e-9,1e-12)
                 image=axis.pcolormesh(grid,fields,data,shading="auto",cmap="viridis" if values["mapMode"]=="Raw R" else "RdBu_r",vmin=low,vmax=high)
                 host=add_inspection_colorbar(figure,HeatmapRender(image),axis,label="R" if values["mapMode"]=="Raw R" else "−d²R/dE²",title=f"{channel} · {values['mapMode']}")

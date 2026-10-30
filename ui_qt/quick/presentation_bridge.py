@@ -44,6 +44,7 @@ class PresentationRows(QAbstractListModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.rows = []
+        self.path_indices = {}
 
     def roleNames(self):
         return self._roles
@@ -63,15 +64,26 @@ class PresentationRows(QAbstractListModel):
     def replace(self, rows):
         self.beginResetModel()
         self.rows = list(rows)
+        self.path_indices = {row["path"]: index for index, row in enumerate(self.rows)}
         self.endResetModel()
 
     def select(self, selected):
         role = next(key for key, value in self._roles.items() if value == b"selected")
+        changed = []
         for index, row in enumerate(self.rows):
             value = row["path"] in selected
             if row["selected"] != value:
                 row["selected"] = value
-                self.dataChanged.emit(self.index(index), self.index(index), [role])
+                changed.append(index)
+        if changed:
+            first = last = changed[0]
+            for index in changed[1:]:
+                if index == last + 1:
+                    last = index
+                else:
+                    self.dataChanged.emit(self.index(first), self.index(last), [role])
+                    first = last = index
+            self.dataChanged.emit(self.index(first), self.index(last), [role])
 
 
 class _Cancelled(Exception):
@@ -167,6 +179,10 @@ class PresentationBridge(QObject):
         self._available = PresentationRows(self)
         self._queue_model = PresentationRows(self)
         self._records = []
+        self._indexed_records = None
+        self._record_lookup = {}
+        self._mcd_status_key = None
+        self._mcd_status_text = ""
         self._shown = []
         self._queue = []
         self._selected_available = []
@@ -219,9 +235,9 @@ class PresentationBridge(QObject):
 
     @Property("QVariantMap", notify=snapshotChanged)
     def snapshot(self):
-        visible_selection = [row["path"] for row in self._available.rows if row["selected"]]
+        visible_selection = {row["path"] for row in self._available.rows if row["selected"]}
         latest = next((path for path in reversed(self._selected_available) if path in visible_selection), "")
-        latest_index = next((i for i, row in enumerate(self._available.rows) if row["path"] == latest), -1)
+        latest_index = self._available.path_indices.get(latest, -1)
         source = Path(self._options["source"]) if self._options["source"] else None
         image_root = Path(self._options["imageRoot"]) if self._options["imageRoot"] else self._experiment_folder or Path.home()
         output = Path(self._options["output"]) if self._options["output"] else default_output_path(source, image_root)
@@ -412,7 +428,11 @@ class PresentationBridge(QObject):
             self._anchors[section] = index
         if section == "available":
             order = [path for path in self._selected_available if path in current]
-            order.extend(row["path"] for row in model.rows if row["path"] in current and row["path"] not in order)
+            ordered = set(order)
+            for row in model.rows:
+                if row["path"] in current and row["path"] not in ordered:
+                    order.append(row["path"])
+                    ordered.add(row["path"])
             self._selected_available = order
         else:
             self._selected_queue = current
@@ -481,7 +501,7 @@ class PresentationBridge(QObject):
         self._append(newest[kind].path for kind in ("mcd_combo", "mcd_b"))
 
     def _refresh_queue(self):
-        records = {str(record.path): record for record in self._records}
+        records = self._records_by_path()
         self._queue_model.replace(self._row(Path(path), index, record=records.get(path), selected=path in self._selected_queue) for index, path in enumerate(self._queue))
 
     @Slot()
@@ -523,7 +543,14 @@ class PresentationBridge(QObject):
         self._rebuild_plan()
 
     def _mcd_status(self):
-        records = {str(record.path): record for record in self._records}
+        key = (id(self._records), tuple(self._queue), id(self._badges))
+        if key != self._mcd_status_key:
+            self._mcd_status_text = self._calculate_mcd_status()
+            self._mcd_status_key = key
+        return self._mcd_status_text
+
+    def _calculate_mcd_status(self):
+        records = self._records_by_path()
         selected = [records[path] for path in self._queue if path in records and records[path].plot_kind in {"mcd_combo", "mcd_b"}]
         if not selected:
             return ""
@@ -534,6 +561,12 @@ class PresentationBridge(QObject):
             return f"MCD Combo and MCD(B) are from the same folder ({labels[0]})." if len(folders) == 1 else f"MCD plots are from different folders ({', '.join(labels)})."
         missing = "MCD(B)" if "mcd_combo" in kinds else "MCD Combo"
         return f"MCD folder {', '.join(labels)} selected; add its matching {missing} plot to verify the pair."
+
+    def _records_by_path(self):
+        if self._indexed_records is not self._records:
+            self._record_lookup = {str(record.path): record for record in self._records}
+            self._indexed_records = self._records
+        return self._record_lookup
 
     def _rebuild_plan(self):
         key = tuple(self._queue), self._options["imagesPerSlide"] or 12, self._options["groupBy"]

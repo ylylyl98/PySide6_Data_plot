@@ -314,16 +314,20 @@ class PowerBridge(PowerAnalysisMixin, PowerPlotMixin, QObject):
                     self._open_selection("single")
 
     def _selection_snapshot(self):
-        groups = [asdict(group) for group in self._catalog["groups"]] if self._catalog is not None else []
-        for group in groups:
+        groups = self._catalog["groups"] if self._catalog is not None else ()
+        query = self._values["query"].casefold().split()
+        filtered = [group for group in groups if (self._values["historyFilter"] == "all" or group.status.casefold() == self._values["historyFilter"])
+                    and all(word in (group.label + " " + " ".join(group.sources)).casefold() for word in query)]
+        shown_groups = filtered if self._values["showOlder"] else filtered[:20]
+        selected = next((group for group in groups if group.key == self._selected_group), None)
+        def serialize(group):
+            group = asdict(group)
             # QVariant maps do not turn nested Python tuples into QML arrays.
             group["sources"] = list(group["sources"])
             group["issues"] = list(group["issues"])
             group["duplicates"] = {role: list(keys) for role, keys in group["duplicates"].items()}
-        query = self._values["query"].casefold().split()
-        filtered = [group for group in groups if (self._values["historyFilter"] == "all" or group["status"].casefold() == self._values["historyFilter"])
-                    and all(word in (group["label"] + " " + " ".join(group["sources"])).casefold() for word in query)]
-        shown = filtered if self._values["showOlder"] else filtered[:20]
+            return group
+        shown = [serialize(group) for group in shown_groups]
         sources = self._catalog["sources"] if self._catalog is not None else {}
         from datetime import datetime
         for group in shown:
@@ -335,7 +339,7 @@ class PowerBridge(PowerAnalysisMixin, PowerPlotMixin, QObject):
             available.append(dict(key=key, title=source.file_name or source.title, format=source.source_format,
                 combined=key in self._catalog["combined"], chosen=key in self._queue, status="Processed" if processed else "New"))
         return dict(measurementGroups=shown, totalGroups=len(filtered), olderCount=max(0, len(filtered) - len(shown)),
-            selectedMeasurement=next((group for group in groups if group["key"] == self._selected_group), {}),
+            selectedMeasurement=next((row for row in shown if row["key"] == self._selected_group), None) or (serialize(selected) if selected is not None else {}),
             selectedGroup=self._selected_group, draft=deepcopy(self._drafts.get(self._selected_group, {})),
             availableSweeps=available, combinationKeys=list(self._queue), activeSelection=deepcopy(self._active_selection or {}),
             selectionWarnings=list(self._catalog["warnings"]) if self._catalog else [],

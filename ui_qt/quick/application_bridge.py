@@ -178,7 +178,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
                     canExport=available and self._cube is not None and self._source is not None and self._export_valid and not self._busy)
         child = self._workflow_bridges.get(self._workflow)
         if child is not None:
-            child_state = child.snapshot
+            child_state = self._child_view_state(child)
             for name in ("busy", "progress", "sourcePath", "status", "exportLabel", "plotTool", "canExport", "parameterGroups",
                          "inspectionVisible", "spectrumVisible", "heatmapFraction", "dividerY",
                          "dividerLeft", "dividerRight"):
@@ -461,6 +461,11 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         return QUrl.fromLocalFile(str(Path(__file__).with_name("qml") / name)) if name else QUrl()
 
     @staticmethod
+    def _child_view_state(child):
+        state = getattr(child, "viewState", None)
+        return child.snapshot if state is None else state
+
+    @staticmethod
     def _child_side_by_side(state):
         return bool(state.get("sideBySide", state.get("inspectionVisible") and
                          state.get("view") == "intensity" and len(state.get("visibleChannels", ())) > 1))
@@ -468,7 +473,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
     def _child_changed(self, key):
         if self._closed:
             return
-        state = self._workflow_bridges[key].snapshot
+        state = self._child_view_state(self._workflow_bridges[key])
         paths = tuple(map(str, state.get("resultPaths", ())))
         if paths != self._child_export_paths.get(key, ()):
             self._child_export_paths[key] = paths
@@ -556,7 +561,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             child.adoptProducts(self._mcd_shared_products)
         if key == "power":
             self._sync_power_references(child, refresh=True)
-        self._status = child.snapshot["status"]
+        self._status = self._child_view_state(child)["status"]
         self._child_changed(key)
         return child
 
@@ -1665,6 +1670,19 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
                 blitter.configure(target, artists)
                 self._blitters.append(blitter)
         self._pl_plot_ready()
+        # Spectrum auto-Y changes its ticks as the selected row changes. Keep
+        # the heatmaps and repaint the complete dynamic axes over one frame.
+        from ui_qt.drr_gate_blitter import DrrGateBlitter
+        for blitter in self._blitters:
+            blitter.disconnect()
+        dynamic = DrrGateBlitter(self._canvas)
+        overlays = [gate_line for _, gate_line in self._maps]
+        overlays.extend(artist for _, _, _, peaks, centers, _, _ in self._manual_artists
+                        for artist in (peaks, centers))
+        dynamic.configure(tuple(axis for axis, _ in self._spectra), tuple(overlays))
+        # The gate remains interactive when the spectrum panel is hidden.
+        dynamic.axes = self._maps[0][0]
+        self._blitters = [dynamic]
         palette = self.colors
         figure.set_facecolor(palette["canvas"])
         for axis in figure.axes:

@@ -60,6 +60,7 @@ class McdBridge(QObject):
         super().__init__(parent)
         self.settings = settings
         self._folder, self._source = "", ""
+        self._source_draft = ""
         self._values = asdict(McdSettings())
         self._values.update(automaticAngles=True, background_ranges_ev="", center=0., width=5., bCursor=0.,
             windowMetric="mean", historyFilter="all", detectionMode="raw", candidateFilter="MCD", recommendedOnly=False,
@@ -125,6 +126,13 @@ class McdBridge(QObject):
 
     @Property("QVariantMap", notify=snapshotChanged)
     def snapshot(self):
+        return self._snapshot(include_feature_payload=True)
+
+    @Property("QVariantMap", notify=snapshotChanged)
+    def viewState(self):
+        return self._snapshot(include_feature_payload=False)
+
+    def _snapshot(self, *, include_feature_payload):
         current = self._current()
         candidates = self._candidates()
         retained = []
@@ -135,15 +143,15 @@ class McdBridge(QObject):
         return dict(workflow="mcd",title="MCD",busy=self._busy,analysisBusy=self._analysis_busy,catalogBusy=self._catalog_busy,canCancel=not self._exporting and (self._busy or self._analysis_busy),
             values=deepcopy(self._values),allCandidates=[dict(item) for item in (tuple(self._products.candidates) if self._products else ())+tuple(self._manual_candidates)],manualLinks=deepcopy(self._manual_links),
             status=self._status,error=self._error,progress=-1 if self._busy else 0,sourcePath=self._folder,source=self._source,
-            sources={"source":self._source},catalog=[dict(row) for row in self._catalog],parameterGroups=self._groups(),
+            sources={"source":self._source},sourceDraft=self._source_draft,catalog=[dict(row) for row in self._catalog],parameterGroups=self._groups(),
             inspectionVisible=current,sideBySide=False,canExport=current and self._window is not None and not self._busy,
             compactInspection=self._compact,panel=self._values["panel"],plotTool=str(self._navigation.mode.name).lower() if self._navigation and self._navigation.mode else "",
             heatmapFraction=self._values["heatmapFraction"],spectrumVisible=self._values["spectrumVisible"],dividerY=self._divider_y(),dividerLeft=float(self._axes["map"].get_position().x0) if "map" in self._axes else .12,dividerRight=float(self._axes["map"].get_position().x1) if "map" in self._axes else .94,
-            candidates=candidates,selectedCandidate=self._selected,retained=retained,selectedRetainedKind=self._retained_selected[0],selectedRetainedId=self._retained_selected[1],
+            candidates=candidates,recommendedCenters=self._recommended_centers(),selectedCandidate=self._selected,retained=retained,selectedRetainedKind=self._retained_selected[0],selectedRetainedId=self._retained_selected[1],
             selectedFeatureStatus=str((self._feature_payload or {}).get("reason",(self._feature_payload or {}).get("status","Select a candidate to analyze measured trajectories."))),
             windowReady=self._window is not None,windowSummary=self._window_summary(),slopes=deepcopy(self._window["slopes"]) if self._window else {},
-            featurePayload=deepcopy(self._feature_payload or {}),sheet=self._sheet,reviewRegions=deepcopy(self._review_regions),reviewSummary=self._review_summary(),
-            showTable=self._values["showTable"],diagnostics=self._diagnostics(),resultPaths=list(self._result_paths),
+            featurePayload=deepcopy(self._feature_payload or {}) if include_feature_payload else {},sheet=self._sheet,reviewRegions=deepcopy(self._review_regions),reviewSummary=self._review_summary(),
+            showTable=self._values["showTable"],diagnostics=self._diagnostics() if self._sheet == "diagnostics" else [],resultPaths=list(self._result_paths),
             summary=self._summary(),workspaceMessage=self._error or "Choose an MCD B-sweep CSV; angle-specific references and processing remain explicit.")
 
     def _publish(self):
@@ -169,6 +177,7 @@ class McdBridge(QObject):
         if not folder.is_dir(): self._message("Choose an existing experiment folder.",error=True); return
         if str(folder) != self._folder:
             self._cancel_all(); self._folder,self._source=str(folder),""; self._requested=None
+            self._source_draft=""; self._sheet=""
             self._manual_candidates=[]; self._manual_links=[]; self._selected=""; self._feature_payload=self._window=None
             self._review_regions=[]; self._suggestion=None
         self._refresh_catalog()
@@ -178,10 +187,14 @@ class McdBridge(QObject):
         if self._exporting or not values or self._closed: return
         try:
             path=_path(values[0],self._folder)
-            if kind in {"source","sources","files"}:
+            if kind=="catalog-source":
+                if len(values)!=1:raise ValueError("Select one original MCD B-sweep CSV.")
+                self.setSourceDraft(str(path));self._refresh_catalog()
+            elif kind in {"source","sources","files"}:
                 if len(values)!=1 or path.suffix.lower()!=".csv" or not path.is_file(): raise ValueError("Select one original MCD B-sweep CSV.")
                 if not self._folder: self._folder=str(path.parent.parent if path.parent.name.casefold()=="mcd" else path.parent)
                 self._source=str(path); self._manual_candidates=[]; self._manual_links=[]; self._selected=""; self._review_regions=[]; self._suggestion=None
+                self._source_draft=self._source; self._sheet=""
                 self._values.update(background_ranges_ev="",manual_protected_ranges_ev=(),suggestion_protected_ranges_ev=(),background_selection="auto")
                 self._queue_load(immediate=True); self._refresh_catalog()
             elif kind in {"dark-pos","dark-neg"}:
@@ -191,6 +204,18 @@ class McdBridge(QObject):
                 if not path.is_dir(): raise ValueError("Choose an existing results folder.")
                 self._output=str(path); self._publish()
         except (ValueError,OSError) as exc: self._message(str(exc),error=True)
+
+    @Slot(str)
+    def setSourceDraft(self, value):
+        if self._closed or self._exporting:return
+        if not value:
+            self._source_draft="";self._publish();return
+        try:
+            path=_path(value,self._folder)
+            if path.suffix.lower()!=".csv" or not path.is_file():
+                raise ValueError("Select one original MCD B-sweep CSV.")
+            self._source_draft=str(path);self._error="";self._publish()
+        except (ValueError,OSError) as exc:self._message(str(exc),error=True)
 
     def _request(self):
         from core.energy_ranges import parse_energy_ranges
@@ -227,8 +252,9 @@ class McdBridge(QObject):
     def _refresh_catalog(self):
         if not self._folder:return
         from ui_qt.quick.mcd_workflow import catalog_mcd
-        folder,source,roots=self._folder,self._source,self._history_roots()
-        self._catalog_busy=True;self._start("catalog",lambda token:catalog_mcd(folder,(source,) if source else (),history_roots=roots))
+        folder,roots=self._folder,self._history_roots()
+        extras=tuple(dict.fromkeys(path for path in (self._source,self._source_draft) if path))
+        self._catalog_busy=True;self._start("catalog",lambda token:catalog_mcd(folder,extras,history_roots=roots))
 
     def _cancel(self, kind):
         self._seq[kind]=self._seq.get(kind,0)+1
@@ -301,7 +327,8 @@ class McdBridge(QObject):
         self._values.update(pos_angle=products.result.pos_angle,neg_angle=products.result.neg_angle)
         energy=products.result.energy_ev
         if not self._center_manual or not np.min(energy)<self._values["center"]<np.max(energy):
-            recommended=next((item for item in products.candidates if item.get("kind")=="window"),None)
+            windows=[item for item in products.candidates if item.get("kind")=="window" and item.get("recommended")]
+            recommended=min(windows,key=lambda item:item.get("score_rank",float("inf")),default=None)
             self._values["center"]=recommended["energy_ev"] if recommended else float(np.median(energy))
         self._values["bCursor"]=float(products.result.pair_b[np.argmin(abs(products.result.pair_b-self._values["bCursor"]))])
         if not self._values["featureLow"]<self._values["featureHigh"]:self._values.update(featureLow=float(min(energy)),featureHigh=float(max(energy)))
@@ -331,7 +358,14 @@ class McdBridge(QObject):
     def _auto_ranges(self):
         if not self._products:return
         from core.processing import compute_auto_limits
-        bounds=compute_auto_limits(self._products.result.cube(self._values["map"]))
+        result = self._products.result
+        cache = getattr(result, "_quick_mcd_auto_limits", None)
+        if cache is None:
+            cache = result._quick_mcd_auto_limits = {}
+        name = self._values["map"]
+        if name not in cache:
+            cache[name] = compute_auto_limits(result.cube(name))
+        bounds = cache[name]
         if not self._values["fixX"]:self._values.update(xmin=bounds.xmin,xmax=bounds.xmax)
         if not self._values["fixY"]:self._values.update(ymin=bounds.ymin,ymax=bounds.ymax)
         if not self._values["fixColors"]:self._values.update(vmin=bounds.vmin,vmax=bounds.vmax)
@@ -362,6 +396,36 @@ class McdBridge(QObject):
             row=dict(item);row["label"]=str(item.get("display_id",item.get("label",item.get("id",""))))+f" · {float(item['energy_ev']):.6g} eV · "+str(item.get("source",""))
             output.append(row)
         return output
+
+    def _recommended_centers(self):
+        rows = []
+        for item in self._products.candidates if self._products else ():
+            if item.get("kind") != "window" or not item.get("recommended"):
+                continue
+            energy, width = float(item["energy_ev"]), float(item["width_mev"])
+            display_id = str(item.get("display_id", item.get("label", item["id"])))
+            rows.append(dict(id=item["id"], display_id=display_id,
+                label=f"{display_id} · {energy:.6g} eV", energy_ev=energy, width_mev=width,
+                selected=math.isclose(self._values["center"], energy, abs_tol=1e-9)
+                    and math.isclose(self._values["width"], width, abs_tol=1e-9)))
+        return rows
+
+    @Slot(str)
+    def selectRecommendedCenter(self, identifier):
+        if self._closed or self._exporting or not self._current():
+            return
+        item = next((item for item in self._products.candidates
+            if item.get("id") == identifier and item.get("kind") == "window" and item.get("recommended")), None) if self._products else None
+        if item is None:
+            return
+        if any(candidate["id"] == identifier for candidate in self._candidates()):
+            self._selected = identifier
+            self._cancel("feature")
+            self._feature_timer.stop()
+            self._feature_payload = None
+        self.setParameter("center", float(item["energy_ev"]))
+        self.setParameter("width", float(item["width_mev"]))
+        self._publish()
 
     def _selected_feature(self):
         return next((item for item in self._candidates() if item["id"]==self._selected),None)
@@ -445,9 +509,13 @@ class McdBridge(QObject):
         if action=="cancel":self._cancel_all();self._message("MCD operation cancelled; the last completed results remain available.");return
         if self._exporting:return
         try:
-            if action in {"select-files","choose-source"}:self.sourceDialogRequested.emit("sources",False)
+            if action in {"select-files","choose-source"}:
+                self._source_draft=self._source;self._sheet="sources";self._refresh_catalog();self._publish()
+            elif action=="browse-sources":self.sourceDialogRequested.emit("catalog-source",False)
+            elif action=="accept-source":
+                if self._source_draft:self.openFiles("sources",[self._source_draft])
             elif action.startswith("choose-"):self.sourceDialogRequested.emit(action.removeprefix("choose-"),False)
-            elif action=="clear-files":self._cancel_all();self._source="";self._requested=None;self._window=self._feature_payload=None;self._publish()
+            elif action=="clear-files":self._cancel_all();self._source=self._source_draft="";self._sheet="";self._requested=None;self._window=self._feature_payload=None;self._publish()
             elif action in {"clear-dark-pos","clear-dark-neg"}:self._values["dark_pos_file" if action.endswith("pos") else "dark_neg_file"]=None;self._queue_load()
             elif action in {"refresh","refresh-catalog"}:self._refresh_catalog()
             elif action in {"reload","update","recalculate"}:self._queue_load(immediate=True)
@@ -558,13 +626,10 @@ class McdBridge(QObject):
         def flag(key,label,**extra):return dict(type="flag",key=key,label=label,value=values[key],enabled=enabled,**extra)
         def action(key,label,active=True):return dict(type="action",key=key,label=label,enabled=enabled and active)
         def text(key,label,**extra):return dict(type="text",key=key,label=label,value=str(values[key]),enabled=enabled,**extra)
-        catalog=[row for row in self._catalog if values["historyFilter"]=="all" or row["status"]==values["historyFilter"]]
-        source_options=[dict(value=row["path"],label=row["name"]+" · "+row["status"]) for row in catalog]
         source_path=Path(self._source) if self._source else None
         summary=source_path.relative_to(self._folder).as_posix() if source_path and self._folder and source_path.is_relative_to(self._folder) else source_path.name if source_path else "No source selected"
         groups=[dict(key="data",title="Data",pinned=True,fields=[dict(type="summary",key="sourceSummary",label="MCD sweep",value=summary,description=self._source),
-            choice("historyFilter","Source status"),dict(type="choice",key="source",label="Experiment sources",value=self._source,options=source_options,enabled=enabled),
-            action("select-files","Select sweep…"),action("clear-files","Clear"),action("refresh-catalog","Refresh sources")]),
+            choice("historyFilter","Source status"),action("select-files","Select file…"),action("clear-files","Clear"),action("refresh-catalog","Refresh sources")]),
             dict(key="pairing",title="Angles and pairing",fields=[flag("automaticAngles","Assign σ+ / σ− automatically"),
                 choice("pos_angle","σ+ measured angle",[dict(value=float(item),label=f"{item:g}°") for item in self._angles],readOnly=values["automaticAngles"]),
                 choice("neg_angle","σ− measured angle",[dict(value=float(item),label=f"{item:g}°") for item in self._angles],readOnly=values["automaticAngles"]),

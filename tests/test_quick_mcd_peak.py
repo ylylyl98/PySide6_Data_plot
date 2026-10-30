@@ -187,6 +187,16 @@ def _isolated():
             self.assertTrue(any(path.endswith(".csv") for path in paths));metadata=json.loads(Path(next(path for path in paths if path.endswith(".json"))).read_text())
             self.assertEqual(metadata["source_descriptor"]["path"],str(self.source));self.assertEqual(metadata["workflow"],"MCD Peak Shift")
             self.assertTrue(self.bridge.snapshot["peakHistory"].startswith("processed"))
+            csv_path=Path(next(path for path in paths if path.endswith(".csv")))
+            self.assertEqual(csv_path.parent,self.root/"Processed Data"/"MCD Peak Shift"/"sample_PeakShift")
+            self.assertIn("analysis_identity",metadata)
+            self.bridge.invoke("export");self.wait()
+            self.assertEqual(self.bridge.snapshot["resultPaths"],paths)
+            self.bridge.setParameter("resultMode","Single peak shift");self.wait()
+            self.bridge.invoke("export");self.wait()
+            different=Path(next(path for path in self.bridge.snapshot["resultPaths"] if path.endswith(".csv")))
+            self.assertEqual(different.parent,csv_path.parent)
+            self.assertNotEqual(different,csv_path)
         def test_export_refuses_changed_source_before_writing_files(self):
             self.load();self.source.write_text(self.source.read_text()+"\n")
             self.bridge.invoke("export");deadline=time.monotonic()+10

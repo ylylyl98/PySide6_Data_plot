@@ -162,13 +162,20 @@ class McdPeakBridge(McdBridge):
             elif kind=="peak-seed":
                 self._methods,self._peak_selected=value;self._manual_peak=None;self._refresh_results();self._message("Manual center reseek complete; existing distinct resonances are retained.")
             elif kind=="peak-export":
-                self._busy=self._exporting=False;self._result_paths=[value["csv_path"],value["sidecar_path"]];self._refresh_peak_history();self._message("Peak Shift CSV and source metadata exported.")
+                self._busy=self._exporting=False;self._result_paths=[value["csv_path"],value["sidecar_path"]];self._refresh_peak_history();self._message("Peak Shift CSV and source metadata "+("updated." if value.get("updated") else "exported."))
             self.operationCompleted.emit(kind,elapsed);self._publish()
         except (ValueError,TypeError,KeyError) as exc:self._message(str(exc),error=True)
 
     @Property("QVariantMap",notify=McdBridge.snapshotChanged)
     def snapshot(self):
-        state=McdBridge.snapshot.fget(self);rows=self._peak_catalog();branches=[];fields=[]
+        return self._peak_snapshot(McdBridge.snapshot.fget(self))
+
+    @Property("QVariantMap",notify=McdBridge.snapshotChanged)
+    def viewState(self):
+        return self._peak_snapshot(McdBridge.viewState.fget(self))
+
+    def _peak_snapshot(self,state):
+        rows=self._peak_catalog();branches=[];fields=[]
         analyses=self._methods.get(self._values["trackerMethod"],{})
         usable=False
         if analyses:
@@ -289,7 +296,8 @@ class McdPeakBridge(McdBridge):
         # Export locks page edits; the worker freezes the accepted analyses
         # before writing, without duplicating every measured point on the GUI.
         products=self._products;methods=self._methods;values=dict(self._values);selected=self._peak_selected
-        output=self._output or str(Path(self._folder)/"Processed Data"/"MCD Peak Shift")
+        source=Path(self._source);base=source.parent.parent if source.parent.name.casefold()=="mcd" else source.parent
+        output=self._output or str(base/"Processed Data"/"MCD Peak Shift")
         ids=(values["selectedK"],values["selectedKp"]);self._busy=self._exporting=True
         self._message("Exporting the frozen Peak Shift CSV and source metadata…")
         self._start("peak-export",lambda token:workflow.export_peak(products,methods,values,selected,output,ids))
@@ -321,7 +329,7 @@ class McdPeakBridge(McdBridge):
             dict(key="peak-display",title="Inspection panels",fields=[flag("showPeakMaps","Inspect channel maps"),choice("mapMode","Map display"),flag("showPeakTracks","Show reliable tracks"),flag("showDerivative","Show SG derivative"),flag("spectrumVisible","Show spectrum below compact maps"),choice("peakPanel","Compact panel"),choice("selectedK","Optical peak K",pairs),choice("selectedKp","Optical peak K′",pairs),action("peak-table","Tracked point table…"),action("valley-table","Derived valley table…")]),
             dict(key="peak-detection",title="Detection and local fit",advanced=True,fields=[number("peakProminence","Prominence fraction"),number("peakDistance","Minimum separation (points)"),number("peakSmoothing","Smoothing points"),number("peakJump","Maximum jump (eV)"),number("peakLimit","Maximum peaks"),number("derivativeWindow","Derivative SG window"),choice("localBackground","Local model background"),number("manualCenter","Manual locator center (eV)"),action("manual-reseek","Reseek near manual center")]),
             dict(key="peak-export",title="Peak Shift export",fields=[dict(type="summary",key="peakHistory",label="Exact-source history",value=self._peak_history[0]),
-                dict(type="summary",key="output",label="Results folder",value=self._output or "Experiment / Processed Data / MCD Peak Shift"),action("choose-output-folder","Change results folder…"),action("export","Export frozen CSV + metadata")])])
+                dict(type="summary",key="output",label="Results folder",value=self._output or "Dataset / Processed Data / MCD Peak Shift (automatic)"),action("choose-output-folder","Change results folder…"),action("export","Export frozen CSV + metadata")])])
         return groups
 
     def _fit_spectrum_y(self):

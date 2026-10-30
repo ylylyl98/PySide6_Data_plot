@@ -189,7 +189,8 @@ def table_rows(methods,values,selected_ids):
 
 
 def export_peak(products,methods,values,selected,output,selected_ids):
-    from core.mcd_peak_export import mcd_peak_shift_export_worker,source_descriptor
+    from core.mcd_peak_export import source_descriptor
+    from core.mcd_peak_save import export_peak_shift_analysis
     from ui_qt.quick.mcd_workflow import fingerprints,input_paths
     if fingerprints(input_paths(products.request))!=products.signatures:raise ValueError("An MCD source or dark reference changed. Reload before exporting.")
     analyses=methods.get(values["trackerMethod"],{})
@@ -199,7 +200,4 @@ def export_peak(products,methods,values,selected,output,selected_ids):
         spectrum_source=values["peakSource"],background_model=values["localBackground"],experiment_folder=products.request.folder,
         source_descriptor=source_descriptor(products.request.folder,products.result.source_file),history_settings=deepcopy(values))
     check_load_cancelled()
-    path=Path(output);path.mkdir(parents=True,exist_ok=True)
-    from datetime import datetime
-    destination=path/(Path(products.result.source_file).stem+"_peak_shift_"+datetime.now().strftime("%Y%m%d_%H%M%S_%f")+".csv")
-    return mcd_peak_shift_export_worker(snapshot,destination)
+    return export_peak_shift_analysis(snapshot,output)

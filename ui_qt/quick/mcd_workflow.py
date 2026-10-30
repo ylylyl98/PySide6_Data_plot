@@ -109,10 +109,29 @@ def detect_catalog(result, mode, *, width_mev=5., folder="", history_roots=()):
     for index, item in enumerate(suggest_mcd_window_centers(result, width_mev, max_candidates=None), 1):
         recommendations.append(dict(id=f"window-{item.center_ev:.9f}", domain="mcd", kind="window", source="MCD recommendation",
             energy_ev=item.center_ev, center_ev=item.center_ev, width_mev=width_mev, label=str(index),
-            score=item.score, recommended=index <= 6, reason=getattr(item, "reason", "")))
+            score=item.score, score_rank=item.score_rank, recommended=item.score_rank <= 6,
+            reason=getattr(item, "reason", "")))
     check_load_cancelled()
     history = read_center_history(folder, portable_source_name(folder, result.source_file),extra_roots=history_roots) if folder else ()
     return tuple(merge_center_candidates(recommendations, history)) + features, tuple(history)
+
+
+def prepare_auto_limits(result):
+    """Prepare shared display limits on the worker; auxiliary maps are optional."""
+    from core.processing import compute_auto_limits
+    from core.load_cancellation import check_load_cancelled
+    limits = getattr(result, "_quick_mcd_auto_limits", {})
+    for name, cube in result.maps.items():
+        check_load_cancelled()
+        if name not in limits:
+            try:
+                limits[name] = compute_auto_limits(cube)
+            except ValueError:
+                # An unavailable Raw/Normalized/Odd map must not prevent a
+                # valid Combo from loading. Selecting it retains its error.
+                if name == "Combo":
+                    raise
+    result._quick_mcd_auto_limits = limits
 
 
 def load_mcd(request, cancellation=None, previous=None):
@@ -129,6 +148,9 @@ def load_mcd(request, cancellation=None, previous=None):
             dark_neg_file=str((Path(request.folder)/request.settings.dark_neg_file).resolve()) if request.settings.dark_neg_file else None)
         result = previous.result if reusable else process_mcd(source, settings)
         check_load_cancelled()
+        # Both native MCD pages share this result. Range percentiles belong to
+        # the load worker, before either page accepts and plots the large maps.
+        prepare_auto_limits(result)
         angles = tuple(detect_angles(source))
         candidates, history = detect_catalog(result, request.detection_mode, folder=request.folder,history_roots=request.history_roots)
         if fingerprints(input_paths(request)) != before:

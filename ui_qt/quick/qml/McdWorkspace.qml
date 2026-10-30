@@ -8,7 +8,7 @@ Rectangle {
     id: page
     required property var bridge
     required property var colors
-    readonly property var state: bridge ? bridge.snapshot : ({})
+    readonly property var state: bridge ? bridge.viewState : ({})
     color: colors.inset
     objectName: "quick_mcd_workspace"
     onColorsChanged: if (bridge) bridge.setPalette(colors)
@@ -24,6 +24,42 @@ Rectangle {
     ColumnLayout {
         anchors.fill: parent
         spacing: 5
+        Flow {
+            objectName: "mcd_peak_center_recommendations"
+            Layout.fillWidth: true
+            Layout.leftMargin: 6
+            Layout.rightMargin: 6
+            Layout.topMargin: 6
+            spacing: 5
+            visible: page.state.inspectionVisible
+            Text {
+                text: "Peak center (eV):"
+                color: page.colors.text
+                height: 30
+                verticalAlignment: Text.AlignVCenter
+            }
+            Repeater {
+                model: page.state.recommendedCenters || []
+                delegate: AppButton {
+                    required property var modelData
+                    objectName: "mcd_recommended_center_" + modelData.id
+                    colors: page.colors
+                    compact: true
+                    text: modelData.label
+                    checked: modelData.selected
+                    enabled: !page.state.busy
+                    description: "Use recommended MCD window at " + Number(modelData.energy_ev).toPrecision(7) + " eV"
+                    onClicked: page.bridge.selectRecommendedCenter(modelData.id)
+                }
+            }
+            Text {
+                visible: !(page.state.recommendedCenters || []).length
+                text: "No reliable center found; set Center energy manually."
+                color: page.colors.muted
+                height: 30
+                verticalAlignment: Text.AlignVCenter
+            }
+        }
         Flow {
             Layout.fillWidth: true
             Layout.margins: 6
@@ -121,4 +157,5 @@ Rectangle {
         Text { Layout.fillWidth: true; Layout.margins: 6; text: page.state.error || page.state.selectedFeatureStatus || page.state.summary || ""; color: page.state.error ? page.colors.error : page.colors.muted; wrapMode: Text.Wrap; font.pointSize: 9 }
     }
     McdReview { bridge: page.bridge; colors: page.colors; hostWidth: page.width; hostHeight: page.height }
+    McdSourceCatalog { bridge: page.bridge; colors: page.colors }
 }

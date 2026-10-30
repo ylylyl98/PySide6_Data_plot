@@ -59,10 +59,13 @@ PL、DRR 和 Compare 使用以下流程：
 | DRR | `Processed Data/DRR/` | 平均图或导数 DAT、元数据、PNG |
 | Compare | `Processed Data/Compare/` | 各通道 DAT/PNG/元数据及 VP 结果 |
 | MCD | `Processed Data/MCD/<analysis package>/` | 图谱 DAT/PNG/元数据、MCD(B) CSV/PNG、诊断、设置 |
+| MCD Peak Shift | `Processed Data/MCD Peak Shift/<source>_PeakShift/` | 稳定命名的分析 CSV 和元数据旁文件 |
 | SHG | `Processed Data/SHG/<analysis package>/` | 包含角度结果与所有角度光谱的 `shg.xlsx`、`analysis_settings.json` |
 | Power Dependence | `Processed Data/Power Dependence/<package>/` | KK/KKp/VP DAT、PNG、元数据 |
 
-MCD 包使用可读的源文件、能量和窗口标识，例如 `<source>_MCD_E1.650000eV_W5meV`。SHG 单文件分析使用有长度限制的名称 `single_<short-source>_515nm_<identity>`；比较分析使用 `compare_<short-reference>_vs_<short-sample>_515nm_<identity>`。`identity` 为八字符源哈希，重复导出追加数字后缀。
+MCD 使用 `<source>_MCD/` 源文件目录，能量和宽度标识（如 `E1.65000eV_W5meV`）用于目录内的文件名。原生 MCD Peak Shift 使用 `<source>_PeakShift/`；文件名包含通道、峰定位能量、扫描方向、跟踪方法、光谱来源、结果类型及短身份哈希。峰位置按 eV 保留六位小数，局部拟合使用定位中心而非拟合模型中心。同一身份重复保存更新原 CSV/元数据，不同中心、方法或结果类型分别保留；时间戳写入元数据，已有时间戳文件及历史条目保留。自选输出目录名为 `MCD Peak Shift` 时直接使用，为 `Processed Data` 时补 `MCD Peak Shift`，其他目录补 `Processed Data/MCD Peak Shift`。长源文件名截短并附哈希；同名但来源路径不同的文件使用独立目录。
+
+SHG 单文件分析使用有长度限制的名称 `single_<short-source>_515nm_<identity>`；比较分析使用 `compare_<short-reference>_vs_<short-sample>_515nm_<identity>`。`identity` 为八字符源哈希，重复导出追加数字后缀。
 
 ### SHG 工作簿与设置
 
@@ -86,7 +89,7 @@ Power 包名称为 `<group>_PowerDep`、`<KK-group>_vs_<KKp-group>_IntensityComp
 
 元数据旁文件与 DAT 放在同一目录；仅读取数值数据时不需要 JSON。生成元数据时，共享核心包含 schema 与应用版本、工作流、数据集类型、创建时间、来源/溯源、处理参数、绘图设置、输出和输出清单。工作流字段进一步记录 DRR 背景、MCD 窗口、SHG 拟合或 Power 配对与对齐信息。
 
-重复导出不会静默覆盖旧结果。简单结果名使用 `_01` 等防冲突后缀；复杂 MCD、SHG 和 Power 分析使用防冲突包目录。关联 DAT、PNG 和 JSON 保持相同逻辑文件名主干或位于同一包中。
+MCD 更新同一来源及中心集合的结果；原生 Peak Shift 更新同一分析身份的结果，新 CSV 和元数据全部生成后再发布，发布失败会回滚。简单结果名使用 `_01` 等防冲突后缀；SHG 和 Power 分析使用防冲突包目录。关联 DAT、PNG 和 JSON 保持相同逻辑文件名主干或位于同一包中。
 
 ## DAT 重新导入与 Origin 使用
 

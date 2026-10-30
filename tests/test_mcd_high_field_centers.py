@@ -18,6 +18,17 @@ def sample():
 
 
 class HighFieldCentersTests(unittest.TestCase):
+    def test_native_recommendation_flags_follow_score_rank_in_energy_order(self):
+        from unittest.mock import patch
+        from ui_qt.quick.mcd_workflow import detect_catalog
+        from core.mcd import McdCenterCandidate
+        candidates = tuple(McdCenterCandidate(1.51 + index*.03, 8-index, 10., 1., 1., 8-index)
+                           for index in range(8))
+        with patch("core.mcd_analysis.detect_analysis_features", return_value=SimpleNamespace(features=())), \
+             patch("core.mcd.suggest_mcd_window_centers", return_value=candidates):
+            rows, _ = detect_catalog(sample(), "raw")
+        self.assertEqual([row["score_rank"] for row in rows if row["recommended"]], [6, 5, 4, 3, 2, 1])
+
     def test_adjacent_peak_and_dip_survive_overlapping_windows(self):
         r = sample(); e = 1239.841984 / r.wavelength_nm
         signal = np.exp(-.5*((e-1.604)/.0005)**2) - .8*np.exp(-.5*((e-1.601)/.0005)**2)

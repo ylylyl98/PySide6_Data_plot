@@ -111,6 +111,9 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
         self._plot_timer = QTimer(self)
         self._plot_timer.setSingleShot(True)
         self._plot_timer.timeout.connect(self._render)
+        self._row_timer = QTimer(self)
+        self._row_timer.setSingleShot(True)
+        self._row_timer.timeout.connect(self._select_plot_row)
         self._filter_timer = QTimer(self)
         self._filter_timer.setSingleShot(True)
         self._filter_timer.timeout.connect(lambda: self._analyze("filter"))
@@ -485,13 +488,13 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
                 if key == "resultRow":
                     value = self._results_model.rows[int(value)]["row_index"]
                 dataset["row"] = max(0, min(int(value), len(dataset["cube"].gate) - 1))
-                self._select_plot_row()
+                self._row_timer.start(0)
             elif key == "selectedBranch":
                 branch = next((branch for branch in dataset["branches"] if branch["id"] == str(value)), None)
                 if branch is not None:
                     self._selected_branch = str(value)
                     dataset["row"] = branch["seed_row"]
-                    self._select_plot_row()
+                    self._row_timer.start(0)
             elif key.startswith("branch."):
                 _, identity, field = key.split(".", 2)
                 for group in (dataset["branches"], dataset.get("branch_catalog", []),
@@ -773,7 +776,7 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
         self._closed = True
         self._appearance.close()
         self._cancel_event.set()
-        for timer in (self._publish_timer, self._plot_timer, self._filter_timer, self._view_timer, self._cursor_timer):
+        for timer in (self._publish_timer, self._plot_timer, self._row_timer, self._filter_timer, self._view_timer, self._cursor_timer):
             timer.stop()
         self._executor.shutdown(wait=True, cancel_futures=True)
         if self.datasets and not self._close_ready:

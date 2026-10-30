@@ -251,9 +251,13 @@ The two persistent tabs, **Single file** and **Compare / Twist**, fit `I(theta) 
 
 MCD loads a B-sweep CSV with numeric `B_T`, angle and wavelength columns. It pairs opposite-angle frames, subtracts optional angle-specific dark/offset spectra and normalizes each angle to its own near-zero-field reference. Inspect raw/corrected paired spectra and MCD linecuts at a chosen actual B field. Source, dark-reference and output-folder dialogs have separate roles; changing output folder preserves source selection.
 
+Choose **Data → Select file…** in MCD or MCD Peak Shift to open the wide measurement list. Long names wrap in full; search by filename or folder and filter processing status. Review or copy the selected full path, then choose **Open selected**. **Browse files…** stages an external CSV in the same selector; cancelling preserves the current measurement.
+
 Drift options include global gain, per-pair scale/offset and robust linear/quadratic spectral-background correction constrained to non-resonant intervals. New sessions default to global gain plus quadratic per-pair spectral baseline. **Select protected regions** opens a reflection plot: drag across each resonance to protect it. Only the active MCD(B) window and enabled protected regions are excluded; sufficiently wide unprotected intervals become blue background bands. Adding/editing/enabling/removing regions recalculates immediately before comparing linear/quadratic models on held-out points. Manual regions survive recalculation and reopening.
 
 The full B–energy map shares the linecuts' energy window. Processing edits recalculate after a short debounce; **Recalculate now** retries. MCD(B) separates increasing/decreasing branches and supports signed mean, field-signed absolute mean and signed integral. Initially only signed mean is shown; it is the primary PNG/settings metric. Magnitude/integral remain optional diagnostics, and CSV retains all metric columns. Compact export includes map PNG/DAT, MCD(B) PNG/CSV, pair diagnostics and reproducible JSON settings.
+
+**Peak center (eV)** above the ordinary MCD plot shows up to six recommended integration centers. Click an energy to update the MCD(B) window. These recommendations remain visible when the Feature catalog is filtered to Spectrum or History. If no reliable center is found, enter **Center energy (eV)** manually.
 
 ### Saved MCD Extract / Compare
 
@@ -264,6 +268,8 @@ Increasing traces use solid lines/filled markers; decreasing traces use dashed l
 ### MCD Peak Shift and Organizer
 
 MCD Peak Shift reuses accepted processed MCD products without reloading. It supports raw/derivative feature tracking, actual-field selection, field fits, manual feature merging and CSV/metadata export. MCD Organizer opens separately for saved-series comparison, energy grouping, slopes, Curie-Weiss fitting, field/temperature range scans, batch theta analysis and scientific export. Tools exposes the independent Organizer entry.
+
+Native Peak Shift saves under `Processed Data/MCD Peak Shift/<source>_PeakShift/`. Repeating the same peak-location/method/result identity updates its CSV and metadata; other analyses remain alongside it. Creation times stay in metadata, and existing timestamp-named exports remain available.
 
 ## Slides
 
