@@ -38,7 +38,9 @@ def isolated():
     class Cases(unittest.TestCase):
         def test_role_picker_multiple_opt_in_and_reset(self):
             with tempfile.TemporaryDirectory() as tmp:
-                root=Path(tmp); chooser=BackgroundSourceCatalogBridge(settings=QSettings(str(root/'settings.ini'),QSettings.IniFormat))
+                # Windows runners can expose TEMP through an 8.3 alias; the
+                # picker returns canonical paths, so construct expectations alike.
+                root=Path(tmp).resolve(); chooser=BackgroundSourceCatalogBridge(settings=QSettings(str(root/'settings.ini'),QSettings.IniFormat))
                 self.addCleanup(chooser.close)
                 first,second,third=[str(root / ('Pbackground_%d.csv' % i)) for i in range(3)]
                 requests=[]; accepted=[]
