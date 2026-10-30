@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
@@ -19,29 +22,29 @@ class DrrExportBaseTests(unittest.TestCase):
         )
         self.assertEqual(result, "run_avg3_DR_R_Self")
 
-    def test_first_derivative_encodes_order_window_poly_grid(self) -> None:
+    def test_first_derivative_uses_compact_suffix(self) -> None:
         result = build_drr_export_base(
             "run.csv", 3, "DR/R Self", 1, 21, 2, "More correct (regrid)"
         )
-        self.assertEqual(result, "run_avg3_DR_R_Self_dE_W21_O2_Regrid")
+        self.assertEqual(result, "run_avg3_DR_R_Self_dE")
 
-    def test_second_derivative_encodes_order_window_poly_grid(self) -> None:
+    def test_second_derivative_uses_compact_suffix(self) -> None:
         result = build_drr_export_base(
             "run.csv", 3, "DR/R Self", 2, 21, 2, "More correct (regrid)"
         )
-        self.assertEqual(result, "run_avg3_DR_R_Self_d2E_W21_O2_Regrid")
+        self.assertEqual(result, "run_avg3_DR_R_Self_d2E")
 
     def test_origin_like_grid_mode_token(self) -> None:
         result = build_drr_export_base(
             "run.csv", 3, "DR/R Self", 1, 21, 2, "Origin-like"
         )
-        self.assertEqual(result, "run_avg3_DR_R_Self_dE_W21_O2_OriginLike")
+        self.assertEqual(result, "run_avg3_DR_R_Self_dE")
 
-    def test_changing_derivative_settings_changes_filename(self) -> None:
+    def test_same_order_different_settings_share_base(self) -> None:
         first = build_drr_export_base("run.csv", 3, "DR/R Self", 1, 21, 2, "More correct (regrid)")
         second = build_drr_export_base("run.csv", 3, "DR/R Self", 1, 23, 2, "More correct (regrid)")
         third = build_drr_export_base("run.csv", 3, "DR/R Self", 2, 21, 3, "More correct (regrid)")
-        self.assertNotEqual(first, second)
+        self.assertEqual(first, second)
         self.assertNotEqual(first, third)
         self.assertNotEqual(second, third)
 
@@ -54,6 +57,12 @@ class DrrExportBaseTests(unittest.TestCase):
             _strip_terminal_drr_derivative_suffix("sample_d2E_OriginLike"),
             "sample",
         )
+        self.assertEqual(_strip_terminal_drr_derivative_suffix("sample_d2E"), "sample")
+        self.assertEqual(_strip_terminal_drr_derivative_suffix("sample_dXdY"), "sample")
+        self.assertEqual(_strip_terminal_drr_derivative_suffix("sample_dXdY_W21_Y5_O2"), "sample")
+        self.assertEqual(_strip_terminal_drr_derivative_suffix("sample_dXdY_W21_O2_WY9_LocalXY"), "sample")
+        self.assertEqual(_strip_terminal_drr_derivative_suffix("sample_dXdY_W21_O2_OriginLike_WY9_LocalXY"), "sample")
+        self.assertEqual(_strip_terminal_drr_derivative_suffix("sample_dXdY_W21_O2_WY9_notes"), "sample_dXdY_W21_O2_WY9_notes")
         # Ordinary user filename text is left untouched.
         self.assertEqual(
             _strip_terminal_drr_derivative_suffix("sample_dE_scan"),
@@ -68,8 +77,8 @@ class DrrExportBaseTests(unittest.TestCase):
         result = build_drr_export_base(
             "sample_dE_W21_O2_Regrid.csv", 4, "DR/R Self", 1, 9, 2, "More correct (regrid)"
         )
-        self.assertEqual(result, "sample_avg4_DR_R_Self_dE_W9_O2_Regrid")
-        self.assertEqual(result.count("_dE_W"), 1)
+        self.assertEqual(result, "sample_avg4_DR_R_Self_dE")
+        self.assertEqual(result.count("_dE"), 1)
 
     def test_csv_and_xlsx_stems_share_filename_grammar(self) -> None:
         csv_base = build_drr_export_base(
@@ -79,7 +88,43 @@ class DrrExportBaseTests(unittest.TestCase):
             "dR_R.xlsx", 2, "DR/R Map", 1, 21, 2, "More correct (regrid)"
         )
         self.assertEqual(csv_base, xlsx_base)
-        self.assertEqual(csv_base, "dR_R_avg2_DR_R_Map_dE_W21_O2_Regrid")
+        self.assertEqual(csv_base, "dR_R_avg2_DR_R_Map_dE")
+
+
+    def test_compact_collision_preserves_distinct_parameters_and_sources(self):
+        from core.export import export_drr_png_and_dat
+        from core.plotting import HeatmapParams
+        with TemporaryDirectory() as tmp, patch('core.export._save_heatmap_png_atomic',
+                                               side_effect=lambda path, *a, **k: Path(path).write_bytes(b'png')):
+            root = Path(tmp)
+            (root / 'a.csv').write_text('first')
+            (root / 'b.csv').write_text('second')
+            cube = DataCube(energy=np.array([1., 2.]), gate=np.array([0.]), Z=np.array([[.1, .2]]),
+                            gate_label='Gate', title='DR/R', cbar_label='DR/R')
+            params = HeatmapParams(title='DR/R', xlabel='Energy', ylabel='Gate', cbar_label='DR/R',
+                vmin=-1., vmax=1., xlim=(1., 2.), ylim=(0., 1.))
+            base = build_drr_export_base('a.csv', 1, 'DR/R P', 2, 21, 2, 'Origin-like')
+            def export(source, window, grid):
+                return export_drr_png_and_dat(tmp, cube=cube, params=params, export_base=base,
+                    metadata_input_files=(('measurement', source),),
+                    metadata_processing={'sg_window': window, 'sg_polyorder': 2, 'grid_mode': grid, 'derivative_order': 2})
+            legacy = export_drr_png_and_dat(tmp, cube=cube, params=params,
+                export_base=base + '_W21_O2_OriginLike',
+                metadata_input_files=(('measurement', 'a.csv'),),
+                metadata_processing={'sg_window': 21, 'sg_polyorder': 2, 'grid_mode': 'Origin-like', 'derivative_order': 2})
+            legacy_bytes = legacy['dat'].read_bytes()
+            first = export('a.csv', 21, 'Origin-like')
+            self.assertNotEqual(first['dat'], legacy['dat'])
+            self.assertEqual(legacy['dat'].read_bytes(), legacy_bytes)
+            original_dat = first['dat'].read_bytes()
+            second = export('a.csv', 23, 'Regrid')
+            third = export('b.csv', 21, 'Origin-like')
+            self.assertEqual([item['dat'].stem for item in (first, second, third)],
+                             [base, base + '_01', base + '_02'])
+            self.assertEqual(first['dat'].read_bytes(), original_dat)
+            self.assertEqual(json.loads(first['dat'].with_suffix('.metadata.json').read_text())['processing']['sg_window'], 21)
+            self.assertEqual(json.loads(second['dat'].with_suffix('.metadata.json').read_text())['processing']['sg_window'], 23)
+            self.assertEqual(export('a.csv', 23, 'Regrid')['dat'], second['dat'])
 
 
 class DrrExportMetadataUiTests(unittest.TestCase):
@@ -138,7 +183,7 @@ class DrrExportMetadataUiTests(unittest.TestCase):
         base = build_drr_export_base(
             "run.csv", 1, "DR/R Self", deriv, used_win, poly, "More correct (regrid)"
         )
-        self.assertEqual(base, "run_avg1_DR_R_Self_dE_W7_O6_Regrid")
+        self.assertEqual(base, "run_avg1_DR_R_Self_dE")
 
 
 if __name__ == "__main__":

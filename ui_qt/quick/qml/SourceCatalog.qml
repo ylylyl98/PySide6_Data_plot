@@ -26,16 +26,13 @@ Basic.Dialog {
     function restoreReopenPosition() {
         if (!visible || !reopenPositionPending)
             return
-        // A cold inventory preview may not contain the file or its group yet.
-        // Restore once, after the target arrives, without triggering a scan.
-        if (state.reopenPositionPending && state.busy)
-            return
-        if (reopenFile && bridge.filesModel.indexOfId(reopenFile) < 0 && state.busy)
-            return
+        // Reveal cached targets immediately, but retain the request until the
+        // final inventory so a later reset cannot undo the remembered position.
         if (groups.visible)
             groups.revealId(state.selectedGroup)
         files.revealId(reopenFile)
-        cancelReopenPosition()
+        if (!state.busy)
+            cancelReopenPosition()
     }
     onOpened: {
         reopenFile = state.focused || (state.selected.length ? state.selected[state.selected.length - 1] : "")

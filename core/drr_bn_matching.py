@@ -17,6 +17,7 @@ from core.drr_bn_profile_cache import BN_GATE_PROFILE_CACHE
 from core.drr_bn_batches import BATCH_POLICY_VERSION, BnMatchBatch, assess_bn_batches
 from core.drr_composite_background import is_composite_background
 from core.drr_measured_bn import MeasuredBnMatcher, is_measured_bn_name
+from core.drr_match_conditions import normalize_relaxed_conditions
 from core.drr_sources import (
     DrrBackgroundResolution, DrrMeasurementAssignment, DrrSource,
     inspect_csv_gate_profile, preview_drr_sources, resolve_source_path,
@@ -25,7 +26,7 @@ from core.load_cancellation import LoadCancelled, check_load_cancelled
 from core.provenance import _digest_signature
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_MAX_GAP_SECONDS = 86400.0
 DEFAULT_MIN_MARGIN_SECONDS = 60.0
 _PREPARED_BN_CONFIRMATION = object()
@@ -35,6 +36,19 @@ def _strings(value, field):
     if not isinstance(value, (list, tuple)) or any(not isinstance(v, str) for v in value):
         raise ValueError(f'{field} must be a list of strings.')
     return tuple(value)
+
+
+def _manual_assignments(value, selected, candidates):
+    if not isinstance(value, (tuple, list)):
+        raise ValueError('Manual BN assignments must be a list.')
+    result = {}
+    for item in value:
+        if (not isinstance(item, (tuple, list)) or len(item) != 2
+                or any(not isinstance(part, str) for part in item)
+                or item[0] not in selected or item[1] not in candidates or item[0] in result):
+            raise ValueError('Invalid manual BN assignment or candidate pool.')
+        result[item[0]] = item[1]
+    return tuple((name, result[name]) for name in selected if name in result)
 
 
 def _number(value, field, *, optional=False):
@@ -120,6 +134,8 @@ class BnMatchPlan:
     min_margin_seconds: float = DEFAULT_MIN_MARGIN_SECONDS
     batches: tuple[BnMatchBatch, ...] = ()
     policy_version: str = BATCH_POLICY_VERSION
+    relaxed_conditions: tuple[str, ...] = ()
+    manual_assignments: tuple[tuple[str, str], ...] = ()
 
     @property
     def ready(self):
@@ -164,6 +180,8 @@ class BnMatchPlan:
             log_directories=list(self.log_directories), max_gap_seconds=self.max_gap_seconds,
             min_margin_seconds=self.min_margin_seconds,
             batches=[batch.to_dict() for batch in self.batches], policy_version=self.policy_version,
+            relaxed_conditions=list(self.relaxed_conditions),
+            manual_assignments=[list(item) for item in self.manual_assignments],
         )
 
     @classmethod
@@ -243,7 +261,8 @@ class BnMatchPlan:
             _strings(value.get('log_directories'), 'log directories'),
             _number(value.get('max_gap_seconds'), 'maximum time gap'),
             _number(value.get('min_margin_seconds'), 'minimum timing margin'),
-            batches, value['policy_version'],
+            batches, value['policy_version'], normalize_relaxed_conditions(value.get('relaxed_conditions')),
+            _manual_assignments(value.get('manual_assignments'), selected, candidates),
         )
         if _plan_signature(plan) != plan.signature:
             raise ValueError('BN match plan signature is invalid.')
@@ -307,6 +326,10 @@ def _plan_signature(plan):
 
 def _row_warnings(match, max_gap, min_margin):
     warnings = []
+    if match.reason.startswith('Manual selection'):
+        warnings.append('Manual BN selection requires explicit review.')
+    if match.relaxed_differences:
+        warnings.append('Relaxed acquisition differences: ' + '; '.join(match.relaxed_differences) + '.')
     if match.timing_basis != 'capture_started_utc':
         warnings.append('Capture logs are incomplete; timing uses file modification times, which can change when files are copied.')
     if match.unknown_conditions:
@@ -320,7 +343,7 @@ def _row_warnings(match, max_gap, min_margin):
 
 def build_bn_match_plan(root, selected, *, candidate_files=None, cancelled=None,
                         max_gap_seconds=DEFAULT_MAX_GAP_SECONDS,
-                        min_margin_seconds=DEFAULT_MIN_MARGIN_SECONDS):
+                        min_margin_seconds=DEFAULT_MIN_MARGIN_SECONDS, relaxed_conditions=(), manual_assignments=()):
     """Suggest one measured BN per source, preserving every row for review.
 
     ``None`` discovers a fresh bounded experiment inventory. An explicit pool,
@@ -329,6 +352,7 @@ def build_bn_match_plan(root, selected, *, candidate_files=None, cancelled=None,
     """
     from dataclasses import replace
 
+    relaxed_conditions = normalize_relaxed_conditions(relaxed_conditions)
     root = Path(root).resolve()
     selected = tuple(dict.fromkeys(str(name) for name in selected))
     max_gap = _number(max_gap_seconds, 'maximum time gap')
@@ -336,6 +360,7 @@ def build_bn_match_plan(root, selected, *, candidate_files=None, cancelled=None,
     automatic = candidate_files is None
     pool = None if automatic else tuple(candidate_files)
     candidates, rows, snapshot, directories, warnings, batch_records = (), [], (), (), [], ()
+    manual = ()
 
     def finish(reason=''):
         by_name = {row.measurement_file: row for row in rows}
@@ -354,7 +379,7 @@ def build_bn_match_plan(root, selected, *, candidate_files=None, cancelled=None,
         )
         all_warnings = tuple(dict.fromkeys((*warnings, *(warning for row in ordered for warning in row.warnings))))
         plan = BnMatchPlan(str(root), selected, candidates, automatic, ordered, resolution, '',
-                           all_warnings, snapshot, directories, max_gap, min_margin, batches)
+                           all_warnings, snapshot, directories, max_gap, min_margin, batches, BATCH_POLICY_VERSION, relaxed_conditions, manual)
         return replace(plan, signature=_plan_signature(plan))
 
     try:
@@ -365,6 +390,7 @@ def build_bn_match_plan(root, selected, *, candidate_files=None, cancelled=None,
         if any(not path.is_relative_to(root) for path in selected_paths):
             return finish('Selected measurement is outside the experiment folder.')
         candidates = _candidate_names(root, pool, cancelled)
+        manual = _manual_assignments(manual_assignments, selected, candidates)
         candidate_paths = tuple(resolve_source_path(root, name) for name in candidates)
         paths = tuple(dict.fromkeys((*selected_paths, *candidate_paths)))
         directories = _log_directories(root, paths)
@@ -402,10 +428,13 @@ def build_bn_match_plan(root, selected, *, candidate_files=None, cancelled=None,
                 references.append(inspect(name))
             except (OSError, ValueError, TypeError) as exc:
                 warnings.append(f'Cannot inspect BN candidate {name}: {exc}')
-        matcher = MeasuredBnMatcher(root, measurements, references, cancelled=cancelled, include_capture_contexts=True)
+        matcher = MeasuredBnMatcher(root, measurements, references, cancelled=cancelled, include_capture_contexts=True, relaxed_conditions=relaxed_conditions)
         for measurement in measurements:
             _check(cancelled)
-            match = matcher.match(measurement)
+            preferred = dict(manual).get(measurement.source)
+            match = matcher.match(measurement, preferred_source=preferred)
+            if preferred is not None and (match.assignment is None or match.assignment.baseline_files != (preferred,)):
+                raise ValueError(f'Manual BN is incompatible with {measurement.source}.')
             _check(cancelled)
             row_warnings = _row_warnings(match, max_gap, min_margin) if match.assignment else ()
             rows.append(BnMatchRow(measurement.source, match.assignment, match.reason,
@@ -434,10 +463,10 @@ def build_bn_match_plan(root, selected, *, candidate_files=None, cancelled=None,
         return finish(f'Measured-BN matching needs review: {exc}')
 
 
-def plan_is_current(plan):
-    """Verify an applicable snapshot without re-reading spectral CSV bodies."""
+def _inputs_are_current(plan):
+    """Verify signed inputs, including an unresolved plan, before rebuilding."""
     try:
-        if not isinstance(plan, BnMatchPlan) or not plan.ready or _plan_signature(plan) != plan.signature:
+        if not isinstance(plan, BnMatchPlan) or _plan_signature(plan) != plan.signature:
             return False
         root = Path(plan.root).resolve()
         paths = tuple(resolve_source_path(root, name) for name in (*plan.selected, *plan.candidate_files))
@@ -451,6 +480,42 @@ def plan_is_current(plan):
                 and _snapshot(paths, plan.log_directories) == plan.snapshot)
     except (OSError, ValueError, TypeError, LoadCancelled):
         return False
+
+
+def plan_is_current(plan):
+    """Verify an applicable snapshot without re-reading spectral CSV bodies."""
+    return isinstance(plan, BnMatchPlan) and plan.ready and _inputs_are_current(plan)
+
+
+def override_bn_match(plan, measurements, baseline_file, *, cancelled=None):
+    """Rebuild a signed plan with explicitly selected, verified BN assignments."""
+    _check(cancelled)
+    if not _inputs_are_current(plan):
+        raise ValueError('BN inputs changed or the plan is invalid; refresh before overriding.')
+    if isinstance(measurements, str):
+        measurements = (measurements,)
+    else:
+        measurements = tuple(measurements)
+    if not measurements or len(set(measurements)) != len(measurements) or any(name not in plan.selected for name in measurements):
+        raise ValueError('Choose measurements from this BN plan.')
+    if baseline_file not in plan.candidate_files:
+        raise ValueError('Manual BN must belong to the candidate pool.')
+    overrides = dict(plan.manual_assignments)
+    overrides.update((name, baseline_file) for name in measurements)
+    rebuilt = build_bn_match_plan(plan.root, plan.selected,
+        candidate_files=None if plan.automatic_candidates else plan.candidate_files,
+        cancelled=cancelled, max_gap_seconds=plan.max_gap_seconds,
+        min_margin_seconds=plan.min_margin_seconds, relaxed_conditions=plan.relaxed_conditions,
+        manual_assignments=tuple(overrides.items()))
+    _check(cancelled)
+    if (rebuilt.snapshot != plan.snapshot or rebuilt.candidate_files != plan.candidate_files
+            or rebuilt.log_directories != plan.log_directories or not _inputs_are_current(plan)
+            or not _inputs_are_current(rebuilt)):
+        raise ValueError('BN inputs changed while applying the manual selection; refresh and retry.')
+    if any(next((row.baseline_file for row in rebuilt.rows if row.measurement_file == name), '') != candidate
+           for name, candidate in overrides.items()):
+        raise ValueError('Manual BN is incompatible with a selected measurement.')
+    return rebuilt
 
 
 @dataclass(frozen=True)
@@ -560,7 +625,8 @@ class BnMatchCache:
 
     def find(self, root, selected, *, candidate_files=None,
              max_gap_seconds=DEFAULT_MAX_GAP_SECONDS,
-             min_margin_seconds=DEFAULT_MIN_MARGIN_SECONDS):
+             min_margin_seconds=DEFAULT_MIN_MARGIN_SECONDS, relaxed_conditions=()):
+        relaxed_conditions = normalize_relaxed_conditions(relaxed_conditions)
         root = Path(root).resolve()
         selected = tuple(dict.fromkeys(str(name) for name in selected))
         try:
@@ -569,6 +635,7 @@ class BnMatchCache:
                 if (plan.root == str(root) and plan.selected == selected
                         and plan.automatic_candidates == (pool is None)
                         and (pool is None or plan.candidate_files == pool)
+                        and plan.relaxed_conditions == relaxed_conditions
                         and plan.max_gap_seconds == max_gap_seconds
                         and plan.min_margin_seconds == min_margin_seconds and plan_is_current(plan)):
                     return plan

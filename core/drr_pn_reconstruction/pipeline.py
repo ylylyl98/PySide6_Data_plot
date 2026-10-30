@@ -12,6 +12,7 @@ GENERALIZED_ALGORITHM_VERSION = "pn_raw_adaptive_regions_v1"
 LOCAL_ALGORITHM_VERSION = "pn_raw_local_evidence_regions_v1"
 CONDITIONED_ALGORITHM_VERSION = "pn_raw_conditioned_regions_v1"
 CONDITIONED_BOUNDED_ALGORITHM_VERSION = "pn_raw_conditioned_bounded_texture_v2"
+CONDITIONED_SINGLE_ALGORITHM_VERSION = "pn_raw_conditioned_single_gate_v1"
 PROTOCOL = {
     "source_preparation": "adopted_v12_v20_v21_v24_v29_v31_v32",
     "classification": "two_explicit_training_repeats_full_gate_axis",
@@ -48,6 +49,13 @@ CONDITIONED_BOUNDED_PROTOCOL = {
     "scientifically_validated": False,
 }
 
+CONDITIONED_SINGLE_PROTOCOL = {**CONDITIONED_PROTOCOL,
+    "source_preparation": "accepted_residual_v12_v20_v21_v24_v29_v31_v32",
+    "source_alignment_policy": "accepted_only", "automatic_application": False,
+    "classification": "single_measurement_gate_group_stability_PN_half_bound_v1",
+    "bounded_texture": "not_evaluated_requires_independent_sample_repeats", "independent_sample_repeats": 1,
+    "scientifically_validated": False}
+
 
 def _array_hash(value):
     return hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest()
@@ -72,7 +80,8 @@ def reconstruct_background(energy, pn_mean, pn_frames, training_samples, *,
     """Recompute source fits, classifications, references and regional construction.
 
     This entry point intentionally has no prepared-source, saved-background or
-    BN arguments. Two explicit training repeats inform source choice. The
+    BN arguments. Two explicit training repeats inform the existing methods;
+    ``conditioned_single`` uses one measurement and conditional gate evidence. The
     ``method='v66'`` retains the historical topology for regression;
     ``method='generalized'`` selects current source-symmetric regions and reports
     deferred repairs; ``method='local_evidence'`` tests compact repairs over
@@ -92,7 +101,7 @@ def reconstruct_background(energy, pn_mean, pn_frames, training_samples, *,
     from .regions_pipeline import prepare_regions
     from .feature_protection import normalize_feature_protection
     protected = normalize_feature_protection(feature_protection)
-    if protected and method != "conditioned_bounded":
+    if protected and method not in {"conditioned_bounded", "conditioned_single"}:
         raise ValueError("Feature protection requires conditioned_bounded reconstruction.")
     if method == "v66":
         from .render_pipeline import render_v66 as render
@@ -106,18 +115,26 @@ def reconstruct_background(energy, pn_mean, pn_frames, training_samples, *,
     elif method == "conditioned":
         from .render_conditioned import render_conditioned as render
         version, protocol = CONDITIONED_ALGORITHM_VERSION, CONDITIONED_PROTOCOL
-    elif method == "conditioned_bounded":
+    elif method in {"conditioned_bounded", "conditioned_single"}:
         from .render_conditioned import render_conditioned as render
-        version, protocol = CONDITIONED_BOUNDED_ALGORITHM_VERSION, CONDITIONED_BOUNDED_PROTOCOL
+        version, protocol = ((CONDITIONED_SINGLE_ALGORITHM_VERSION, CONDITIONED_SINGLE_PROTOCOL) if method == "conditioned_single"
+                             else (CONDITIONED_BOUNDED_ALGORITHM_VERSION, CONDITIONED_BOUNDED_PROTOCOL))
     else:
         raise ValueError("Unknown P/N reconstruction method.")
 
     e = np.asarray(energy, float)
     samples = np.asarray(training_samples, float)
-    if (samples.ndim != 3 or samples.shape[0] != 2 or samples.shape[1] < 3
+    if (samples.ndim != 3 or samples.shape[0] != (1 if method == "conditioned_single" else 2) or samples.shape[1] < 3
             or e.ndim != 1 or samples.shape[2] != len(e)
             or not np.all(np.isfinite(samples) & (samples > 0))):
-        raise ValueError("The reconstruction protocol needs two positive raw training repeats on the complete gate/energy grid.")
+        raise ValueError("The single-measurement reconstruction protocol needs one positive raw training measurement on the complete gate/energy grid."
+                         if method == "conditioned_single" else
+                         "The reconstruction protocol needs two positive raw training repeats on the complete gate/energy grid.")
+
+    if method == "conditioned_single":
+        frames = np.asarray(pn_frames)
+        if frames.ndim != 3 or frames.shape[0] != 2 or frames.shape[1] < 4 or frames.shape[1] % 2:
+            raise ValueError("Single-measurement reconstruction requires an even number of at least four P/N frames.")
 
     def check():
         check_load_cancelled()
@@ -134,7 +151,7 @@ def reconstruct_background(energy, pn_mean, pn_frames, training_samples, *,
     timings = {}
     source_started = perf_counter()
     update("source_preparation", "start")
-    alignment_policy = "accepted_only" if method == "conditioned_bounded" else "legacy_all_fitted"
+    alignment_policy = "accepted_only" if method in {"conditioned_bounded", "conditioned_single"} else "legacy_all_fitted"
     def prepare():
         return prepare_sources(e, pn_mean, pn_frames, cancelled=cancelled, progress=update,
                                alignment_policy=alignment_policy)
@@ -155,7 +172,7 @@ def reconstruct_background(energy, pn_mean, pn_frames, training_samples, *,
     region_started = perf_counter()
     update("regions", "start")
     regions = prepare_regions(e, pn_mean, pn_frames, samples, source_result=prepared,
-                              cancelled=cancelled, progress=update)
+                              cancelled=cancelled, progress=update, single_measurement=method == "conditioned_single")
     update("regions", "complete")
     timings["regions"] = perf_counter() - region_started
     rendered = {}
@@ -208,6 +225,11 @@ def reconstruct_background(energy, pn_mean, pn_frames, training_samples, *,
     }
     if bounded_result is not None:
         report.update(bounded_result["diagnostics"])
+    if method == "conditioned_single":
+        report.update(independent_sample_repeats=1,
+            uncertainty_basis="gate_group_dispersion_and_conditional_PN_half_difference",
+            cross_measurement_drift="not evaluable from one measurement",
+            bounded_texture="not evaluated; independent sample repeats unavailable")
     if protected:
         from .feature_protection import apply_feature_protection
         protection_started = perf_counter()
@@ -232,19 +254,23 @@ def reconstruct_background(energy, pn_mean, pn_frames, training_samples, *,
             arrays[key] = half
             arrays[f"{key}_log"] = np.log(half)
             halves[label] = half_detail
-        arrays["construction_type"] = np.array("conditioned_bounded_with_explicit_raw_source_protection")
+        arrays["construction_type"] = np.array(
+            "conditioned_single_with_explicit_raw_source_protection" if method == "conditioned_single"
+            else "conditioned_bounded_with_explicit_raw_source_protection")
         report["settings"]["feature_protection"] = protected
         report["feature_protection"] = {"full": detail, "conditional_halves": halves}
         report["generation_scope"] += (
             " Explicit protected ranges preserve the chosen raw source's log curvature with smooth curvature transitions and a full-fit global affine log gauge;"
             " intensity and DRR amplitudes can change across the complete spectrum."
             " source selection is user-declared, not an automatic featureless-source certificate.")
-        report["final_array_contract"].update({
+        report.setdefault("final_array_contract", {}).update({
             "background": "Final native background after explicit raw-source protection; use this sampled array, not inherited parent polynomials.",
             "feature_protection_prefix": "Protection geometry, weights and increments; parent arrays describe the pre-protection background.",
-            "bounded_prefix": "Fine-correction diagnostics before explicit feature protection; not the final applied intensity increment.",
             "final_polynomial_available": False,
         })
+        if method == "conditioned_bounded":
+            report["final_array_contract"]["bounded_prefix"] = (
+                "Fine-correction diagnostics before explicit feature protection; not the final applied intensity increment.")
         report["half_check_limitation"] += (
             " Protection halves use the same full-fit geometry and global affine integration constants with their own raw P/N means and parent;"
             " they are conditional checks, not independent validation.")

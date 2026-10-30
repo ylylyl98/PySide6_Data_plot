@@ -1,6 +1,6 @@
 """Frozen app requests for raw P/N reconstruction, with explicit sample roles.
 
-Only the two selected training files enter generation. Other measurements are
+Only the explicitly selected training files enter generation. Other measurements are
 listed as checks but never hashed into the generator key or read by fitting.
 Saving and applying remain the existing dialog/store's responsibility.
 """
@@ -21,6 +21,7 @@ from .feature_protection import normalize_feature_protection
 from .pipeline import (
     GENERALIZED_ALGORITHM_VERSION, GENERALIZED_PROTOCOL,
     CONDITIONED_BOUNDED_ALGORITHM_VERSION, CONDITIONED_BOUNDED_PROTOCOL,
+    CONDITIONED_SINGLE_ALGORITHM_VERSION, CONDITIONED_SINGLE_PROTOCOL,
 )
 
 
@@ -29,6 +30,8 @@ _METHOD_SPECS = {
                     "PN adaptive reconstruction — draft"),
     "conditioned_bounded": (CONDITIONED_BOUNDED_ALGORITHM_VERSION, CONDITIONED_BOUNDED_PROTOCOL,
                             "PN conditioned + bounded texture — draft"),
+    "conditioned_single": (CONDITIONED_SINGLE_ALGORITHM_VERSION, CONDITIONED_SINGLE_PROTOCOL,
+                           "PN single measurement reconstruction — draft"),
 }
 
 
@@ -48,7 +51,7 @@ def _method_for_version(version):
 @dataclass(frozen=True)
 class ReconstructionRequest:
     key: PnGenerationKey
-    training_files: tuple[str, str]
+    training_files: tuple[str, ...]
     evaluation_files: tuple[str, ...]
 
     @property
@@ -64,13 +67,15 @@ class ReconstructionRequest:
 def _settings(training_files, method="generalized", feature_protection=()):
     _algorithm, protocol, _label = _method_spec(method)
     protected = normalize_feature_protection(feature_protection)
-    if protected and method != "conditioned_bounded":
-        raise ValueError("Feature protection requires conditioned_bounded reconstruction.")
+    if protected and method not in ("conditioned_bounded", "conditioned_single"):
+        raise ValueError("Feature protection requires conditioned_bounded or conditioned_single reconstruction.")
     settings = {
         **protocol,
         "sample_analysis": {"training_files": list(training_files),
             "subset": "all gates and full native energy", "y_axis": "auto",
-            "split_policy": "explicit-two-training-repeats; all other selected files check only"},
+            "split_policy": ("single-measurement gate-group evidence; independent sample repeatability unavailable"
+                if method == "conditioned_single" else
+                "explicit-two-training-repeats; all other selected files check only")},
     }
     if protected:
         settings["feature_protection"] = protected
@@ -83,9 +88,12 @@ def prepare_reconstruction_request(folder, pair, measurements, *, training_files
 
     ``generalized`` retains the existing API default. ``conditioned_bounded``
     is an explicit opt-in for the conditioned parent with optional bounded raw
-    common fine correction. Neither request authorizes automatic application.
+    common fine correction. ``conditioned_single`` uses one complete measurement
+    with conditional gate evidence, without independent sample repeat checks.
+    No request authorizes automatic application.
     """
     algorithm, _protocol, _label = _method_spec(method)
+    single = method == "conditioned_single"
     pair = DrrPnPair(**pair) if isinstance(pair, dict) else pair
     if len(pair.p_files) != 1 or len(pair.n_files) != 1:
         raise ValueError("Raw reconstruction needs one original file per P/N role and all frames.")
@@ -94,7 +102,9 @@ def prepare_reconstruction_request(folder, pair, measurements, *, training_files
     paths = tuple(resolve_source_path(folder, name) for name in measurements)
     train = tuple(resolve_source_path(folder, name) for name in training_files)
     sources = tuple(resolve_source_path(folder, name) for name in (*pair.p_files, *pair.n_files))
-    if len(train) != 2 or len(set(train)) != 2:
+    if single and (len(train) != 1 or len(paths) != 1):
+        raise ValueError("Single measurement reconstruction requires exactly one selected measurement and one training file.")
+    if not single and (len(train) != 2 or len(set(train)) != 2):
         raise ValueError("Select exactly two distinct training measurement repeats.")
     if len(set(paths)) != len(paths) or not set(train).issubset(paths):
         raise ValueError("Training files must be distinct members of the selected measurement group.")
@@ -134,7 +144,9 @@ def _verify_request(folder, pair, request):
     except (KeyError, TypeError) as exc:
         raise ValueError("Invalid reconstruction source or dependency identity.") from exc
     if (source_paths != expected_sources or any(len(paths) != 1 for paths in source_paths.values())
-            or len(training) != 2 or len(set(training)) != 2
+            or len(training) != (1 if method == "conditioned_single" else 2)
+            or len(set(training)) != len(training)
+            or (method == "conditioned_single" and request.evaluation_files)
             or set(training).intersection((*source_paths["P"], *source_paths["N"]))
             or dependencies != expected_dependencies):
         raise ValueError("The reconstruction source or dependency identity does not match the frozen method and training files.")
@@ -160,7 +172,7 @@ def _generate_reconstruction_background(folder, pair, *, request, cancelled, pro
     method = request.method
     algorithm, protocol, label = _method_spec(method)
     protected = request.settings.get("feature_protection", ())
-    if protected:
+    if protected and method != "conditioned_single":
         label = "PN conditioned + explicit feature protection — draft"
     options = {"feature_protection": protected} if protected else {}
     result = generate_from_files(folder, pair.p_files[0], pair.n_files[0], request.training_files,
@@ -181,6 +193,11 @@ def _generate_reconstruction_background(folder, pair, *, request, cancelled, pro
         "automatic_application": False,
         "scientifically_validated": False,
         "scientific_acceptance": "Review dR/R and d2E for the intended features, their baseline neighborhoods and repeatability in this measurement group. Outside-range residuals are not an automatic rejection of local use; numerical generation does not establish scientific validation."}
+    if method == "conditioned_single":
+        report["scientific_acceptance"] = (
+            "Review dR/R, d2E and feature neighborhoods. Gate groups and conditional P/N halves do not establish "
+            "independent sample repeatability or cross-measurement drift. Fixed sample resonances may imitate "
+            "background texture. Numerical generation does not establish scientific validation.")
     encoded = json.dumps(report, ensure_ascii=False, sort_keys=True, allow_nan=False)
     key = hashlib.sha256(encoded.encode("utf8") + result.arrays["background"].tobytes()).hexdigest()
     source = replace(result.document.sources[-1], key=f"PN-reconstructed-{key[:20]}",

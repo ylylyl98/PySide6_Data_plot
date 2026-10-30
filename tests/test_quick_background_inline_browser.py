@@ -410,6 +410,15 @@ Basic.ApplicationWindow {
                 self.assertEqual(self.background.draft.files, tuple(self.portable(path) for path in self.bn[:8]))
             for kind, references in (("p", (self.p,)), ("n", (self.n,)), ("pn", (self.p, self.n))):
                 click(find("drr_background_source_" + kind))
+                if kind == "pn":
+                    # P+N now starts in the dedicated create/saved workflow;
+                    # ordinary CSV assignment remains an explicit saved route.
+                    self.assertTrue(find("drr_pn_simple_workflow").isVisible())
+                    self.background.setPnMode("saved")
+                    self.settle()
+                    find("drr_pn_choose_saved_files").forceActiveFocus()
+                    QTest.keyClick(window, Qt.Key_Space)
+                    self.settle()
                 self.assertTrue(find("drr_background_inline_browser").isVisible())
                 self.assertTrue(self.catalog.snapshot["selectionOpen"])
                 self.assertEqual(self.catalog.snapshot["selected"], [])

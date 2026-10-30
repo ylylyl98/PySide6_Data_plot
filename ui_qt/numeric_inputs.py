@@ -75,7 +75,6 @@ class NumericDoubleSpinBox(NativeDoubleSpinBox):
     scientific_threshold = 1e-3
 
     def __init__(self, *args, **kwargs):
-        self._editing = False
         self._user_edit_pending = False
         self._description_tooltip = ''
         super().__init__(*args, **kwargs)
@@ -92,8 +91,6 @@ class NumericDoubleSpinBox(NativeDoubleSpinBox):
         self._user_edit_pending = False
 
     def textFromValue(self, value):
-        if self._editing:
-            return super().textFromValue(value)
         if self.display_significant_digits is not None:
             if self.scientific_threshold is not None and value and (abs(value) < self.scientific_threshold or abs(value) >= 1e6):
                 return self._scientific_display(value, self.display_significant_digits)
@@ -149,14 +146,8 @@ class NumericDoubleSpinBox(NativeDoubleSpinBox):
             return self.value()
         return super().valueFromText(text)
 
-    def focusInEvent(self, event):
-        self._editing = True
-        self.lineEdit().setText(self.prefix() + super().textFromValue(self.value()) + self.suffix())
-        super().focusInEvent(event)
-
     def focusOutEvent(self, event):
         super().focusOutEvent(event)
-        self._editing = False
         self.lineEdit().setText(self.prefix() + self.textFromValue(self.value()) + self.suffix())
 
     def setToolTip(self, text):

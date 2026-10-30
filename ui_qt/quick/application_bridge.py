@@ -74,6 +74,10 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         self._drr_backgrounds = ()
         self._drr_background_bridge = None
         self._drr_background_recipe = None
+        self._drr_matching_folder = ""
+        self._drr_matching_drafts = {}
+        self._drr_matching_kind = None
+        self._drr_pending_background_draft = None
         self._drr_restore_pending = False
         self._drr_background_required = False
         self._drr_background_notice = ""
@@ -257,6 +261,11 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
 
     def _background_summary(self):
         if self._drr_background_required:
+            draft = self._drr_pending_background_draft
+            if draft is not None:
+                pool = draft.bn_candidates if draft.kind == "bn" else draft.pn_candidates
+                candidates = "experiment candidates" if pool is None else f"{len(pool)} candidate backgrounds"
+                return f"{draft.kind.upper()}: {candidates} · {len(self._sources)} measurements · Review matching and apply"
             return "Background: awaiting selection"
         if self._drr_products is not None and self._drr_products.request.background_mode == "imported":
             return "Imported map · no background division"
@@ -266,6 +275,13 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             if recipe.fixed:
                 return f"{kind}: {len(recipe.files)} reference files · Fixed"
             count = len(recipe.context.measurements) if recipe.context is not None else len(recipe.assignments)
+            if recipe.mode == "External":
+                matched = (recipe.draft is not None and (recipe.draft.assignment_method == "matched"
+                    or recipe.draft.bn_plan is not None or recipe.draft.pn_plan is not None))
+                matched = matched or len({item.baseline_files for item in recipe.assignments}) > 1
+                if matched:
+                    return f"{kind}: matched per measurement · {count} measurements · {len(recipe.files)} backgrounds"
+                return f"{kind}: common reference · {len(recipe.files)} files · {count} measurements"
             return f"{kind}: {recipe.mode} · {count} measurements"
         if self._drr_processing["backgroundMode"] == "external" and self._drr_backgrounds:
             return "External: " + ", ".join(Path(name).name for name in self._drr_backgrounds)
@@ -276,6 +292,46 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         from ui_qt.quick.drr_background_workflow import BackgroundContext
         return BackgroundContext(self._folder, self._sources, self._drr_display.y_axis_spec(),
             int(self._drr_processing["sgWindow"]), int(self._drr_processing["sgPolyorder"]))
+
+    def _clear_drr_matching_pools(self):
+        self._drr_matching_folder = ""
+        self._drr_matching_drafts.clear()
+        self._drr_matching_kind = None
+        self._drr_pending_background_draft = None
+
+    def _remember_drr_matching_pools(self):
+        """Retain choices in this experiment, without retaining matching approvals."""
+        from ui_qt.quick.drr_background_workflow import matching_pool_draft
+        if not self._folder:
+            return
+        folder = str(Path(self._folder).resolve())
+        if self._drr_matching_folder != folder:
+            self._clear_drr_matching_pools()
+            self._drr_matching_folder = folder
+        background = self._drr_background_bridge
+        if (self._background_open and background is not None and background.context is not None
+                and background.context.folder == folder):
+            drafts, current = background.source_drafts, background.draft
+        elif (self._drr_background_recipe is not None and self._drr_background_recipe.draft is not None
+                and self._drr_background_recipe.context is not None
+                and self._drr_background_recipe.context.folder == folder):
+            current = self._drr_background_recipe.draft
+            drafts = {current.kind: current}
+        else:
+            return
+        for kind, draft in drafts.items():
+            pool = matching_pool_draft(draft)
+            if pool is None:
+                self._drr_matching_drafts.pop(kind, None)
+            else:
+                self._drr_matching_drafts[kind] = pool
+        self._drr_matching_kind = current.kind if current.kind in self._drr_matching_drafts else None
+
+    def _matching_draft_for_folder(self):
+        if self._drr_matching_folder != str(Path(self._folder).resolve()):
+            self._clear_drr_matching_pools()
+            return None
+        return self._drr_matching_drafts.get(self._drr_matching_kind)
 
     def _bn_scope(self):
         return (self._sequence, self._workflow, self._folder, self._sources,
@@ -369,14 +425,15 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
                 background.closeRequested.connect(self._close_background_dialog)
                 background.requestFiles.connect(self.backgroundFileDialogRequested)
                 background.requestSave.connect(self.backgroundSaveDialogRequested)
-            current = (self._drr_background_recipe.draft if self._drr_background_recipe is not None else
+            current = (self._drr_pending_background_draft or (self._drr_background_recipe.draft if self._drr_background_recipe is not None else
                 BackgroundDraft(kind="bn" if self._drr_backgrounds and all(is_measured_bn_name(name) for name in self._drr_backgrounds) else "custom",
                     files=self._drr_backgrounds, which=self._drr_processing["backgroundFrame"], auto_bn_compare=self._automatic_bn_enabled())
                 if self._drr_processing["backgroundMode"] == "external" else
-                BackgroundDraft(kind="self", which="first" if self._drr_processing["backgroundMode"] == "self-first" else "last", auto_bn_compare=self._automatic_bn_enabled()))
+                BackgroundDraft(kind="self", which="first" if self._drr_processing["backgroundMode"] == "self-first" else "last", auto_bn_compare=self._automatic_bn_enabled())))
             self._drr_background_bridge.open(context, current,
                 raw_snapshot=self._drr_products.raw_snapshot if self._drr_products is not None else None,
-                initial_error=self._drr_background_notice if self._drr_background_required else "")
+                initial_error=self._drr_background_notice if self._drr_background_required else "",
+                source_drafts=self._drr_matching_drafts if self._drr_matching_folder == context.folder else None)
             self._drr_background_bridge.restore_comparison(self._bn_payload or
                 (current.calibration["payload"] if current.calibration is not None else None))
             self._background_open = True
@@ -405,6 +462,9 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
                           "Background application cancelled; the previous result was retained.")
 
     def _close_background_dialog(self):
+        self._remember_drr_matching_pools()
+        if self._drr_background_required:
+            self._drr_pending_background_draft = self._matching_draft_for_folder()
         if self._background_applications:
             self._sequence += 1
             if self._load_cancellation is not None:
@@ -758,6 +818,8 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         if path.is_file():
             self.openFile(QUrl.fromLocalFile(str(path)))
         elif path.is_dir():
+            if self._workflow == "drr" and str(path.resolve()) != self._folder:
+                self._clear_drr_matching_pools()
             self._folder = str(path.resolve())
             self._remember_folder(self._folder)
             child = self._workflow_bridges.get(self._workflow)
@@ -831,7 +893,6 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             previous_recipe = self._drr_background_recipe
             keep_background = (previous_recipe is not None and previous_recipe.fixed
                 and all(Path(name).suffix.lower() == ".csv" for name in paths))
-            self.cancelDrrBackground()
             self._clear_files(keep_background=keep_background)
             self._sources = paths
             if not self._folder or not all(Path(name).is_relative_to(self._folder) for name in paths):
@@ -842,6 +903,16 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             if keep_background:
                 self._load_fixed_background(previous_recipe)
             else:
+                original_csv = all(Path(name).suffix.lower() == ".csv" for name in paths)
+                draft = self._matching_draft_for_folder() if original_csv else None
+                if not original_csv:
+                    self._clear_drr_matching_pools()
+                if draft is not None:
+                    self._drr_pending_background_draft = draft
+                    self._require_drr_background(
+                        f"{draft.kind.upper()} candidate pool retained. Review new matches for this group, then Apply.")
+                    self.openDrrBackground()
+                    return
                 self._drr_background_required = all(Path(name).suffix.lower() == ".csv" for name in paths)
                 self._load_drr(restore_background=True, auto_open_background=True)
 
@@ -1023,7 +1094,9 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         # Clearing the measurement selection is also a way to change groups.
         # Only an explicit background reset (or a non-CSV load) releases Keep.
         if self._workflow == "drr":
+            self._remember_drr_matching_pools()
             self.cancelDrrBackground()
+            self._drr_pending_background_draft = None
         if keep_background is None:
             recipe = self._drr_background_recipe
             keep_background = self._workflow == "drr" and recipe is not None and recipe.fixed
@@ -1104,6 +1177,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
                 self._drr_backgrounds = recipe.files
                 self._drr_restore_pending = False
                 self._drr_background_required = False
+                self._drr_pending_background_draft = None
                 self._drr_processing.update(backgroundMode=result.request.background_mode, backgroundFrame=recipe.which)
                 if from_dialog:
                     self._drr_background_bridge.application_finished()
@@ -1464,6 +1538,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             if self._sources and any(Path(name).suffix.lower() != ".csv" for name in self._sources):
                 return
             self.cancelDrrBackground()
+            self._clear_drr_matching_pools()
             self._cancel_bn_check()
             self._sequence += 1
             if self._load_cancellation is not None:

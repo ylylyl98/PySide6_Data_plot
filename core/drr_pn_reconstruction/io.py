@@ -43,14 +43,18 @@ def _readonly(value):
     return result
 
 
-def load_raw_inputs(folder, p_file, n_file, training_files):
+def load_raw_inputs(folder, p_file, n_file, training_files, *, single_measurement=False):
     """Load one original CSV per source, all frames, with explicit sample roles.
 
     Frame order and the native spectral grid are retained. The initial
-    reconstruction protocol uses equal, even P/N frame counts for its first/
+    reconstruction protocols use equal, even P/N frame counts for their first/
     second-half checks. Evaluation files must be passed separately to evaluators.
+    ``single_measurement=True`` accepts one actual sample file, without creating
+    synthetic training repeats.
     """
-    if isinstance(training_files, (str, Path)) or len(training_files) != 2:
+    if single_measurement and (isinstance(training_files, (str, Path)) or len(training_files) != 1):
+        raise ValueError("Select exactly one raw training measurement file for the single measurement protocol.")
+    if not single_measurement and (isinstance(training_files, (str, Path)) or len(training_files) != 2):
         raise ValueError("Select exactly two distinct raw training measurement files for this protocol.")
     paths = tuple(resolve_source_path(folder, str(p)) for p in (p_file, n_file, *training_files))
     if len(set(paths)) != len(paths):
@@ -108,7 +112,8 @@ def generate_from_files(folder, p_file, n_file, training_files, *, cancelled=Non
     regions (``generalized``), experimental compact repairs (``local_evidence``),
     bounded-source construction with conditional compact repairs (``conditioned``),
     or that construction with optional supported raw-common fine correction
-    (``conditioned_bounded``).
+    (``conditioned_bounded``), or a conditioned parent using one measurement's
+    gate-group stability without a bounded fine correction (``conditioned_single``).
     Scientific acceptance for other measurements is not inferred from a
     successful numerical reconstruction. No saved baseline is overwritten.
     """
@@ -122,12 +127,13 @@ def generate_from_files(folder, p_file, n_file, training_files, *, cancelled=Non
     scope = load_scope(_CallbackCancellation(cancelled)) if cancelled is not None else nullcontext()
     with scope:
         protected = normalize_feature_protection(feature_protection)
-        if protected and method != "conditioned_bounded":
-            raise ValueError("Feature protection requires conditioned_bounded reconstruction.")
+        if protected and method not in ("conditioned_bounded", "conditioned_single"):
+            raise ValueError("Feature protection requires conditioned_bounded or conditioned_single reconstruction.")
         started = perf_counter()
         code = {str(path): _file_digest(path) for path in dependency_paths()}
         load_started = perf_counter()
-        raw = load_raw_inputs(folder, p_file, n_file, training_files)
+        raw = load_raw_inputs(folder, p_file, n_file, training_files,
+                              **({"single_measurement": True} if method == "conditioned_single" else {}))
         load_seconds = perf_counter() - load_started
         source_identity = {"implementation": code,
                            "raw_sources": [{"role": row["role"], "sha256": row["sha256"]}

@@ -499,7 +499,8 @@ class QuickDrrWorkflowTests(unittest.TestCase):
         metadata = json.loads(dat.with_suffix(".metadata.json").read_text(encoding="utf-8"))
         self.assertEqual(metadata["processing"]["savgol_window_y"], 9)
         self.assertEqual(metadata["processing"]["savgol_window_y_requested"], 21)
-        self.assertIn("_Y9_", dat.name)
+        self.assertTrue(dat.stem.endswith("_dXdY"))
+        self.assertNotIn("_Y9_", dat.name)
 
     def test_dat_metadata_changes_removal_or_appearance_invalidate_loaded_products(self):
         for change in ("changed", "deleted", "appeared"):

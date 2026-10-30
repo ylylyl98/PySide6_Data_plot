@@ -158,6 +158,18 @@ use collision-safe suffixes such as `_01`; SHG and Power analyses
 use collision-safe package directories. Associated DAT, PNG, and JSON files
 retain the same logical stem or package.
 
+DRR filenames retain the sample, average count, background label and derivative
+type, for example `sample_avg3_DR_R_PN_d2E.png`. The native interface uses the
+recorded background kind: `P`, `N`, `PN`, `PN-Match` or `BN`. `PN-Match` means
+different P+N backgrounds are assigned within the group; references without a
+known kind retain `External`. Short IDs, version numbers and processing tokens
+such as `W21_O2_Regrid` are omitted. `dE`, `d2E` and `dXdY` still distinguish
+derivatives. Complete windows, polynomial orders, grid settings, sources and
+per-file assignments remain in metadata. Different analyses sharing a short
+name get numeric collision suffixes; identical saved analyses can reuse the
+current name family. Old long filenames remain readable, while new exports use
+compact names.
+
 ## DAT re-import and Origin use
 
 Exported DAT files remain tab-delimited, Origin-friendly numerical matrices and

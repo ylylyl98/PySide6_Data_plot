@@ -8,6 +8,7 @@ import tempfile
 from threading import Event
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 from core.drr_composite_background import (
     CompositeBackground, CompositeSource, load_composite_source, save_composite_background,
@@ -63,6 +64,23 @@ class PnMatchingTests(unittest.TestCase):
         self.assertEqual([row.baseline_file for row in plan.rows], [early, late])
         self.assertEqual(plan.resolution.numerical_path, 'heterogeneous')
         self.assertTrue(all(len(item.baseline_files) == 1 for item in plan.resolution.assignments))
+
+    def test_verified_run_conflict_preserves_choices_and_rechecks_override(self):
+        early = self.write('Pbackground_001', 900)
+        late = self.write('Pbackground_002', 1900)
+        second = self.write('TG_rep02', 2000, varying=True)
+        times = {str(self.root / name).casefold(): stamp for name, stamp in
+                 ((self.measurement, 1000), (second, 2000), (early, 900), (late, 1900))}
+        clock = SimpleNamespace(capture_context=lambda source: SimpleNamespace(
+            verified_run=True, run_id='run', experiment_id='experiment'))
+        with patch('core.drr_pn_matching._timing', return_value=(times, 'capture_log', '', clock)):
+            plan = self.plan(selected=(self.measurement, second))
+        self.assertEqual([row.baseline_file for row in plan.rows], [early, late])
+        self.assertEqual(plan.batches[0][1], 'conflict')
+        self.assertTrue(all(any('Verified capture batch:' in w for w in row.warnings) for row in plan.rows))
+        changed = override_pn_match(plan, second, early)
+        self.assertEqual(changed.batches[0][1], 'conflict')  # joint timing is tied
+        self.assertTrue(changed.ready)
 
     def test_role_grid_and_known_condition_conflicts_are_excluded(self):
         valid = self.write('Pbackground_good', 800)
@@ -161,6 +179,46 @@ class PnMatchingTests(unittest.TestCase):
         plan = self.plan()
         self.assertEqual(plan.rows[0].baseline_file, second)
         self.assertEqual(plan.rows[0].timing_basis, 'capture_started_utc')
+
+    def test_real_capture_runs_group_p_and_n_and_keep_conflicting_choices(self):
+        second = self.write('TG_rep02', 1001, varying=True)
+        for kind, gate in (('p', -10), ('n', 10)):
+            with self.subTest(kind=kind):
+                early = self.write(kind.upper() + 'background_early', 1999, gate=gate)
+                late = self.write(kind.upper() + 'background_late', 999, gate=gate)
+                events = [dict(event='capture_started', output={'file': name},
+                    experiment_id='experiment-A', run_id=run,
+                    started_utc=datetime.fromtimestamp(stamp, timezone.utc).isoformat())
+                    for name, stamp, run in ((self.measurement, 1000, 'run-A'),
+                        (second, 2000, 'run-A'), (early, 900, 'reference'), (late, 1900, 'reference'))]
+                (self.root / 'run.experiment.events.jsonl').write_text('\n'.join(map(json.dumps, events)))
+                plan = self.plan(kind, selected=(self.measurement, second), candidate_files=(early, late))
+                self.assertTrue(plan.ready)
+                self.assertEqual([row.baseline_file for row in plan.rows], [early, late])
+                self.assertEqual([row.timing_basis for row in plan.rows], ['capture_started_utc'] * 2)
+                self.assertEqual(plan.batches[0][0], (self.measurement, second))
+                self.assertEqual(plan.batches[0][1], 'conflict')
+                self.assertTrue(all(any('Verified capture batch:' in w for w in row.warnings) for row in plan.rows))
+
+    def test_unverified_and_incompatible_measurements_do_not_form_batch(self):
+        second = self.write('TG_rep02', 1010, varying=True)
+        other = self.write('TG_other', 1020, varying=True, prefix=self.prefix.replace('p2n1', 'p3n1'))
+        grid = self.write('TG_grid', 1030, varying=True, columns='740,760,781')
+        background = self.write('Pbackground', 900)
+        names = (self.measurement, second, other, grid, background)
+        def write_log(verified):
+            events = [dict(event='capture_started', output={'file': name}, experiment_id='experiment-A',
+                started_utc=datetime.fromtimestamp(1000 + i * 10, timezone.utc).isoformat(),
+                **({'run_id': 'run-A'} if verified else {})) for i, name in enumerate(names)]
+            (self.root / 'run.experiment.events.jsonl').write_text('\n'.join(map(json.dumps, events)))
+        write_log(False)
+        plan = self.plan(selected=names[:-1], candidate_files=(background,))
+        self.assertEqual(plan.batches, ())
+        write_log(True)
+        plan = self.plan(selected=names[:-1], candidate_files=(background,))
+        self.assertEqual(len(plan.batches), 1)
+        self.assertEqual(plan.batches[0][0], (self.measurement, second))
+        self.assertEqual([row.measurement_file for row in plan.rows], list(names[:-1]))
 
     def test_bad_capture_log_for_incompatible_candidate_does_not_block_match(self):
         valid = self.write('Pbackground_good', 900)

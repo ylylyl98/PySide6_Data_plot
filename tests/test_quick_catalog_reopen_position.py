@@ -367,6 +367,67 @@ Basic.ApplicationWindow {
             self.assertEqual(self.bridge.snapshot["selected"], [target])
             self.assertTrue(self.row(self.files, target).property("checked"))
 
+        def test_pl_warm_reopen_centers_last_loaded_file_after_hidden_reset(self):
+            rows = [dict(row, kind="PL") for row in self.catalog["files"][:180]]
+            catalog = dict(files=rows, groups=[], sources=())
+            target = rows[146]["id"]
+            self.open([], workflow="pl")
+            self.bridge._finish(self.bridge._generation, catalog, "", 1., None)
+            self.position(self.files, 146)
+            self.click(self.row(self.files, target))
+            self.accept()
+            self.bridge._catalog = dict(files=[], groups=[], sources=())
+            self.bridge._refresh_models()
+            QTest.qWait(30)
+            self.bridge._catalog = catalog
+            self.bridge._refresh_models()
+            self.position(self.files, 0)
+            self.open([target], workflow="pl")
+            self.wait(lambda: self.row_visible(self.files, target), "The PL file was not restored on reopen")
+            self.assert_row_centered(self.files, target, "PL measurement")
+            self.assertEqual(self.bridge.snapshot["focused"], target)
+            self.assertTrue(self.row(self.files, target).property("checked"))
+
+        def test_pl_cached_target_keeps_position_through_final_inventory(self):
+            rows = [dict(row, kind="PL") for row in self.catalog["files"][:180]]
+            target = rows[146]["id"]
+            # The remembered file can be near the top of an optimistic cache;
+            # newer acquisitions arrive ahead of it in the final inventory.
+            self.open([target], workflow="pl")
+            preview = dict(files=rows[144:156], groups=[], sources=())
+            self.bridge._preview(self.bridge._generation, preview)
+            QTest.qWait(70)
+            self.assertTrue(self.dialog.property("reopenPositionPending"))
+            self.bridge._finish(self.bridge._generation, dict(files=rows, groups=[], sources=()), "", 1., None)
+            self.wait(lambda: self.row_visible(self.files, target), "Final PL inventory lost the remembered position")
+            self.assert_row_centered(self.files, target, "PL measurement after inventory refresh")
+
+        def test_pl_cached_target_is_revealed_while_full_inspection_is_still_busy(self):
+            rows = [dict(row, kind="PL") for row in self.catalog["files"][:180]]
+            target = rows[146]["id"]
+            self.open([target], workflow="pl")
+            self.bridge._preview(self.bridge._generation, dict(files=rows[100:160], groups=[], sources=()))
+            self.wait(lambda: self.row_visible(self.files, target), "Cached PL target waited for a full scan")
+            self.assertTrue(self.bridge.snapshot["busy"])
+            self.assertTrue(self.dialog.property("reopenPositionPending"))
+            self.bridge._finish(self.bridge._generation, dict(files=rows, groups=[], sources=()), "", 1., None)
+            self.wait(lambda: not self.dialog.property("reopenPositionPending"))
+            self.assert_row_centered(self.files, target, "PL measurement after slow inspection")
+
+        def test_pl_browsing_cached_preview_cancels_late_reopen_position(self):
+            rows = [dict(row, kind="PL") for row in self.catalog["files"][:180]]
+            target, draft = rows[146]["id"], rows[2]["id"]
+            self.open([target], workflow="pl")
+            self.bridge._preview(self.bridge._generation, dict(files=rows[:12], groups=[], sources=()))
+            self.wait(lambda: self.row_visible(self.files, draft))
+            self.click(self.row(self.files, draft))
+            self.assertFalse(self.dialog.property("reopenPositionPending"))
+            self.bridge._finish(self.bridge._generation, dict(files=rows, groups=[], sources=()), "", 1., None)
+            QTest.qWait(70)
+            self.assertTrue(self.row_visible(self.files, draft))
+            self.assertFalse(self.row_visible(self.files, target))
+            self.assertEqual(self.bridge.snapshot["selected"], [draft])
+
         def test_filtered_target_finishes_without_mutating_search_or_selection(self):
             target = self.catalog["groups"][25]["members"][30]
             self.bridge.setParameter("query", "measurement-00")

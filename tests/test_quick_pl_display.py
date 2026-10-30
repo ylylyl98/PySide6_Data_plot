@@ -259,6 +259,48 @@ Window {
             self.key(window, Qt.Key_Down)
             self.assertAlmostEqual(self.value("axis.xmin"), 1.3)
 
+        def test_compact_focus_commit_cancel_and_steps_preserve_precision(self):
+            self.load()
+            precise = 1.6499192414680808
+            self.assertTrue(self.state.setNumber("axis.xmin", str(precise)))
+            self.idle()
+            window = self.window()
+            field = self.item(window, "drr_input_axis.xmin")
+            other = self.item(window, "drr_input_axis.xmax")
+            changes = []
+            self.state.parameterChanged.connect(lambda *args: changes.append(args))
+            for _ in range(2):
+                field.forceActiveFocus()
+                settle()
+                self.assertEqual(field.property("text"), "1.6499")
+                self.key(window, Qt.Key_Return, "\r")
+                other.forceActiveFocus()
+                settle()
+                self.assertEqual(field.property("text"), "1.6499")
+                self.assertEqual(self.value("axis.xmin"), precise)
+            self.edit(window, "axis.xmin", "nan")
+            self.key(window, Qt.Key_Return, "\r")
+            self.assertTrue(self.state.error)
+            self.key(window, Qt.Key_Escape)
+            self.assertFalse(self.state.error)
+            self.assertEqual(field.property("text"), "1.6499")
+            self.assertEqual(self.value("axis.xmin"), precise)
+            self.assertEqual(changes, [])
+            step = self.state.snapshot["numbers"]["axis.xmin"]["step"]
+            self.key(window, Qt.Key_Up)
+            stepped = self.value("axis.xmin")
+            # Existing backend steps use 16 significant digits, not the short label.
+            self.assertAlmostEqual(stepped, precise + step, places=14)
+            other.forceActiveFocus()
+            field.forceActiveFocus()
+            settle()
+            self.assertEqual(field.property("text"), self.state.snapshot["numbers"]["axis.xmin"]["text"])
+            self.assertEqual(self.value("axis.xmin"), stepped)
+            self.edit(window, "axis.xmin", "1.71234567890123")
+            self.key(window, Qt.Key_Return, "\r")
+            self.assertEqual(self.value("axis.xmin"), 1.71234567890123)
+            self.assertEqual(field.property("text"), "1.7123")
+
         def test_invalid_draft_blocks_scale_switch_and_survives_refresh(self):
             self.load()
             window = self.window()

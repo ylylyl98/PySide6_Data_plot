@@ -7,10 +7,11 @@ from dataclasses import asdict, fields, replace
 from datetime import datetime
 import json
 import math
+import re
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QObject, Property, Qt, Signal, Slot, QUrl
+from PySide6.QtCore import QObject, Property, Qt, Signal, Slot, QUrl, QTimer
 
 from core.load_cancellation import LoadCancellation, LoadCancelled, load_scope
 from ui_qt.quick.drr_background_workflow import BackgroundContext, BackgroundDraft, parse_regions, prepare_application
@@ -32,6 +33,9 @@ class DrrBackgroundBridge(QObject):
     closeRequested = Signal()
     applicationCancelRequested = Signal()
     _finished = Signal(int, object, str)
+    _pn_history_finished = Signal(int, object, str)
+    _pn_batch_finished = Signal(int, object, str)
+    _pn_batch_progress = Signal(int, str)
 
     def __init__(self, *, settings, auto_compare_supported=False, parent=None):
         super().__init__(parent)
@@ -41,6 +45,7 @@ class DrrBackgroundBridge(QObject):
         self._draft = BackgroundDraft()
         self._source_drafts = {}
         self._source_methods = {}
+        self._explicit_methods = set()
         self._file_selection_bridge = None
         self._file_selection_session = None
         self._inline_selection_bridge = None
@@ -53,6 +58,34 @@ class DrrBackgroundBridge(QObject):
         self._pn_files = {"P": (), "N": ()}
         self._training = set()
         self._generation = "reconstruction"
+        self._pn_mode = "create"
+        self._pn_history_loading = False
+        self._pn_history_loaded = False
+        self._pn_history_epoch = 0
+        self._pn_history_token = None
+        self._pn_history_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="quick-pn-history")
+        self._pn_history_finished.connect(self._complete_pn_history, Qt.ConnectionType.QueuedConnection)
+        self._pn_selection_revision = 0
+        self._pn_manual_training = False
+        self._pn_training_summary = ""
+        self._pn_single_eligible = False
+        self._pn_preview_verified = False
+        self._pn_batch_plan = None
+        self._pn_batch_result = None
+        self._pn_batch_loading = False
+        self._pn_batch_error = ""
+        self._pn_batch_acknowledged = False
+        self._pn_batch_preview = 0
+        self._pn_batch_expanded_options = set()
+        self._pn_batch_epoch = 0
+        self._pn_batch_token = None
+        self._pn_batch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="quick-pn-pairing")
+        self._pn_batch_finished.connect(self._complete_pn_batch_plan, Qt.ConnectionType.QueuedConnection)
+        self._pn_batch_progress.connect(self._update_pn_batch_progress, Qt.ConnectionType.QueuedConnection)
+        self._pn_batch_timer = QTimer(self)
+        self._pn_batch_timer.setSingleShot(True)
+        self._pn_batch_timer.setInterval(300)
+        self._pn_batch_timer.timeout.connect(self._start_pn_batch_plan)
         self._pn_frames = {"P": "all", "N": "all"}
         self._versions = ()
         self._version = None
@@ -69,6 +102,11 @@ class DrrBackgroundBridge(QObject):
         self._raw_preview = None
         self._page = "settings"
         self._method = "common"
+        self._matching = False
+        self._match_timer = QTimer(self)
+        self._match_timer.setSingleShot(True)
+        self._match_timer.setInterval(300)
+        self._match_timer.timeout.connect(self._start_scheduled_match)
         self._status = "Choose original CSV measurements to configure a background."
         self._error = ""
         self._busy = False
@@ -202,9 +240,16 @@ class DrrBackgroundBridge(QObject):
     def draft(self):
         return self._draft
 
-    def open(self, context, current=None, *, raw_snapshot=None, catalog=(), initial_error=""):
+    @property
+    def source_drafts(self):
+        """Current per-source drafts, including uncommitted candidate selections."""
+        return {**self._source_drafts, self._draft.kind: self._draft}
+
+    def open(self, context, current=None, *, raw_snapshot=None, catalog=(), initial_error="", source_drafts=None):
         if not isinstance(context, BackgroundContext):
             raise TypeError("BackgroundContext is required.")
+        self._cancel_pn_history()
+        self._cancel_pn_batch_plan()
         self.cancel()
         self._raw_preview, self._raw_preview_key = None, None
         self._texts["rawSource"] = ""
@@ -223,10 +268,13 @@ class DrrBackgroundBridge(QObject):
             self._draft = BackgroundDraft(**{key: value for key, value in values.items() if key in names})
         else:
             self._draft = BackgroundDraft()
-        self._source_drafts = {self._draft.kind: self._draft}
-        self._method = "matched" if (self._draft.bn_plan or self._draft.pn_plan or
+        self._source_drafts = {key: value for key, value in (source_drafts or {}).items() if key in _KINDS and isinstance(value, BackgroundDraft) and value.kind == key}
+        self._source_drafts[self._draft.kind] = self._draft
+        self._explicit_methods = {key for key, draft in self._source_drafts.items() if getattr(draft, "assignment_method_explicit", False) or draft.files or draft.saved_assignments or draft.bn_plan or draft.pn_plan or getattr(draft, "assignment_method", "common") == "matched"}
+        self._method = "matched" if (getattr(self._draft, "assignment_method", "common") == "matched" or self._draft.bn_plan or self._draft.pn_plan or
             self._draft.saved_assignments and self._draft.kind in {"bn", "p", "n", "pn"}) else "common"
-        self._source_methods = {self._draft.kind: self._method}
+        self._source_methods = {key: ("matched" if getattr(draft, "assignment_method", "common") == "matched" or draft.bn_plan or draft.pn_plan or draft.saved_assignments and key in {"bn", "p", "n", "pn"} else "common") for key, draft in self._source_drafts.items()}
+        self._source_methods[self._draft.kind] = self._method
         self._flags.update(fixed=self._draft.fixed, auto_bn_compare=self._draft.auto_bn_compare,
                            allow_stale=self._draft.allow_stale, acknowledged=False)
         self._page, self._opened, self._error = "settings", True, initial_error
@@ -237,12 +285,33 @@ class DrrBackgroundBridge(QObject):
         self._comparison, self._fit_view = None, 0
         self._invalid_numbers.clear()
         self._pn_files, self._training = {"P": (), "N": ()}, set()
+        self._pn_batch_plan = self._pn_batch_result = None
+        self._pn_batch_error = ""
+        self._pn_batch_acknowledged = False
         self._generation = "saved" if self._version is not None else "reconstruction"
+        if self._generation == "reconstruction":
+            self._pn_frames = {"P": "all", "N": "all"}
+        self._pn_mode = "saved" if (self._version is not None or self._pn_external_reference_active()) else "create"
+        self._pn_manual_training = False
+        self._pn_single_eligible = False
+        self._flags["manual_training"] = False
+        self._pn_selection_revision += 1
+        self._pn_preview_verified = False
+        self._pn_history_loaded = False
+        self._pn_history_loading = False
+        self._pn_history_epoch += 1
+        if self._draft.kind == "pn":
+            self._auto_training()
         if self._version is not None:
             self._pn_files = {"P": tuple(self._version.pair.p_files), "N": tuple(self._version.pair.n_files)}
         self._set_fit_recipe(self._draft.fitted_result or {})
         self._status = f"{len(context.measurements)} measurements. Browse references directly, or load the P/N catalog when needed."
         self._refresh()
+        if self._draft.kind == "pn":
+            self._start_pn_history()
+        if self._method == "matched" and not (self._draft.bn_plan or self._draft.pn_plan or self._draft.saved_assignments):
+            self._schedule_match()
+            self._refresh()
 
     def _templates(self):
         try:
@@ -321,11 +390,24 @@ class DrrBackgroundBridge(QObject):
         rows = []
         for row in getattr(plan, "rows", ()):
             assignment = getattr(row, "assignment", None)
+            evidence = str(getattr(row, "evidence", ""))
+            evidence = re.sub(r";\s*original source time gap [^;]+", "", evidence, flags=re.IGNORECASE)
+            basis = getattr(row, "timing_basis", "")
+            basis_label = {"capture_started_utc": "acquisition log", "capture_log": "acquisition log",
+                           "filesystem_mtime_proxy": "file modification time (proxy)",
+                           "unavailable": "unavailable"}.get(basis, basis.replace("_", " "))
             rows.append(dict(measurement=getattr(row, "measurement_file", ""),
                              background=", ".join(assignment.baseline_files) if assignment else "Unresolved",
-                             detail="; ".join((str(getattr(row, "evidence", "")), *map(str, getattr(row, "warnings", ())))),
-                             candidates=list(getattr(row, "candidate_files", ())),
-                             canOverride=self._draft.pn_plan is not None))
+                             timeGapLabel=f"{row.time_gap_seconds:g} s" if getattr(row, "time_gap_seconds", None) is not None else "unavailable",
+                             timeSourceLabel=basis_label or "unavailable",
+                             reviewRequired=not assignment or bool(getattr(row, "warnings", ())),
+                             detail="; ".join(filter(None, (evidence,
+                                 f"Time gap: {row.time_gap_seconds:g} s" if getattr(row, "time_gap_seconds", None) is not None else "",
+                                 f"Time source: {basis_label}" if basis else "",
+                                 *map(str, getattr(row, "warnings", ()))))),
+                             candidates=list(getattr(plan, "candidate_files", ())) if self._draft.bn_plan is not None else list(getattr(row, "candidate_files", ())),
+                             canOverride=self._draft.pn_plan is not None or self._draft.bn_plan is not None,
+                             overrideNeedsVerification=self._draft.bn_plan is not None))
         if plan is None:
             rows.extend(dict(measurement=item.measurement_file,
                 background=", ".join(item.baseline_files) if item.baseline_mode == "External" else item.baseline_mode,
@@ -337,17 +419,43 @@ class DrrBackgroundBridge(QObject):
         self._numbers["gate"] = int(np.clip(self._numbers["gate"], 0, gate_maximum))
         assignments = tuple(getattr(getattr(plan, "resolution", None), "assignments", ()) or self._draft.saved_assignments)
         common = not assignments or len({(item.baseline_mode, item.baseline_files, item.baseline_which, item.regions) for item in assignments}) == 1
-        can_fix = (self._draft.kind not in {"self", "fitted"} and self._draft.calibration is None and common
+        can_fix = (self._method != "matched" and self._draft.kind not in {"self", "fitted"} and self._draft.calibration is None and common
             and all(item.baseline_mode == "External" for item in assignments))
         if plan is not None and not plan.ready:
             can_fix = False
         if not can_fix:
             self._flags["fixed"] = False
+        saved_valid = bool(self._context and self._draft.saved_assignments and
+            tuple(item.measurement_file for item in self._draft.saved_assignments) == self._context.measurements)
+        warnings_acknowledged = (self._draft.bn_warnings_acknowledged if self._draft.bn_plan is not None
+                                 else self._draft.pn_warnings_acknowledged)
+        matched_ready = (saved_valid if plan is None else bool(plan.ready and
+            (not getattr(plan, "warnings", ()) or warnings_acknowledged)))
         sources = [dict(key=source.key, label=source.label, files=list(source.files), which=source.which)
                    for source in self._document.sources] if self._document else []
+        from core.drr_match_conditions import CONDITION_LABELS
+        relaxed = tuple(getattr(self._draft, "relaxed_conditions", ()))
+        conditions = [dict(key=key, label=label, relaxed=key in relaxed) for key, label in CONDITION_LABELS.items()]
+        condition_summary = ("Strict conditions" if not relaxed else
+                             "Allow differences: " + ", ".join(CONDITION_LABELS[key] for key in relaxed))
+        training_files = tuple(name for name in self._context.measurements if name in self._training) if self._context else ()
+        single = bool(self._context and len(self._context.measurements) == 1 and self._generation == "reconstruction")
+        training_ready = (self._pn_single_eligible and training_files == self._context.measurements
+                          if single else len(training_files) == 2)
+        training_summary = self._pn_training_summary
+        if self._generation == "assisted" and self._context and (self._draft.kind == "pn" or self._page == "pn"):
+            from core.drr_pn_assisted import split_measurements
+            try:
+                training_files, check_files = split_measurements(self._context.measurements)
+                training_summary = f"Sample-assisted uses {len(training_files)} training and {len(check_files)} check measurements in selection order."
+            except ValueError as exc:
+                training_files, training_summary = (), str(exc)
+        elif self._generation == "pn-only":
+            training_files, training_summary = (), "P/N-only generation does not use sample measurements."
         self._snapshot = dict(opened=self._opened, busy=self._busy, page=self._page, status=self._status, error=self._error,
             measurementSummary=f"{len(self._context.measurements)} original measurements" if self._context else "No measurements",
             files=list(self._draft.files), kind=self._draft.kind, method=self._method,
+            recommendMatching=self._draft.kind in {"bn", "p", "n", "pn"} and self._method == "common" and len(self._draft.files) > 1 and self._draft.kind not in self._explicit_methods,
             selectedCandidates=(list(self._background_files()) if self._draft.saved_assignments else
                 list(self._draft.bn_candidates or ()) if self._draft.kind == "bn" else list(self._draft.pn_candidates or ())),
             candidatePoolAutomatic=self._draft.kind == "bn" and self._draft.bn_candidates is None and not self._draft.saved_assignments,
@@ -356,7 +464,7 @@ class DrrBackgroundBridge(QObject):
             selectedRegion=self._selected_region if self._selected_region is not None else -1,
             choices=dict(kind=choice(_KIND_LABELS, _KINDS.index(self._draft.kind)),
                          frame=choice(("First frame", "Last frame", "All frames, equal file weight"), _FRAMES.index(self._draft.which)),
-                         method=choice(("Same files for all measurements", "Match files to each measurement"), int(self._method == "matched")),
+                         method=choice(("Same background for the group (average selected files)", "Match each measurement by compatibility and time"), int(self._method == "matched")),
                          generation=choice(("Use saved background", "P/N reconstruction draft", "Experimental sample-assisted draft", "Experimental P/N-only draft"), _GENERATORS.index(self._generation)),
                          pFrame=choice(("First", "Last", "All"), _FRAMES.index(self._pn_frames["P"])),
                          nFrame=choice(("First", "Last", "All"), _FRAMES.index(self._pn_frames["N"])),
@@ -371,8 +479,30 @@ class DrrBackgroundBridge(QObject):
                             next((i for i, version in enumerate(self._versions) if self._version and version.version_id == self._version.version_id), -1))),
             numbers=dict(self._numbers), flags=dict(self._flags), texts=dict(self._texts), mappings=rows,
             warnings=list(getattr(plan, "warnings", ())), sources=sources,
+            matching=self._matching or self._match_timer.isActive(),
+            matchingConditions=conditions, matchingConditionsSummary=condition_summary,
+            matchSummary=(f"Matched {sum(bool(getattr(row, 'assignment', None)) for row in getattr(plan, 'rows', ()))}/{len(self._context.measurements)} · {sum(not getattr(row, 'assignment', None) or bool(getattr(row, 'warnings', ())) or bool(getattr(row, 'anomaly', False)) for row in getattr(plan, 'rows', ()))} need review" if plan is not None and self._context else ""),
             regions=[dict(low=region.xmin_ev, high=region.xmax_ev, source=region.source_key) for region in self._document.regions] if self._document else [],
             pFiles=list(self._pn_files["P"]), nFiles=list(self._pn_files["N"]),
+            pnExternalReferenceActive=self._pn_external_reference_active(),
+            pnContextKey=json.dumps([self._context.folder, list(self._context.measurements)], ensure_ascii=False, separators=(",", ":")) if self._context else "",
+            pnMode=self._pn_mode, pnHistoryLoading=self._pn_history_loading, pnHistoryLoaded=self._pn_history_loaded,
+            pnTrainingSummary=training_summary, pnTrainingFiles=list(training_files),
+            pnUsesMeasurements=self._generation in {"reconstruction", "assisted"}, pnTrainingReady=training_ready,
+            pnSingleMeasurement=single,
+            pnTrainingRequired=self._generation == "reconstruction",
+            pnMethodLabel={"reconstruction": "Single measurement draft" if single else "P/N reconstruction", "assisted": "Sample-assisted (experimental)", "pn-only": "P/N only (experimental)", "saved": "Saved background"}.get(self._generation, self._generation),
+            pnFramesSummary=("All acquired frames" if self._pn_frames == {"P": "all", "N": "all"} else
+                f"P: {self._pn_frames['P']} · N: {self._pn_frames['N']}"),
+            pnCreateReady=bool(self._pn_files["P"] and self._pn_files["N"] and not self._busy and
+                (self._generation != "reconstruction" or training_ready and self._pn_frames == {"P": "all", "N": "all"}) and
+                (self._generation != "assisted" or self._context and bool(self._context.measurements)) and
+                self._generation in {"reconstruction", "assisted", "pn-only"}),
+            pnVersionNeedsSnapshot=bool(self._version is not None and not getattr(self._version, "fresh", False)),
+            pnPreviewReady=bool(self._version is not None and self._document is not None and self._pn_preview_verified),
+            pnCanApply=bool(self._version is not None and self._document is not None and self._pn_preview_verified and
+                (self._version.fresh or self._flags["allow_stale"] and self._version.status != "invalid") and not self._busy),
+            pnVersionLabel=(f"v{getattr(self._version, 'number', '?')} · {getattr(self._version, 'status', 'unknown')}" if self._version is not None else ""),
             catalogLoaded=self._catalog_loaded,
             pairSummary=self._pair_summary(),
             pnCatalog=[dict(file=entry.source.source, role=entry.role, detail=entry.reason,
@@ -381,7 +511,7 @@ class DrrBackgroundBridge(QObject):
             versionStatus="; ".join(self._version.status_reasons) if self._version else "No saved version selected; generation is explicit.",
             hasDocument=self._document is not None, hasFit=self._fit_reference is not None,
             hasPreview=(self._page == "fit" and self._fit_raw is not None or self._page == "bn" and self._bn_payload is not None
-                        or self._page == "raw" and self._raw_preview is not None or self._page in {"pn", "composite"} and self._document is not None),
+                        or self._page == "raw" and self._raw_preview is not None or (self._page in {"pn", "composite"} or self._page == "settings" and self._draft.kind == "pn") and self._document is not None),
             plotTool=str(self._navigation.mode) if self._navigation is not None else "",
             canUndo=bool(self._undo), canUseVersion=self._version is not None,
             canCalibrate=self._draft.kind == "bn" and bool(self._draft.files),
@@ -394,10 +524,73 @@ class DrrBackgroundBridge(QObject):
             gateMaximum=gate_maximum,
             gateDescription=f"{preview_cube.gate_label}: {preview_cube.gate[self._numbers['gate']]:.9g}" if preview_cube is not None else "",
             invalidNumberFields=sorted(self._invalid_numbers),
-            applyEnabled=self._context is not None and not self._busy and not self._invalid_numbers)
+            applyEnabled=self._context is not None and not self._busy and not self._matching and not self._match_timer.isActive() and not self._invalid_numbers
+                and not (self._draft.kind in {"bn", "p", "n", "pn"} and self._method == "common" and len(self._draft.files) > 1 and self._draft.kind not in self._explicit_methods)
+                and (self._method != "matched" or matched_ready))
+        self._snapshot.update(self._pn_batch_snapshot())
         self.snapshotChanged.emit()
 
+    def _pn_batch_snapshot(self):
+        active, plan, result = self._pn_batch_active(), self._pn_batch_plan, self._pn_batch_result
+        state = dict(pnBatchActive=active, pnBatchLoading=self._pn_batch_loading,
+            pnBatchRows=[], pnBatchWarnings=list(getattr(plan, "warnings", ())),
+            pnBatchAcknowledged=self._pn_batch_acknowledged, pnBatchError=self._pn_batch_error,
+            pnBatchSummary="", pnBatchUnresolved=0, pnBatchPreviewItems=[], pnBatchPreviewIndex=self._pn_batch_preview)
+        if not active:
+            # Multiple raw files belong to the reconstruction planner, rather
+            # than the experimental generators' file-averaging inputs.
+            if self._pn_mode == "create" and any(len(names) > 1 for names in self._pn_files.values()):
+                state.update(pnCreateReady=False, pnCanApply=False,
+                    pnTrainingSummary="Multiple P/N candidates require P/N reconstruction. Choose that method in Advanced settings.")
+            return state
+        rows = []
+        for row in getattr(plan, "rows", ()):
+            segment = next((segment for segment in plan.segments if row.measurement_file in segment.measurement_files), None)
+            original_current = next((i for i, option in enumerate(row.options)
+                            if (option.p_file, option.n_file) == (row.p_file, row.n_file)), -1)
+            option_indices = list(range(len(row.options) if row.measurement_file in self._pn_batch_expanded_options else min(25, len(row.options))))
+            if original_current >= 0 and original_current not in option_indices:
+                option_indices.append(original_current)
+            current = option_indices.index(original_current) if original_current >= 0 else -1
+            selected = row.options[original_current] if original_current >= 0 else None
+            def gap(value):
+                return "unknown" if value is None else f"{value:g} s"
+            rows.append(dict(measurement=row.measurement_file, p=row.p_file, n=row.n_file,
+                current=current, optionIndices=option_indices,
+                options=[f"P: {Path(row.options[i].p_file).name} · N: {Path(row.options[i].n_file).name}"
+                         for i in option_indices], moreOptions=len(row.options) > len(option_indices),
+                totalOptions=len(row.options),
+                evidence=row.evidence, warnings=list(row.warnings), manual=row.manual,
+                training=("Single measurement draft · between-measurement repeatability unavailable"
+                          if segment and segment.method == "conditioned_single" else
+                          f"{len(segment.training_files)} training repeats · {len(segment.measurement_files)-len(segment.training_files)} check measurements"
+                          if segment else "Training awaits a P/N assignment"),
+                time=(f"Measurement → P {gap(selected.measurement_p_gap)} · N {gap(selected.measurement_n_gap)}; "
+                      f"P ↔ N {gap(selected.pair_gap)} · {row.timing_basis}" if selected else "Choose a compatible P/N pair")))
+        resolved = sum(bool(row["p"] and row["n"]) for row in rows)
+        total = len(self._context.measurements) if self._context else 0
+        pairs = len({(row["p"], row["n"]) for row in rows if row["p"] and row["n"]})
+        ready = bool(plan is not None and plan.ready and not self._pn_batch_loading)
+        summary = ("Preparing assignments…" if self._pn_batch_loading else
+                   f"{resolved}/{total} measurements · {pairs} P/N pairs · {len(getattr(plan, 'segments', ()))} reconstruction tasks")
+        state.update(pnBatchRows=rows, pnBatchSummary=summary, pnBatchUnresolved=total-resolved,
+            canUseVersion=False,
+            pnTrainingSummary="Training measurements are prepared separately for each local assignment. Expand assignments to review.",
+            pnTrainingFiles=[], pnSingleMeasurement=False, pnMethodLabel="P/N backgrounds for each measurement",
+            pnTrainingReady=ready,
+            pnCreateReady=ready and not self._busy and self._pn_frames == {"P": "all", "N": "all"},
+            pnPreviewReady=bool(result is not None and self._pn_preview_verified and self._document is not None),
+            pnCanApply=bool(result is not None and self._pn_preview_verified and not self._busy
+                and (not plan.warnings or self._pn_batch_acknowledged)))
+        if result is not None:
+            state["pnBatchPreviewItems"] = [f"Background {i+1} · P {Path(version.pair.p_files[0]).name} · N {Path(version.pair.n_files[0]).name}"
+                                            for i, version in enumerate(result.versions)]
+        state["matching"] = state["pnBatchLoading"] or self._snapshot.get("matching", False)
+        return state
+
     def _pair_summary(self):
+        if self._pn_batch_active():
+            return f"{len(self._pn_files['P'])} P and {len(self._pn_files['N'])} N candidates · automatically assigned to measurements below."
         if not all(self._pn_files.values()) or not self._context:
             return "Choose P and N independently; neither choice selects a saved version."
         try:
@@ -449,6 +642,7 @@ class DrrBackgroundBridge(QObject):
         if self._closed or epoch != self._epoch or self._token.cancelled:
             return
         self._busy = False
+        self._matching = False
         callback, self._completion = self._completion, None
         try:
             if error:
@@ -462,6 +656,9 @@ class DrrBackgroundBridge(QObject):
 
     @Slot()
     def cancel(self):
+        self._cancel_pn_batch_plan()
+        self._match_timer.stop()
+        self._matching = False
         self._cancel_file_selection()
         self._cancel_inline_selection()
         if self._applying:
@@ -472,6 +669,262 @@ class DrrBackgroundBridge(QObject):
             self._token.cancel()
         self._busy = False
         self._completion = None
+
+    def _pn_external_reference_active(self):
+        draft = self._draft
+        return bool(draft.kind == "pn" and draft.version is None and
+            (draft.files or draft.saved_assignments or draft.pn_plan or draft.pn_candidates
+             or draft.assignment_method == "matched"))
+
+    def _auto_training(self):
+        if self._context is None or (self._draft.kind != "pn" and self._page != "pn"):
+            return
+        from ui_qt.drr_pn_repeat_selection import choose_training_repeats
+        choice = choose_training_repeats(self._context.folder, self._context.measurements,
+            excluded_files=(*self._pn_files["P"], *self._pn_files["N"]), allow_single=True)
+        self._pn_single_eligible = choice.single_measurement and choice.usable
+        if self._pn_manual_training:
+            return
+        self._training = set(choice.training_files)
+        self._pn_training_summary = choice.reason
+
+    def _pn_batch_active(self):
+        return (self._pn_mode == "create" and self._generation == "reconstruction"
+                and (self._draft.kind == "pn" or self._page == "pn")
+                and any(len(names) > 1 for names in self._pn_files.values()))
+
+    def _cancel_pn_batch_plan(self):
+        self._pn_batch_timer.stop()
+        self._pn_batch_epoch += 1
+        if self._pn_batch_token is not None:
+            self._pn_batch_token.cancel()
+        self._pn_batch_loading = False
+
+    def _schedule_pn_batch_plan(self):
+        self._cancel_pn_batch_plan()
+        self._pn_batch_plan = None
+        self._pn_batch_error = ""
+        self._pn_batch_expanded_options.clear()
+        self._invalidate_pn_preview()
+        if (self._context is not None and self._pn_batch_active()
+                and all(self._pn_files.values()) and self._opened and not self._closed):
+            self._pn_batch_loading = True
+            self._pn_batch_timer.start()
+
+    def _start_pn_batch_plan(self):
+        if self._closed or self._context is None or not self._pn_batch_active():
+            return
+        context, candidates = self._context, dict(self._pn_files)
+        relaxed = tuple(self._draft.relaxed_conditions)
+        epoch = self._pn_batch_epoch
+        token = self._pn_batch_token = LoadCancellation()
+        def work():
+            from core.drr_pn_batch_plan import build_pn_batch_plan
+            with load_scope(token):
+                return build_pn_batch_plan(context.folder, context.measurements,
+                    p_candidates=candidates["P"], n_candidates=candidates["N"],
+                    relaxed_conditions=relaxed, cancelled=lambda: token.cancelled)
+        future = self._pn_batch_executor.submit(work)
+        def done(result):
+            value, error = None, ""
+            try:
+                value = result.result()
+            except (LoadCancelled, InterruptedError):
+                error = "Cancelled"
+            except Exception as exc:
+                error = str(exc)
+            try:
+                self._pn_batch_finished.emit(epoch, value, error)
+            except RuntimeError:
+                pass
+        future.add_done_callback(done)
+        self._refresh()
+
+    @Slot(int, object, str)
+    def _complete_pn_batch_plan(self, epoch, plan, error):
+        if self._closed or epoch != self._pn_batch_epoch or not self._pn_batch_active():
+            return
+        self._pn_batch_loading = False
+        if error:
+            if error != "Cancelled":
+                self._pn_batch_error = error
+                self._error = error
+        else:
+            self._pn_batch_plan = plan
+            self._pn_batch_error = ""
+            self._error = ""
+            self._status = ("P/N assignments ready. Generate the required backgrounds, then review and apply."
+                            if plan.ready else "Some measurements need a P/N choice. Expand assignments to resolve them.")
+        self._refresh()
+
+    @Slot(int, str)
+    def _update_pn_batch_progress(self, revision, message):
+        if self._busy and revision == self._pn_selection_revision and not self._closed:
+            self._status = message
+            self._refresh()
+
+    @Slot(str, int)
+    def setPnBatchPair(self, measurement, index):
+        if self._busy or self._pn_batch_plan is None or not self._pn_batch_active():
+            return
+        row = next((row for row in self._pn_batch_plan.rows if row.measurement_file == measurement), None)
+        if row is None or not 0 <= index < len(row.options):
+            return
+        from core.drr_pn_batch_plan import override_pn_batch_pair
+        plan, option = self._pn_batch_plan, row.options[index]
+        self._invalidate_pn_preview()
+        def complete(value):
+            self._pn_batch_plan = value
+            self._status = "P/N assignment changed. Generate the updated backgrounds before applying."
+        self._run(lambda token: override_pn_batch_pair(plan, measurement, option.p_file, option.n_file),
+                  complete, "Checking the selected P/N pair…")
+
+    @Slot(int)
+    def setPnBatchPreview(self, index):
+        result = self._pn_batch_result
+        if self._busy or result is None or not 0 <= index < len(result.versions):
+            return
+        self._pn_batch_preview = index
+        self._version, self._document = result.versions[index], result.documents[index]
+        self._draw_preview()
+        self._refresh()
+
+    @Slot(bool)
+    def acknowledgePnBatchWarnings(self, value):
+        if not self._busy:
+            self._pn_batch_acknowledged = bool(value)
+            self._refresh()
+
+    @Slot(str)
+    def showAllPnBatchPairs(self, measurement):
+        if not self._busy and self._pn_batch_plan is not None and any(
+                row.measurement_file == measurement for row in self._pn_batch_plan.rows):
+            self._pn_batch_expanded_options.add(measurement)
+            self._refresh()
+
+    @Slot()
+    def refreshPnBatchAssignments(self):
+        if not self._busy and self._pn_batch_active():
+            self._schedule_pn_batch_plan()
+            self._error = ""
+            self._refresh()
+
+    def _invalidate_pn_preview(self):
+        self._pn_selection_revision += 1
+        self._version = None
+        self._document = None
+        self._pn_preview_verified = False
+        self._pn_batch_result = None
+        self._pn_batch_acknowledged = False
+        if self._draft.version is not None:
+            self._draft = replace(self._draft, version=None)
+
+    @Slot(str)
+    def setPnMode(self, mode):
+        if mode not in {"create", "saved"} or self._busy:
+            return
+        if mode != self._pn_mode:
+            was_batch = self._pn_batch_active()
+            self._pn_mode = mode
+            if mode == "create":
+                self._invalidate_pn_preview()
+                if self._generation == "saved":
+                    self._generation = "reconstruction"
+                    self._pn_frames = {"P": "all", "N": "all"}
+            else:
+                self._pn_selection_revision += 1
+                self._cancel_pn_batch_plan()
+                if was_batch:
+                    self._invalidate_pn_preview()
+            if mode == "create" and self._pn_batch_active():
+                self._schedule_pn_batch_plan()
+        if mode == "saved" and not self._pn_history_loaded and not self._pn_history_loading:
+            self._start_pn_history()
+        self._refresh()
+
+    def _cancel_pn_history(self):
+        self._pn_history_epoch += 1
+        if self._pn_history_token is not None:
+            self._pn_history_token.cancel()
+            self._pn_history_token = None
+        self._pn_history_loading = False
+
+    def _start_pn_history(self):
+        if self._closed or self._context is None:
+            return
+        self._cancel_pn_history()
+        self._pn_history_token = LoadCancellation()
+        token = self._pn_history_token
+        epoch, context, revision = self._pn_history_epoch, self._context, self._pn_selection_revision
+        current_version = self._version
+        self._pn_history_loading = True
+        self._refresh()
+        def work():
+            with load_scope(token):
+                return load_history()
+        def load_history():
+            from core.drr_pn_store import DrrPnStore
+            from core.drr_composite_background import read_composite_background
+            token.check()
+            store = DrrPnStore(context.folder)
+            versions = store.list_versions()
+            token.check()
+            try:
+                associated = store.find_applied(context.measurements)
+            except (ValueError, OSError) as exc:
+                associated = None
+                association_error = str(exc)
+            else:
+                association_error = ""
+            token.check()
+            current = store.get_version(current_version.version_id) if current_version is not None else None
+            token.check()
+            preview = current if current is not None else associated
+            document = read_composite_background(preview.csv_path) if preview is not None else None
+            token.check()
+            return versions, associated, current, document, revision, association_error
+        future = self._pn_history_executor.submit(work)
+        def done(result):
+            try:
+                value, error = result.result(), ""
+            except Exception as exc:
+                value, error = None, str(exc)
+            try:
+                self._pn_history_finished.emit(epoch, value, error)
+            except RuntimeError:
+                pass
+        future.add_done_callback(done)
+
+    @Slot(int, object, str)
+    def _complete_pn_history(self, epoch, result, error):
+        if self._closed or not self._opened or epoch != self._pn_history_epoch:
+            return
+        self._pn_history_loading = False
+        self._pn_history_loaded = not bool(error)
+        if error:
+            self._error = "Could not load P/N history: " + error
+        else:
+            versions, associated, current, document, revision, association_error = result
+            if association_error:
+                self._status = association_error
+            if revision == self._pn_selection_revision:
+                self._versions = tuple(versions)
+            else:
+                known = {item.version_id for item in self._versions}
+                self._versions = (*self._versions, *(item for item in versions if item.version_id not in known))
+            if (current is not None and revision == self._pn_selection_revision and self._version is not None
+                    and self._version.version_id == current.version_id):
+                self._version, self._document = current, document
+                self._pn_preview_verified = True
+                self._draw_preview()
+            elif (associated is not None and revision == self._pn_selection_revision and self._version is None
+                    and self._draft.kind == "pn" and not self._pn_external_reference_active()
+                    and not self._pn_files["P"] and not self._pn_files["N"]):
+                self._version, self._document = associated, document
+                self._pn_preview_verified = True
+                self._pn_mode = "saved"
+                self._draw_preview()
+        self._refresh()
 
     def _load_catalog(self):
         context, supplied = self._context, self._catalog
@@ -504,19 +957,30 @@ class DrrBackgroundBridge(QObject):
     def setChoice(self, key, index):
         if self._busy:
             return
+        if self._matching and key in {"kind", "method", "frame"}:
+            self.cancel()
         try:
             items = self._snapshot["choices"][key]["items"]
             if not 0 <= index < len(items):
                 raise ValueError("Choose a listed value.")
             if key == "kind":
+                self._cancel_pn_batch_plan()
                 self._cancel_file_selection()
                 self._source_drafts[self._draft.kind] = self._draft
                 self._source_methods[self._draft.kind] = self._method
                 kind = _KINDS[index]
                 self._draft = self._source_drafts.get(kind, BackgroundDraft(kind=kind, which="last" if kind == "self" else "all"))
                 self._flags.update(fixed=self._draft.fixed, auto_bn_compare=self._draft.auto_bn_compare, acknowledged=False)
-                self._method = self._source_methods.get(kind, "matched" if self._draft.bn_plan or self._draft.pn_plan else "common")
+                self._method = self._source_methods.get(kind, "matched" if getattr(self._draft, "assignment_method", "common") == "matched" or self._draft.bn_plan or self._draft.pn_plan else "common")
                 self._bn_payload = None
+                if kind == "pn" and not self._pn_history_loaded and not self._pn_history_loading:
+                    self._auto_training()
+                    self._pn_mode = "saved" if (self._draft.version or self._pn_external_reference_active()) else "create"
+                    self._start_pn_history()
+                if self._method == "matched" and not (self._draft.bn_plan or self._draft.pn_plan or self._draft.saved_assignments):
+                    self._schedule_match()
+                if self._pn_batch_active():
+                    self._schedule_pn_batch_plan()
             elif key == "frame":
                 which = _FRAMES[index]
                 if which == "all" and (self._draft.kind == "self" or any(
@@ -528,18 +992,37 @@ class DrrBackgroundBridge(QObject):
                     regions=tuple(replace(region, baseline_which=which) for region in item.regions))
                     for item in self._draft.saved_assignments)
                 self._draft = replace(self._draft, which=which, bn_plan=None, pn_plan=None,
-                    saved_assignments=assignments,
+                    saved_assignments=assignments, batch_result=None,
+                    saved_matching_review=None if self._draft.batch_result is not None else self._draft.saved_matching_review,
                     regions=tuple(replace(region, baseline_which=which) for region in self._draft.regions))
                 self._bn_payload = None
+                if self._method == "matched":
+                    self._schedule_match()
             elif key == "method":
+                if self._method == ("common", "matched")[index]:
+                    self._explicit_methods.add(self._draft.kind)
+                    self._draft = replace(self._draft, assignment_method=self._method, assignment_method_explicit=True)
+                    self._refresh()
+                    return
+                self._explicit_methods.add(self._draft.kind)
                 self._cancel_file_selection()
+                names = self._background_files()
                 self._method = ("common", "matched")[index]
-                self._draft = replace(self._draft, bn_plan=None, pn_plan=None, saved_assignments=(), version=None, calibration=None)
+                self._draft = replace(self._draft, assignment_method=self._method, assignment_method_explicit=True, fixed=False, bn_plan=None, pn_plan=None, saved_assignments=(), version=None, calibration=None, batch_result=None, saved_matching_review=None,
+                    **({"bn_candidates" if self._draft.kind == "bn" else "pn_candidates": names} if self._method == "matched" else {"files": names}))
+                if self._method == "matched":
+                    self._schedule_match()
                 self._bn_payload = None
             elif key == "generation":
+                if self._generation != _GENERATORS[index]:
+                    self._invalidate_pn_preview()
                 self._generation = _GENERATORS[index]
+                self._schedule_pn_batch_plan()
             elif key in {"pFrame", "nFrame"}:
-                self._pn_frames[key[0].upper()] = _FRAMES[index]
+                role = key[0].upper()
+                if self._pn_frames[role] != _FRAMES[index]:
+                    self._invalidate_pn_preview()
+                self._pn_frames[role] = _FRAMES[index]
             elif key == "fitMethod":
                 self._fit_method = ("spline", "polynomial")[index]
                 self._invalidate_fit()
@@ -547,6 +1030,11 @@ class DrrBackgroundBridge(QObject):
                 self._fit_view = index
                 self._draw_preview()
             elif key == "version":
+                self._pn_batch_result = None
+                self._cancel_pn_batch_plan()
+                self._pn_selection_revision += 1
+                self._pn_preview_verified = False
+                self._document = None
                 self._version = self._versions[index]
                 self._generation = "saved"
                 self._flags["allow_stale"] = False
@@ -603,6 +1091,51 @@ class DrrBackgroundBridge(QObject):
         self._refresh()
 
     @Slot(str, bool)
+    def setRelaxedCondition(self, key, value):
+        from core.drr_match_conditions import normalize_relaxed_conditions
+        if (self._method != "matched" and not self._pn_batch_active()) or self._draft.kind not in {"bn", "p", "n", "pn"} or (self._busy and not self._matching):
+            return
+        selected = set(self._draft.relaxed_conditions)
+        selected.add(key) if value else selected.discard(key)
+        try:
+            selected = normalize_relaxed_conditions(selected)
+        except ValueError as exc:
+            self._error = str(exc)
+            self._refresh()
+            return
+        self._change_relaxed_conditions(selected)
+
+    @Slot()
+    def resetMatchingConditions(self):
+        if (self._method == "matched" or self._pn_batch_active()) and self._draft.kind in {"bn", "p", "n", "pn"} and not (self._busy and not self._matching):
+            self._change_relaxed_conditions(())
+
+    def _change_relaxed_conditions(self, selected):
+        if selected == self._draft.relaxed_conditions:
+            return
+        if self._pn_batch_active():
+            self._draft = replace(self._draft, relaxed_conditions=selected)
+            self._schedule_pn_batch_plan()
+            self._error = ""
+            self._refresh()
+            return
+        if self._matching:
+            self.cancel()
+        pool = self._draft.bn_candidates if self._draft.kind == "bn" else self._draft.pn_candidates
+        pool_key = "bn_candidates" if self._draft.kind == "bn" else "pn_candidates"
+        if pool is None and self._draft.saved_assignments:
+            pool = self._background_files()
+        self._draft = replace(self._draft, relaxed_conditions=selected, bn_plan=None, pn_plan=None,
+                              **{pool_key: pool}, saved_assignments=(), calibration=None, batch_result=None, saved_matching_review=None, bn_warnings_acknowledged=False,
+                              pn_warnings_acknowledged=False)
+        self._flags["acknowledged"] = False
+        self._bn_payload = None
+        self._error = ""
+        self._status = "Matching conditions changed. Previous mapping and review were cleared."
+        self._schedule_match()
+        self._refresh()
+
+    @Slot(str, bool)
     def setFlag(self, key, value):
         if self._busy:
             return
@@ -610,10 +1143,22 @@ class DrrBackgroundBridge(QObject):
             self._error = "Automatic BN comparison is unavailable in this session. Compare the selected group in BN comparison."
             self._refresh()
             return
-        if key.startswith("training:") and self._context:
+        if key == "manual_training":
+            self._pn_manual_training = bool(value)
+            self._flags["manual_training"] = bool(value)
+            if not value:
+                self._auto_training()
+            self._pn_training_summary = ("Select the current measurement for the single measurement draft." if self._context and len(self._context.measurements) == 1 else "Choose exactly two training repeats.") if value else self._pn_training_summary
+            self._invalidate_pn_preview()
+        elif key.startswith("training:") and self._context:
             name = key.split(":", 1)[1]
             if name in self._context.measurements:
-                self._training.add(name) if value else self._training.discard(name)
+                if (name in self._training) != bool(value):
+                    self._training.add(name) if value else self._training.discard(name)
+                    self._pn_manual_training = True
+                    self._flags["manual_training"] = True
+                    self._pn_training_summary = ("Single measurement draft: gate-group and P/N half-frame evidence; between-measurement repeatability unavailable." if len(self._context.measurements) == 1 else "Manually selected training repeats; choose exactly two.")
+                    self._invalidate_pn_preview()
         elif key in self._flags:
             self._flags[key] = value
             if key in {"fixed", "auto_bn_compare", "allow_stale"}:
@@ -627,6 +1172,8 @@ class DrrBackgroundBridge(QObject):
     @Slot(str, str)
     def setText(self, key, text):
         if key in self._texts and not self._busy:
+            if key == "featureProtection" and self._texts[key] != text:
+                self._invalidate_pn_preview()
             self._texts[key] = text
             if key.startswith("bn."):
                 self._bn_payload = None
@@ -659,7 +1206,8 @@ class DrrBackgroundBridge(QObject):
             raise ValueError("This source does not use external reference files.")
         chooser = self.fileSelectionBridge
         files = self._pn_files[role] if role in {"P", "N"} else self._background_files()
-        chooser.open_selection(self._context.folder, self._draft.kind if self._draft.kind in {"bn", "p", "n", "pn", "custom"} else "pn", files, role=role)
+        chooser.open_selection(self._context.folder, self._draft.kind if self._draft.kind in {"bn", "p", "n", "pn", "custom"} else "pn", files, role=role,
+                               multiple=role in {"P", "N"} and self._generation == "reconstruction")
         self._file_selection_session = (self._context, self._draft.kind, self._method, role)
         self.fileSelectionRequested.emit()
 
@@ -683,7 +1231,9 @@ class DrrBackgroundBridge(QObject):
                 self.selectFiles(role, list(names))
             else:
                 self._pn_files[role] = ()
-                self._version, self._document = None, None
+                self._invalidate_pn_preview()
+                self._auto_training()
+                self._schedule_pn_batch_plan()
                 self._status = f"{role} selection cleared. Choose a source before generating."
                 self._error = ""
                 self._refresh()
@@ -706,13 +1256,15 @@ class DrrBackgroundBridge(QObject):
         else:
             changes = {"files": names}
         self._draft = replace(self._draft, **changes, bn_plan=None, pn_plan=None, version=None,
-                              calibration=None, saved_assignments=(), bn_warnings_acknowledged=False,
+                              calibration=None, saved_assignments=(), batch_result=None, saved_matching_review=None, bn_warnings_acknowledged=False,
                               pn_warnings_acknowledged=False)
         self._bn_payload = None
         self._flags["acknowledged"] = False
         self._status = (f"{len(names)} candidate files selected. Match the group again to review the updated mapping."
                         if self._method == "matched" else f"{len(names)} reference files selected. Apply background to use this draft.")
         self._error = ""
+        if self._method == "matched":
+            self._schedule_match()
 
     @Slot(str)
     def removeBackgroundFile(self, name):
@@ -755,12 +1307,15 @@ class DrrBackgroundBridge(QObject):
         try:
             if role in {"P", "N"}:
                 from core.drr_pn_selection import pn_source_matches_role
-                if len(names) != 1 or not pn_source_matches_role(names[0], role):
-                    raise ValueError("Choose one original file for this P/N role; an opposite role or BN file cannot be relabelled.")
+                if ((len(names) != 1 and self._generation != "reconstruction")
+                        or not all(pn_source_matches_role(name, role) for name in names)):
+                    raise ValueError("Choose original files for this P/N role; opposite roles and BN files cannot be relabelled. Experimental generators use one file per role.")
                 self._cancel_file_selection()
-                self._pn_files[role] = names
-                self._version = None
-                self._document = None
+                if self._pn_files[role] != names:
+                    self._pn_files[role] = names
+                    self._invalidate_pn_preview()
+                    self._auto_training()
+                    self._schedule_pn_batch_plan()
                 self._status = "P/N selection updated. Generate explicitly or choose a saved version."
             elif role in {"background", "background-add"}:
                 self._set_background_files(tuple(dict.fromkeys((*self._background_files(), *names))) if role == "background-add" else names)
@@ -786,7 +1341,23 @@ class DrrBackgroundBridge(QObject):
 
     @Slot(str, str)
     def overrideMatch(self, measurement, background):
-        if self._busy or self._draft.pn_plan is None:
+        if self._busy or self._matching:
+            return
+        if self._draft.bn_plan is not None:
+            from core.drr_bn_matching import override_bn_match
+            draft = self._draft
+            self._draft = replace(draft, bn_warnings_acknowledged=False, pn_warnings_acknowledged=False)
+            self._flags["acknowledged"] = False
+            def work(token):
+                return override_bn_match(draft.bn_plan, (measurement,), background, cancelled=lambda: token.cancelled)
+            def complete(plan):
+                self._draft = replace(self._draft, bn_plan=plan, bn_warnings_acknowledged=False)
+                self._status = "Manual BN assignment checked; review the updated mapping and warnings."
+            self._run(work, complete, "Checking the selected BN candidate and updating the group mapping…")
+            self._matching = True
+            self._refresh()
+            return
+        if self._draft.pn_plan is None:
             return
         from core.drr_pn_matching import override_pn_match
         try:
@@ -815,6 +1386,21 @@ class DrrBackgroundBridge(QObject):
         self._edit_document(replace(self._document, regions=tuple(region for i, region in enumerate(self._document.regions) if i != index)))
         self._refresh()
 
+    def _select_common_background(self, kind, **changes):
+        """Discard match certificates before adopting an advanced common reference."""
+        self._source_drafts[self._draft.kind] = self._draft
+        self._source_methods[self._draft.kind] = self._method
+        self.cancel()
+        self._method = "common"
+        self._source_methods[kind] = "common"
+        self._explicit_methods.add(kind)
+        self._flags["acknowledged"] = False
+        self._flags["fixed"] = False
+        self._draft = replace(self._draft, kind=kind, assignment_method="common", assignment_method_explicit=True,
+            relaxed_conditions=(), saved_matching_review=None, bn_candidates=None, pn_candidates=None,
+            bn_plan=None, pn_plan=None, saved_assignments=(), batch_result=None, bn_warnings_acknowledged=False,
+            pn_warnings_acknowledged=False, fixed=False, **changes)
+
     @Slot(str)
     def invoke(self, action):
         if action == "cancel-task":
@@ -825,10 +1411,19 @@ class DrrBackgroundBridge(QObject):
         if action == "cancel":
             self.cancel()
             self._opened = False
+            self._cancel_pn_history()
             self.closeRequested.emit()
             self._refresh()
             return
         if self._busy or not self._context:
+            return
+        if action == "apply" and self._snapshot.get("recommendMatching"):
+            self._error = "Choose how to use these multiple backgrounds before applying."
+            self._refresh()
+            return
+        if action == "apply" and (self._matching or self._match_timer.isActive()):
+            self._error = "Wait for matching to finish before applying."
+            self._refresh()
             return
         try:
             if action == "choose-files" or action.startswith("choose-files:"):
@@ -838,12 +1433,38 @@ class DrrBackgroundBridge(QObject):
                 self.requestFiles.emit(role, role in {"background", "background-add", "composite-add"})
             elif action.startswith("page:"):
                 self._page = action.split(":", 1)[1]
+                if self._page == "pn":
+                    self._auto_training()
                 if self._page not in {"settings", "pn", "fit", "composite", "bn", "raw"}:
                     raise ValueError("Unknown background page.")
                 self._draw_preview()
             elif action == "refresh":
                 self._catalog = ()
                 self._load_catalog()
+            elif action == "pn-refresh-history":
+                self._start_pn_history()
+            elif action == "pn-generate":
+                if self._generation == "reconstruction" and not self._snapshot.get("pnTrainingReady"):
+                    raise ValueError(self._pn_training_summary or "Choose the required training measurements.")
+                self._generate(force=False)
+            elif action == "pn-apply":
+                if not self._snapshot.get("pnCanApply"):
+                    raise ValueError("Select or generate and verify a P/N version before applying.")
+                batch = self._pn_batch_result if self._pn_batch_active() else None
+                acknowledged = self._pn_batch_acknowledged
+                if batch is None:
+                    self._select_common_background("pn", version=self._version, files=(), which="all",
+                        allow_stale=self._flags["allow_stale"], calibration=None)
+                context, draft = self._context, self._draft
+                def apply_complete(value):
+                    self._status = "Background verified; awaiting the owning selection's final context check."
+                    self.applyRequested.emit(value)
+                def prepare(token):
+                    if batch is not None:
+                        from ui_qt.quick.drr_pn_batch_workflow import prepare_pn_batch_application
+                        return prepare_pn_batch_application(context, batch, warnings_acknowledged=acknowledged)
+                    return prepare_application(context, draft)
+                self._run(prepare, apply_complete, "Verifying background inputs before application…")
             elif action == "match":
                 self._match()
             elif action in {"generate", "regenerate"}:
@@ -853,16 +1474,16 @@ class DrrBackgroundBridge(QObject):
                     raise ValueError("Select or generate a saved P/N background first.")
                 if not self._version.fresh and not self._flags["allow_stale"]:
                     raise ValueError("This version is stale. Explicitly choose its saved snapshot to continue.")
-                self._draft = replace(self._draft, kind="pn", version=self._version, files=(), which="all",
-                    allow_stale=self._flags["allow_stale"], bn_plan=None, pn_plan=None, calibration=None, saved_assignments=())
+                self._select_common_background("pn", version=self._version, files=(), which="all",
+                    allow_stale=self._flags["allow_stale"], calibration=None)
                 self._page, self._status = "settings", "Saved P/N background retained in this draft. Apply background to use it."
             elif action == "fit":
                 self._fit_background()
             elif action == "use-fit":
                 if self._fit_reference is None:
                     raise ValueError("Fit and inspect the current recipe first.")
-                self._draft = replace(self._draft, kind="fitted", fitted_result=self._fit_recipe(), files=(), version=None,
-                                      bn_plan=None, pn_plan=None, calibration=None, saved_assignments=())
+                fitted_result = self._fit_recipe()
+                self._select_common_background("fitted", fitted_result=fitted_result, files=(), version=None, calibration=None)
                 self._page, self._status = "settings", "Fitted recipe retained in this draft. Apply background to use it."
             elif action == "suggest-fit":
                 self._suggest_fit()
@@ -929,8 +1550,7 @@ class DrrBackgroundBridge(QObject):
                 original = action == "use-bn-original"
                 if not original and not self._bn_payload["eligible"]:
                     raise ValueError("This candidate has not passed joint DR/R and D2E validation.")
-                self._draft = replace(self._draft, kind="bn", calibration=dict(payload=self._bn_payload, original=original),
-                                      bn_plan=None, pn_plan=None, version=None, fixed=False)
+                self._select_common_background("bn", calibration=dict(payload=self._bn_payload, original=original), version=None)
                 self._page, self._status = "settings", "BN choice retained in this draft; apply to change the main DRR result."
             elif action == "preview-raw":
                 self._preview_raw()
@@ -967,34 +1587,60 @@ class DrrBackgroundBridge(QObject):
         self._busy = False
         if not error:
             self._opened = False
+            self._cancel_pn_history()
             self.closeRequested.emit()
         self._refresh()
 
-    def _match(self):
+    def _schedule_match(self):
+        if self._matching:
+            self.cancel()
+        self._match_timer.stop()
+        if self._opened and self._method == "matched" and self._draft.kind in {"bn", "p", "n", "pn"}:
+            pool = self._draft.bn_candidates if self._draft.kind == "bn" else self._draft.pn_candidates
+            if pool or (self._draft.kind == "bn" and pool is None):
+                self._status = f"Preparing to match {len(self._context.measurements)} measurements…"
+                self._match_timer.start()
+
+    def _start_scheduled_match(self):
+        if self._file_selection_session is not None:
+            self._match_timer.start()
+            return
+        if self._opened and self._method == "matched" and not self._busy:
+            self._match(interactive=False)
+
+    def _match(self, *, interactive=True):
         context, draft = self._context, self._draft
         def work(token):
             if draft.kind == "bn":
                 from core.drr_bn_matching import build_bn_match_plan
-                return build_bn_match_plan(context.folder, context.measurements, candidate_files=draft.bn_candidates, cancelled=lambda: token.cancelled)
+                return build_bn_match_plan(context.folder, context.measurements, candidate_files=draft.bn_candidates, cancelled=lambda: token.cancelled, relaxed_conditions=draft.relaxed_conditions)
             from core.drr_pn_matching import build_pn_match_plan
             if draft.kind not in {"p", "n", "pn"} or not draft.pn_candidates:
                 raise ValueError("Select a P/N candidate pool explicitly before matching.")
             return build_pn_match_plan(context.folder, context.measurements, kind=draft.kind,
-                candidate_files=draft.pn_candidates, which=draft.which, cancelled=lambda: token.cancelled)
+                candidate_files=draft.pn_candidates, which=draft.which, cancelled=lambda: token.cancelled, relaxed_conditions=draft.relaxed_conditions)
         def complete(plan):
             self._draft = replace(draft, **{"bn_plan" if draft.kind == "bn" else "pn_plan": plan},
                                   bn_warnings_acknowledged=False, pn_warnings_acknowledged=False)
             self._flags["acknowledged"] = False
             self._status = "Mapping ready; review all rows and acknowledge warnings." if plan.ready else "Mapping incomplete; choose another background pool."
-        self._run(work, complete, "Matching the selected measurement group…")
+        self._run(work, complete, f"Matching {len(context.measurements)} measurements; review is required before applying…")
+        self._matching = True
+        if not interactive:
+            self._busy = False
+        self._refresh()
 
     def _pair(self):
         from core.drr_pn_pairing import DrrPnPair
         return DrrPnPair(self._pn_files["P"], self._pn_files["N"])
 
     def _generate(self, *, force):
+        if self._pn_batch_active():
+            self._generate_pn_batch(force=force)
+            return
         from ui_qt.quick.drr_background_workflow import generate_pn
         context, pair, mode = self._context, self._pair(), self._generation
+        self._invalidate_pn_preview()
         training = tuple(name for name in context.measurements if name in self._training)
         protected = []
         for part in self._texts["featureProtection"].split(";"):
@@ -1012,11 +1658,55 @@ class DrrBackgroundBridge(QObject):
             return *result, DrrPnStore(context.folder).list_versions()
         def complete(value):
             self._version, self._document, report, self._versions = value
+            self._pn_preview_verified = True
             self._flags["allow_stale"] = False
             self._texts["report"] = json.dumps(report, ensure_ascii=False, indent=2, default=str)
-            self._status = "Immutable P/N draft saved. Numerical generation does not establish scientific validation. Use in settings, then Apply."
+            self._status = ("P/N draft saved. Review its preview, then apply to the current group; generation does not establish scientific validation."
+                if self._page == "settings" else "Immutable P/N draft saved. Numerical generation does not establish scientific validation. Use in settings, then Apply.")
             self._draw_preview()
         self._run(work, complete, "Generating an explicit P/N draft; the applied background is retained…")
+
+    def _generate_pn_batch(self, *, force):
+        from ui_qt.quick.drr_pn_batch_workflow import generate_pn_batch
+        plan, context = self._pn_batch_plan, self._context
+        if plan is None or not plan.ready or self._pn_batch_loading:
+            raise ValueError("Resolve every measurement's P/N assignment before generating.")
+        if self._pn_frames != {"P": "all", "N": "all"}:
+            raise ValueError("P/N reconstruction uses all acquired frames in each source.")
+        protected = []
+        for part in self._texts["featureProtection"].split(";"):
+            if not part.strip():
+                continue
+            values = part.replace(",", " ").split()
+            if len(values) != 3 or values[0].upper() not in {"P", "N"}:
+                raise ValueError("Feature protection: P 1.70 1.72; N 1.85 1.87")
+            protected.append(dict(source=values[0].upper(), xmin_ev=float(values[1]), xmax_ev=float(values[2])))
+        acknowledged = self._pn_batch_acknowledged
+        self._invalidate_pn_preview()
+        revision = self._pn_selection_revision
+        def work(token):
+            result = generate_pn_batch(context, plan, feature_protection=protected, force=force,
+                cancelled=lambda: token.cancelled,
+                progress=lambda *parts: self._pn_batch_progress.emit(revision, " · ".join(map(str, parts))))
+            from core.drr_pn_store import DrrPnStore
+            return result, DrrPnStore(context.folder).list_versions()
+        def complete(value):
+            result, self._versions = value
+            if revision != self._pn_selection_revision or context != self._context:
+                return
+            self._pn_batch_result = result
+            self._pn_batch_acknowledged = acknowledged
+            self._pn_batch_preview = 0
+            self._version, self._document = result.versions[0], result.documents[0]
+            self._pn_preview_verified = True
+            self._flags["allow_stale"] = False
+            self._texts["report"] = json.dumps(dict(
+                summary="Per-measurement P/N drafts; generation does not establish scientific validation.",
+                assignments=[asdict(row) for row in result.assignments],
+                warnings=list(plan.warnings), reports=list(result.reports)), ensure_ascii=False, indent=2, default=str)
+            self._status = f"{len(result.versions)} backgrounds ready. Review each preview and matching warnings, then apply to the current group."
+            self._draw_preview()
+        self._run(work, complete, f"Generating {len(plan.segments)} P/N backgrounds; the applied group is retained…")
 
     def _load_version(self):
         from core.drr_composite_background import read_composite_background
@@ -1029,6 +1719,7 @@ class DrrBackgroundBridge(QObject):
             return current, read_composite_background(current.csv_path)
         def complete(value):
             self._version, self._document = value
+            self._pn_preview_verified = True
             self._pn_files = {"P": tuple(self._version.pair.p_files), "N": tuple(self._version.pair.n_files)}
             self._texts["report"] = json.dumps(self._version.settings, indent=2)
             self._draw_preview()
@@ -1044,6 +1735,7 @@ class DrrBackgroundBridge(QObject):
             return version, read_composite_background(version.csv_path), DrrPnStore(context.folder).list_versions()
         def complete(value):
             self._version, self._document, self._versions = value
+            self._pn_preview_verified = True
             self._generation = "saved"
             self._status = "Saved background imported with verified original provenance; not applied."
             self._draw_preview()
@@ -1273,7 +1965,7 @@ class DrrBackgroundBridge(QObject):
         has_preview = (self._page == "fit" and self._fit_raw is not None
             or self._page == "bn" and self._bn_payload is not None
             or self._page == "raw" and self._raw_preview is not None
-            or self._page in {"pn", "composite"} and self._document is not None)
+            or (self._page in {"pn", "composite"} or self._page == "settings" and self._draft.kind == "pn") and self._document is not None)
         if self._closed or not has_preview:
             return
         self._ensure_canvas()
@@ -1383,7 +2075,7 @@ class DrrBackgroundBridge(QObject):
             self._raw_spectrum_line,=axes.plot(cube.energy, cube.Z[gate], label="Original intensity")
             self._raw_spectrum_axis=axes
             axes.set_title(f"{cube.gate_label}: {cube.gate[gate]:g}")
-        elif self._document is not None and self._page in {"pn", "composite"}:
+        elif self._document is not None and (self._page in {"pn", "composite"} or self._page == "settings" and self._draft.kind == "pn"):
             from core.drr_composite_background import compose_background
             energy, intensity, boundaries = compose_background(self._document)
             for source in self._document.sources:
@@ -1428,6 +2120,10 @@ class DrrBackgroundBridge(QObject):
             if self._raw_gate_blitter:self._raw_gate_blitter.disconnect()
             if self.canvas is not None:
                 self.canvas.mpl_disconnect(self._plot_click)
+            self._cancel_pn_history()
+            self._cancel_pn_batch_plan()
+            self._pn_batch_executor.shutdown(wait=False, cancel_futures=True)
+            self._pn_history_executor.shutdown(wait=False, cancel_futures=True)
             self._executor.shutdown(wait=False, cancel_futures=True)
             if self._file_selection_bridge is not None:
                 self._file_selection_bridge.close()

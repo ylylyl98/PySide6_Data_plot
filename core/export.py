@@ -754,7 +754,9 @@ def _drr_grid_token(sg_mode_label: str) -> str:
 
 
 _TERMINAL_DRR_DERIVATIVE_RE = re.compile(
-    r"_(?:dE|d2E)(?:_W\d+_O\d+)?_(?:Regrid|OriginLike)$"
+    r"_(?:(?:dE|d2E)(?:_W\d+_O\d+)?(?:_(?:Regrid|OriginLike))?"
+    r"|dXdY(?:_W\d+_O\d+(?:_OriginLike)?_WY\d+_LocalXY"
+    r"|_W\d+_Y\d+_O\d+(?:_(?:Regrid|OriginLike))?)?)$"
 )
 
 
@@ -783,8 +785,7 @@ def build_drr_export_base(
     suffix = mode_label.replace("/", "_").replace(" ", "_")
     if derivative_order in (1, 2):
         deriv_tok = "dE" if derivative_order == 1 else "d2E"
-        grid_tok = _drr_grid_token(sg_mode_label)
-        deriv_tag = f"_{deriv_tok}_W{int(sg_window)}_O{int(sg_polyorder)}_{grid_tok}"
+        deriv_tag = f"_{deriv_tok}"
     else:
         deriv_tag = ""
     return f"{safe}_{suffix}{deriv_tag}"
@@ -935,6 +936,7 @@ def _existing_drr_result(
     operation: str = "DR/R",
     preferred_stem: str | None = None,
     history_index: dict | None = None,
+    restrict_to_preferred_family: bool = False,
 ) -> tuple[str, dict] | None:
     """Find a prior DRR result, including metadata written before fingerprints existed."""
     def read_record(metadata_path):
@@ -956,7 +958,11 @@ def _existing_drr_result(
         if preferred is not None:
             return preferred
     entries = _drr_export_index(out_dir, snapshot=history_index)
+    family = (re.compile(r'^' + re.escape(safe_stem(preferred_stem)) + r'(?:_\d{2,})?\.metadata\.json$')
+              if restrict_to_preferred_family and preferred_stem is not None else None)
     for name in sorted(entries):
+        if family is not None and not family.fullmatch(name):
+            continue
         entry = entries[name]
         if entry['operation'] != operation or entry['fingerprint'] != analysis_fingerprint:
             continue
@@ -1101,6 +1107,7 @@ def export_drr_png_and_dat(
             operation=operation,
             preferred_stem=export_base,
             history_index=_history_index,
+            restrict_to_preferred_family=drr_style,
         )
         if drr_style or reuse_existing_analysis
         else None

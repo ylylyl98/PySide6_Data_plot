@@ -289,7 +289,7 @@ def _isolated():
             self.assertIs(self.background._bn_payload, payload)
             self.assertEqual(self.applied, [])
 
-        def test_advanced_p_role_remains_single_validated_and_independent_of_n(self):
+        def test_p_role_multiple_choices_are_validated_independently_of_n(self):
             self.background.setChoice("kind", 3)
             self.background.selectFiles("P", [str(self.p)])
             self.background.selectFiles("N", [str(self.n)])
@@ -307,7 +307,7 @@ def _isolated():
             self.open_catalog("choose-files:P")
             self.catalog.setParameter("showAllFiles", True)
             self.catalog.selectFile(str(self.n), True)
-            self.assertEqual(self.catalog.snapshot["selected"], [str(self.n)])
+            self.assertEqual(self.catalog.snapshot["selected"], [str(self.p), str(self.n)])
             self.catalog.invoke("accept")
             self.assertEqual(self.background.snapshot["pFiles"], [self.portable(self.p)])
             self.assertEqual(self.background.snapshot["nFiles"], [self.portable(self.n)])
