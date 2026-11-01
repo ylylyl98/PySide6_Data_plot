@@ -38,7 +38,9 @@ class PnPackagingTests(unittest.TestCase):
         self.assertIn(Path("core/drr_pn_reconstruction/pipeline.py"), original[io])
         for spec in SPECS:
             with self.subTest(spec=spec), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
-                bundle = Path(directory) / "_internal"
+                # Hosted Windows runners may use an 8.3 TEMP alias (RUNNER~1).
+                # dependency_paths() resolves it to its canonical long path.
+                bundle = (Path(directory) / "_internal").resolve()
                 for target, source in self.core_inventory(spec).items():
                     destination = bundle / target
                     destination.parent.mkdir(parents=True, exist_ok=True)
