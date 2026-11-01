@@ -54,6 +54,10 @@ class QuickFileDialogsTests(unittest.TestCase):
                 property url suggestedFile
                 property url acceptedFolder
                 property int rejectedCount: 0
+                property int activeFolderOptions: folderPicker._dialog ? folderPicker._dialog.options : -1
+                function useFallbackFolderPicker() {
+                    folderPicker.options = FolderDialog.DontUseNativeDialog
+                }
                 function openFolder() {
                     DialogState.prepareFolder(folderPicker, targetFolder)
                     folderPicker.open()
@@ -90,6 +94,9 @@ class QuickFileDialogsTests(unittest.TestCase):
         self.window = self.engine.rootObjects()[0]
         self.folder = self.window.findChild(QObject, "folder_picker")
         self.file = self.window.findChild(QObject, "file_picker")
+        self.default_folder_options = self.folder.property("options")
+        # Lifecycle tests exercise the deterministic Qt fallback explicitly.
+        QMetaObject.invokeMethod(self.window, "useFallbackFolderPicker")
         self.addCleanup(self.dispose)
         QTest.qWait(30)
 
@@ -132,6 +139,16 @@ class QuickFileDialogsTests(unittest.TestCase):
         self.assert_folder(second, self.b)
         self.assert_folder(self.folder, self.b)
         self.assertEqual(self.window.property("rejectedCount"), 1)
+
+    def test_folder_allows_native_platform_picker_by_default(self):
+        self.assertEqual(self.default_folder_options, 0)
+        self.folder.setProperty("options", self.default_folder_options)
+        self.target(self.a)
+        self.invoke("openFolder")
+        # Offscreen platforms use Qt's automatic fallback with the same options.
+        dialog = self.active_dialog(self.folder)
+        self.assertEqual(self.window.property("activeFolderOptions"), 0)
+        self.assert_folder(dialog, self.a)
 
     def test_folder_result_is_copied_before_result_signal_and_disposal(self):
         self.target(self.a)
