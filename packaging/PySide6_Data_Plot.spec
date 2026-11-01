@@ -20,6 +20,14 @@ pptx_datas = collect_data_files("pptx")
 quick_qml_datas = [
     (str(project_root / "ui_qt" / "quick" / "qml"), "ui_qt/quick/qml"),
 ]
+# P/N provenance hashes source bytes, and reconstruction discovers its code
+# with rglob("*.py"). PYZ modules alone cannot satisfy these filesystem reads.
+# Preserve the full source tree so new dependencies remain covered; include
+# only Python sources, excluding caches and other development artifacts.
+core_source_datas = [
+    (str(path), str(path.parent.relative_to(project_root)))
+    for path in sorted((project_root / "core").rglob("*.py"))
+]
 pywin32_binaries = [
     (get_pywin32_module_file_attribute("pythoncom"), "pywin32_system32"),
     (get_pywin32_module_file_attribute("pywintypes"), "pywin32_system32"),
@@ -73,6 +81,7 @@ analysis = Analysis(
         *matplotlib_datas,
         *pptx_datas,
         *quick_qml_datas,
+        *core_source_datas,
     ],
     hiddenimports=[
         "run_quick",

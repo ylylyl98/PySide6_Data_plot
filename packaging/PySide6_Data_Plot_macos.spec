@@ -15,6 +15,14 @@ pptx_datas = collect_data_files("pptx")
 quick_qml_datas = [
     (str(project_root / "ui_qt" / "quick" / "qml"), "ui_qt/quick/qml"),
 ]
+# P/N provenance hashes source bytes, and reconstruction discovers its code
+# with rglob("*.py"). PYZ modules alone cannot satisfy these filesystem reads.
+# Preserve the full source tree so new dependencies remain covered; include
+# only Python sources, excluding caches and other development artifacts.
+core_source_datas = [
+    (str(path), str(path.parent.relative_to(project_root)))
+    for path in sorted((project_root / "core").rglob("*.py"))
+]
 # The same explicit Fluent runtime inventory used by the Windows shell. These
 # files are read from disk by install_theme() and the shell's icon factory.
 _fluent_runtime_assets = (
@@ -51,6 +59,7 @@ analysis = Analysis(
         (str(project_root / "assets" / "icons"), "assets/icons"),
         *pptx_datas,
         *quick_qml_datas,
+        *core_source_datas,
         *fluent_datas,
     ],
     hiddenimports=[

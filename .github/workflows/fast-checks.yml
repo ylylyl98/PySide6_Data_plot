@@ -145,6 +145,7 @@ jobs:
           tests.test_drr_display_bridge
           tests.test_drr_quick_display
           tests.test_quick_display_packaging
+          tests.test_drr_pn_packaging
           tests.test_numeric_inputs
           tests.test_compact_spinbox
 
