@@ -32,8 +32,9 @@ def _spec_values(filename):
         if not isinstance(statement, ast.Assign):
             continue
         names = {target.id for target in statement.targets if isinstance(target, ast.Name)}
-        if "quick_qml_datas" in names:
-            namespace["quick_qml_datas"] = eval(compile(ast.Expression(statement.value), filename, "eval"), namespace)
+        for name in ("quick_qml_datas", "core_source_datas"):
+            if name in names:
+                namespace[name] = eval(compile(ast.Expression(statement.value), filename, "eval"), namespace)
         if isinstance(statement.value, ast.Call) and isinstance(statement.value.func, ast.Name) and statement.value.func.id == "Analysis":
             keywords = {argument.arg: argument.value for argument in statement.value.keywords}
             return {
