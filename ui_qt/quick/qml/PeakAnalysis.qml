@@ -225,7 +225,6 @@ Basic.ApplicationWindow {
         parentWindow: window
         id: exportDialog
         objectName: "peak_export_dialog"
-        options: FolderDialog.DontUseNativeDialog
         title: "Export complete analysis package"
         onAccepted: window.peakBridge.exportTo(selectedFolder.toString())
     }

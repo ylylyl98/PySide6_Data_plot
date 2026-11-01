@@ -127,6 +127,7 @@ Controls.ApplicationWindow {
     AppFolderDialog {
         id: folderPicker; objectName: "selection_folder_picker"
         colors: window.colors; parentWindow: window
+        options: Dialogs.FolderDialog.DontUseNativeDialog
         onAccepted: window.acceptedFolder = selectedFolder
         onRejected: window.folderRejections++
     }

@@ -206,7 +206,6 @@ Controls.ApplicationWindow {
         colors: window.colors
         parentWindow: window
         id: folderDialog
-        options: FolderDialog.DontUseNativeDialog
         objectName: "app_folder_dialog"
         title: "Choose a data folder"
         onAccepted: window.appBridge.acceptFolder(window.folderDialogWorkflow, window.folderDialogPurpose, selectedFolder)

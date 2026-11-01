@@ -88,7 +88,6 @@ Basic.ApplicationWindow {
         parentWindow: window
         id: folderDialog
         title: window.folderRole === "experiment-folder" ? "Choose experiment or processed MCD folder" : "Choose Organizer results folder"
-        options: FolderDialog.DontUseNativeDialog
         onAccepted: window.organizerBridge.openFiles(window.folderRole, [selectedFolder])
     }
     Connections {

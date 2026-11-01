@@ -1688,6 +1688,9 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         from ui_qt.inspection_colorbar import add_inspection_colorbar
         from ui_qt.quick.spectrum_limits import fit_spectrum_y
         self._ensure_plot()
+        from ui_qt.quick.drr_plot_update import reuse_drr_plot
+        if reuse_drr_plot(self):
+            return
         # Preserve explicit Y zoom while rebuilding the same product, but a
         # newly loaded/processed cube starts with automatic spectrum limits.
         manual_y = {}
@@ -1759,6 +1762,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         dynamic.axes = self._maps[0][0]
         self._blitters = [dynamic]
         palette = self.colors
+        figure._dptk_quick_colors = dict(palette)
         figure.set_facecolor(palette["canvas"])
         for axis in figure.axes:
             axis.set_facecolor(palette["canvas"])

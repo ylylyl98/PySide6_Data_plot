@@ -9,7 +9,9 @@ QtObject {
     property string title: "Choose a folder"
     property url currentFolder
     property url selectedFolder
-    property int options: FolderDialog.DontUseNativeDialog
+    // Native pickers provide Explorer views, search and date-column sorting.
+    // Qt automatically falls back when the platform has no native picker.
+    property int options: 0
     property var parentWindow: null
     property var colors: null
     property bool visible: false

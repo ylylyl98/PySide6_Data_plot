@@ -75,7 +75,6 @@ Basic.ApplicationWindow {
         parentWindow: window
         id: folderDialog
         objectName: "drr_analysis_folder_dialog"
-        options: FolderDialog.DontUseNativeDialog
         title: "Choose folder"
         onAccepted: window.bridge.openFiles(window.dialogKind, [selectedFolder])
     }
