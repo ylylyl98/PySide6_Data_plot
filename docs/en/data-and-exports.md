@@ -246,8 +246,12 @@ viewport are omitted from the PNG mesh. DAT files and interactive data retain
 all measurements. Singular or nearly singular ranges and invalid log bounds
 retain the full extent for Matplotlib's usual automatic range handling. Measured
 right axes, normalization, dimensions and saved-image reuse are preserved.
-Generated title markers show only the current product: `(DR/R)
-(d2(DR/R)/dE2)` becomes `(d2(DR/R)/dE2)`. Metadata retains the original title.
+PNG titles omit the `PIXIS` camera token and trailing product labels such as
+`(DR/R)`, `(d2E)` and `(dXdY)`; the colorbar identifies the plotted quantity.
+The applied background type is appended as `· P`, `· N`, `· P+N`, `· BN`,
+`· Fitted`, `· First` or `· Last`. Unknown or mixed reference types omit this
+suffix. Imported DAT maps retain a known type from their sidecar metadata.
+Metadata retains the original title and records the visible PNG title.
 Saving refreshes PNGs produced under the earlier title policy while reusing
 unchanged DAT files.
 

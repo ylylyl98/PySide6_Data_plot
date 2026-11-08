@@ -28,7 +28,7 @@ from matplotlib.font_manager import FontProperties
 from matplotlib.ticker import FixedFormatter, FixedLocator, FuncFormatter, NullFormatter, NullLocator
 
 from core.loader import DataCube
-from core.drr_export_title import TITLE_POLICY_VERSION, display_title
+from core.drr_export_title import TITLE_POLICY_VERSION, background_label, display_title
 from core.plotting import COMPARE_PANEL_ORDER, HeatmapParams, plot_heatmap, resolve_split_boundary, plain_log_ticks, visible_mesh_data
 from core.png_render_timing import TimedPngCanvas, collect_png_timings, time_png_stage
 from core.png_geometry import widened_figsize
@@ -341,7 +341,8 @@ def create_unique_package_dir(root: str | Path, base: str) -> Path:
     raise FileExistsError(f"Could not allocate an analysis package for {base!r}.")
 
 
-def _save_heatmap_png(path: Path, cube: DataCube, params: HeatmapParams, *, drr: bool) -> Path:
+def _save_heatmap_png(path: Path, cube: DataCube, params: HeatmapParams, *, drr: bool,
+                      png_title: str | None = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     if params.y_axis_log and np.any(np.asarray(cube.gate) <= 0):
         positive = np.isfinite(cube.gate) & (np.asarray(cube.gate) > 0)
@@ -350,7 +351,7 @@ def _save_heatmap_png(path: Path, cube: DataCube, params: HeatmapParams, *, drr:
         cube = DataCube(cube.energy, np.asarray(cube.gate)[positive], np.asarray(cube.Z)[positive],
                         cube.gate_label, cube.title, cube.cbar_label)
     with time_png_stage('build'):
-        fig = _build_streamlit_style_heatmap_fig(cube, params, drr=drr)
+        fig = _build_streamlit_style_heatmap_fig(cube, params, drr=drr, png_title=png_title)
     try:
         # These exports use fixed axes positions, with no automatic layout.
         # Keep the complete figure canvas so every heatmap has the same pixel
@@ -480,7 +481,8 @@ def _axis_edges_from_centers(values: np.ndarray, *, log_scale: bool = False) -> 
 
 
 @with_plot_font
-def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *, drr: bool):
+def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *, drr: bool,
+                                      png_title: str | None = None):
     e = np.asarray(cube.energy, float).ravel()
     g = np.asarray(cube.gate, float).ravel()
     z = np.asarray(cube.Z, float)
@@ -612,7 +614,7 @@ def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *,
             obstacles = [a.get_tightbbox(renderer) for a in fig.axes[1:]]
             obstacles += [t.get_window_extent(renderer) for t in fig.texts
                           if t.get_gid() == 'drr-colorbar-quantity']
-            complete_title(fig, display_title(params.title), title_left, axpos.x1,
+            complete_title(fig, png_title if png_title is not None else display_title(params.title), title_left, axpos.x1,
                            obstacles=obstacles)
             # Keep the title first for existing export consumers.
             fig.texts.insert(0, fig.texts.pop())
@@ -651,7 +653,8 @@ def _build_streamlit_style_heatmap_fig(cube: DataCube, params: HeatmapParams, *,
         from core.compact_region_export import compact_wide_header
         from core.png_geometry import compact_horizontal_margins
         compact_horizontal_margins(fig)
-        compact_wide_header(fig, ax, display_title(params.title) if drr else _prettify_title(params.title))
+        compact_wide_header(fig, ax, (png_title if png_title is not None else display_title(params.title))
+                            if drr else _prettify_title(params.title))
     return fig
 
 
@@ -978,10 +981,11 @@ def _save_heatmap_png_atomic(
     params: HeatmapParams,
     *,
     drr: bool,
+    png_title: str | None = None,
 ) -> None:
     temporary = path.with_name(f".{path.stem}.{uuid4().hex}.tmp{path.suffix}")
     try:
-        _save_heatmap_png(temporary, cube, params, drr=drr)
+        _save_heatmap_png(temporary, cube, params, drr=drr, **({"png_title": png_title} if png_title is not None else {}))
         # Unit tests may replace the renderer with a no-op. Production renders
         # the temporary file and atomically promotes it here.
         if temporary.exists():
@@ -1036,6 +1040,7 @@ def export_drr_png_and_dat(
     _history_index: dict | None = None,
     include_original_png: bool = False,
     _png_suffix: str = "",
+    png_background: str | None = None,
 ) -> Dict[str, Path]:
     """Export one heatmap and its DAT table.
 
@@ -1044,6 +1049,8 @@ def export_drr_png_and_dat(
     ``False`` while still sharing the same data-export path.
     ``include_original_png`` adds a 1.0× view when a wider PNG is selected,
     sharing one DAT and history. At 1.0× it saves only the original image.
+    ``png_background`` overrides the short reference label for imported maps;
+    otherwise the label comes from the applied processing metadata.
     """
     if include_original_png and params.png_width_scale > 1.0:
         if not drr_style:
@@ -1052,7 +1059,8 @@ def export_drr_png_and_dat(
                       processed_name=processed_name, metadata_input_files=tuple(metadata_input_files),
                       metadata_processing=metadata_processing, metadata_extra=metadata_extra,
                       reuse_existing_analysis=reuse_existing_analysis, export_progress=export_progress,
-                      _history_index=_history_index if _history_index is not None else {})
+                      _history_index=_history_index if _history_index is not None else {},
+                      png_background=png_background)
         original = export_drr_png_and_dat(params=replace(params, png_width_scale=1.0), **shared)
         wide = export_drr_png_and_dat(params=params,
                                       _png_suffix=f"_{float(params.png_width_scale)}x", **shared)
@@ -1092,10 +1100,12 @@ def export_drr_png_and_dat(
     analysis_fingerprint = _drr_analysis_fingerprint(
         sources, processing, operation=operation
     )
+    png_background = background_label(processing) if png_background is None else png_background
+    png_title = display_title(params.title, background=png_background) if drr_style else None
     plot_fingerprint = _fingerprint_json(
         {
             "render_version": 8 if drr_style else HEATMAP_PNG_RENDER_VERSION,
-            **({"title_policy_version": TITLE_POLICY_VERSION, "display_title": display_title(params.title)} if drr_style else {}),
+            **({"title_policy_version": TITLE_POLICY_VERSION, "display_title": png_title} if drr_style else {}),
             **({"wide_header_version": 2} if params.png_width_scale > 1.0 else {}),
             "params": params,
         }
@@ -1166,7 +1176,8 @@ def export_drr_png_and_dat(
     if needs_png:
         with collect_png_timings(export_progress) as png_times:
             with time_png_stage('total'):
-                run_step('Rendering PNG', _save_heatmap_png_atomic, png_path, cube, params, drr=drr_style)
+                run_step('Rendering PNG', _save_heatmap_png_atomic, png_path, cube, params, drr=drr_style,
+                         **({"png_title": png_title} if drr_style else {}))
         if export_progress is not None:
             details = ', '.join(f'{name}={png_times.get(name, 0.):.3f} s'
                                 for name in ('build', 'title', 'draw', 'encode_write', 'total'))
@@ -1181,6 +1192,9 @@ def export_drr_png_and_dat(
     if drr_style:
         figures[png_path.name] = {
             "plot": _metadata_jsonable(params),
+            "display_title": png_title,
+            "png_background": png_background,
+            "title_policy_version": TITLE_POLICY_VERSION,
             "plot_fingerprint": plot_fingerprint,
             "created_utc": figures.get(png_path.name, {}).get("created_utc") or datetime.now(timezone.utc).isoformat(),
             "data_file": dat_path.name,
@@ -1197,7 +1211,8 @@ def export_drr_png_and_dat(
         outputs=[dat_path, *figure_paths],
         extra={
             **(metadata_extra or {}),
-            **({"display_title": display_title(params.title), "title_policy_version": TITLE_POLICY_VERSION} if drr_style else {}),
+            **({"display_title": png_title, "png_background": png_background,
+                "title_policy_version": TITLE_POLICY_VERSION} if drr_style else {}),
             "analysis_fingerprint": analysis_fingerprint,
             "plot_fingerprint": plot_fingerprint,
             **({"figures": figures,
@@ -1247,6 +1262,7 @@ def export_drr_pair_pngs_and_dat(
     processed_name: str = "Processed Data/DRR",
     export_progress=None,
     include_original_png: bool = False,
+    png_background: str | None = None,
 ) -> ExportPathResult:
     """Export the raw DRR map and its energy second derivative as one pair.
 
@@ -1276,6 +1292,7 @@ def export_drr_pair_pngs_and_dat(
         processed_name=processed_name,
         metadata_input_files=input_files,
         metadata_processing=raw_processing,
+        png_background=png_background,
         metadata_extra=metadata_extra,
         export_progress=(lambda message: export_progress('Raw: ' + message)) if export_progress else None,
         _history_index=history_index,
@@ -1289,6 +1306,7 @@ def export_drr_pair_pngs_and_dat(
         processed_name=processed_name,
         metadata_input_files=input_files,
         metadata_processing=second_processing,
+        png_background=png_background,
         metadata_extra=metadata_extra,
         _history_index=history_index,
         include_original_png=include_original_png,

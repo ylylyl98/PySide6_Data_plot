@@ -408,7 +408,7 @@ Rectangle {
                     }
                 }
             }
-            Note { visible: root.state.recommendMatching === true; text: "Several backgrounds selected: choose how to use them above. For time-based per-measurement suggestions, choose Match each measurement." }
+            Note { visible: root.state.recommendMatching === true; text: "Common reference will average the selected files. For time-based per-measurement suggestions, choose Match each measurement." }
         }
         Loader {
             Layout.fillWidth: true

@@ -1,4 +1,4 @@
-"""Explicit background policy and debounced candidate matching."""
+"""Usable common references and explicit debounced candidate matching."""
 import os
 from pathlib import Path
 import subprocess
@@ -47,12 +47,13 @@ def _isolated():
                 time.sleep(.005)
             self.assertTrue(predicate())
 
-        def test_multi_file_mode_is_explicit_and_preserves_candidates(self):
+        def test_multi_file_mode_preserves_candidates_when_switching_methods(self):
             b = self.bridge
             b.open(self.context, BackgroundDraft(kind='p'))
             b.selectFiles('background', ['a.csv', 'b.csv'])
             self.assertTrue(b.snapshot['recommendMatching'])
             self.assertEqual(b.draft.files, ('a.csv', 'b.csv'))
+            self.assertTrue(b.snapshot['applyEnabled'])
             b.setChoice('method', 1)
             self.assertEqual(b.draft.pn_candidates, ('a.csv', 'b.csv'))
             self.assertEqual(b.draft.assignment_method, 'matched')
@@ -60,6 +61,29 @@ def _isolated():
             b.setChoice('method', 0)
             self.assertEqual(b.draft.files, ('a.csv', 'b.csv'))
             self.assertFalse(b.snapshot['recommendMatching'])
+
+        def test_fresh_common_multiselect_applies_once_without_reconfirming_method(self):
+            applied = []
+            b = self.bridge
+            b.applyRequested.connect(applied.append)
+            for kind in ('p', 'n', 'bn'):
+                with self.subTest(kind=kind):
+                    b.open(self.context, BackgroundDraft(kind=kind, which='all'))
+                    b.selectFiles('background-add', ['a.csv'])
+                    self.assertTrue(b.snapshot['applyEnabled'])
+                    b.selectFiles('background-add', ['b.csv'])
+                    b.selectFiles('background-add', ['c.csv'])
+                    self.assertEqual(b.draft.files, ('a.csv', 'b.csv', 'c.csv'))
+                    self.assertEqual(b.snapshot['method'], 'common')
+                    self.assertTrue(b.snapshot['applyEnabled'])
+                    self.assertEqual(len(applied), 0)
+                    prepared = SimpleNamespace(draft=b.draft)
+                    with patch('ui_qt.quick.drr_background_bridge.prepare_application', return_value=prepared) as prepare:
+                        b.invoke('apply')
+                        self.wait_for(lambda: len(applied) == 1 and not b.snapshot['busy'])
+                    self.assertEqual(prepare.call_count, 1)
+                    self.assertEqual(prepare.call_args.args[1].files, ('a.csv', 'b.csv', 'c.csv'))
+                    self.assertIs(applied.pop(), prepared)
 
         def test_open_matched_schedules_and_debounces_latest_pool(self):
             b = self.bridge

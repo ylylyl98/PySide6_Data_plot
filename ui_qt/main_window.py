@@ -11728,6 +11728,10 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                 loaded.drr_baseline_text == "None"
                 or loaded.drr_mode_label == "DR/R Map"
             )
+            png_background = None
+            if is_precomputed_map:
+                from core.drr_export_title import imported_background_label
+                png_background = imported_background_label(getattr(loaded.cube, 'import_metadata', None))
             is_fitted = loaded.drr_baseline_text == 'Fitted (sample)'
             drr_assignments = [
                 item.to_dict() if hasattr(item, "to_dict") else dict(item)
@@ -11888,6 +11892,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                     metadata_processing_raw=raw_processing,
                     metadata_processing_second=second_processing,
                     metadata_extra=metadata_extra,
+                    png_background=png_background,
                     export_progress=lambda message: log.emit('DRR export: ' + message),
                     include_original_png=True,
                 )
@@ -11928,6 +11933,7 @@ class MainWindow(FeatureTabsMixin, ToolsPageMixin, QMainWindow):
                         "derivative_grid": options.drr_sg_mode_label,
                     },
                     metadata_extra=metadata_extra,
+                    png_background=png_background,
                 )
                 save_status = getattr(paths, "save_status", "created")
                 out_folder = str(paths["png"].parent)
