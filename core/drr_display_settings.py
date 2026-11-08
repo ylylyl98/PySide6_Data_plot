@@ -1,6 +1,7 @@
 """Portable DRR display history, separate from background/processing recipes."""
 from copy import deepcopy
 from collections import OrderedDict
+import hashlib
 import json
 import math
 import os
@@ -103,7 +104,15 @@ def _signature(path):
     path = Path(path)
     stamp = _digest_signature(path)
     if stamp is not None:
-        return stamp
+        # These are small display JSON files. Even Windows ChangeTime can
+        # collide across rapid same-size edits with a restored mtime, so verify
+        # content before reusing parsed metadata. CSV signatures stay separate.
+        try:
+            with path.open('rb') as stream:
+                digest = hashlib.file_digest(stream, 'sha256').digest()
+            return (*stamp, digest)
+        except OSError:
+            return (*stamp, object())  # A failed check must never reuse a cache.
     try:
         stat = path.stat()
         # Still parse readable metadata when strong change stamps are not

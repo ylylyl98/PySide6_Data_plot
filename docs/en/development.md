@@ -271,7 +271,9 @@ DRR export metadata can also supply saved ranges. Settings update only after a
 successful save and use the view captured when saving starts.
 
 DRR loading reuses parsed display history, including missing-file/center lookups,
-and reads only changed sidecars when new exports appear. External edits, source
+and reparses only changed sidecars when new exports appear. The small history
+JSON files are checked by content hash as well as filesystem stamps, so rapid
+same-size edits with restored timestamps still invalidate the cache. External edits, source
 path changes, and deleted records invalidate the cache. Disabling both memory
 options skips history queries. Loading also reuses unchanged source-file hashes;
 source cleanup always checks fresh hashes.

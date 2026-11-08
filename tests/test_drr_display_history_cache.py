@@ -138,6 +138,33 @@ class DisplayHistoryCacheTests(unittest.TestCase):
         self.assertEqual(history.find_candidates(str(self.root), ['old_720nmc.csv'])['exact']['ranges']['xmin'], 1.57)
 
     def test_same_size_metadata_and_index_edits_with_restored_mtime_are_visible(self):
+        self._assert_same_size_edits_are_visible()
+
+    def test_equal_mtime_history_keeps_filename_priority(self):
+        first = self.write('a.metadata.json', xmin=1.55, note='x' * 200)
+        second = self.write('z.metadata.json', xmin=1.56)
+        stamp = first.stat()
+        os.utime(second, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        self.assertEqual(history.find_candidates(self.root, ['old_720nmc.csv'])['exact']['ranges']['xmin'], 1.56)
+
+    def test_mixed_strong_and_fallback_signatures_keep_history_readable(self):
+        first = self.write('a.metadata.json', xmin=1.55)
+        second = self.write('z.metadata.json', xmin=1.56)
+        stamp = first.stat()
+        os.utime(second, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        original = history._digest_signature
+        def signature(path):
+            return None if path == first else original(path)
+        with patch.object(history, '_digest_signature', side_effect=signature):
+            self.assertEqual(history.find_candidates(self.root, ['old_720nmc.csv'])['exact']['ranges']['xmin'], 1.56)
+
+    def test_same_size_edits_with_colliding_change_stamps_are_visible(self):
+        # Fast writes on Windows can retain every filesystem stamp, including
+        # ChangeTime. Reproduce that collision independently of clock speed.
+        with patch.object(history, '_digest_signature', return_value=(1, 1, 1, 1, 1)):
+            self._assert_same_size_edits_are_visible()
+
+    def _assert_same_size_edits_are_visible(self):
         path = self.write()
         state = history.find_candidates(self.root, ['old_720nmc.csv'])['exact']
         before = path.stat()
