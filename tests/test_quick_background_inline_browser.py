@@ -438,6 +438,41 @@ Basic.ApplicationWindow {
             self.assertFalse("matplotlib.backends.backend_qtagg" in sys.modules,
                              "Inline QML unexpectedly loaded the Widgets Matplotlib backend")
 
+            # A fresh draft must accept multiple rows without requiring the
+            # already-selected Common button to be clicked or applying once.
+            for kind in ("p", "n", "bn"):
+                with self.subTest(fresh_kind=kind):
+                    references = [self.csv(f"fresh_{kind.upper()}background_{index}.csv")
+                                  for index in range(3)]
+                    self.background.open(self.context, BackgroundDraft(kind=kind, which="all"))
+                    self.background.setInlineSelectionVisible(True)
+                    self.catalog.refresh(True)
+                    self.wait(lambda: not self.catalog.snapshot["busy"] and
+                              all(str(path) in self.visible_paths() for path in references))
+                    self.assertEqual(self.background.draft.files, ())
+                    self.assertEqual(self.background.snapshot["method"], "common")
+                    for path in references:
+                        self.catalog.setParameter("query", path.name)
+                        self.settle()
+                        click(find("drr_background_available_" + path.name))
+                    selected = tuple(self.portable(path) for path in references)
+                    self.assertEqual(self.background.draft.files, selected)
+                    self.assertEqual(self.catalog.snapshot["selected"], [str(path) for path in references])
+                    apply_button = find("drr_background_apply")
+                    self.assertTrue(apply_button.isEnabled(), self.background.snapshot)
+                    before = len(self.applied)
+                    captured = []
+                    def prepare(context, draft):
+                        captured.append((context, draft))
+                        return draft
+                    with patch("ui_qt.quick.drr_background_bridge.prepare_application", side_effect=prepare):
+                        click(apply_button)
+                        self.wait(lambda: len(self.applied) == before + 1)
+                    self.assertEqual(len(captured), 1)
+                    self.assertEqual(captured[0][0], self.context)
+                    self.assertEqual(captured[0][1].files, selected)
+                    self.assertEqual(self.applied[-1], captured[0][1])
+
     result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Cases))
     print(f"BACKGROUND_INLINE_TESTS={result.testsRun}")
     return 0 if result.wasSuccessful() else 1

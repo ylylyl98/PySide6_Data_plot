@@ -7,18 +7,60 @@ import re
 
 _DURATION = r'\d+(?:[p.]\d+)?\s*(?:ms|us|µs|s)'
 _EXPOSURE = rf'{_DURATION}\s*[x×]\s*\d+'
-TITLE_POLICY_VERSION = 2
+TITLE_POLICY_VERSION = 3
 
 # These are generated product labels, not arbitrary parenthesized conditions.
 # Mixed-coordinate labels may contain the gate unit's own parentheses.
 _PRODUCT = (r'\((?:DR/R|d\(DR/R\)/dE|d2\(DR/R\)/dE2|'
             r'd2\(DR/R\)/\(dE\s+d(?:[^()]|\([^()]*\))+\)|'
             r'dE|d2E|dXdY|Advanced first derivative,\s*dE)\)')
-_PRODUCT_MARKER = re.compile(_PRODUCT, re.IGNORECASE)
-_PRODUCT_CHAIN = re.compile(rf'(?<!\S){_PRODUCT}(?:\s+{_PRODUCT})+\s*$', re.IGNORECASE)
+_PRODUCT_CHAIN = re.compile(rf'(?<!\S){_PRODUCT}(?:\s+{_PRODUCT})*\s*$', re.IGNORECASE)
 
 
-def display_title(original: str) -> str:
+def background_label(processing: dict | None) -> str:
+    """Describe the applied reference type, never infer it from a filename."""
+    if not isinstance(processing, dict):
+        return ""
+    mode = processing.get("background_mode") or processing.get("baseline_selection", "")
+    if not isinstance(mode, str):
+        return ""
+    self_modes = {"self-first": "First", "Self (first frame)": "First",
+                  "self-last": "Last", "Self (last frame)": "Last"}
+    if mode in self_modes:
+        return self_modes[mode]
+    if mode in {"imported", "None", "Imported map"}:
+        return ""
+    if mode in {"fitted", "Fitted (sample)"} or processing.get("selection_method") == "fitted_sample":
+        return "Fitted"
+    assignments = processing.get("drr_background_assignments") or ()
+    if (not isinstance(assignments, (tuple, list))
+            or any(not isinstance(item, dict) or item.get("regions") for item in assignments)):
+        return ""
+    if any(not isinstance(item.get("baseline_mode", ""), str) for item in assignments):
+        return ""
+    modes = {item.get("baseline_mode", "") for item in assignments}
+    if modes and modes <= self_modes.keys():
+        labels = {self_modes[item] for item in modes}
+        return next(iter(labels)) if len(labels) == 1 else ""
+    if any(item != "External" for item in modes):
+        return ""
+    kind = processing.get("background_kind")
+    return ({"p": "P", "n": "N", "pn": "P+N", "bn": "BN", "fitted": "Fitted"}.get(kind, "")
+            if isinstance(kind, str) else "")
+
+
+def imported_background_label(metadata: dict | None) -> str:
+    """Retain a verified short label when a saved map is exported again."""
+    if not isinstance(metadata, dict):
+        return ""
+    label = background_label(metadata.get("processing"))
+    if label:
+        return label
+    saved = metadata.get("png_background")
+    return saved if isinstance(saved, str) and saved in {"P", "N", "P+N", "BN", "Fitted", "First", "Last"} else ""
+
+
+def display_title(original: str, *, background: str = "") -> str:
     protected = []
     def protect(match):
         protected.append(match.group())
@@ -54,12 +96,11 @@ def display_title(original: str) -> str:
         if field.strip():
             kept.append(field.strip())
     result = re.sub(r'\s+', ' ', ' '.join(kept)).strip()
-    chain = _PRODUCT_CHAIN.search(result)
-    if chain is not None:
-        # Processing appends the current product to its source title. Retain
-        # only that final label in the PNG, preserving the full source title.
-        current = tuple(_PRODUCT_MARKER.finditer(chain.group()))[-1].group()
-        result = result[:chain.start()] + current
+    # The colorbar identifies the quantity. Remove generated trailing product
+    # labels and the camera token from the PNG, preserving source provenance.
+    result = re.sub(r'(?i)(?<!\S)PIXIS(?!\S)', '', result)
+    result = _PRODUCT_CHAIN.sub('', result).strip()
+    result = re.sub(r'\s+', ' ', result).strip()
     for index, value in enumerate(protected):
         result = result.replace(f'PROTECTEDTITLETOKEN{index}TOKEN', value)
-    return result
+    return f'{result} · {background}' if result and background else result or background

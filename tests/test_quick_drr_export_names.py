@@ -67,6 +67,9 @@ class QuickDrrExportNamesTests(unittest.TestCase):
                 self.assertEqual(meta['sg_polyorder'],2)
                 self.assertEqual(meta['derivative_grid'],'More correct (regrid)')
                 self.assertEqual(len(meta['drr_background_assignments']),1)
+                label = {'p': 'P', 'n': 'N', 'pn': 'P+N', 'bn': 'BN'}.get(kind)
+                title = self.metadata(result)['display_title']
+                self.assertTrue(title.endswith(' · '+label) if label else ' · ' not in title, title)
 
     def test_real_saved_pn_version_name(self):
         from core.drr_pn_pairing import DrrPnPair
@@ -110,6 +113,25 @@ class QuickDrrExportNamesTests(unittest.TestCase):
         result=self.export(load_drr(request,prepared_background=prepared))
         self.assertIn('_DR_R_PN-Match',result['raw_png'].stem)
         self.assertEqual(len(self.metadata(result)['processing']['drr_background_assignments']),2)
+
+    def test_imported_dat_keeps_background_type_across_repeated_exports(self):
+        result = self.export(self.products('p', (self.p,)))
+        for _ in range(2):
+            request = DrrRequest((str(result['raw_dat']),), window=9, polyorder=2,
+                experiment_folder=str(self.root))
+            result = self.export(load_drr(request), view='pair')
+            for key in ('raw_dat', 'second_dat'):
+                metadata = self.metadata(result, key)
+                self.assertEqual(metadata['png_background'], 'P')
+                self.assertTrue(metadata['display_title'].endswith(' · P'))
+
+    def test_self_background_title_uses_first_or_last(self):
+        for mode, expected in (('self-first', 'First'), ('self-last', 'Last')):
+            products = load_drr(DrrRequest((str(self.m),), background_mode=mode,
+                y_axis='tg', window=9, polyorder=2))
+            result = self.export(products, view='pair')
+            for key in ('raw_dat', 'second_dat'):
+                self.assertTrue(self.metadata(result, key)['display_title'].endswith(' · '+expected))
 
     def test_pn_heterogeneous_assignment_uses_match_label(self):
         assignments=(DrrMeasurementAssignment(self.m.name,'External',(str(self.p),),'all'),

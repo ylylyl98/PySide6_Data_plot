@@ -525,7 +525,6 @@ class DrrBackgroundBridge(QObject):
             gateDescription=f"{preview_cube.gate_label}: {preview_cube.gate[self._numbers['gate']]:.9g}" if preview_cube is not None else "",
             invalidNumberFields=sorted(self._invalid_numbers),
             applyEnabled=self._context is not None and not self._busy and not self._matching and not self._match_timer.isActive() and not self._invalid_numbers
-                and not (self._draft.kind in {"bn", "p", "n", "pn"} and self._method == "common" and len(self._draft.files) > 1 and self._draft.kind not in self._explicit_methods)
                 and (self._method != "matched" or matched_ready))
         self._snapshot.update(self._pn_batch_snapshot())
         self.snapshotChanged.emit()
@@ -1416,10 +1415,6 @@ class DrrBackgroundBridge(QObject):
             self._refresh()
             return
         if self._busy or not self._context:
-            return
-        if action == "apply" and self._snapshot.get("recommendMatching"):
-            self._error = "Choose how to use these multiple backgrounds before applying."
-            self._refresh()
             return
         if action == "apply" and (self._matching or self._match_timer.isActive()):
             self._error = "Wait for matching to finish before applying."

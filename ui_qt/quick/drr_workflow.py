@@ -200,11 +200,15 @@ def _export_mode_label(request):
 
 def export_drr(products: DrrProducts, *, folder, raw_params, second_params, view, display_state=None):
     from core.export import build_drr_export_base, export_drr_png_and_dat, _validate_drr_pair_product
+    from core.drr_export_title import imported_background_label
     request = products.request
     if not products.input_signatures or _input_signatures(request) != products.input_signatures:
         raise ValueError("A measurement/background changed since loading. Reload before exporting.")
     mode = _MODE_LABELS[request.background_mode]
     filename_mode = _export_mode_label(request)
+    png_background = None
+    if request.background_mode == "imported":
+        png_background = imported_background_label(getattr(products.source, "import_metadata", None))
     inputs = tuple(("measurement", name) for name in request.files) + tuple(
         ("background", name) for name in request.backgrounds if request.background_mode == "external")
     outputs = {}
@@ -301,6 +305,7 @@ def export_drr(products: DrrProducts, *, folder, raw_params, second_params, view
             export_base=base, processed_name="Processed Data/DRR",
             metadata_input_files=inputs,
             metadata_processing=processing,
+            png_background=png_background,
             include_original_png=True,
             metadata_extra={"ui_state": display_state, "display_save_pending": True} if display_state is not None else None)
         outputs.update({f"{name}_{key}": value for key, value in result.items()})

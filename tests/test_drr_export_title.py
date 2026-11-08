@@ -41,25 +41,25 @@ class DrrExportTitleTests(unittest.TestCase):
     def test_explicit_background_file_and_processing_suffix(self):
         from core.drr_export_title import display_title
         self.assertEqual(display_title('sample | background file="C:/Data/my background.csv" | TG-rBG=0 (DR/R external, avg 3)'),
-                         'sample TG-rBG=0 (DR/R)')
+                         'sample TG-rBG=0')
         self.assertEqual(display_title('sample | background mode=self_last | 2026-09-21_12-30-45 | unknown=2'),
                          'sample unknown=2')
 
-    def test_terminal_generated_product_chain_keeps_only_current_product(self):
+    def test_removes_camera_and_terminal_generated_product_labels(self):
         from core.drr_export_title import display_title
         cases = (
             ('YZ383 pwn1 0T 1.67KREF 730nmc RotIn49deg TG+1BG=0 PIXIS (DR/R) (d2(DR/R)/dE2)',
-             'YZ383 pwn1 0T 1.67KREF 730nmc RotIn49deg TG+1BG=0 PIXIS (d2(DR/R)/dE2)'),
-            ('sample_PIXIS (DR/R external, avg 3) (d2(DR/R)/dE2)', 'sample PIXIS (d2(DR/R)/dE2)'),
-            ('sample (DR/R) (d(DR/R)/dE)', 'sample (d(DR/R)/dE)'),
-            ('sample (DR/R) (d(DR/R)/dE) (d2(DR/R)/dE2)', 'sample (d2(DR/R)/dE2)'),
-            ('sample (DR/R) (d2E)', 'sample (d2E)'),
-            ('sample (DR/R) (dXdY)', 'sample (dXdY)'),
-            ('sample (DR/R) (d2(DR/R)/(dE dGate (V)))', 'sample (d2(DR/R)/(dE dGate (V)))'),
-            ('sample (DR/R) (Advanced first derivative, dE)', 'sample (Advanced first derivative, dE)'),
-            ('sample (DR/R) (DR/R)', 'sample (DR/R)'),
-            ('sample (DR/R)', 'sample (DR/R)'),
-            ('sample (DR/R external, avg 3)', 'sample (DR/R)'),
+             'YZ383 pwn1 0T 1.67KREF 730nmc RotIn49deg TG+1BG=0'),
+            ('sample_PIXIS (DR/R external, avg 3) (d2(DR/R)/dE2)', 'sample'),
+            ('sample (DR/R) (d(DR/R)/dE)', 'sample'),
+            ('sample (DR/R) (d(DR/R)/dE) (d2(DR/R)/dE2)', 'sample'),
+            ('sample (DR/R) (d2E)', 'sample'),
+            ('sample (DR/R) (dXdY)', 'sample'),
+            ('sample (DR/R) (d2(DR/R)/(dE dGate (V)))', 'sample'),
+            ('sample (DR/R) (Advanced first derivative, dE)', 'sample'),
+            ('sample (DR/R) (DR/R)', 'sample'),
+            ('sample (DR/R)', 'sample'),
+            ('sample (DR/R external, avg 3)', 'sample'),
         )
         for original, expected in cases:
             with self.subTest(original=original):
@@ -68,9 +68,11 @@ class DrrExportTitleTests(unittest.TestCase):
     def test_product_cleanup_preserves_unknown_conditions_and_math(self):
         from core.drr_export_title import display_title
         original = 'sample note=(DR/R) custom=d2E $x (DR/R) (d2E)$ (DR/R) (d2E)'
-        self.assertEqual(display_title(original), 'sample note=(DR/R) custom=d2E $x (DR/R) (d2E)$ (d2E)')
-        for original in ('sample (DR/R) (unknown product)', 'sample (DR/R) (d2E) unknown-condition',
-                         'sample (DR/R) custom=7 (d2E)', 'sample(DR/R) (d2E)'):
+        self.assertEqual(display_title(original), 'sample note=(DR/R) custom=d2E $x (DR/R) (d2E)$')
+        self.assertEqual(display_title('sample(DR/R) (d2E)'), 'sample(DR/R)')
+        self.assertEqual(display_title('sample (DR/R) custom=7 (d2E)'), 'sample (DR/R) custom=7')
+        self.assertEqual(display_title('PIXIS-study custom=PIXIS $PIXIS$ PIXIS'), 'PIXIS-study custom=PIXIS $PIXIS$')
+        for original in ('sample (DR/R) (unknown product)', 'sample (DR/R) (d2E) unknown-condition'):
             with self.subTest(original=original):
                 self.assertEqual(display_title(original), original)
 
@@ -84,9 +86,9 @@ class DrrExportTitleTests(unittest.TestCase):
         self.assertEqual(cube.title, original)
         self.assertEqual(second.title, original + ' (d2(DR/R)/dE2)')
         self.assertEqual(second.cbar_label, 'd2(DR/R)/dE2')
-        self.assertEqual(display_title(second.title), 'sample PIXIS (d2(DR/R)/dE2)')
+        self.assertEqual(display_title(second.title), 'sample')
 
-    def test_regular_and_wide_render_only_current_product_marker(self):
+    def test_regular_and_wide_render_keep_quantity_only_in_colorbar(self):
         cube, params = example()
         original = 'sample_PIXIS (DR/R external, avg 3) (d2(DR/R)/dE2)'
         for width in (1., 2.):
@@ -94,27 +96,78 @@ class DrrExportTitleTests(unittest.TestCase):
                 variant = replace(params, title=original, cbar_label='d2(DR/R)/dE2', png_width_scale=width)
                 fig = _build_streamlit_style_heatmap_fig(cube, variant, drr=True)
                 FigureCanvasAgg(fig).draw()
-                self.assertEqual(' '.join(fig.texts[0].get_text().split()), 'sample PIXIS (d2(DR/R)/dE2)')
+                self.assertEqual(' '.join(fig.texts[0].get_text().split()), 'sample')
                 quantity = next(text for text in fig.texts if text.get_gid() == 'drr-colorbar-quantity')
                 self.assertEqual(quantity.get_text(), 'd2(DR/R)/dE2')
                 self.assertEqual(variant.title, original)
                 fig.clear()
+
+    def test_background_type_comes_from_applied_metadata(self):
+        from core.drr_export_title import background_label
+        cases = (
+            ({'background_mode': 'self-first', 'background_kind': 'p'}, 'First'),
+            ({'baseline_selection': 'Self (last frame)'}, 'Last'),
+            ({'background_mode': 'fitted'}, 'Fitted'),
+            ({'background_kind': 'pn'}, 'P+N'),
+            ({'background_kind': 'bn', 'baseline_selection': 'External', 'baseline_which': 'first'}, 'BN'),
+            ({'baseline_selection': 'External', 'baseline_which': 'last'}, ''),
+            ({'background_mode': 'imported', 'baseline_which': 'last'}, ''),
+            ({'drr_background_assignments': [{'baseline_mode': 'Self (first frame)'}]}, 'First'),
+            ({'drr_background_assignments': [{'baseline_mode': 'Self (first frame)'},
+                                             {'baseline_mode': 'Self (last frame)'}]}, ''),
+            ({'background_kind': 'p', 'drr_background_assignments': [
+                {'baseline_mode': 'External', 'regions': [{'baseline_files': ['other.csv']}]}]}, ''),
+            ([], ''),
+        )
+        for processing, expected in cases:
+            with self.subTest(processing=processing):
+                self.assertEqual(background_label(processing), expected)
+
+    def test_saved_png_title_matches_metadata_for_all_background_types_and_widths(self):
+        from core import export
+        cube, params = example()
+        original = 'YZ383_pwn1_0T_1.67KREF_730nmc_RotIn49deg_TG+1BG=0_PIXIS (DR/R) (d2E)'
+        base = 'YZ383 pwn1 0T 1.67KREF 730nmc RotIn49deg TG+1BG=0'
+        cases = [({'background_kind': kind}, label) for kind, label in
+                 (('p', 'P'), ('n', 'N'), ('pn', 'P+N'), ('bn', 'BN'), ('fitted', 'Fitted'))]
+        cases += [({'baseline_selection': 'Self (first frame)'}, 'First'),
+                  ({'baseline_selection': 'Self (last frame)'}, 'Last')]
+        real_builder = export._build_streamlit_style_heatmap_fig
+        for processing, label in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as folder:
+                seen = []
+                def capture(*args, **kwargs):
+                    fig = real_builder(*args, **kwargs)
+                    FigureCanvasAgg(fig).draw()
+                    seen.append(' '.join(fig.texts[0].get_text().split()))
+                    return fig
+                variant = replace(params, title=original, png_width_scale=2.)
+                with patch.object(export, '_build_streamlit_style_heatmap_fig', side_effect=capture):
+                    paths = export.export_drr_png_and_dat(folder, cube=cube, params=variant,
+                        export_base='source', metadata_processing=processing, include_original_png=True)
+                expected = base + ' · ' + label
+                self.assertEqual(seen, [expected, expected])
+                metadata = json.loads(paths['dat'].with_suffix('.metadata.json').read_text(encoding='utf-8'))
+                self.assertEqual(metadata['display_title'], expected)
+                self.assertTrue(all(record['display_title'] == expected for record in metadata['figures'].values()))
+                self.assertEqual(metadata['plot']['title'], original)
+                self.assertEqual(variant.title, original)
 
     def test_old_png_title_policy_refreshes_figures_without_rewriting_dat(self):
         from core import export
         from core.drr_export_title import TITLE_POLICY_VERSION, display_title
         cube, params = example()
         original = 'sample PIXIS (DR/R) (d2(DR/R)/dE2)'
-        expected = 'sample PIXIS (d2(DR/R)/dE2)'
+        expected = 'sample'
         for width in (1., 2.):
             with self.subTest(width=width), tempfile.TemporaryDirectory() as folder:
                 variant = replace(params, title=original, cbar_label='d2(DR/R)/dE2', png_width_scale=width)
                 kwargs = dict(folder=folder, cube=cube, params=variant, export_base='original_source_name',
                               metadata_processing={'derivative_order': 2}, include_original_png=width > 1.)
                 def save_png(path, cube, params, **options):
-                    path.write_text(export.display_title(params.title), encoding='utf-8')
+                    path.write_text(options.get('png_title', export.display_title(params.title)), encoding='utf-8')
                 with patch.object(export, '_save_heatmap_png', side_effect=save_png) as render:
-                    with patch.object(export, 'display_title', side_effect=lambda title: title):
+                    with patch.object(export, 'display_title', side_effect=lambda title, **kwargs: title):
                         first = export.export_drr_png_and_dat(**kwargs)
                     metadata = first['dat'].with_suffix('.metadata.json')
                     payload = json.loads(metadata.read_text(encoding='utf-8'))

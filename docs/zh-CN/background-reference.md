@@ -50,7 +50,7 @@ Self 提供 **First frame / Last frame**；新草稿默认 Last。更改帧只�
 <a id="external"></a>
 ## 外部参考与逐文件分配
 
-原生 Quick 中先选择测量组，再选择 P、N 或 BN。**Common reference** 和 **Match each measurement (recommended)** 两个选项始终显示。新的多文件选择必须明确选择方式；仅选择文件不会改变已有配方。原生 BN/P/N/P + N 设置并排显示可用文件和已选参考。切换来源标签会保留各来源的文件与分配方式；搜索只编辑当前来源草稿。**Show all CSV files**、**Browse files…** 可选其他文件，无须引入新来源类型。单击/双击候选文件添加，复选框切换选择；在已选列表中双击、Delete 或 **Remove** 移除；**Clear all** 同时清除被搜索或视图隐藏的参考。P/N 生成仍使用独立单角色选择器，提供 **Use selected**、**Close**。
+原生 Quick 中先选择测量组，再选择 P、N 或 BN。**Common reference** 和 **Match each measurement (recommended)** 两个选项始终显示。新的选择默认使用 Common reference，可连续添加多个文件后一次 Apply，将所选文件平均为公共参考；需要逐测量分配时再明确选择 Match each measurement。添加文件保留当前方式，包括恢复的匹配配方。原生 BN/P/N/P + N 设置并排显示可用文件和已选参考。切换来源标签会保留各来源的文件与分配方式；搜索只编辑当前来源草稿。**Show all CSV files**、**Browse files…** 可选其他文件，无须引入新来源类型。单击/双击候选文件添加，复选框切换选择；在已选列表中双击、Delete 或 **Remove** 移除；**Clear all** 同时清除被搜索或视图隐藏的参考。P/N 生成仍使用独立单角色选择器，提供 **Use selected**、**Close**。
 
 文件列表只枚举文件名和时间戳，不读取 CSV 网格或处理历史；改变选择不重新扫描目录。原生 P/N 页在后台加载保存历史，采集详情可另行加载。文件对话框从请求工作流的目录开始，清除以前打开/保存操作留下的文件名。
 
