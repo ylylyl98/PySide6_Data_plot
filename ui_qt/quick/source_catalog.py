@@ -85,7 +85,7 @@ def _catalog_inventory(folder,workflow,include_all=False):
     root=Path(folder).resolve()
     if workflow=="megasweep":
         from core.megasweep_catalog import inventory
-        return inventory(root)
+        return inventory(root, recursive=include_all)
     if workflow=="drr":
         from core.drr_sources import drr_source_paths
         paths=drr_source_paths(root,include_all=include_all)
@@ -143,7 +143,7 @@ def scan_catalog(folder,workflow,*,include_all=False,cache_path=None,cancellatio
     with load_scope(cancellation):
         if workflow=="megasweep":
             from core.megasweep_catalog import scan
-            return scan(root, cancellation)
+            return scan(root, cancellation, recursive=include_all)
         if workflow=="pl" and not _uncached and cache_path is not None:
             from core.source_catalog_cache import SourceCatalogCache
             cache=SourceCatalogCache(str(root),workflow+"-"+str(int(include_all)),cache_root=Path(cache_path).parent/"inventory")
@@ -210,6 +210,7 @@ class SourceCatalogBridge(QObject):
         self._workflow,self._folder,self._query="pl","",""
         self._type=str(settings.value("quick/catalog/plType","PL"))
         self._megasweep_type="All"
+        self._megasweep_mode="PL";self._megasweep_scope="folder";self._megasweep_experiment=""
         self._status_filter=str(settings.value("pl/source_filter","all"))
         self._saved_only=self._include_all=self._include_backgrounds=False
         self._only_new=str(settings.value("drr/source_unprocessed_only",True)).lower() in {"true","1","yes","on"}
@@ -251,7 +252,7 @@ class SourceCatalogBridge(QObject):
     def chosenModel(self):return self._chosen
     @Property("QVariantMap",notify=snapshotChanged)
     def snapshot(self):
-        return dict(workflow=self._workflow,folder=self._folder,query=self._query,type=self._type,megasweepType=self._megasweep_type,statusFilter=self._status_filter,
+        return dict(workflow=self._workflow,folder=self._folder,query=self._query,type=self._type,megasweepType=self._megasweep_type,megasweepScope=self._megasweep_scope,megasweepMode=self._megasweep_mode,experimentRoot=self._megasweep_experiment,scanFolder=self._active_scan_scope()[1],statusFilter=self._status_filter,
             savedOnly=self._saved_only,includeAll=self._include_all,includeBackgrounds=self._include_backgrounds,onlyNew=self._only_new,
             selected=list(self._selected),selectedGroup=self._selected_group,focused=self._focused,reopenPositionPending=self._reopen_group_pending,busy=self._busy,status=self._status,error=self._error,
             counts=dict(self._counts),canAccept=bool(self._selected) and (self._catalog_validated or set(self._selected)<=self._explicit_selected),
@@ -263,7 +264,7 @@ class SourceCatalogBridge(QObject):
             self._dialog_open=True
             self._prepare_pending=False;self._prepare_timer.stop()
             self._watch_active=True
-            scope=(self._workflow,self._folder,self._include_all)
+            scope=self._active_scan_scope()
             # Opening a picker changes selection, not its source inventory.
             # Reuse an ongoing inspection or the last validated list; a small
             # asynchronous inventory probe catches changes while it was hidden.
@@ -275,6 +276,38 @@ class SourceCatalogBridge(QObject):
                 if not self._watch_probe_running and not self._watch_timer.isActive():
                     self._watch_timer.start(0)
             else:self.refresh()
+
+    def _active_scan_scope(self):
+        if self._workflow == "megasweep":
+            root=self._megasweep_experiment if self._megasweep_scope=="experiment" else self._folder
+            return (self._workflow,root,self._megasweep_scope!="folder",self._megasweep_mode,self._megasweep_scope)
+        return (self._workflow,self._folder,self._include_all)
+
+    def openMegasweep(self,folder,experiment_root,mode,selected):
+        """Open at a measurement folder with a mode-specific search scope."""
+        if self._closed:return
+        mode=str(mode)
+        if mode not in {"PL","Reflection","Transport"}:raise ValueError("Unknown Megasweep mode")
+        folder=str(Path(folder).resolve()); experiment=str(Path(experiment_root or folder).resolve())
+        scope=str(self.settings.value("quick/catalog/megasweepScope/"+mode,"folder"))
+        if scope not in {"folder","subfolders","experiment"}:scope="folder"
+        changed=(self._workflow!="megasweep" or folder!=self._folder or experiment!=self._megasweep_experiment
+                 or mode!=self._megasweep_mode or scope!=self._megasweep_scope)
+        self._megasweep_mode,self._megasweep_experiment,self._megasweep_scope=mode,experiment,scope
+        self._query="";self._megasweep_type="Transport" if mode=="Transport" else "Optical"
+        if changed and (self._workflow,self._folder)==("megasweep",folder):
+            self._reset_megasweep_scope()
+        self.open("megasweep",folder,selected,False)
+        if selected:
+            self._focused=str(Path(selected[-1]).resolve())
+            self._refresh_models()
+
+    def _reset_megasweep_scope(self):
+        self._prepare_timer.stop();self._prepare_pending=False
+        if self._cancel:self._cancel.cancel()
+        self._generation+=1;self._busy=False;self._scan_scope=None
+        self._stop_watches();self._catalog=dict(files=[],groups=[],sources=())
+        self._catalog_validated=False;self._watch_signature=None
 
     @Slot(str,str)
     def prepare(self,workflow,folder):
@@ -400,11 +433,14 @@ class SourceCatalogBridge(QObject):
         self._watch_timer.stop();self._refresh_pending=False
         self._cancel_watch_check()
         self._watch_candidate=None;self._watch_candidate_since=0.
-        folder,workflow,include_all=self._folder,self._workflow,self._include_all
-        self._scan_scope=(workflow,folder,include_all)
+        active=self._active_scan_scope()
+        workflow,folder,include_all=active[:3]
+        self._scan_scope=active
         from PySide6.QtCore import QSettings,QStandardPaths
         base=Path(self.settings.fileName()).parent if self.settings.format()==QSettings.IniFormat else Path(QStandardPaths.writableLocation(QStandardPaths.CacheLocation))
-        cache=base/"quick-source-catalog"/(sha256(folder.casefold().encode()).hexdigest()+".json")
+        cache_base=base/"quick-source-catalog"
+        if workflow=="megasweep":cache_base=cache_base/("megasweep-"+sha256(repr(active).encode()).hexdigest())
+        cache=cache_base/(sha256(folder.casefold().encode()).hexdigest()+".json")
         self._preserve_catalog=self._catalog_validated
         self._busy=True;self._catalog_validated=False;self._error="";self._status="Inspecting sources and saved processing history…";self.snapshotChanged.emit()
         def run():
@@ -469,9 +505,10 @@ class SourceCatalogBridge(QObject):
     def _sync_watches(self):
         if not self._watch_active:return
         # Watch only the active experiment and discovered source directories.
-        paths={self._folder,*(str(Path(row["id"]).parent) for row in self._catalog["files"])}
-        root=Path(self._folder)
-        paths.update(str(path) for path in (root/"Initial Data",root/"Initial Data"/"REF",root/"Processed Data",root/"Processed Data"/self._workflow.upper()) if path.is_dir())
+        root=Path(self._active_scan_scope()[1])
+        paths={str(root),*(str(Path(row["id"]).parent) for row in self._catalog["files"]),*self._catalog.get("watch_dirs",[])}
+        if self._workflow!="megasweep":
+            paths.update(str(path) for path in (root/"Initial Data",root/"Initial Data"/"REF",root/"Processed Data",root/"Processed Data"/self._workflow.upper()) if path.is_dir())
         wanted={path for path in paths if Path(path).is_dir()}
         current=set(self._watcher.directories())
         if current-wanted:self._watcher.removePaths(list(current-wanted))
@@ -501,7 +538,8 @@ class SourceCatalogBridge(QObject):
         from core.load_cancellation import LoadCancellation
         self._watch_probe_running=True
         self._watch_serial+=1;serial=self._watch_serial
-        folder,workflow,include_all=self._folder,self._workflow,self._include_all
+        active=self._active_scan_scope()
+        workflow,folder,include_all=active[:3]
         cancellation=self._watch_cancel=LoadCancellation()
         def check():
             try:
@@ -549,7 +587,7 @@ class SourceCatalogBridge(QObject):
                     if self._type!="All" and row["kind"]!=self._type:continue
                     if self._status_filter!="all" and row["status"]!={"unprocessed":"new"}.get(self._status_filter,self._status_filter):continue
                 elif self._workflow=="megasweep":
-                    if self._megasweep_type!="All" and row["kind"] not in {self._megasweep_type,"CSV"}:continue
+                    if self._megasweep_type!="All" and row["kind"] not in {self._megasweep_type,"CSV"} and row["id"] not in self._selected:continue
                 elif self._workflow=="drr":
                     if row["background"] and not self._include_backgrounds:continue
                     if self._only_new and row["status"]!="new":continue
@@ -580,6 +618,11 @@ class SourceCatalogBridge(QObject):
     def setParameter(self,key,value):
         self._reopen_group_pending=False
         if key=="query":self._query=str(value)
+        elif key=="megasweepScope" and self._workflow=="megasweep" and value in {"folder","subfolders","experiment"}:
+            value=str(value)
+            if value==self._megasweep_scope:return
+            self._megasweep_scope=value;self.settings.setValue("quick/catalog/megasweepScope/"+self._megasweep_mode,value)
+            self._query="";self._reset_megasweep_scope();self._watch_active=True;self.refresh();return
         elif key=="megasweepType" and value in {"All","Optical","Transport"}:self._megasweep_type=str(value)
         elif key=="type":self._type=str(value);self.settings.setValue("quick/catalog/plType",self._type)
         elif key=="statusFilter":self._status_filter=str(value);self.settings.setValue("pl/source_filter",self._status_filter)

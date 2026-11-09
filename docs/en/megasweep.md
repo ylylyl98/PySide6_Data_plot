@@ -15,6 +15,23 @@ filters and external files. Classification uses headers only; actual compatibili
 is checked when loading. Generated `Processed Data/` and `*_outputs/` directories
 are excluded from the measurement inventory.
 
+By default, the picker lists compatible files in the current mode's remembered
+folder and reveals its selected file. PL, Reflection and Transport separately
+remember their browsing folder, last file and search scope across restarts.
+Remembered files are not automatically loaded or analyzed. Reopening clears old
+search text so it cannot hide the selected file.
+
+| Search scope | Files shown |
+| --- | --- |
+| Current folder (default) | CSVs in the browsing folder |
+| Include subfolders | The browsing folder and its subfolders |
+| Entire experiment | The experiment root and its subfolders |
+
+Choosing a new Folder prioritizes that folder without clearing loaded data.
+Selecting a file moves the next File picker to its parent directory. For an
+external file outside the current experiment, that parent becomes the new
+experiment root.
+
 Changing the browsing folder does not move a loaded measurement's output folder.
 Switching modes or workflows does not replace another mode's selected CSV.
 Use Reload after acquisition changes a file. Parameter changes operate on the
@@ -51,7 +68,17 @@ Reflection uses the same background file browser components as DRR, with a
 separate selection. Open **Background references** to choose CSV files from the
 current browsing folder and its subfolders, excluding analysis output folders.
 Use **Browse files…** to add references from elsewhere. Selection changes apply to
-the current measurement; switching measurements restores that file's own references.
+the current measurement. Choose **Custom, P, N or BN** in the background window.
+Each role retains its own files and browsing location. Only the current role's
+references are used, as a shared reference for every sweep point; other roles
+are not pooled into the calculation. Switching measurements restores that file's
+role groups. Changing Folder does not move a remembered role browsing location.
+
+Explicit Pback/Nback/BNbackground filename labels filter candidates and detect
+role conflicts. Unlabelled files may be assigned manually, subject to spectral
+channel validation. Custom rejects a pool containing multiple explicitly named
+roles. Legacy single-pool selections are retained under Custom without guessing
+roles; mixed labelled references must be regrouped before calculation.
 Its numerical background processing follows Megasweep:
 
 | Setting | Meaning |
@@ -65,7 +92,7 @@ and equal-file averaging differ when files contain different numbers of frames.
 Spectral channels must match before a background is applied. The browser's filename
 classification does not certify numerical compatibility.
 
-DRR-specific P/N reconstruction, fitted backgrounds and BN calibration are not
+P+N reconstruction is not performed. DRR-specific fitted backgrounds and BN calibration are not
 implicitly applied to Megasweep measurements by sharing the browser.
 
 ## Exports and movies

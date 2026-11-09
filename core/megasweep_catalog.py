@@ -7,21 +7,28 @@ import os
 from pathlib import Path
 
 
-def source_paths(folder):
+_EXCLUDED = {"processed data", ".git", ".venv", "build", "dist", "archive", "__pycache__"}
+
+
+def _allowed_directory(name):
+    return name.casefold() not in _EXCLUDED and not name.startswith(".") and not name.casefold().endswith("_outputs")
+
+
+def source_paths(folder, recursive=True):
     root = Path(folder).resolve()
-    excluded = {"processed data", ".git", ".venv", "build", "dist", "archive", "__pycache__"}
     for directory, directories, files in os.walk(root, followlinks=False):
-        directories[:] = [name for name in directories if name.casefold() not in excluded
-                          and not name.startswith(".") and not name.casefold().endswith("_outputs")]
+        if not recursive:
+            directories[:] = []
+        directories[:] = [name for name in directories if _allowed_directory(name)]
         for name in sorted(files):
             if name.lower().endswith(".csv"):
                 yield Path(directory) / name
 
 
-def inventory(folder, cancellation=None):
+def inventory(folder, cancellation=None, *, recursive=True):
     root = Path(folder).resolve()
     rows = []
-    for path in source_paths(root):
+    for path in source_paths(root, recursive=recursive):
         if cancellation:
             cancellation.check()
         try:
@@ -32,10 +39,10 @@ def inventory(folder, cancellation=None):
     return sorted(rows)
 
 
-def scan(folder, cancellation=None):
+def scan(folder, cancellation=None, *, recursive=True):
     root = Path(folder).resolve()
     rows = []
-    for relative, size, modified_ns in inventory(root, cancellation):
+    for relative, size, modified_ns in inventory(root, cancellation, recursive=recursive):
         if cancellation:
             cancellation.check()
         path = root / relative
@@ -65,5 +72,12 @@ def scan(folder, cancellation=None):
         rows.append(dict(id=str(path.resolve()), source=relative, name=path.name, kind=kind,
                          status="unknown", saved=False, modified=modified_ns / 1e9, size=size,
                          processedAt="", background=False, detail=detail))
+    watch_dirs=[]
+    if recursive:
+        for directory, directories, _ in os.walk(root, followlinks=False):
+            if cancellation: cancellation.check()
+            directories[:]=[name for name in directories if _allowed_directory(name)]
+            watch_dirs.append(str(Path(directory)))
+    else: watch_dirs=[str(root)]
     return dict(files=sorted(rows, key=lambda row: (-row["modified"], row["source"].casefold())),
-                groups=[], sources=())
+                groups=[], sources=(), watch_dirs=watch_dirs)

@@ -38,7 +38,9 @@ def child():
             self.bg = BackgroundSourceCatalogBridge(settings=QSettings("DPTK tests", "Megasweep QML"), parent=self)
             self.data = dict(mode="PL", values=dict(view="slice"), parameterGroups=[], busy=False,
                 sourceFile="example.csv", sourcePath="", canExport=True, summary="Loaded", error="", status="Ready",
-                movieOptions=dict(fps=30), moviePreviewFrameCount=4, moviePreviewFrameIndex=0, movieDuration=4/30)
+                movieOptions=dict(fps=30), moviePreviewFrameCount=4, moviePreviewFrameIndex=0, movieDuration=4/30,
+                backgroundRole="custom", backgroundGroups=dict(custom=["c.csv"], p=["p1.csv", "p2.csv"], n=[], bn=["bn.csv"]),
+                backgroundRoleOptions=[dict(value="custom",label="Custom"),dict(value="p",label="P"),dict(value="n",label="N"),dict(value="bn",label="BN")])
             self.actions = []
         @Property("QVariantMap", notify=changed)
         def snapshot(self): return self.data
@@ -51,6 +53,7 @@ def child():
         @Slot(str, "QVariant")
         def setParameter(self, key, value):
             if key == "mode": self.data["mode"] = value
+            elif key == "background_role": self.data["backgroundRole"] = value
             elif key == "movie.previewFrame": self.data["moviePreviewFrameIndex"] = value
             elif key.startswith("movie."): self.data["movieOptions"][key[6:]] = value
             self.actions.append((key, value)); self.changed.emit()
@@ -102,13 +105,22 @@ MegasweepWorkspace { bridge: win.bridge; colors: win.colors; Layout.fillWidth: t
     assert not find("megasweep_return_to_map").isVisible()
     click("megasweep_background")
     assert find("megasweep_background_browser").isVisible()
+    role = find("megasweep_background_role")
+    assert role.property("currentText") == "Custom · 1"
+    click("megasweep_background_role"); QTest.keyClick(window, Qt.Key.Key_Down); QTest.keyClick(window, Qt.Key.Key_Return); app.processEvents()
+    assert bridge.data["backgroundRole"] == "p" and role.property("currentText") == "P · 2"
+    assert bridge.data["backgroundGroups"]["custom"] == ["c.csv"]
+    click("megasweep_background_role"); QTest.keyClick(window, Qt.Key.Key_Up); QTest.keyClick(window, Qt.Key.Key_Return); app.processEvents()
+    assert bridge.data["backgroundRole"] == "custom"
+    assert find("megasweep_background_role_help").isVisible()
     for width in (640, 800, 1000, 1440):
         window.setWidth(width); window.setHeight(560); app.processEvents()
-        for name in ("drr_background_inline_browse", "drr_background_available_files", "drr_background_chosen_files", "megasweep_background_close"):
+        for name in ("megasweep_background_role", "megasweep_background_role_help", "drr_background_inline_browse", "drr_background_available_files", "drr_background_chosen_files", "megasweep_background_close"):
             item = find(name); point = item.mapToScene(item.boundingRect().center())
             assert 0 <= point.x() < width and 0 <= point.y() < 560, (width, name, point)
     assert ("choose-background", None) in bridge.actions
     click("megasweep_background_close")
+    assert "Custom (1)" in find("megasweep_background").property("text")
     click("megasweep_mode_transport")
     assert bridge.data["mode"] == "Transport"
     assert not find("megasweep_export_video").isVisible()

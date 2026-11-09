@@ -70,3 +70,28 @@ class MegasweepStoreTests(unittest.TestCase):
             self.assertEqual((v['view'],v['cut_type'],v['cut_value']),('slice','Vbg',1.5))
             self.assertEqual((v['direction'],v['pass_index']),('forward',2)); self.assertEqual((v['vmin'],v['vmax']),(-1,2))
             self.assertFalse(v['x_auto']); self.assertEqual((v['xmin'],v['xmax']),(0,3))
+
+    def test_v2_migrates_only_into_custom_without_losing_paths(self):
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / 'sample.csv'
+            target = session_path(directory, source, 'Reflection')
+            old = {'version':2, 'csv_path':str(source), 'mode':'Reflection', 'values':{'baseline':4}, 'background_paths':['missing/P.csv','N.csv']}
+            target.write_text(json.dumps(old))
+            loaded = load_session(directory, source, 'Reflection')
+            self.assertEqual(loaded['values']['background_role'], 'custom')
+            self.assertEqual(loaded['background_groups'], {'custom':old['background_paths'], 'p':[], 'n':[], 'bn':[]})
+            self.assertTrue(loaded['migration_notices'])
+            self.assertEqual(json.loads(target.read_text())['version'], 2)
+
+    def test_group_roundtrip_and_invalid_role(self):
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / 'sample.csv'
+            groups = {'custom':['custom.csv'], 'p':['P.csv'], 'n':['N.csv'], 'bn':['BN.csv']}
+            save_session(directory, source, 'Reflection', {'background_role':'p'}, groups['p'], background_groups=groups)
+            result = load_session(directory, source, 'Reflection')
+            self.assertEqual(result['values']['background_role'], 'p')
+            self.assertEqual(result['background_groups'], groups)
+            self.assertEqual(result['background_paths'], groups['p'])
+            target = session_path(directory, source, 'Reflection')
+            raw = json.loads(target.read_text()); raw['values']['background_role'] = 'bogus'; target.write_text(json.dumps(raw))
+            with self.assertRaises(ValueError): load_session(directory, source, 'Reflection')

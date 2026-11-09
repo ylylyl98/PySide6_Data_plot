@@ -45,9 +45,14 @@ jobs:
           tests.test_megasweep_catalog
           tests.test_megasweep_core
           tests.test_megasweep_exports
+          tests.test_megasweep_background_roles
           tests.test_megasweep_store
           tests.test_quick_megasweep
           tests.test_quick_megasweep_background
+          tests.test_quick_megasweep_roles
+          tests.test_quick_megasweep_role_ui
+          tests.test_quick_megasweep_locations
+          tests.test_quick_megasweep_picker
           tests.test_quick_megasweep_qml
           tests.test_quick_application_shell
           tests.test_quick_numeric_format

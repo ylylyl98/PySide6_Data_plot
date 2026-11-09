@@ -79,7 +79,9 @@ Controls.ApplicationWindow {
         fileDialogWorkflow = requestState.workflow
         fileDialog.fileMode = multiple ? FileDialog.OpenFiles : FileDialog.OpenFile
         let megasweepBackground = requestState.workflow === "megasweep" && purpose.startsWith("inline-catalog:")
-        fileDialog.title = megasweepBackground ? "Choose Megasweep background files"
+        let backgroundRole = requestState.backgroundRole || "custom"
+        let backgroundLabel = backgroundRole === "custom" ? "custom" : backgroundRole.toUpperCase()
+        fileDialog.title = megasweepBackground ? "Choose Megasweep " + backgroundLabel + " background files"
                          : purpose === "select-background" ? "Choose external DRR background files"
                          : purpose === "settings" ? "Open SHG analysis settings"
                          : purpose === "saved-results" ? "Open a saved DAT result" : "Choose measurement files"
@@ -88,7 +90,7 @@ Controls.ApplicationWindow {
                                : (purpose === "select-background" || megasweepBackground) ? ["Background measurements (*.csv)"]
                                : (requestState.fileNameFilters || ["Measurement data (*.dat *.csv *.xlsx)", "All files (*)"])
         // Snapshot notifications are batched; read the current request directory now.
-        DialogState.prepareFile(fileDialog, requestState.sourceFolderUrl, "")
+        DialogState.prepareFile(fileDialog, megasweepBackground ? requestState.backgroundFolderUrl : requestState.sourceFolderUrl, "")
         fileDialog.open()
     }
     function chooseFolder(purpose) {

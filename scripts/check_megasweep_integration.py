@@ -149,7 +149,7 @@ def main():
             settle()
             background_dialog = window.findChild(QObject, 'app_file_dialog')
             assert background_dialog is not None and background_dialog.property('visible')
-            assert background_dialog.property('title') == 'Choose Megasweep background files'
+            assert background_dialog.property('title') == 'Choose Megasweep custom background files'
             assert background_dialog.property('nameFilters') == ['Background measurements (*.csv)']
             QMetaObject.invokeMethod(background_dialog, 'reject')
             settle()
@@ -157,6 +157,27 @@ def main():
             QMetaObject.invokeMethod(window.findChild(QObject, 'megasweep_background_dialog'), 'close')
             window.setWidth(1440); window.setHeight(940)
             settle()
+            references = {}
+            for role, level in (('p', 1000.), ('n', 800.), ('bn', 900.)):
+                reference = root / (role.upper() + 'background.csv')
+                pd.DataFrame([[0, 0, *np.full(41, level)]], columns=columns).to_csv(reference, index=False)
+                references[role] = str(reference)
+                child.setParameter('background_role', role)
+                child.openFiles('background', [str(reference)])
+                loaded(child)
+                assert child.snapshot['backgroundFiles'] == [str(reference)]
+                assert child._result['background_role'] == role
+            child.setParameter('background_role', 'p'); loaded(child)
+            assert child.snapshot['backgroundFiles'] == [references['p']]
+            assert child.snapshot['backgroundGroups']['n'] == [references['n']]
+            child.invoke('export')
+            wait(lambda: not child.snapshot['busy'], 'role export')
+            role_exports = child.snapshot['resultPaths']
+            metadata = json.loads(next(Path(p) for p in role_exports if p.endswith('.json')).read_text(encoding='utf-8'))
+            assert metadata['background_role'] == 'p'
+            assert metadata['background_paths'] == [references['p']]
+            child.setParameter('background_role', 'custom'); loaded(child)
+            assert child.snapshot['backgroundFiles'] == [str(background)]
             child.invoke('reflection-preview')
             wait(lambda: not child.snapshot['busy'], 'reference preview')
             assert not child.snapshot['error'], child.snapshot['error']
@@ -214,7 +235,7 @@ def main():
             assert child.snapshot['sourceFile'] == str(optical)
             assert 'PySide6.QtWidgets' not in sys.modules
             assert not errors, errors
-            report = dict(status='ok', captures=captures, exports=paths, movie_exports=movie_paths, errors=errors,
+            report = dict(status='ok', captures=captures, exports=paths, role_exports=role_exports, movie_exports=movie_paths, errors=errors,
                           modes=['PL','Reflection','Transport'], widgets_imported=False)
             (args.output / 'report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
             print(json.dumps(report, indent=2))

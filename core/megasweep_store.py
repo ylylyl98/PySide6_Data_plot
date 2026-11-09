@@ -5,7 +5,8 @@ import json
 import os
 from pathlib import Path
 
-VERSION = 2
+VERSION = 3
+BACKGROUND_ROLES = ('custom', 'p', 'n', 'bn')
 
 def identity(path):
     return os.path.normcase(os.path.abspath(os.path.expanduser(str(path))))
@@ -28,8 +29,9 @@ def load_session(directory, path, mode):
     if not target.exists():
         return {}
     payload = json.loads(target.read_text(encoding='utf-8'))
-    if not isinstance(payload, dict) or payload.get('version') not in (1, VERSION):
+    if not isinstance(payload, dict) or payload.get('version') not in (1, 2, VERSION):
         raise ValueError('Unsupported Megasweep session format')
+    old_version = payload['version']
     if payload.get('csv_path') and identity(payload['csv_path']) != identity(path):
         raise ValueError('Megasweep session belongs to another source')
     if payload['version'] == 1:
@@ -110,13 +112,35 @@ def load_session(directory, path, mode):
         return {}
     if not isinstance(payload.get('values', {}), dict) or not isinstance(payload.get('background_paths', []), list):
         raise ValueError('Invalid Megasweep session')
+    if not all(isinstance(item, str) for item in payload.get('background_paths', [])):
+        raise ValueError('Invalid Megasweep background paths')
+    if old_version in (1, 2):
+        payload = dict(payload)
+        payload['values'] = dict(payload.get('values', {}), background_role='custom')
+        payload['background_groups'] = {role: list(payload.get('background_paths', [])) if role == 'custom' else [] for role in BACKGROUND_ROLES}
+        payload['version'] = VERSION
+        if payload.get('background_paths'):
+            payload['migration_notices'] = [*payload.get('migration_notices', []), 'Previous background files were kept in the Custom reference group.']
+    else:
+        groups = payload.get('background_groups')
+        if not isinstance(groups, dict) or set(groups) - set(BACKGROUND_ROLES):
+            raise ValueError('Invalid Megasweep background groups')
+        if any(not isinstance(groups.get(role, []), list) or not all(isinstance(item, str) for item in groups.get(role, [])) for role in BACKGROUND_ROLES):
+            raise ValueError('Invalid Megasweep background group paths')
+        if payload.get('values', {}).get('background_role', 'custom') not in BACKGROUND_ROLES:
+            raise ValueError('Invalid Megasweep background role')
+        payload = dict(payload, background_groups={role: list(groups.get(role, [])) for role in BACKGROUND_ROLES})
     return payload
 
-def save_session(directory, path, mode, values, background_paths, source_root='', output_directory=''):
+def save_session(directory, path, mode, values, background_paths, source_root='', output_directory='', *, background_groups=None):
     target = session_path(directory, path, mode)
     target.parent.mkdir(parents=True, exist_ok=True)
+    groups = ({role: list(background_groups.get(role, [])) for role in BACKGROUND_ROLES}
+              if background_groups is not None else {role: list(background_paths) if role == 'custom' else [] for role in BACKGROUND_ROLES})
+    saved_values = dict(values)
+    if background_groups is None: saved_values['background_role'] = 'custom'
     payload = {'version': VERSION, 'csv_path': identity(path), 'mode': mode,
-               'values': values, 'background_paths': list(background_paths), 'source_root': str(source_root), 'output_directory': str(output_directory)}
+               'values': saved_values, 'background_groups': groups, 'background_paths': list(background_paths), 'source_root': str(source_root), 'output_directory': str(output_directory)}
     temporary = target.with_suffix('.tmp')
     temporary.write_text(json.dumps(payload, ensure_ascii=False, allow_nan=False, indent=2), encoding='utf-8')
     os.replace(temporary, target)

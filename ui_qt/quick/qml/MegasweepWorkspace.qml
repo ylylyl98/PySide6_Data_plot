@@ -11,6 +11,11 @@ Rectangle {
     required property var bridge
     required property var colors
     readonly property var state: bridge ? bridge.snapshot : ({})
+    readonly property var roleOptions: state.backgroundRoleOptions || [{value:"custom",label:"Custom"},{value:"p",label:"P"},{value:"n",label:"N"},{value:"bn",label:"BN"}]
+    readonly property string currentRole: state.backgroundRole || "custom"
+    readonly property var roleGroups: state.backgroundGroups || ({})
+    function roleLabel(role) { for (let option of roleOptions) if (option.value === role) return option.label; return role }
+    function roleCount(role) { return (roleGroups[role] || []).length }
     property bool backgroundOpen: false
     property string lastMode: state.mode || ""
     onStateChanged: { if ((state.mode || "") !== lastMode) { backgroundOpen = false; lastMode = state.mode || "" } }
@@ -34,7 +39,25 @@ Rectangle {
         onClosed: page.backgroundOpen = false
         background: Rectangle { color: page.colors.surface; border.color: page.colors.border; radius: 6 }
         contentItem: ColumnLayout {
-            BackgroundFileBrowser { objectName: "megasweep_background_browser"; Layout.fillWidth: true; Layout.fillHeight: true; bridge: page.bridge ? page.bridge.backgroundSelectionBridge : null; colors: page.colors; chosenTitle: "Selected backgrounds" }
+            spacing: 7
+            RowLayout {
+                Layout.fillWidth: true
+                Basic.Label { text: "Reference role"; color: page.colors.text }
+                AppComboBox {
+                    id: roleSelector
+                    objectName: "megasweep_background_role"
+                    Layout.fillWidth: true
+                    colors: page.colors
+                    enabled: !page.state.busy
+                    model: page.roleOptions.map(option => option.label + " · " + page.roleCount(option.value))
+                    currentIndex: Math.max(0, page.roleOptions.findIndex(option => option.value === page.currentRole))
+                    Accessible.name: "Reference role and number of selected files"
+                    onActivated: index => page.bridge.setParameter("background_role", page.roleOptions[index].value)
+                }
+            }
+            Basic.Label { objectName: "megasweep_background_role_help"; Layout.fillWidth: true; text: "The selected role is used for all scan points. Assign unknown filenames to a role manually and verify their spectra."; color: page.colors.muted; wrapMode: Text.Wrap }
+            Basic.Label { objectName: "megasweep_background_status"; Layout.fillWidth: true; text: page.state.backgroundSelectionError || page.state.error || page.state.status || ""; color: (page.state.backgroundSelectionError || page.state.error) ? page.colors.error : page.colors.muted; visible: text.length > 0; wrapMode: Text.Wrap }
+            BackgroundFileBrowser { objectName: "megasweep_background_browser"; Layout.fillWidth: true; Layout.fillHeight: true; bridge: page.bridge ? page.bridge.backgroundSelectionBridge : null; colors: page.colors; chosenTitle: page.roleLabel(page.currentRole) + " backgrounds" }
             AppButton { objectName: "megasweep_background_close"; Layout.alignment: Qt.AlignRight; colors: page.colors; text: "Close"; onClicked: backgroundDialog.close() }
         }
     }
@@ -48,7 +71,7 @@ Rectangle {
             spacing: 4
             AppButton { objectName: "megasweep_select_files"; colors: page.colors; text: "Open file…"; enabled: !page.state.busy; onClicked: page.bridge.invoke("select-files") }
             AppButton { objectName: "megasweep_update"; colors: page.colors; text: "Update"; enabled: !page.state.busy && !!page.state.sourceFile; onClicked: page.bridge.invoke("update") }
-            AppButton { objectName: "megasweep_background"; colors: page.colors; text: "Background references"; visible: page.state.mode === "Reflection"; checkable: true; checked: page.backgroundOpen; onClicked: { page.backgroundOpen = !page.backgroundOpen; if (page.backgroundOpen) page.bridge.invoke("choose-background") } }
+            AppButton { objectName: "megasweep_background"; colors: page.colors; text: "Background: " + page.roleLabel(page.currentRole) + " (" + page.roleCount(page.currentRole) + ")"; visible: page.state.mode === "Reflection"; checkable: true; checked: page.backgroundOpen; onClicked: { page.backgroundOpen = !page.backgroundOpen; if (page.backgroundOpen) page.bridge.invoke("choose-background") } }
             AppButton { objectName: "megasweep_return_to_map"; colors: page.colors; text: "Return to map"; visible: page.state.mode === "Reflection" && page.state.reflectionPreviewVisible === true; enabled: !page.state.busy; onClicked: page.bridge.invoke("return-to-map") }
             AppButton { objectName: "megasweep_reflection_preview"; colors: page.colors; text: "Preview reference spectra"; visible: page.state.mode === "Reflection" && page.state.reflectionPreviewVisible !== true; enabled: !page.state.busy && !!page.state.sourceFile; onClicked: page.bridge.invoke("reflection-preview") }
             AppButton { objectName: "megasweep_slice_previous"; colors: page.colors; text: "Previous slice"; visible: page.state.values && page.state.values.view === "slice"; enabled: !page.state.busy && !!page.state.sourceFile; onClicked: page.bridge.invoke("slice-previous") }

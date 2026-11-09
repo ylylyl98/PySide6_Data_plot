@@ -198,6 +198,9 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
                 state["sourceSummary"] = child_state.get("sourceFile") or "No measurement selected"
                 state["exportLabel"] = "Save CSV + PNG"
                 state["workspaceTitle"] = "Megasweep · " + child_state.get("mode", "PL")
+                background_folder = child_state.get("backgroundFolder", "")
+                state["backgroundRole"] = child_state.get("backgroundRole", "custom")
+                state["backgroundFolderUrl"] = QUrl.fromLocalFile(background_folder).toString() if background_folder else state["sourceFolderUrl"]
             state["sideBySide"] = self._child_side_by_side(child_state)
             # Native workspaces own their empty, loading and error states too.
             state["workspaceMessage"] = ""
@@ -586,8 +589,11 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         if key == self._workflow and not self._closed:
             if key == "megasweep" and purpose in {"sources", "select-files"}:
                 child = self._workflow_bridges[key]
-                self._source_catalog.setParameter("megasweepType", "Transport" if child.snapshot["mode"] == "Transport" else "Optical")
-                self._source_catalog.open(key, self._folder, child.snapshot.get("selectedSources", []), False)
+                state = child.snapshot
+                self._source_catalog.setParameter("megasweepType", "Transport" if state["mode"] == "Transport" else "Optical")
+                self._source_catalog.openMegasweep(state.get("pickerFolder") or self._folder,
+                    state.get("experimentRoot") or self._folder, state["mode"],
+                    state.get("pickerSelected", state.get("selectedSources", [])))
                 self.sourceCatalogRequested.emit()
                 return
             self.fileDialogRequested.emit(purpose, multiple)
@@ -627,7 +633,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             child.sourceDialogRequested.connect(lambda purpose, multiple: self._child_file_dialog(key, purpose, multiple))
             child.plotBackendChanged.connect(lambda: self.plotBackendChanged.emit() if key == self._workflow else None)
             child.setPalette(self.colors)
-            if self._folder:
+            if self._folder and (key != "megasweep" or not child.snapshot.get("pickerFolder")):
                 child.setExperimentFolder(self._folder)
         child = self._workflow_bridges[key]
         if key in {"mcd", "mcd_peak_shift"} and self._mcd_shared_products is not None:

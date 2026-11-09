@@ -59,10 +59,10 @@ with TemporaryDirectory() as directory:
         assert child.snapshot['backgroundFiles'] == []
         chooser.selectFile(str(bg2), True)
         assert child.snapshot['backgroundFiles'] == [str(bg2)]
-        # Folder changes invalidate outstanding requests and rebind the visible browser.
+        # Measurement-folder changes invalidate outstanding requests but preserve the reference folder.
         chooser.invoke('browse'); stale = requests[-1][0]
         shell.setSourcePath(str(nested))
-        assert chooser.snapshot['folder'] == str(nested.resolve())
+        assert chooser.snapshot['folder'] == str(root.resolve())
         shell.acceptFiles('megasweep', stale, [QUrl.fromLocalFile(str(bg1))])
         assert child.snapshot['backgroundFiles'] == [str(bg2)]
         # Switching modes also invalidates the former picker, even after reopening it.

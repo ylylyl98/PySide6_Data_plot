@@ -53,5 +53,97 @@ class MegasweepCatalogTests(unittest.TestCase):
                 picker.close()
 
 
+    def test_scope_selection_mode_isolation_and_reopen(self):
+        from time import monotonic, sleep
+        with TemporaryDirectory() as folder:
+            root=Path(folder); current=root/'measurement'; nested=current/'nested'; other=root/'other'
+            nested.mkdir(parents=True); other.mkdir()
+            paths=[current/'current.csv',nested/'nested.csv',other/'other.csv']
+            for path in paths: path.write_text('Vbg,Vtg,700,701\n0,0,1,2\n')
+            settings=QSettings(str(root/'picker.ini'),QSettings.IniFormat)
+            picker=SourceCatalogBridge(settings=settings)
+            def wait():
+                until=monotonic()+10
+                while picker.snapshot['busy'] and monotonic()<until:
+                    self.app.processEvents(); sleep(.005)
+                self.app.processEvents()
+                self.assertFalse(picker.snapshot['busy']); self.assertFalse(picker.snapshot['error'])
+            def shown(): return {row['id'] for row in picker.filesModel.rows}
+            try:
+                picker.openMegasweep(str(current),str(root),'PL',[str(paths[0])]); wait()
+                self.assertEqual(picker.snapshot['megasweepScope'],'folder'); self.assertEqual(shown(),{str(paths[0])})
+                picker.setParameter('query','does not exist')
+                picker.openMegasweep(str(current),str(root),'PL',[str(paths[0])]); wait()
+                self.assertEqual(picker.snapshot['query'],''); self.assertEqual(picker.snapshot['focused'],str(paths[0])); self.assertEqual(shown(),{str(paths[0])})
+                picker.setParameter('megasweepScope','subfolders'); wait()
+                self.assertEqual(shown(),{str(paths[0]),str(paths[1])})
+                picker.setParameter('megasweepScope','experiment'); wait()
+                self.assertEqual(shown(),{str(p) for p in paths})
+                picker.openMegasweep(str(current),str(root),'Transport',[str(paths[0])]); wait()
+                self.assertEqual(picker.snapshot['megasweepScope'],'folder'); self.assertEqual(shown(),{str(paths[0])})
+                picker.openMegasweep(str(current),str(root),'PL',[str(paths[1])]); wait()
+                self.assertEqual(picker.snapshot['megasweepScope'],'experiment'); self.assertEqual(shown(),{str(p) for p in paths})
+                self.assertEqual(picker.snapshot['focused'],str(paths[1]))
+                picker.open('pl',str(current),[],False); wait()
+                self.assertEqual(picker.snapshot['workflow'],'pl'); self.assertFalse(picker.snapshot['includeAll'])
+            finally: picker.close()
+
+    def test_scanner_defaults_remain_recursive_for_backgrounds(self):
+        from core.megasweep_catalog import source_paths
+        with TemporaryDirectory() as folder:
+            root=Path(folder); (root/'child').mkdir(); (root/'a.csv').write_text('a,b\n1,2\n'); (root/'child'/'b.csv').write_text('a,b\n1,2\n')
+            self.assertEqual(len(list(source_paths(root))),2)
+            self.assertEqual(len(list(source_paths(root,recursive=False))),1)
+            self.assertEqual(len(inventory(root,recursive=False)),1)
+
+    def test_mode_default_filter_and_selected_exception(self):
+        from time import monotonic, sleep
+        with TemporaryDirectory() as folder:
+            root=Path(folder); optical=root/'optical.csv'; transport=root/'transport.csv'
+            optical.write_text('Vbg,Vtg,700,701\n0,0,1,2\n'); transport.write_text('Vbg,Vtg,I\n0,0,1\n')
+            picker=SourceCatalogBridge(settings=QSettings(str(root/'test.ini'),QSettings.IniFormat))
+            def wait():
+                limit=monotonic()+10
+                while picker.snapshot['busy'] and monotonic()<limit: self.app.processEvents(); sleep(.005)
+                self.app.processEvents(); self.assertFalse(picker.snapshot['busy'])
+            try:
+                picker.openMegasweep(str(root),str(root),'PL',[]); wait()
+                self.assertEqual(picker.snapshot['megasweepType'],'Optical')
+                self.assertEqual({row['id'] for row in picker.filesModel.rows},{str(optical)})
+                picker.openMegasweep(str(root),str(root),'Transport',[]); wait()
+                self.assertEqual(picker.snapshot['megasweepType'],'Transport')
+                self.assertEqual({row['id'] for row in picker.filesModel.rows},{str(transport)})
+                picker.openMegasweep(str(root),str(root),'PL',[str(transport)]); wait()
+                self.assertEqual(picker.snapshot['focused'],str(transport))
+                self.assertIn(str(transport),{row['id'] for row in picker.filesModel.rows})
+                picker.setParameter('megasweepType','All')
+                self.assertEqual(picker.filesModel.rowCount(),2)
+            finally: picker.close()
+
+    def test_rapid_scope_change_discards_stale_result(self):
+        from threading import Event
+        from time import monotonic, sleep
+        with TemporaryDirectory() as folder:
+            root=Path(folder); nested=root/'nested'; nested.mkdir()
+            (root/'a.csv').write_text('X,Y,700,701\n0,0,1,2\n'); (nested/'b.csv').write_text('X,Y,700,701\n0,0,1,2\n')
+            picker=SourceCatalogBridge(settings=QSettings(str(root/'test.ini'),QSettings.IniFormat))
+            entered=Event(); release=Event(); original=picker._scan_catalog
+            def slow(folder,workflow,**kwargs):
+                if workflow=='megasweep' and not kwargs['include_all']:
+                    entered.set(); release.wait(5)
+                return original(folder,workflow,**kwargs)
+            picker._scan_catalog=slow
+            try:
+                picker.openMegasweep(str(root),str(root),'PL',[])
+                self.assertTrue(entered.wait(5))
+                picker.setParameter('megasweepScope','subfolders'); release.set()
+                limit=monotonic()+10
+                while picker.snapshot['busy'] and monotonic()<limit: self.app.processEvents(); sleep(.005)
+                self.app.processEvents()
+                self.assertFalse(picker.snapshot['busy']); self.assertEqual(picker.snapshot['megasweepScope'],'subfolders')
+                self.assertEqual({row['name'] for row in picker.filesModel.rows},{'a.csv','b.csv'})
+                self.assertIn(str(nested),picker._watcher.directories())
+            finally: release.set(); picker.close()
+
 if __name__ == '__main__':
     unittest.main()

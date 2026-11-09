@@ -11,7 +11,7 @@ def default_parameters():
                 baseline=595.0, auto_baseline=True, sg_window=31, sg_poly=3, ratio=1.0, tg_is_y=True,
                 convention='TG+rBG', transformed=False, cut_type='doping', cut_coordinates='explicit', cut_axis='first', batch_axes='selected', cut_value=0.0,
                 epsilon=0.03, min_points=2, exact_coordinates=False, derivative='spectrum',
-                derivative_window=9, background_average='all_frames', background_scale=1.0, auto_background_scale=True, background_scale_frame=None, background_scale_x=0.0, background_scale_y=0.0, background_scale_windows=[(1.53,1.545),(1.565,1.58)],
+                derivative_window=9, background_role='custom', background_groups={}, background_average='all_frames', background_scale=1.0, auto_background_scale=True, background_scale_frame=None, background_scale_x=0.0, background_scale_y=0.0, background_scale_windows=[(1.53,1.545),(1.565,1.58)],
                 x_column='', y_column='', channel='', direction=None, pass_index=None,
                 rc_feature='auto', cmap='turbo', color_auto=True, vmin=0.0, vmax=1.0, x_auto=True, xmin=0.0, xmax=1.0, y_auto=True, ymin=0.0, ymax=1.0, export_dpi=300, movie_options={}, movie_ranges={}, movie_colors={})
 
@@ -54,7 +54,9 @@ def load_dataset(path, mode='PL', x_col=None, y_col=None):
     return data
 
 
-def load_background(paths, wavelength, average='all_frames', cancelled=None):
+def load_background(paths, wavelength, average='all_frames', cancelled=None, *, role='custom'):
+    from .background_roles import inspect_background_roles
+    inspect_background_roles(paths,role)
     if not paths: raise ValueError('No background CSV files were selected.')
     if average not in ('all_frames','first_frame','last_frame','file_equal'):
         raise ValueError('Unknown background averaging mode: ' + str(average))
@@ -114,7 +116,11 @@ def analyze(dataset,parameters,background_paths=(),cancelled=None):
         return dict(base,kind='map',x=raw['X2D'],y=raw['Y2D'],z=raw['Z2D'],x_label=label(x),y_label=label(y),signal_label=label(channel),data=raw)
     spectra=dataset['Intensity']; diagnostics={'background_average':p['background_average']} if mode=='Reflection' else {}
     if mode=='Reflection' and view not in ('ibias','resistance'):
-        bg=load_background(background_paths,dataset['wavelength'],p['background_average'],cancelled)
+        from .background_roles import inspect_background_roles
+        provenance=inspect_background_roles(background_paths,p['background_role'])
+        diagnostics['background_role']=provenance['role']; diagnostics['background_sources']=provenance['sources']
+        base['background_role']=provenance['role']; base['background_sources']=provenance['sources']
+        bg=load_background(background_paths,dataset['wavelength'],p['background_average'],cancelled,role=p['background_role'])
         scale=p['background_scale']
         if p['auto_background_scale']:
             if p['background_scale_frame'] is None:
@@ -218,7 +224,7 @@ def export_result(result,directory,*,parameters=None):
         if xlim: ax.set_xlim(xlim)
         if ylim: ax.set_ylim(ylim)
         FigureCanvasAgg(fig); fig.savefig(png,dpi=dpi); fig.clear()
-        metadata.write_text(json.dumps(dict(source_path=result['source_path'],mode=result['mode'],kind=result['kind'],title=result['title'],background_paths=result.get('background_paths',[]),units=result.get('units',{}),parameters=p,diagnostics=result['diagnostics']),default=_json_default,indent=2,ensure_ascii=False),encoding='utf8')
+        metadata.write_text(json.dumps(dict(source_path=result['source_path'],mode=result['mode'],kind=result['kind'],title=result['title'],background_paths=result.get('background_paths',[]),background_role=result.get('background_role'),background_sources=result.get('background_sources',[]),units=result.get('units',{}),parameters=p,diagnostics=result['diagnostics']),default=_json_default,indent=2,ensure_ascii=False),encoding='utf8')
         with _export_lock:
             number=1
             while True:
@@ -245,6 +251,9 @@ class BatchCancelled(InterruptedError):
 
 def export_batch(dataset,parameters,background_paths,directory,cancelled=None):
     p=_params(parameters); paths=[]
+    if dataset['mode']=='Reflection':
+        from .background_roles import validate_background_role
+        validate_background_role(p['background_role'],background_paths)
     axes=(p['cut_axis'],) if p['batch_axes']=='selected' else ('first','second')
     if p['batch_axes'] not in ('selected','both'): raise ValueError('Unknown batch axes')
     for axis in axes:
@@ -278,7 +287,7 @@ def export_video(dataset,parameters,background_paths,directory,cancelled=None):
     spectra=np.asarray(dataset['Intensity'])
     if dataset['mode']=='Reflection':
         reference=reflection_preview(dataset,p,background_paths,cancelled)
-        metadata.update(background_scale=reference['scale'],background_scale_info=reference['scale_info'],background_scale_frame=reference['frame'])
+        metadata.update(background_role=reference['background_role'],background_sources=reference['background_sources'],background_scale=reference['scale'],background_scale_info=reference['scale_info'],background_scale_frame=reference['frame'])
         spectra=a.compute_rc_spectra(spectra,reference['background'],reference['scale'])
     def make_cut(value):
         _check(cancelled)
@@ -322,7 +331,9 @@ def reflection_preview(dataset,parameters,background_paths,cancelled=None):
     """Return raw, reference and RC spectra for the nearest measured sweep point."""
     if dataset['mode'] != 'Reflection': raise ValueError('Reflection data required.')
     p=_params(parameters); _check(cancelled)
-    bg=load_background(background_paths,dataset['wavelength'],p['background_average'],cancelled)
+    from .background_roles import inspect_background_roles
+    provenance=inspect_background_roles(background_paths,p['background_role'])
+    bg=load_background(background_paths,dataset['wavelength'],p['background_average'],cancelled,role=p['background_role'])
     xs=np.asarray(dataset['x_data'],float); ys=np.asarray(dataset['y_data'],float)
     valid=np.isfinite(xs)&np.isfinite(ys)
     if not valid.any(): raise ValueError('No finite reflection sweep coordinates')
@@ -336,7 +347,7 @@ def reflection_preview(dataset,parameters,background_paths,cancelled=None):
     if p['auto_background_scale']:
         scale,info=a.estimate_background_scale(dataset['Intensity'][frame],bg,dataset['energy'],p['background_scale_windows'])
     raw=dataset['Intensity'][frame]
-    return dict(frame=frame,x=float(xs[frame]),y=float(ys[frame]),energy=dataset['energy'],wavelength=dataset['wavelength'],raw=raw,background=bg,scaled_background=bg*scale,rc=a.compute_rc_spectra(raw,bg,scale),scale=scale,scale_info=info)
+    return dict(background_role=provenance['role'],background_sources=provenance['sources'],frame=frame,x=float(xs[frame]),y=float(ys[frame]),energy=dataset['energy'],wavelength=dataset['wavelength'],raw=raw,background=bg,scaled_background=bg*scale,rc=a.compute_rc_spectra(raw,bg,scale),scale=scale,scale_info=info)
 
 
 class MoviePreviewSession:

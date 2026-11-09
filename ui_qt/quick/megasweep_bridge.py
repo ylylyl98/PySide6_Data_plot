@@ -9,6 +9,9 @@ from PySide6.QtCore import QObject, Property, QStandardPaths, QTimer, QUrl, Sign
 from ui_qt.quick.megasweep_state import new_state
 from ui_qt.quick.megasweep_plot import MegasweepPlotMixin
 
+_BACKGROUND_ROLES = ('custom', 'p', 'n', 'bn')
+_BACKGROUND_OPTIONS = (('custom', 'Custom'), ('p', 'P'), ('n', 'N'), ('bn', 'BN'))
+
 _DISPLAY_KEYS = ('cmap','color_auto','vmin','vmax','x_auto','xmin','xmax','y_auto','ymin','ymax','export_dpi')
 
 class MegasweepBridge(MegasweepPlotMixin, QObject):
@@ -28,8 +31,9 @@ class MegasweepBridge(MegasweepPlotMixin, QObject):
         self._legacy_directory = None if session_directory else Path(QStandardPaths.writableLocation(QStandardPaths.GenericDataLocation)) / 'MegasweepAnalysis' / 'sessions'
         self._dataset_cache = {}
         self._states = {mode: new_state(mode) for mode in ('PL', 'Reflection', 'Transport')}
+        self._restore_locations()
         self._mode = 'PL'
-        self._folder = ''
+        self._folder = self._states['PL']['picker_folder']
         self._status = 'Select a Megasweep CSV file.'
         self._error = ''
         self._busy = self._closed = False
@@ -61,6 +65,48 @@ class MegasweepBridge(MegasweepPlotMixin, QObject):
         self._background.selectionEdited.connect(self._background_edited)
         self._background.dialogRequested.connect(self.sourceDialogRequested)
         self._background_mode = None
+        self._background_error = ''
+
+    @staticmethod
+    def _existing_path(value, *, directory):
+        if not value: return ''
+        try:
+            path = Path(str(value)).expanduser().resolve()
+            return str(path) if (path.is_dir() if directory else path.is_file()) else ''
+        except (OSError, ValueError, TypeError): return ''
+
+    def _restore_locations(self):
+        for mode, state in self._states.items():
+            prefix = 'quick/megasweep/locations/' + mode + '/'
+            for key in ('picker_folder', 'experiment_root', 'background_folder'):
+                state[key] = self._existing_path(self.settings.value(prefix + key, ''), directory=True)
+            for role in _BACKGROUND_ROLES:
+                state['background_folders'][role] = self._existing_path(self.settings.value(prefix + 'background_folders/' + role, ''), directory=True)
+            if not state['background_folders']['custom']:
+                state['background_folders']['custom'] = state['background_folder']
+            state['recent_source'] = self._existing_path(self.settings.value(prefix + 'recent_source', ''), directory=False)
+            if not state['picker_folder']:
+                state['picker_folder'] = (state['experiment_root'] or
+                    (str(Path(state['recent_source']).parent) if state['recent_source'] else ''))
+
+    def _save_locations(self):
+        prefix = 'quick/megasweep/locations/' + self._mode + '/'
+        for key in ('picker_folder', 'experiment_root', 'recent_source', 'background_folder'):
+            self.settings.setValue(prefix + key, self._state[key])
+        for role in _BACKGROUND_ROLES:
+            self.settings.setValue(prefix + 'background_folders/' + role, self._state['background_folders'][role])
+
+    def _picker_folder(self):
+        state = self._state
+        return (self._existing_path(state['picker_folder'], directory=True)
+                or self._existing_path(state['experiment_root'], directory=True)
+                or (str(Path(recent).parent) if (recent := self._existing_path(state['recent_source'], directory=False)) else ''))
+
+    def _background_folder(self):
+        state = self._state
+        return (self._existing_path(state['background_folders'][state['values']['background_role']], directory=True)
+                or self._existing_path(state['experiment_root'], directory=True)
+                or self._picker_folder())
 
     @property
     def _state(self): return self._states[self._mode]
@@ -87,8 +133,14 @@ class MegasweepBridge(MegasweepPlotMixin, QObject):
         return dict(workflow='megasweep', title='Megasweep', mode=self._mode, values=deepcopy(state['values']),
             parameterGroups=self._groups(), status=self._status, error=self._error, busy=self._busy,
             progress=-1 if self._busy else 0, canExport=bool(result) and not self._busy and not self._error and not self._reflection_visible, reflectionPreviewVisible=self._reflection_visible,
-            sourcePath=self._folder, sourceFile=state['source'], selectedSources=[state['source']] if state['source'] else [],
-            backgroundFiles=list(state['backgrounds']), summary=summary, plotTool=self._plot_tool,
+            sourcePath=self._picker_folder(), sourceFile=state['source'], selectedSources=[state['source']] if state['source'] else [],
+            pickerFolder=self._picker_folder(),
+            experimentRoot=self._existing_path(state['experiment_root'], directory=True),
+            pickerSelected=[selected] if (selected := self._existing_path(state['source'] or state['recent_source'], directory=False)) else [],
+            backgroundFolder=self._background_folder(),
+            backgroundFiles=list(state['backgrounds']), backgroundSelectionError=self._background_error, backgroundRole=state['values']['background_role'],
+            backgroundGroups=deepcopy(state['background_groups']),
+            backgroundRoleOptions=[dict(value=role, label=label) for role, label in _BACKGROUND_OPTIONS], summary=summary, plotTool=self._plot_tool,
             movieOptions=self._movie_options(), moviePreviewUrl=self._movie_preview, moviePreviewStatus=self._status, movieError=self._movie_error, moviePreviewFrameIndex=self._preview_frame, moviePreviewFrameCount=self._preview_count, movieDuration=self._preview_duration, moviePreviewBusy=self._busy and self._operation == 'preview',
             resultPaths=list(self._result_paths), inspectionVisible=bool(result), workspaceMessage=self._error or self._status)
 
@@ -110,7 +162,7 @@ class MegasweepBridge(MegasweepPlotMixin, QObject):
         state = self._state
         if not state['source']: return
         from core.megasweep_store import save_session
-        try: save_session(self._session_directory, state['source'], self._mode, state['values'], state['backgrounds'], state.get('source_root', ''), state.get('output_directory', ''))
+        try: save_session(self._session_directory, state['source'], self._mode, state['values'], state['backgrounds'], state.get('source_root', ''), state.get('output_directory', ''), background_groups=state['background_groups'])
         except (OSError, ValueError, TypeError) as exc: self.logMessage.emit('Could not save Megasweep session: ' + str(exc))
 
     def _restore(self):
@@ -123,7 +175,8 @@ class MegasweepBridge(MegasweepPlotMixin, QObject):
             for notice in data.get('migration_notices', []): self.logMessage.emit('Megasweep session migration: ' + str(notice))
             for key, value in data.get('values', {}).items():
                 if key in state['values'] or key in ('movie_first', 'movie_last', 'movie_stride'): state['values'][key] = value
-            state['backgrounds'] = [str(p) for p in data.get('background_paths', []) if isinstance(p, str)]
+            state['background_groups'] = {role: list(data.get('background_groups', {}).get(role, [])) for role in _BACKGROUND_ROLES}
+            state['backgrounds'] = list(state['background_groups'][state['values']['background_role']])
             if data.get('source_root'):
                 saved_root = Path(data['source_root']).expanduser().resolve()
                 if Path(state['source']).resolve().is_relative_to(saved_root): state['source_root'] = str(saved_root)
@@ -149,6 +202,7 @@ class MegasweepBridge(MegasweepPlotMixin, QObject):
 
     def _effective_values(self):
         values = deepcopy(self._state['values'])
+        values['background_groups'] = deepcopy(self._state['background_groups'])
         values.update(color_min=None if values['color_auto'] else values['vmin'], color_max=None if values['color_auto'] else values['vmax'], x_limits=None if values['x_auto'] else (values['xmin'], values['xmax']), y_limits=None if values['y_auto'] else (values['ymin'], values['ymax']))
         return values
 
@@ -161,11 +215,12 @@ class MegasweepBridge(MegasweepPlotMixin, QObject):
         self.snapshotChanged.emit()
 
     def _rebind_background(self):
-        if self._background_mode == self._mode and self._background.snapshot['selectionOpen'] and self._folder:
-            self._background.open_inline_selection(self._folder, 'custom', self._state['backgrounds'])
+        if self._background_mode == self._mode and self._background.snapshot['selectionOpen'] and self._background_folder():
+            self._background.open_inline_selection(self._background_folder(), self._state['values']['background_role'], self._state['backgrounds'])
 
     @Slot()
     def invalidateBackgroundSelection(self):
+        self._background_error = ''
         self._background_mode = None
         self._background._stop_selection()
         self._background.snapshotChanged.emit()
@@ -175,8 +230,9 @@ class MegasweepBridge(MegasweepPlotMixin, QObject):
         if not value or self._closed or (self._busy and self._operation == 'export'): return
         url = QUrl(str(value)); folder = Path(url.toLocalFile() if url.isLocalFile() else str(value)).expanduser().resolve()
         if not folder.is_dir(): self._message('Experiment folder does not exist.', error=True); return
-        changed = str(folder) != self._folder
-        self._folder = str(folder)
+        changed = str(folder) != self._folder or str(folder) != self._state['experiment_root']
+        self._folder = self._state['picker_folder'] = self._state['experiment_root'] = str(folder)
+        self._save_locations()
         if changed: self._rebind_background()
         self.snapshotChanged.emit()
 
@@ -188,14 +244,23 @@ class MegasweepBridge(MegasweepPlotMixin, QObject):
         if not path.is_absolute() and self._folder: path = Path(self._folder) / path
         path = path.resolve()
         if not path.is_file(): self._message('Source file does not exist: ' + str(path), error=True); return
+        experiment = self._existing_path(self._state['experiment_root'], directory=True)
+        external = not experiment or not path.is_relative_to(Path(experiment))
+        if external:
+            self._state['experiment_root'] = str(path.parent)
         if str(path) != self._state['source']:
+            self._background_error = ''
             self._save(); self._state['source'] = str(path)
-            root = Path(self._folder).resolve() if self._folder else path.parent
+            root = Path(self._state['experiment_root']).resolve()
             self._state['source_root'] = str(root if path.is_relative_to(root) else path.parent)
             self._state['values'] = new_state(self._mode)['values']; self._state['backgrounds'] = []
+            self._state['background_groups'] = {role: [] for role in _BACKGROUND_ROLES}
             self._restore()
             self._rebind_background()
-        if not self._folder: self._folder = str(path.parent)
+        if external: self._state['source_root'] = str(path.parent)
+        self._folder = self._state['picker_folder'] = str(path.parent)
+        self._state['recent_source'] = str(path)
+        self._save_locations()
         self._queue(immediate=True)
 
     @Slot(str, 'QVariantList')
@@ -216,11 +281,27 @@ class MegasweepBridge(MegasweepPlotMixin, QObject):
         if key == 'mode':
             mode = 'Reflection' if str(value) == 'DRR' else str(value)
             if mode not in self._states or mode == self._mode: return
+            previous_root = self._existing_path(self._state['experiment_root'], directory=True)
             self._save(); self._invalidate(); self.invalidateBackgroundSelection(); self._mode = mode
+            if not self._state['experiment_root']:
+                self._state['experiment_root'] = previous_root
+            if not self._state['picker_folder']:
+                self._state['picker_folder'] = self._existing_path(self._folder, directory=True)
+            self._folder = self._picker_folder()
+            self._save_locations()
             if self._canvas:
                 self._canvas.figure.clear(); self._canvas.draw_idle()
             self._queue(immediate=True); return
         values = self._state['values']
+        if key == 'background_role':
+            role = str(value).lower()
+            if role not in _BACKGROUND_ROLES or role == values['background_role']: return
+            self._background_error = ''
+            values['background_role'] = role
+            self._state['backgrounds'] = list(self._state['background_groups'][role])
+            self._rebind_background()
+            self._queue()
+            return
         if key == 'movie.previewFrame':
             try: self._pending_preview_frame = max(0, int(value))
             except (ValueError, TypeError): return
@@ -315,7 +396,27 @@ class MegasweepBridge(MegasweepPlotMixin, QObject):
     @Slot(str, 'QVariantList')
     def _background_accepted(self, workflow, paths):
         if self._closed or (self._busy and self._operation == 'export'): return
-        self._state['backgrounds'] = [str(p) for p in paths]; self._queue(immediate=True)
+        normalized = [str(Path(p.toLocalFile() if isinstance(p, QUrl) and p.isLocalFile() else str(p)).expanduser().resolve()) for p in paths]
+        role = self._state['values']['background_role']
+        try:
+            from core.megasweep.background_roles import validate_background_role
+            validate_background_role(role, normalized)
+        except ValueError as exc:
+            self._background.rebind_inline_selection(self._state['backgrounds'])
+            self._background_error = str(exc)
+            self.statusMessage.emit(self._background_error)
+            self.logMessage.emit(self._background_error)
+            self.snapshotChanged.emit()
+            return
+        self._background_error = ''
+        self._state['backgrounds'] = normalized
+        self._state['background_groups'][role] = list(normalized)
+        if normalized:
+            path = Path(normalized[-1])
+            if path.parent.is_dir():
+                self._state['background_folders'][role] = str(path.parent)
+                if role == 'custom': self._state['background_folder'] = str(path.parent)
+        self._save_locations(); self._queue(immediate=True)
 
     def _start(self, kind, fn):
         current = self._current()
@@ -426,11 +527,17 @@ class MegasweepBridge(MegasweepPlotMixin, QObject):
             self._render(); self.snapshotChanged.emit()
         elif action == 'select-files': self.sourceDialogRequested.emit('sources', False)
         elif action == 'choose-background':
-            if self._folder:
+            self._background_error = ''
+            if self._background_folder():
                 self._background_mode = self._mode
-                self._background.open_inline_selection(self._folder, 'custom', self._state['backgrounds'])
+                self._background.open_inline_selection(self._background_folder(), self._state['values']['background_role'], self._state['backgrounds'])
+                self.snapshotChanged.emit()
             else: self._message('Select an experiment folder first.', error=True)
-        elif action == 'clear-background': self._state['backgrounds'] = []; self._queue()
+        elif action == 'clear-background':
+            self._background_error = ''
+            self._state['backgrounds'] = []
+            self._state['background_groups'][self._state['values']['background_role']] = []
+            self._rebind_background(); self._queue()
         elif action in ('update', 'reload'):
             if action == 'reload': self._dataset_cache.clear()
             self._queue(immediate=True, force=True)
