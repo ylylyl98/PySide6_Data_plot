@@ -21,7 +21,7 @@ from tempfile import TemporaryDirectory
 from time import perf_counter
 
 
-WORKFLOWS = ("pl", "drr", "cmp", "power", "mcd", "mcd_peak_shift", "shg", "slides", "tools")
+WORKFLOWS = ("pl", "drr", "cmp", "power", "mcd", "mcd_peak_shift", "shg", "megasweep", "slides", "tools")
 FAILURE_MARKERS = ("Traceback (most recent call last)", "ModuleNotFoundError", "ImportError:", "DLL load failed",
     "QQmlApplicationEngine failed", "failed to load component", "is not a type", "is not installed",
     "Cannot load library", "ReferenceError", "TypeError:", "Binding loop", "Cannot assign", "Unable to assign")
@@ -120,7 +120,8 @@ def create_fixtures(root):
 
 
 def build_cases(fixtures):
-    cases = [SmokeCase("default-check", ()), SmokeCase("demo-check", ("--demo",), expect_plot=True)]
+    cases = [SmokeCase("default-check", ()), SmokeCase("demo-check", ("--demo",), expect_plot=True),
+             SmokeCase("megasweep-runtime", ("--check-megasweep-runtime",), kind="megasweep-runtime")]
     cases.extend(SmokeCase("empty-" + workflow, ("--workflow", workflow), workflow=workflow) for workflow in WORKFLOWS)
     cases.extend((SmokeCase("synthetic-pl-dat", ("--workflow", "pl", "--open", str(fixtures["pl"])), expect_plot=True),
         SmokeCase("synthetic-drr-dat", ("--workflow", "drr", "--open", str(fixtures["drr"])), workflow="drr", expect_plot=True),
@@ -184,6 +185,12 @@ def inspect_report(report, case):
                 or report.get("background_dialog_open") is not True or report.get("can_export") is not False
                 or not report.get("background_visible_frames", 0) or plot_frame):
             errors.append("The DRR CSV must open background settings without a provisional plot or export")
+    elif case.kind == "megasweep-runtime":
+        if report.get("status") != "ok": errors.append("Megasweep runtime check did not declare status=ok")
+        if report.get("modes") != ["PL", "Reflection", "Transport"]: errors.append("Megasweep modes were not all checked")
+        if report.get("widgets_imported") is not False: errors.append("Megasweep runtime imported Widgets")
+        if report.get("frozen") and report.get("ffmpeg_bundled") is not True: errors.append("Frozen Megasweep did not confirm a bundled FFmpeg")
+        if (report.get("movie") or {}).get("validation") != "FFmpeg full decode passed": errors.append("Megasweep MP4 full decode was not confirmed")
     elif case.kind == "drr":
         if report.get("widgetsImported") is not False:
             errors.append("The DRR report did not confirm widgetsImported=false")
@@ -207,7 +214,7 @@ def run_case(prefix, case, temporary, artifacts, timeout):
     # report or capture as current evidence. Only these generated files clear.
     report_path.unlink(missing_ok=True)
     capture_path.unlink(missing_ok=True)
-    arguments = list(case.arguments) + ["--check"]
+    arguments = list(case.arguments) + ([] if case.kind == "megasweep-runtime" else ["--check"])
     session = case_root / "workspace.npz"
     if case.kind in {"peak", "drr"}:
         arguments.extend(("--session", str(session)))
@@ -215,9 +222,9 @@ def run_case(prefix, case, temporary, artifacts, timeout):
         arguments.extend(("--settings", str(case_root / "isolated.ini")))
     elif case.kind == "drr":
         arguments.extend(("--settings-file", str(case_root / "isolated.ini")))
-    if case.kind in {"main", "drr"}:
+    if case.kind in {"main", "drr", "megasweep-runtime"}:
         arguments.extend(("--report", str(report_path)))
-    if case.kind != "drr":
+    if case.kind not in {"drr", "megasweep-runtime"}:
         arguments.extend(("--capture", str(capture_path)))
     command = [*prefix, *arguments]
     evidence = dict(name=case.name, kind=case.kind, arguments=arguments, status="error", errors=[],
@@ -249,14 +256,16 @@ def run_case(prefix, case, temporary, artifacts, timeout):
     evidence["failure_markers"] = [marker for marker in FAILURE_MARKERS if marker.casefold() in logs.casefold()]
     if evidence["failure_markers"]:
         evidence["errors"].append("Import/QML/runtime failures were found in the captured diagnostic logs")
-    if case.kind in {"main", "drr"}:
+    if case.kind in {"main", "drr", "megasweep-runtime"}:
         try:
             application_report = json.loads(report_path.read_text(encoding="utf-8"))
             evidence["application_report"] = application_report
             evidence["errors"].extend(inspect_report(application_report, case))
+            if case.kind == "megasweep-runtime" and len(prefix) == 1 and application_report.get("frozen") is not True:
+                evidence["errors"].append("The built executable did not confirm frozen runtime")
         except (OSError, ValueError, TypeError) as error:
             evidence["errors"].append("The application report could not be read: " + str(error))
-    if case.kind != "drr":
+    if case.kind not in {"drr", "megasweep-runtime"}:
         try:
             evidence["capture"] = png_evidence(capture_path)
         except (OSError, ValueError) as error:
@@ -275,6 +284,7 @@ def run_case(prefix, case, temporary, artifacts, timeout):
             evidence["errors"].append("The Peak workspace was not saved after restoring its synthetic snapshot: " + str(error))
     evidence["scope"] = ({"main": "QML page, isolated settings, no Widgets import, captured window; real data cases additionally require a presented scientific plot.",
         "drr": "Synthetic DRR workspace loaded, QGuiApplication/QML and at least one Agg scientific render; no Widgets import, warnings or reported errors.",
+        "megasweep-runtime": "Isolated PL, Reflection and Transport numerical/export smoke and offline MP4 encode/decode; frozen mode requires bundled FFmpeg.",
         "peak": "Fitted PL snapshot restored and saved, completed --check and captured window; no missing-import/runtime markers. Peak has no explicit Widgets/frame telemetry report.",
         "organizer": "Empty Organizer QML window completed --check and captured a frame; no missing-import/runtime markers. This case does not exercise MCD scientific analysis or expose Widgets telemetry."})[case.kind]
     evidence["artifacts"] = str(case_artifacts)

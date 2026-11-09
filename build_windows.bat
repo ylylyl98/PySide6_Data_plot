@@ -37,6 +37,8 @@ if errorlevel 1 (
     exit /b 1
 )
 
+rem The frozen matrix launches --check-megasweep-runtime as a waited child,
+rem and records its offline bundled FFmpeg encode/decode evidence in the report.
 python "scripts\check_frozen_quick.py" "dist\PySide6_Data_Plot\PySide6_Data_Plot.exe" --report "build\frozen-quick-report.json"
 if errorlevel 1 (
     echo The packaged native Qt Quick application failed its isolated workflow checks.
