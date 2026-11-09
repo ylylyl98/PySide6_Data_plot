@@ -47,6 +47,7 @@ jobs:
           tests.test_megasweep_exports
           tests.test_megasweep_store
           tests.test_quick_megasweep
+          tests.test_quick_megasweep_background
           tests.test_quick_megasweep_qml
           tests.test_quick_application_shell
           tests.test_quick_numeric_format

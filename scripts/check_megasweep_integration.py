@@ -20,7 +20,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
     os.environ.setdefault('QT_QUICK_BACKEND', 'software')
-    from PySide6.QtCore import QSettings, QUrl, QEvent, QCoreApplication, qInstallMessageHandler, QObject, QMetaObject
+    from PySide6.QtCore import QSettings, QUrl, QEvent, QCoreApplication, qInstallMessageHandler, QObject, QMetaObject, QPointF
     from PySide6.QtGui import QGuiApplication
     from PySide6.QtQml import QQmlApplicationEngine
     from PySide6.QtQuickControls2 import QQuickStyle
@@ -69,6 +69,21 @@ def main():
             destination = args.output / (name + '.png')
             assert window.grabWindow().save(str(destination)), 'capture failed'
             captures.append(str(destination))
+        def find_item(name, parent=None):
+            parent = parent if parent is not None else window.contentItem()
+            if parent.objectName() == name:
+                return parent
+            for item in parent.childItems():
+                match = find_item(name, item)
+                if match is not None:
+                    return match
+            return None
+        def assert_in_window(name):
+            item = find_item(name)
+            assert item is not None and item.isVisible(), name
+            bounds = item.mapRectToScene(item.boundingRect())
+            assert bounds.left() >= 0 and bounds.top() >= 0, (name, bounds)
+            assert bounds.right() <= window.width() and bounds.bottom() <= window.height(), (name, bounds)
         try:
             settle()
             assert 'PySide6.QtWidgets' not in sys.modules
@@ -122,6 +137,26 @@ def main():
             child.setParameter('auto_background_scale', False)
             loaded(child)
             bridge.invoke('theme-dark'); capture('reflection-dark')
+            child.invoke('choose-background')
+            workspace = window.findChild(QObject, 'quick_megasweep_workspace')
+            workspace.setProperty('backgroundOpen', True)
+            for width in (1000, 800, 640):
+                window.setWidth(width); window.setHeight(560)
+                capture(f'background-{width}')
+                for name in ('drr_background_inline_browse', 'drr_background_inline_clear', 'megasweep_background_close'):
+                    assert_in_window(name)
+            child.backgroundSelectionBridge.invoke('browse')
+            settle()
+            background_dialog = window.findChild(QObject, 'app_file_dialog')
+            assert background_dialog is not None and background_dialog.property('visible')
+            assert background_dialog.property('title') == 'Choose Megasweep background files'
+            assert background_dialog.property('nameFilters') == ['Background measurements (*.csv)']
+            QMetaObject.invokeMethod(background_dialog, 'reject')
+            settle()
+            assert not background_dialog.property('visible')
+            QMetaObject.invokeMethod(window.findChild(QObject, 'megasweep_background_dialog'), 'close')
+            window.setWidth(1440); window.setHeight(940)
+            settle()
             child.invoke('reflection-preview')
             wait(lambda: not child.snapshot['busy'], 'reference preview')
             assert not child.snapshot['error'], child.snapshot['error']
@@ -132,6 +167,21 @@ def main():
             child.selectFiles([str(transport)])
             child.setParameter('x_column', 'Vbg'); child.setParameter('y_column', 'Vtg'); child.setParameter('channel', 'Current')
             loaded(child); capture('transport-dark')
+            window.setWidth(640); window.setHeight(560); settle()
+            controls = window.findChild(QObject, 'quick_megasweep_controls')
+            scroll = controls.findChild(QObject, 'app_parameter_scroll')
+            field = find_item('app_parameter_pass_index', controls)
+            assert field is not None, 'Transport pass index editor missing'
+            flick = scroll.property('contentItem')
+            offset = field.mapToScene(QPointF()).y() - scroll.mapToScene(QPointF()).y()
+            flick.setProperty('contentY', max(0., min(float(flick.property('contentHeight')) - flick.height(),
+                                                    float(flick.property('contentY')) + offset - 30.)))
+            settle(); assert_in_window('app_parameter_pass_index')
+            field_top = field.mapToScene(QPointF()).y()
+            scroll_top = scroll.mapToScene(QPointF()).y()
+            assert scroll_top <= field_top and field_top + field.height() <= scroll_top + scroll.height()
+            capture('transport-parameters-640')
+            window.setWidth(1440); window.setHeight(940)
             child.setParameter('mode', 'PL'); loaded(child)
             assert child.snapshot['sourceFile'] == str(optical)
             assert child.snapshot['values']['view'] == 'slice'
@@ -147,7 +197,13 @@ def main():
             movie_dialog = window.findChild(QObject, 'megasweep_movie_dialog')
             assert movie_dialog is not None
             QMetaObject.invokeMethod(movie_dialog, 'open'); capture('movie-preview-dark')
+            for width in (1000, 800, 640):
+                window.setWidth(width); window.setHeight(560)
+                capture(f'movie-{width}')
+                for name in ('megasweep_movie_export', 'megasweep_movie_play', 'megasweep_movie_seek'):
+                    assert_in_window(name)
             QMetaObject.invokeMethod(movie_dialog, 'close')
+            window.setWidth(1440); window.setHeight(940)
             child.invoke('export-video')
             wait(lambda: not child.snapshot['busy'], 'movie export', timeout=45)
             assert not child.snapshot.get('movieError'), child.snapshot.get('movieError')

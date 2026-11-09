@@ -30,6 +30,7 @@ Basic.Control {
         AppParameterPane {
             Layout.fillWidth: true
             Layout.fillHeight: true
+            pinDataGroup: false
             bridge: panel.bridge
             colors: panel.colors
             groups: (panel.state.parameterGroups || []).map(group => Object.assign({}, group,

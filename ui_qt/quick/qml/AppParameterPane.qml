@@ -9,6 +9,7 @@ Basic.Control {
     required property var bridge
     required property var colors
     property var groups: []
+    property bool pinDataGroup: true
     property string message: ""
     property var groupSchema: []
     property var descriptors: ({})
@@ -49,7 +50,7 @@ Basic.Control {
                 } else rows.push({key: key, type: field.type})
             }
             return {key: groupKey, rows: rows,
-                    pinned: group.pinned === true || groupKey.toLowerCase() === "data"}
+                    pinned: group.pinned === true || (pinDataGroup && groupKey.toLowerCase() === "data")}
         })
         descriptors = fields
         groupDescriptors = headings

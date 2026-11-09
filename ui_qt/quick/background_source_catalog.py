@@ -18,8 +18,11 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
     selectionCancelled = Signal()
     selectionEdited = Signal("QVariantList")
 
-    def __init__(self, *, settings, parent=None, inline=False):
+    def __init__(self, *, settings, parent=None, inline=False, inventory_kind='drr'):
         super().__init__(settings=settings, parent=parent)
+        if inventory_kind not in {'drr', 'megasweep'}:
+            raise ValueError('Unsupported background inventory kind.')
+        self._inventory_kind = inventory_kind
         self._inline_selection = bool(inline)
         self._editing_enabled = True
         self._source_kind = "bn"
@@ -123,15 +126,21 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
         path = Path(url.toLocalFile() if url.isLocalFile() else str(value))
         return str((path if path.is_absolute() else root / path).resolve())
 
-    def _scan_catalog(self, folder, workflow, *, include_all=False, cancellation=None, **options):
+    def _source_paths(self, root, include_all):
+        if self._inventory_kind == 'megasweep':
+            from core.megasweep_catalog import source_paths
+            return source_paths(root)
         from core.drr_sources import drr_source_paths
+        return drr_source_paths(root, include_all=include_all)
+
+    def _scan_catalog(self, folder, workflow, *, include_all=False, cancellation=None, **options):
         from core.drr_measured_bn import is_measured_bn_name
         from core.drr_pn_pairing import detect_pn_role
         from core.load_cancellation import load_scope
         root = Path(folder).resolve()
         with load_scope(cancellation):
             rows = []
-            for path in drr_source_paths(root, include_all=include_all):
+            for path in self._source_paths(root, include_all):
                 if cancellation:
                     cancellation.check()
                 if path.suffix.casefold() != ".csv":
@@ -162,11 +171,10 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
 
     def _source_inventory(self, folder, workflow, include_all=False):
         """Reference choices depend on CSV metadata, not saved DRR history."""
-        from core.drr_sources import drr_source_paths
         from core.load_cancellation import check_load_cancelled
         root = Path(folder).resolve()
         rows = []
-        for path in drr_source_paths(root, include_all=include_all):
+        for path in self._source_paths(root, include_all):
             check_load_cancelled()
             if path.suffix.casefold() != ".csv":
                 continue
@@ -298,3 +306,10 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
     def close(self):
         self._stop_selection()
         super().close()
+
+
+class MegasweepBackgroundSourceCatalogBridge(BackgroundSourceCatalogBridge):
+    """Recursive Megasweep inventory with a separate optimistic display cache."""
+
+    def __init__(self, *, settings, parent=None, inline=False):
+        super().__init__(settings=settings, parent=parent, inline=inline, inventory_kind='megasweep')

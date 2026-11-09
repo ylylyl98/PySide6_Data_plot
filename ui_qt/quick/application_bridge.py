@@ -670,6 +670,8 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
     def selectWorkflow(self, key):
         if key == self._workflow or key not in {item.key for item in FEATURES}:
             return
+        if self._workflow == "megasweep":
+            self._workflow_bridges["megasweep"].invalidateBackgroundSelection()
         if self._workflow == "drr":
             self._cancel_bn_check()
             self.cancelDrrBackground()

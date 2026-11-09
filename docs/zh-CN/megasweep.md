@@ -38,6 +38,10 @@ Megasweep 是 app 内的原生 Qt Quick 工作区，用于双扫描轴光学数�
 
 Reflection 复用 DRR 的背景文件浏览组件，独立保存选择，计算遵循 Megasweep 规则：
 
+点击 **Background references** 打开背景选择窗口。列表包含当前浏览目录及子目录
+中的 CSV，并排除分析输出目录；**Browse files…** 可添加其他目录的背景。
+选择会直接应用到当前测量，切换测量文件时会显示该文件自己的背景选择。
+
 | 设置 | 含义 |
 | --- | --- |
 | All frames equally（默认） | 所选文件中的全部选中帧等权平均 |

@@ -48,7 +48,11 @@ likewise requires measured channels in its configured reference windows.
 ## Reflection backgrounds
 
 Reflection uses the same background file browser components as DRR, with a
-separate selection. Its numerical background processing follows Megasweep:
+separate selection. Open **Background references** to choose CSV files from the
+current browsing folder and its subfolders, excluding analysis output folders.
+Use **Browse files…** to add references from elsewhere. Selection changes apply to
+the current measurement; switching measurements restores that file's own references.
+Its numerical background processing follows Megasweep:
 
 | Setting | Meaning |
 | --- | --- |

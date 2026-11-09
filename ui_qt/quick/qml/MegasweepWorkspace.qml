@@ -2,6 +2,7 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls.Basic as Basic
 import QtQuick.Layouts
+import QtQuick.Window
 import Dptk 1.0
 
 Rectangle {
@@ -19,7 +20,24 @@ Rectangle {
     onColorsChanged: if (bridge) bridge.setPalette(colors)
     Component.onCompleted: if (bridge) bridge.setPalette(colors)
 
-    MegasweepMovieDialog { id: movieDialog; bridge: page.bridge; colors: page.colors }
+    MegasweepMovieDialog { id: movieDialog; parent: page.Window.window ? page.Window.window.contentItem : page; bridge: page.bridge; colors: page.colors }
+    Basic.Dialog {
+        id: backgroundDialog
+        objectName: "megasweep_background_dialog"
+        parent: page.Window.window ? page.Window.window.contentItem : page
+        anchors.centerIn: parent
+        width: Math.min(1000, parent.width - 24)
+        height: Math.min(640, parent.height - 24)
+        title: "Background references"
+        modal: true
+        visible: page.backgroundOpen && page.state.mode === "Reflection"
+        onClosed: page.backgroundOpen = false
+        background: Rectangle { color: page.colors.surface; border.color: page.colors.border; radius: 6 }
+        contentItem: ColumnLayout {
+            BackgroundFileBrowser { objectName: "megasweep_background_browser"; Layout.fillWidth: true; Layout.fillHeight: true; bridge: page.bridge ? page.bridge.backgroundSelectionBridge : null; colors: page.colors; chosenTitle: "Selected backgrounds" }
+            AppButton { objectName: "megasweep_background_close"; Layout.alignment: Qt.AlignRight; colors: page.colors; text: "Close"; onClicked: backgroundDialog.close() }
+        }
+    }
 
     ColumnLayout {
         anchors.fill: parent
@@ -60,14 +78,7 @@ Rectangle {
                     horizontalAlignment: Text.AlignHCenter
                 }
             }
-            ColumnLayout {
-                objectName: "megasweep_background_browser"
-                visible: page.state.mode === "Reflection" && page.backgroundOpen
-                Basic.SplitView.preferredHeight: visible ? 300 : 0
-                Basic.SplitView.minimumHeight: visible ? 180 : 0
-                Basic.SplitView.maximumHeight: visible ? 600 : 0
-                BackgroundFileBrowser { Layout.fillWidth: true; Layout.fillHeight: true; bridge: page.bridge ? page.bridge.backgroundSelectionBridge : null; colors: page.colors; chosenTitle: "Selected backgrounds" }
-            }
+
         }
         ColumnLayout {
             Layout.fillWidth: true

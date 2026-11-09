@@ -102,7 +102,13 @@ MegasweepWorkspace { bridge: win.bridge; colors: win.colors; Layout.fillWidth: t
     assert not find("megasweep_return_to_map").isVisible()
     click("megasweep_background")
     assert find("megasweep_background_browser").isVisible()
+    for width in (640, 800, 1000, 1440):
+        window.setWidth(width); window.setHeight(560); app.processEvents()
+        for name in ("drr_background_inline_browse", "drr_background_available_files", "drr_background_chosen_files", "megasweep_background_close"):
+            item = find(name); point = item.mapToScene(item.boundingRect().center())
+            assert 0 <= point.x() < width and 0 <= point.y() < 560, (width, name, point)
     assert ("choose-background", None) in bridge.actions
+    click("megasweep_background_close")
     click("megasweep_mode_transport")
     assert bridge.data["mode"] == "Transport"
     assert not find("megasweep_export_video").isVisible()
@@ -117,6 +123,12 @@ MegasweepWorkspace { bridge: win.bridge; colors: win.colors; Layout.fillWidth: t
         assert (action, None) in bridge.actions, action
     click("megasweep_export_video")
     assert find("megasweep_movie_dialog").property("visible")
+    for width in (640, 800, 1000, 1440):
+        window.setWidth(width); window.setHeight(560); app.processEvents()
+        for name in ("megasweep_movie_first", "megasweep_movie_preview", "megasweep_movie_seek", "megasweep_movie_export"):
+            item = find(name); point = item.mapToScene(item.boundingRect().center())
+            assert 0 <= point.x() < width and 0 <= point.y() < 560, (width, name, point)
+    window.setWidth(1100); window.setHeight(760); app.processEvents()
     for name in ("megasweep_movie_first", "megasweep_movie_last", "megasweep_movie_stride", "megasweep_movie_fps", "megasweep_movie_width", "megasweep_movie_height", "megasweep_movie_direction", "megasweep_movie_preview", "megasweep_movie_seek", "megasweep_movie_play", "megasweep_movie_export"):
         assert find(name).isVisible(), name
     first = find("megasweep_movie_first")

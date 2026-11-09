@@ -56,9 +56,10 @@ class MegasweepBridge(MegasweepPlotMixin, QObject):
         self._pending = set()
         self._timer = QTimer(self); self._timer.setSingleShot(True); self._timer.timeout.connect(self._load)
         self._completed.connect(self._finish)
-        from ui_qt.quick.background_source_catalog import BackgroundSourceCatalogBridge
-        self._background = BackgroundSourceCatalogBridge(settings=settings, parent=self, inline=True)
+        from ui_qt.quick.background_source_catalog import MegasweepBackgroundSourceCatalogBridge
+        self._background = MegasweepBackgroundSourceCatalogBridge(settings=settings, parent=self, inline=True)
         self._background.selectionEdited.connect(self._background_edited)
+        self._background.dialogRequested.connect(self.sourceDialogRequested)
         self._background_mode = None
 
     @property
@@ -159,12 +160,25 @@ class MegasweepBridge(MegasweepPlotMixin, QObject):
             else: self._status = 'Parameters changed. Select Update to process.'
         self.snapshotChanged.emit()
 
+    def _rebind_background(self):
+        if self._background_mode == self._mode and self._background.snapshot['selectionOpen'] and self._folder:
+            self._background.open_inline_selection(self._folder, 'custom', self._state['backgrounds'])
+
+    @Slot()
+    def invalidateBackgroundSelection(self):
+        self._background_mode = None
+        self._background._stop_selection()
+        self._background.snapshotChanged.emit()
+
     @Slot(str)
     def setExperimentFolder(self, value):
         if not value or self._closed or (self._busy and self._operation == 'export'): return
         url = QUrl(str(value)); folder = Path(url.toLocalFile() if url.isLocalFile() else str(value)).expanduser().resolve()
         if not folder.is_dir(): self._message('Experiment folder does not exist.', error=True); return
-        self._folder = str(folder); self.snapshotChanged.emit()
+        changed = str(folder) != self._folder
+        self._folder = str(folder)
+        if changed: self._rebind_background()
+        self.snapshotChanged.emit()
 
     @Slot('QVariantList')
     def selectFiles(self, values):
@@ -180,13 +194,18 @@ class MegasweepBridge(MegasweepPlotMixin, QObject):
             self._state['source_root'] = str(root if path.is_relative_to(root) else path.parent)
             self._state['values'] = new_state(self._mode)['values']; self._state['backgrounds'] = []
             self._restore()
+            self._rebind_background()
         if not self._folder: self._folder = str(path.parent)
         self._queue(immediate=True)
 
     @Slot(str, 'QVariantList')
     def openFiles(self, purpose, values):
         if self._busy and self._operation == 'export': return
-        if purpose in ('sources', 'select-files', 'source'): self.selectFiles(values)
+        if purpose.startswith('inline-catalog:'):
+            try: token = int(purpose.split(':', 1)[1])
+            except ValueError: return
+            if self._background_mode == self._mode: self._background.accept_external(token, values)
+        elif purpose in ('sources', 'select-files', 'source'): self.selectFiles(values)
         elif purpose == 'background': self._background_accepted('drr', values)
 
     @Slot(str, 'QVariant')
@@ -197,7 +216,7 @@ class MegasweepBridge(MegasweepPlotMixin, QObject):
         if key == 'mode':
             mode = 'Reflection' if str(value) == 'DRR' else str(value)
             if mode not in self._states or mode == self._mode: return
-            self._save(); self._invalidate(); self._background_mode = None; self._background._stop_selection(); self._mode = mode
+            self._save(); self._invalidate(); self.invalidateBackgroundSelection(); self._mode = mode
             if self._canvas:
                 self._canvas.figure.clear(); self._canvas.draw_idle()
             self._queue(immediate=True); return
