@@ -22,7 +22,8 @@ def main(argv=None, *, production=False):
     parser.add_argument("--capture", type=Path)
     parser.add_argument("--settings-file", type=Path)
     parser.add_argument("--open", type=Path, dest="sources", action="append", help="Measurement path; repeat for multiple channels")
-    parser.add_argument("--workflow", choices=("pl", "drr", "cmp", "power", "mcd", "mcd_peak_shift", "shg", "slides", "tools"), default="pl")
+    parser.add_argument("--workflow", choices=("pl", "drr", "cmp", "power", "mcd", "mcd_peak_shift", "shg", "megasweep", "slides", "tools"), default="pl")
+    parser.add_argument("--megasweep-mode", choices=("PL", "Reflection", "Transport"), default="PL")
     parser.add_argument("--report", type=Path)
     parser.add_argument("--theme", choices=("light", "dark", "system", "high-contrast"))
     parser.add_argument("--width", type=int, default=1320)
@@ -104,6 +105,8 @@ def main(argv=None, *, production=False):
         if not args.check and not args.demo:
             bridge.startServices()
         bridge.selectWorkflow(args.workflow)
+        if args.workflow == "megasweep":
+            bridge.workflowBridge.setParameter("mode", args.megasweep_mode)
         if args.sources:
             bridge.selectFiles([QUrl.fromLocalFile(str(path.resolve())) for path in args.sources])
         elif args.demo:
@@ -176,7 +179,7 @@ def main(argv=None, *, production=False):
                       background_dialog_open=bridge._background_open, can_export=bridge.snapshot.get("canExport", False),
                       background_visible_frames=len(background_frames),
                       workflow=bridge.snapshot["workflow"], visible_frames=len(frames),
-                      supported_scope="native shell, PL, DRR, Compare, Power, MCD, MCD Peak Shift, SHG, Slides and separate analysis windows")
+                      supported_scope="native shell, PL, DRR, Compare, Power, MCD, MCD Peak Shift, SHG, Megasweep, Slides and separate analysis windows")
         if report["widgets_imported"]:
             report["status"] = "error"
             errors.append("The native Quick path imported QtWidgets")

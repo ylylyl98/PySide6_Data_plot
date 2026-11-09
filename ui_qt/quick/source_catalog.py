@@ -83,6 +83,9 @@ def _catalog_inventory(folder,workflow,include_all=False):
     """Track only inputs which can change this picker, excluding its own cache."""
     from core.load_cancellation import check_load_cancelled
     root=Path(folder).resolve()
+    if workflow=="megasweep":
+        from core.megasweep_catalog import inventory
+        return inventory(root)
     if workflow=="drr":
         from core.drr_sources import drr_source_paths
         paths=drr_source_paths(root,include_all=include_all)
@@ -138,6 +141,9 @@ def scan_catalog(folder,workflow,*,include_all=False,cache_path=None,cancellatio
     from core.load_cancellation import load_scope
     root=Path(folder).resolve()
     with load_scope(cancellation):
+        if workflow=="megasweep":
+            from core.megasweep_catalog import scan
+            return scan(root, cancellation)
         if workflow=="pl" and not _uncached and cache_path is not None:
             from core.source_catalog_cache import SourceCatalogCache
             cache=SourceCatalogCache(str(root),workflow+"-"+str(int(include_all)),cache_root=Path(cache_path).parent/"inventory")
@@ -203,6 +209,7 @@ class SourceCatalogBridge(QObject):
         self.settings=settings
         self._workflow,self._folder,self._query="pl","",""
         self._type=str(settings.value("quick/catalog/plType","PL"))
+        self._megasweep_type="All"
         self._status_filter=str(settings.value("pl/source_filter","all"))
         self._saved_only=self._include_all=self._include_backgrounds=False
         self._only_new=str(settings.value("drr/source_unprocessed_only",True)).lower() in {"true","1","yes","on"}
@@ -244,7 +251,7 @@ class SourceCatalogBridge(QObject):
     def chosenModel(self):return self._chosen
     @Property("QVariantMap",notify=snapshotChanged)
     def snapshot(self):
-        return dict(workflow=self._workflow,folder=self._folder,query=self._query,type=self._type,statusFilter=self._status_filter,
+        return dict(workflow=self._workflow,folder=self._folder,query=self._query,type=self._type,megasweepType=self._megasweep_type,statusFilter=self._status_filter,
             savedOnly=self._saved_only,includeAll=self._include_all,includeBackgrounds=self._include_backgrounds,onlyNew=self._only_new,
             selected=list(self._selected),selectedGroup=self._selected_group,focused=self._focused,reopenPositionPending=self._reopen_group_pending,busy=self._busy,status=self._status,error=self._error,
             counts=dict(self._counts),canAccept=bool(self._selected) and (self._catalog_validated or set(self._selected)<=self._explicit_selected),
@@ -272,7 +279,7 @@ class SourceCatalogBridge(QObject):
     @Slot(str,str)
     def prepare(self,workflow,folder):
         """Warm the active folder without opening or changing a picker draft."""
-        if self._closed or workflow not in {"pl","drr"} or not folder:return
+        if self._closed or workflow not in {"pl","drr","megasweep"} or not folder:return
         folder=str(Path(folder).resolve())
         if (workflow,folder)!=(self._workflow,self._folder):
             self._dialog_open=False
@@ -307,7 +314,7 @@ class SourceCatalogBridge(QObject):
         elif not self._foreground_busy and self._refresh_pending and self._watch_active:self._watch_timer.start(0)
 
     def _configure(self,workflow,folder,selected,saved_only=False,*,restore_position=False):
-        if self._closed or workflow not in {"pl","drr"}:return
+        if self._closed or workflow not in {"pl","drr","megasweep"}:return
         folder=str(Path(folder or Path.cwd()).resolve())
         changed=(workflow,folder)!=(self._workflow,self._folder)
         if changed or bool(saved_only)!=self._saved_only:
@@ -337,7 +344,7 @@ class SourceCatalogBridge(QObject):
     @Slot(str,str,"QVariantList")
     def recordLoaded(self,workflow,folder,files):
         """Bookmark a successful measurement load, separately from picker drafts."""
-        if self._closed or workflow not in {"pl","drr"}:return
+        if self._closed or workflow not in {"pl","drr","megasweep"}:return
         paths=tuple(str(Path(path).resolve()) for path in files)
         if not paths:return
         scope=(workflow,str(Path(folder or Path.cwd()).resolve()),all(Path(path).suffix.casefold()==".dat" for path in paths))
@@ -541,7 +548,9 @@ class SourceCatalogBridge(QObject):
                 if self._workflow=="pl":
                     if self._type!="All" and row["kind"]!=self._type:continue
                     if self._status_filter!="all" and row["status"]!={"unprocessed":"new"}.get(self._status_filter,self._status_filter):continue
-                else:
+                elif self._workflow=="megasweep":
+                    if self._megasweep_type!="All" and row["kind"] not in {self._megasweep_type,"CSV"}:continue
+                elif self._workflow=="drr":
                     if row["background"] and not self._include_backgrounds:continue
                     if self._only_new and row["status"]!="new":continue
             visible_ids.add(row["id"])
@@ -571,6 +580,7 @@ class SourceCatalogBridge(QObject):
     def setParameter(self,key,value):
         self._reopen_group_pending=False
         if key=="query":self._query=str(value)
+        elif key=="megasweepType" and value in {"All","Optical","Transport"}:self._megasweep_type=str(value)
         elif key=="type":self._type=str(value);self.settings.setValue("quick/catalog/plType",self._type)
         elif key=="statusFilter":self._status_filter=str(value);self.settings.setValue("pl/source_filter",self._status_filter)
         elif key=="selectedGroup":self._selected_group=str(value)
@@ -591,7 +601,7 @@ class SourceCatalogBridge(QObject):
         self._reopen_group_pending=False
         path=str(Path(path).resolve())
         if selected:
-            if self._workflow=="pl" or self._saved_only:self._selected=[path]
+            if self._workflow in {"pl","megasweep"} or self._saved_only:self._selected=[path]
             elif path not in self._selected:self._selected.append(path)
             self._focused=path
             self._explicit_selected.add(path)
@@ -605,7 +615,7 @@ class SourceCatalogBridge(QObject):
             url=value if isinstance(value,QUrl) else QUrl(str(value))
             paths.append(str(Path(url.toLocalFile() if url.isLocalFile() else str(value)).resolve()))
         if not paths:return
-        self._selected=paths[-1:] if self._workflow=="pl" or self._saved_only else list(dict.fromkeys([*self._selected,*paths]))
+        self._selected=paths[-1:] if self._workflow in {"pl","megasweep"} or self._saved_only else list(dict.fromkeys([*self._selected,*paths]))
         self._focused=paths[-1];self._explicit_selected.update(paths)
         self._refresh_selection()
 

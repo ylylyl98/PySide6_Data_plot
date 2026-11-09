@@ -33,6 +33,7 @@ Controls.ApplicationWindow {
         {key: "mcd", label: "MCD", description: "Magnetic circular dichroism"},
         {key: "mcd_peak_shift", label: "MCD Peak Shift", description: "Track reflection resonance energies versus magnetic field"},
         {key: "shg", label: "SHG", description: "Second harmonic generation processing"},
+        {key: "megasweep", label: "Megasweep", description: "Dual-axis optical and transport sweeps"},
         {key: "slides", label: "Slides", description: "Build a PowerPoint from processed plot PNGs"},
         {key: "tools", label: "Tools", description: "Data tools and application diagnostics"}
     ]

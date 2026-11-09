@@ -99,6 +99,10 @@ def main() -> int:
     if "--check-quick-display" in sys.argv:
         from scripts.check_quick_display import check_quick_display
         return check_quick_display()
+    if "--check-megasweep-runtime" in sys.argv:
+        index = sys.argv.index("--check-megasweep-runtime")
+        from ui_qt.quick.megasweep_runtime_check import main as megasweep_runtime_check
+        return megasweep_runtime_check(sys.argv[index + 1:])
     if "--check-powerpoint-integration" in sys.argv:
         from core.presentation import powerpoint_integration_available
 

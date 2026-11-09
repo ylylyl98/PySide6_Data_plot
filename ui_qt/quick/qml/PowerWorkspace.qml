@@ -36,6 +36,7 @@ Rectangle {
                 AppButton { colors: page.colors; text: "Measurements…"; onClicked: page.bridge.invoke("choose-group") }
                 AppButton { objectName: "power_view_intensity"; colors: page.colors; text: "Intensity"; primary: page.state.mode !== "vp"; onClicked: page.bridge.setParameter("mode", page.state.vpAvailable ? "intensity" : "single") }
                 AppButton { objectName: "power_view_vp"; colors: page.colors; text: "VP"; primary: page.state.mode === "vp"; enabled: page.state.vpAvailable; onClicked: page.bridge.setParameter("mode", "vp") }
+                AppButton { objectName: "power_analyze_peaks"; colors: page.colors; text: "Analyze peaks"; primary: true; visible: !page.state.analysisEnabled; enabled: page.state.analysisAvailable && !page.state.busy; onClicked: page.bridge.invoke("analysis.fit") }
                 AppButton { colors: page.colors; text: "Fit power law…"; enabled: page.state.analysisEnabled && page.state.analysisExportReady; onClicked: page.bridge.invoke("analysis.law") }
             }
             Item {

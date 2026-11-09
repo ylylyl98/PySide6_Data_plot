@@ -2,15 +2,16 @@
 
 This mixin consumes immutable captured PowerBridge products and its worker queue.
 All numerical fits use the existing scientific core, without a dialog or Widgets
-owner. Cache entries and manual corrections are deliberately session-only.
+owner. Peak guesses are edited as a draft before fitting the complete sweep.
 """
 from __future__ import annotations
 
 from collections import OrderedDict
 from copy import deepcopy
 from math import isfinite
+from threading import Lock
 
-from PySide6.QtCore import QAbstractListModel, QModelIndex, Qt
+from PySide6.QtCore import QAbstractListModel, QModelIndex, Qt, QTimer
 
 
 _EXPLORATORY = ("Selecting intervals near alpha = 1 is exploratory, not independent evidence of linearity. "
@@ -58,7 +59,22 @@ class _PeakResultsModel(QAbstractListModel):
 class PowerAnalysisMixin:
     def _analysis_init(self):
         self._analysis_values = dict(enabled=False, model="Lorentzian", metric="Integrated area",
-            intensityLog=True, linewidthLog=True, selectedPeak=0, showResults=False)
+            intensityLog=True, linewidthLog=True, selectedPeak=0, showResults=False,
+            issuesOnly=False, advanced=False, pickMode="move")
+        self._analysis_draft = False
+        self._analysis_dataset_base = None
+        self._analysis_save_future = None
+        self._analysis_save_pending = {}
+        self._analysis_save_lock = Lock()
+        self._analysis_save_active = None
+        self._analysis_save_error = ""
+        self._analysis_save_timer = QTimer(self)
+        self._analysis_save_timer.setSingleShot(True)
+        self._analysis_save_timer.setInterval(250)
+        self._analysis_save_timer.timeout.connect(self._analysis_flush_saves)
+        self._analysis_seed_lines = []
+        self._analysis_seed_labels = []
+        self._analysis_drag = None
         self._peak_rows = []
         self._analysis_results = {}
         self._analysis_settings = None
@@ -99,14 +115,22 @@ class PowerAnalysisMixin:
             return None
         cubes = self._products["cubes"]
         signatures = tuple(self._signatures) or tuple((label, id(cube)) for label, cube in cubes.items())
-        return (signatures, tuple((label, len(cube.energy), len(cube.gate)) for label, cube in cubes.items()),
+        roles = tuple(sorted((str(key), str(value)) for key, value in (self._active_selection or {}).items()))
+        return (signatures, tuple((label, len(cube.energy), len(cube.gate)) for label, cube in cubes.items()), roles,
                 float(self._products["background"]))
 
     def _analysis_key(self, rows=None):
         return (self._analysis_base_key(), self._analysis_values["model"], _freeze_rows(self._peak_rows if rows is None else rows))
 
     def _analysis_ready(self):
-        return bool(self._analysis_results) and self._analysis_current_key == self._analysis_key()
+        return not self._analysis_draft and bool(self._analysis_results) and self._analysis_current_key == self._analysis_key()
+
+    def _analysis_visible_rows(self):
+        return [row for row in self._analysis_result_rows
+                if not self._analysis_values["issuesOnly"] or row["status"] != "ok"]
+
+    def _analysis_update_table(self):
+        self._analysis_results_model.replace(self._analysis_visible_rows() if self._analysis_ready() else [])
 
     def _analysis_snapshot(self):
         enabled, ready = self._analysis_enabled(), self._analysis_ready()
@@ -121,21 +145,26 @@ class PowerAnalysisMixin:
         return dict(analysisEnabled=enabled, analysisRequested=self._analysis_values["enabled"],
             analysisReady=ready,
             analysisAvailable=bool(self._products) and self._values["mode"] != "vp", fitBusy="fit" in self._running,
-            analysisExportReady=not enabled or ready and not (self._running & {"fit", "refit", "law"}) and not self._analysis_law_error,
+            detectBusy="detect" in self._running, analysisDraft=self._analysis_draft,
+            analysisIssuesOnly=self._analysis_values["issuesOnly"],
+            analysisIssueCount=sum(row["status"] != "ok" for row in self._analysis_result_rows) if ready else 0,
+            analysisPickMode=self._analysis_values["pickMode"],
+            analysisExportReady=not enabled or ready and not (self._running & {"fit", "detect", "refit", "law"}) and not self._analysis_law_error,
             analysisStatus=self._analysis_status, analysisModel=self._analysis_values["model"],
             analysisMetric=self._analysis_values["metric"], analysisShowResults=self._analysis_values["showResults"],
             analysisSelectedPeak=self._analysis_values["selectedPeak"], peaks=deepcopy(self._peak_rows),
             analysisSelectedChannel=self._analysis_selected_channel or "",
-            peakResults=list(self._analysis_result_rows) if ready and self._analysis_values["showResults"] else [],
+            peakResults=self._analysis_visible_rows() if ready and self._analysis_values["showResults"] else [],
             peakResultCount=len(self._analysis_result_rows) if ready else 0,
             analysisLawWarning=self._analysis_law_error, refit=refit, law=law)
 
     def _analysis_cancel_fit(self):
-        for kind in ("fit", "refit", "law"):
+        for kind in ("fit", "detect", "refit", "law"):
             self._cancel(kind)
         self._analysis_request_key = self._analysis_current_key = None
         self._analysis_results_model.replace([])
         self._refit_trial = None
+        self._analysis_drag = None
         self._disconnect_law_selector()
         if self._stage in {"refit", "law"}:
             self._stage = "plot"
@@ -151,53 +180,185 @@ class PowerAnalysisMixin:
         self._analysis_status = "Load a Power intensity sweep to analyze spectra."
         self._analysis_artists = []
         self._analysis_trends = ()
+        self._peak_rows = []
+        self._analysis_draft = False
+        self._analysis_dataset_base = None
 
     def _analysis_data_changed(self):
+        base = self._analysis_base_key()
+        if base == self._analysis_dataset_base and self._analysis_draft:
+            self._schedule_plot()
+            return
         self._analysis_cancel_fit()
+        if base != self._analysis_dataset_base:
+            self._peak_rows = []
+            self._analysis_draft = False
+            self._analysis_selected_rows = {}
+            self._analysis_selected_channel = None
+        self._analysis_dataset_base = base
         if self._analysis_enabled():
-            self._analysis_request_fit()
+            self._analysis_request_fit(restore=True)
         else:
             self._analysis_results, self._analysis_result_rows = {}, []
 
-    def _analysis_request_fit(self, *, detect=False):
+    def _analysis_store_path(self):
+        if not self._folder or not self._active_selection:
+            return None
+        import hashlib
+        import json
+        from pathlib import Path
+        from ui_qt.quick.settings_storage import settings_storage_dir
+        identity = (str(Path(self._folder).resolve()), self._active_selection,
+            [(record[0], record[-1]) for record in self._signatures])
+        digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
+        return settings_storage_dir(self.settings) / "power-analysis" / (digest + ".npz")
+
+    def _analysis_save(self, *, debounce=True):
+        """Capture immediately, coalesce edits, and keep one writer off-thread."""
+        if not self._analysis_ready() or self._closed:
+            return
+        try:
+            path = self._analysis_store_path()
+        except (OSError, RuntimeError) as error:
+            self.logMessage.emit("Power analysis could not be saved: " + str(error))
+            return
+        if path is None:
+            return
+        cubes, background = dict(self._products["cubes"]), float(self._products["background"])
+        rows, model, results = deepcopy(self._peak_rows), self._analysis_values["model"], dict(self._analysis_results)
+        entry = self._analysis_cache[self._analysis_current_key]
+        laws, ranges = deepcopy(self._analysis_law_fits), deepcopy(entry.get("ranges", []))
+        law_error = self._analysis_law_error
+        preferences = {key: self._analysis_values[key] for key in
+            ("metric", "intensityLog", "linewidthLog", "showResults", "issuesOnly", "advanced")}
+        payload = dict(cubes=cubes, background=background, rows=rows, model=model, results=results,
+            laws=laws, ranges=ranges, law_error=law_error, preferences=preferences)
+        with self._analysis_save_lock:
+            self._analysis_save_pending[path] = payload
+        if debounce:
+            self._analysis_save_timer.start()
+        else:
+            self._analysis_flush_saves()
+
+    def _analysis_flush_saves(self, *, wait=False):
+        """Drain the latest snapshot per dataset; shutdown flushes the debounce."""
+        self._analysis_save_timer.stop()
+        def operation(token):
+            try:
+                from core.power_analysis_store import save_analysis
+                while True:
+                    with self._analysis_save_lock:
+                        if not self._analysis_save_pending:
+                            self._analysis_save_active = None
+                            return
+                        path = next(iter(self._analysis_save_pending))
+                        payload = self._analysis_save_pending.pop(path)
+                    try:
+                        save_analysis(path, **payload)
+                        with self._analysis_save_lock:
+                            self._analysis_save_error = ""
+                    except Exception as error:
+                        message = "Power analysis could not be saved: " + str(error)
+                        with self._analysis_save_lock:
+                            self._analysis_save_error = message
+                        if not self._closed:
+                            self.logMessage.emit(message)
+                            self.statusMessage.emit(message)
+            finally:
+                with self._analysis_save_lock:
+                    if self._analysis_save_active is token:
+                        self._analysis_save_active = None
+        while True:
+            with self._analysis_save_lock:
+                if self._analysis_save_pending and self._analysis_save_active is None:
+                    token = self._analysis_save_active = object()
+                    self._analysis_save_future = self._executor.submit(operation, token)
+                future = self._analysis_save_future
+            if not wait:
+                return
+            if future is not None:
+                future.result()
+            with self._analysis_save_lock:
+                if not self._analysis_save_pending and self._analysis_save_active is None:
+                    return
+
+    def _analysis_mark_draft(self):
+        self._analysis_cancel_fit()
+        self._analysis_draft = True
+        self._analysis_law_fits, self._analysis_law_error = [], ""
+        self._analysis_status = "Peak guesses changed. Check the markers, then Fit all powers."
+        self._message(self._analysis_status)
+        self._schedule_plot()
+        self._publish()
+
+    def _analysis_request_fit(self, *, detect=False, preview=False, restore=False):
         if not self._analysis_enabled() or not self._products:
             return
+        was_ready = self._analysis_ready()
+        self._analysis_flush_saves()
         from ui_qt.quick.power_workflow import fit_peaks, verify_fingerprints
         self._analysis_cancel_fit()
         rows = [] if detect else deepcopy(self._peak_rows)
         model, cubes = self._analysis_values["model"], dict(self._products["cubes"])
         base, signatures = self._analysis_base_key(), tuple(self._signatures)
+        try:
+            store_path = self._analysis_store_path()
+        except (OSError, RuntimeError) as error:
+            store_path = None
+            self.logMessage.emit("Power analysis cache unavailable: " + str(error))
+        pending_save = self._analysis_save_future
         key = (base, model, _freeze_rows(rows))
         self._analysis_request_key = key
-        if rows and key in self._analysis_cache:
-            self._analysis_adopt(key, self._analysis_cache[key])
-            self._message(self._analysis_status + " Cached fits reused.")
-            self._schedule_plot()
-            return
+        cached = self._analysis_cache.get(key) if rows and not preview else None
         self._analysis_results, self._analysis_result_rows = {}, []
         self._analysis_law_fits, self._analysis_law_error = [], ""
-        self._analysis_status = "Fitting all spectra… Plot controls remain available."
+        self._analysis_draft = bool(preview)
+        self._analysis_status = ("Finding peak guesses across powers and channels…" if preview else
+            "Fitting all spectra… Plot controls remain available.")
         def operation(cancellation):
             from core.load_cancellation import load_scope, check_load_cancelled
-            from core.power_multi_peaks import detect_peak_seeds
+            from core.power_analysis_store import analysis_fingerprint
+            from core.power_multi_peaks import detect_power_peak_seeds
             from ui_qt.quick.power_workflow import peak_settings
             with load_scope(cancellation):
                 if signatures:
                     verify_fingerprints(signatures)
+                fingerprint = analysis_fingerprint(cubes, base[-1])
+                check_load_cancelled()
+                if cached is not None and cached.get("fingerprint") == fingerprint:
+                    return dict(request=key, base=base, rows=rows, settings=cached["settings"],
+                        results=cached["results"], ranges=cached.get("ranges", []),
+                        laws=cached.get("laws", []), law_error=cached.get("lawError", ""), cached=True,
+                        fingerprint=fingerprint, keep_plot=was_ready)
+                if restore and not detect and store_path is not None:
+                    from core.power_analysis_store import load_analysis
+                    if pending_save is not None:
+                        try:
+                            pending_save.result()
+                        except Exception:
+                            pass
+                    saved = load_analysis(store_path, cubes, base[-1])
+                    if saved is not None:
+                        check_load_cancelled()
+                        if signatures:
+                            verify_fingerprints(signatures)
+                        return dict(request=key, base=base, restored=True, **saved)
                 requested_rows = rows
                 if not requested_rows:
                     requested_rows = [dict(center=seed.center_ev, width=seed.fwhm_ev * 1000.,
                         height=seed.height, lower=seed.center_min_ev, upper=seed.center_max_ev)
-                        for seed in detect_peak_seeds(next(iter(cubes.values())))]
+                        for seed in detect_power_peak_seeds(cubes)]
                 check_load_cancelled()
-                results = fit_peaks(cubes, requested_rows, model, cancellation=cancellation)
+                results = {} if preview else fit_peaks(cubes, requested_rows, model, cancellation=cancellation)
                 if signatures:
                     verify_fingerprints(signatures)
-                return dict(request=key, base=base, rows=requested_rows, settings=peak_settings(requested_rows, model), results=results)
-        self._start("fit", operation)
+                return dict(request=key, base=base, rows=requested_rows, settings=peak_settings(requested_rows, model),
+                    results=results, fingerprint=fingerprint)
+        self._start("detect" if preview else "fit", operation)
         self._publish()
 
-    def _analysis_adopt(self, key, entry):
+    def _analysis_adopt(self, key, entry, *, persist=True):
+        self._analysis_draft = False
         self._analysis_current_key = self._analysis_request_key = key
         self._analysis_results = entry["results"]
         self._analysis_settings = entry["settings"]
@@ -208,12 +369,14 @@ class PowerAnalysisMixin:
         while len(self._analysis_cache) > 4:
             self._analysis_cache.popitem(last=False)
         self._analysis_result_rows = self._analysis_table_rows()
-        self._analysis_results_model.replace(self._analysis_result_rows)
+        self._analysis_update_table()
         valid = sum(row["status"] == "ok" for row in self._analysis_result_rows)
         self._analysis_status = f"{valid}/{len(self._analysis_result_rows)} peak fits valid. Failed or unresolved fits are omitted from trends."
+        if persist:
+            self._analysis_save(debounce=False)
 
     def _analysis_error(self, kind, error):
-        if kind == "fit":
+        if kind in {"fit", "detect"}:
             self._analysis_current_key = None
             self._analysis_status = "Peak analysis failed: " + error
         elif kind == "refit" and self._refit_state:
@@ -227,18 +390,41 @@ class PowerAnalysisMixin:
                         row["error"] = error
             else:
                 self._analysis_law_error = error
+                entry = self._analysis_cache.get(self._analysis_current_key)
+                if entry is not None:
+                    entry.update(lawError=error, laws=[])
+                    self._analysis_law_fits = []
+                    self._analysis_save()
 
     def _analysis_finish(self, kind, payload, elapsed):
-        if kind == "fit":
+        if kind in {"fit", "detect"}:
             if payload["request"] != self._analysis_request_key or payload["base"] != self._analysis_base_key() or not self._analysis_enabled():
                 return True
             self._peak_rows = deepcopy(payload["rows"])
             self._analysis_values["selectedPeak"] = min(self._analysis_values["selectedPeak"], len(self._peak_rows) - 1)
+            if kind == "detect":
+                self._analysis_draft = True
+                self._analysis_status = f"{len(self._peak_rows)} peak guesses found. Check the markers, then Fit all powers."
+                self._message(self._analysis_status)
+                self._schedule_plot()
+                return True
+            if payload.get("restored"):
+                self._analysis_values["model"] = payload["model"]
+                for name, value in payload.get("preferences", {}).items():
+                    if name in {"intensityLog", "linewidthLog", "showResults", "issuesOnly", "advanced"} and isinstance(value, bool):
+                        self._analysis_values[name] = value
+                    elif name == "metric" and value in {"Integrated area", "Peak height"}:
+                        self._analysis_values[name] = value
             key = self._analysis_key()
-            entry = dict(results=payload["results"], settings=payload["settings"], ranges=[], laws=[], lawError="")
-            self._analysis_adopt(key, entry)
-            self._message(self._analysis_status + f" ({elapsed / 1000:.3f} s)")
-            self._schedule_plot()
+            entry = dict(results=payload["results"], settings=payload["settings"], ranges=payload.get("ranges", []),
+                laws=payload.get("laws", []), lawError=payload.get("law_error", ""), fingerprint=payload["fingerprint"])
+            self._analysis_adopt(key, entry, persist=not (payload.get("restored") or payload.get("cached")))
+            self._message(("Saved analysis restored. " if payload.get("restored") else
+                "Cached fits reused. " if payload.get("cached") else "") + self._analysis_status + f" ({elapsed / 1000:.3f} s)")
+            if entry.get("ranges") and entry.get("lawError"):
+                self._analysis_evaluate_applied_laws()
+            if not (payload.get("keep_plot") and self._plot_workspace == "plot" and self._main_plot_unchanged()):
+                self._schedule_plot()
             return True
         if kind == "refit":
             if not self._refit_state or self._stage != "refit" or payload["identity"] != self._refit_identity():
@@ -254,6 +440,8 @@ class PowerAnalysisMixin:
                 rows[index] = fit
                 updated[label] = tuple(rows)
                 entry = dict(self._analysis_cache[self._analysis_current_key], results=updated)
+                if entry.get("ranges"):
+                    entry.update(laws=[], lawError="Power-law intervals need recalculation after manual refit.")
                 self._analysis_adopt(self._analysis_current_key, entry)
                 self._stage, self._refit_trial = "plot", None
                 self._message(f"Applied manual refit to {label}, row {index + 1}, {fit.power_uw:g} uW only.")
@@ -269,6 +457,7 @@ class PowerAnalysisMixin:
                 entry = self._analysis_cache.get(self._analysis_current_key)
                 if entry is not None:
                     entry.update(laws=self._analysis_law_fits, lawError=self._analysis_law_error)
+                self._analysis_save()
             elif self._stage == "law" and self._law_state and payload["version"] == self._law_version:
                 self._law_state["rows"] = payload["rows"]
                 self._law_state["message"] = payload["message"]
@@ -293,7 +482,7 @@ class PowerAnalysisMixin:
                     return True
                 if field not in self._analysis_values:
                     return True
-                if field in {"enabled", "intensityLog", "linewidthLog", "showResults"}:
+                if field in {"enabled", "intensityLog", "linewidthLog", "showResults", "issuesOnly", "advanced"}:
                     value = bool(value)
                 elif field == "model" and value not in {"Lorentzian", "Gaussian"}:
                     raise ValueError("Choose Lorentzian or Gaussian.")
@@ -301,23 +490,32 @@ class PowerAnalysisMixin:
                     raise ValueError("Choose integrated area or peak height.")
                 elif field == "selectedPeak":
                     value = max(0, min(int(value), max(0, len(self._peak_rows) - 1)))
+                elif field == "pickMode" and value not in {"move", "add"}:
+                    raise ValueError("Choose Move selected peak or Add peak on click.")
                 if self._analysis_values[field] == value:
                     return True
                 self._analysis_values[field] = value
-                if field in {"enabled", "model"}:
+                if field == "enabled":
                     if self._analysis_enabled():
-                        self._analysis_request_fit()
+                        if not self._analysis_draft:
+                            self._analysis_request_fit(restore=not self._peak_rows)
                     else:
                         self._analysis_cancel_fit()
                     self._schedule_plot()
-                elif field != "showResults":
+                elif field == "model":
+                    self._analysis_mark_draft()
+                elif field == "issuesOnly":
+                    self._analysis_update_table()
+                elif field not in {"showResults", "advanced", "pickMode"}:
                     self._schedule_plot()
+                if field in {"metric", "intensityLog", "linewidthLog", "showResults", "issuesOnly", "advanced"}:
+                    self._analysis_save()
             elif key.startswith("peak."):
                 _, index, field = key.split(".")
                 if field in {"center", "width"} and 0 <= int(index) < len(self._peak_rows):
                     value = self._analysis_number(value, positive=field == "width")
                     self._peak_rows[int(index)][field] = value
-                    self._analysis_request_fit()
+                    self._analysis_mark_draft()
             elif key.startswith("refit."):
                 self._analysis_refit_parameter(key[6:], value)
             else:
@@ -347,7 +545,13 @@ class PowerAnalysisMixin:
             return True
         try:
             if action == "analysis.detect":
-                self._analysis_request_fit(detect=True)
+                self._analysis_request_fit(detect=True, preview=True)
+            elif action == "analysis.fit":
+                self._analysis_values["enabled"] = True
+                self._error = ""
+                self._analysis_request_fit(restore=not self._peak_rows and not self._analysis_draft)
+            elif action == "analysis.nextIssue":
+                self._analysis_next_issue()
             elif action == "analysis.add":
                 if len(self._peak_rows) >= 8:
                     self._message("At most eight simultaneous peaks are supported.")
@@ -357,18 +561,18 @@ class PowerAnalysisMixin:
                 if cube is None:
                     raise ValueError("Load a Power spectrum before adding a peak.")
                 centers = sorted(row["center"] for row in self._peak_rows)
-                gaps = [float(cube.energy[0]), *centers, float(cube.energy[-1])]
+                cubes = self._products["cubes"].values()
+                lo = max(float(c.energy[0]) for c in cubes)
+                hi = min(float(c.energy[-1]) for c in self._products["cubes"].values())
+                gaps = [lo, *centers, hi]
                 index = int(np.argmax(np.diff(gaps)))
                 center = .5 * (gaps[index] + gaps[index + 1])
-                self._peak_rows.append(dict(center=center, width=10., height=None, lower=None, upper=None))
-                self._peak_rows.sort(key=lambda row: row["center"])
-                self._analysis_values["selectedPeak"] = next(i for i, row in enumerate(self._peak_rows) if row["center"] == center)
-                self._analysis_request_fit()
+                self._analysis_add_peak(center)
             elif action == "analysis.remove":
                 if len(self._peak_rows) > 1:
                     self._peak_rows.pop(self._analysis_values["selectedPeak"])
                     self._analysis_values["selectedPeak"] = min(self._analysis_values["selectedPeak"], len(self._peak_rows) - 1)
-                    self._analysis_request_fit()
+                    self._analysis_mark_draft()
             elif action == "analysis.manual":
                 self._analysis_open_refit()
             elif action == "analysis.law":
@@ -393,6 +597,38 @@ class PowerAnalysisMixin:
         self._publish()
         return True
 
+    def _analysis_add_peak(self, center):
+        if len(self._peak_rows) >= 8:
+            raise ValueError("At most eight simultaneous peaks are supported.")
+        center = self._analysis_number(center)
+        cubes = self._products["cubes"]
+        lo = max(float(cube.energy[0]) for cube in cubes.values())
+        hi = min(float(cube.energy[-1]) for cube in cubes.values())
+        if not lo < center < hi:
+            raise ValueError("Place the peak inside the shared measured energy range.")
+        if any(abs(row["center"] - center) < 1e-7 for row in self._peak_rows):
+            raise ValueError("A peak guess already exists at this energy.")
+        self._peak_rows.append(dict(center=center, width=10., height=None, lower=None, upper=None))
+        self._peak_rows.sort(key=lambda row: row["center"])
+        self._analysis_values["selectedPeak"] = next(i for i, row in enumerate(self._peak_rows) if row["center"] == center)
+        self._analysis_mark_draft()
+
+    def _analysis_next_issue(self):
+        if not self._analysis_ready():
+            return
+        seen, issues = set(), []
+        for row in self._analysis_result_rows:
+            identity = (row["channel"], row["index"])
+            if row["status"] != "ok" and identity not in seen:
+                seen.add(identity)
+                issues.append(row)
+        if not issues:
+            self._message("No failed or unresolved peak fits to review.")
+            return
+        current = (self._analysis_selected_channel, self._selected_row_index)
+        index = next((i + 1 for i, row in enumerate(issues) if (row["channel"], row["index"]) == current), 0)
+        self._analysis_inspect_row(issues[index % len(issues)])
+
     def _analysis_selected_index(self, label):
         import numpy as np
         cube = self._products["cubes"][label]
@@ -404,9 +640,12 @@ class PowerAnalysisMixin:
         return int(np.argmin(abs(cube.gate - self._values["gate"])))
 
     def _analysis_select_result(self, index):
-        if not self._analysis_ready() or not 0 <= index < len(self._analysis_result_rows):
+        rows = self._analysis_visible_rows()
+        if not self._analysis_ready() or not 0 <= index < len(rows):
             return
-        row = self._analysis_result_rows[index]
+        self._analysis_inspect_row(rows[index])
+
+    def _analysis_inspect_row(self, row):
         self._selected_row_index = row["index"]
         self._analysis_selected_channel = row["channel"]
         self._analysis_selected_rows[row["channel"]] = row["index"]
@@ -438,7 +677,8 @@ class PowerAnalysisMixin:
         self._disconnect_law_selector()
         self._stage = "refit"
         channel = self._analysis_selected_channel if self._analysis_selected_channel in self._analysis_results else next(iter(self._analysis_results))
-        self._refit_state = dict(channel=channel, channels=list(self._analysis_results), selectedPeak=0)
+        self._refit_state = dict(channel=channel, channels=list(self._analysis_results),
+            selectedPeak=self._analysis_values["selectedPeak"])
         self._analysis_load_refit()
 
     def _analysis_load_refit(self):
@@ -649,6 +889,7 @@ class PowerAnalysisMixin:
         self._stage = "plot"
         self._disconnect_law_selector()
         self._message(f"Applied {len(ranges)} independent peak power-law fits. " + _EXPLORATORY)
+        self._analysis_save()
         self._schedule_plot()
 
     def _analysis_evaluate_applied_laws(self):
@@ -691,17 +932,27 @@ class PowerAnalysisMixin:
 
     def _analysis_render_spectrum(self, spectrum_axis, residual_axis):
         self._analysis_spectrum, self._analysis_residual = spectrum_axis, residual_axis
-        for artist in self._analysis_artists:
+        for artist in [*self._analysis_artists, *self._analysis_seed_lines, *self._analysis_seed_labels]:
             try:
                 artist.remove()
             except (ValueError, NotImplementedError):
                 pass
         self._analysis_artists = []
+        self._analysis_seed_lines, self._analysis_seed_labels = [], []
         if residual_axis is not None:
             residual_axis.clear()
             residual_axis.set(xlabel="Energy (eV)", ylabel="Residual")
             residual_axis.axhline(0, color="gray", lw=.7)
-        if not self._analysis_enabled() or not self._analysis_ready():
+        if not self._analysis_enabled():
+            return
+        for index, row in enumerate(self._peak_rows):
+            selected = index == self._analysis_values["selectedPeak"]
+            self._analysis_seed_lines.append(spectrum_axis.axvline(row["center"], color=f"C{index % 10}",
+                alpha=.65 if selected else .35, lw=1.7 if selected else .8, ls="--"))
+            self._analysis_seed_labels.append(spectrum_axis.text(row["center"], .77, f"P{index + 1}",
+                transform=spectrum_axis.get_xaxis_transform(), color=f"C{index % 10}",
+                va="top", ha="center", fontsize=7))
+        if not self._analysis_ready():
             return
         for channel_index, (label, fits) in enumerate(self._analysis_results.items()):
             if not fits:
@@ -934,15 +1185,30 @@ class PowerAnalysisMixin:
             return False
         if self._stage == "law":
             return False
-        if not self._analysis_enabled() or not self._analysis_ready():
+        if not self._analysis_enabled() or self._running & {"fit", "detect", "export"}:
             return False
         if event.inaxes is self._analysis_spectrum:
+            if self._analysis_values["pickMode"] == "add":
+                try:
+                    self._analysis_add_peak(float(event.xdata))
+                except ValueError as error:
+                    self._message(str(error))
+                return True
             row = self._analysis_values["selectedPeak"]
             if 0 <= row < len(self._peak_rows):
-                self._peak_rows[row]["center"] = float(event.xdata)
-                self._analysis_request_fit()
+                if getattr(event, "x", None) is not None:
+                    nearest = min(range(len(self._peak_rows)), key=lambda index:
+                        abs(event.inaxes.transData.transform((self._peak_rows[index]["center"], 0))[0] - event.x))
+                    distance = abs(event.inaxes.transData.transform((self._peak_rows[nearest]["center"], 0))[0] - event.x)
+                    if distance <= 9:
+                        row = nearest
+                self._analysis_values["selectedPeak"] = row
+                self._analysis_drag = dict(index=row, axis=event.inaxes, base=self._analysis_base_key(),
+                    rows=_freeze_rows(self._peak_rows), center=float(event.xdata))
                 self._publish()
             return True
+        if not self._analysis_ready():
+            return False
         if event.inaxes in self._analysis_trends:
             import numpy as np
             candidates = []
@@ -973,10 +1239,83 @@ class PowerAnalysisMixin:
             return True
         return False
 
+    def _analysis_drag_center(self, x):
+        index = self._analysis_drag["index"]
+        cubes = self._products["cubes"]
+        lo = self._peak_rows[index - 1]["center"] if index else max(float(c.energy[0]) for c in cubes.values())
+        hi = self._peak_rows[index + 1]["center"] if index + 1 < len(self._peak_rows) else min(float(c.energy[-1]) for c in cubes.values())
+        margin = min(1e-7, (hi - lo) / 4)
+        return max(lo + margin, min(hi - margin, float(x)))
+
+    def _analysis_motion(self, event):
+        if not self._analysis_drag or event.inaxes is not self._analysis_drag["axis"] or event.xdata is None:
+            return
+        center = self._analysis_drag_center(event.xdata)
+        self._analysis_drag["center"] = center
+        index = self._analysis_drag["index"]
+        if index < len(self._analysis_seed_lines):
+            self._analysis_seed_lines[index].set_xdata([center, center])
+            self._analysis_seed_labels[index].set_x(center)
+            self._analysis_paint_drag()
+
+    def _analysis_paint_drag(self):
+        """Paint only the moving seed against a captured, unchanged plot."""
+        from core.typography import matplotlib_font_context, try_render_lock
+        drag, canvas = self._analysis_drag, self._canvas
+        axis, index = drag["axis"], drag["index"]
+        view = (canvas.figure.bbox.bounds, tuple(axis.get_xlim()), tuple(axis.get_ylim()))
+        if (self._background_image is None or self._background_bounds != canvas.figure.bbox.bounds
+                or self._plot_timer.isActive() or canvas.backend._timer.isActive()):
+            canvas.draw_idle()
+            return
+        with try_render_lock() as acquired:
+            if not acquired:
+                canvas.draw_idle()
+                return
+            artists = (self._analysis_seed_lines[index], self._analysis_seed_labels[index])
+            if drag.get("view") != view or drag.get("frame") != canvas.frame_generation:
+                visible = [artist.get_visible() for artist in artists]
+                try:
+                    for artist in artists:
+                        artist.set_visible(False)
+                    canvas.restore_region(self._background_image)
+                    self._draw_dynamic()
+                    drag["background"] = canvas.copy_from_bbox(canvas.figure.bbox)
+                    drag["view"] = view
+                finally:
+                    for artist, shown in zip(artists, visible):
+                        artist.set_visible(shown)
+            else:
+                canvas.restore_region(drag["background"])
+            with matplotlib_font_context(axis):
+                for artist in artists:
+                    axis.draw_artist(artist)
+            canvas.blit(canvas.figure.bbox)
+            drag["frame"] = canvas.frame_generation
+
+    def _analysis_release(self, event):
+        drag = self._analysis_drag
+        if drag is None:
+            return
+        if (self._stage != "plot" or drag["base"] != self._analysis_base_key()
+                or drag["rows"] != _freeze_rows(self._peak_rows)
+                or event.inaxes is not drag["axis"] or event.xdata is None
+                or self._running & {"fit", "detect", "export"}):
+            self._analysis_drag = None
+            self._schedule_plot()
+            return
+        center = self._analysis_drag_center(event.xdata)
+        self._analysis_drag = None
+        if abs(center - self._peak_rows[drag["index"]]["center"]) > 1e-9:
+            self._peak_rows[drag["index"]]["center"] = center
+            self._analysis_mark_draft()
+        else:
+            self._schedule_plot()
+
     def _analysis_descriptors(self):
         values = self._analysis_values
         available = bool(self._products) and self._values["mode"] != "vp"
-        editable = available and self._stage == "plot" and "export" not in self._running
+        editable = available and self._stage == "plot" and not (self._running & {"fit", "detect", "export"})
         def action(key, label, enabled=editable):
             return dict(key=key, type="action", label=label, enabled=enabled)
         def choice(key, label, value, options):
@@ -984,23 +1323,30 @@ class PowerAnalysisMixin:
                 options=[dict(value=value, label=label) for value, label in options], enabled=editable)
         fields = [dict(key="analysis.enabled", type="flag", label="Intensity + linewidth vs power", value=values["enabled"], enabled=available),
             dict(key="analysis-status", type="summary", value=self._analysis_status)]
+        fields.append(dict(key="analysis.fit", type="action", label="Fit all powers" if values["enabled"] else "Analyze peaks",
+            primary=True, enabled=editable))
         if values["enabled"]:
-            fields.extend([choice("analysis.model", "Peak model", values["model"], [("Lorentzian", "Lorentzian"), ("Gaussian", "Gaussian")]),
-                choice("analysis.selectedPeak", "Selected peak / click target", values["selectedPeak"], [(index, f"Peak {index + 1}") for index in range(len(self._peak_rows))])])
+            fields.extend([choice("analysis.selectedPeak", "Selected peak / click target", values["selectedPeak"], [(index, f"Peak {index + 1}") for index in range(len(self._peak_rows))]),
+                choice("analysis.pickMode", "Spectrum clicks", values["pickMode"], [("move", "Move selected peak"), ("add", "Add peak on click")])])
             for index, row in enumerate(self._peak_rows):
                 for field, title in (("center", "Center (eV)"), ("width", "FWHM (meV)")):
                     fields.append(dict(key=f"peak.{index}.{field}", type="number", label=title, value=row[field],
                         pair=f"peak-{index}", pairLabel=f"Peak {index + 1}", shortLabel=title,
                         min=1e-6 if field == "width" else -1e4, max=1e4, step=.001 if field == "center" else 1.,
                         decimals=7 if field == "center" else 5, enabled=editable))
-            fields.extend([action("analysis.detect", "Detect peaks"), action("analysis.add", "Add"), action("analysis.remove", "Remove", editable and len(self._peak_rows) > 1),
+            fields.extend([action("analysis.detect", "Detect peak guesses"), action("analysis.add", "Add"), action("analysis.remove", "Remove", editable and len(self._peak_rows) > 1),
+                dict(key="analysis.advanced", type="flag", label="Advanced fit and display settings", value=values["advanced"], enabled=available)])
+            if values["advanced"]:
+                fields.extend([choice("analysis.model", "Peak model", values["model"], [("Lorentzian", "Lorentzian"), ("Gaussian", "Gaussian")]),
                 choice("analysis.metric", "PL intensity", values["metric"], [("Integrated area", "Integrated area"), ("Peak height", "Peak height")]),
                 choice("analysis.intensityLog", "Intensity Y axis", values["intensityLog"], [(True, "Log"), (False, "Linear")]),
-                choice("analysis.linewidthLog", "Linewidth Y axis", values["linewidthLog"], [(True, "Log"), (False, "Linear")]),
+                choice("analysis.linewidthLog", "Linewidth Y axis", values["linewidthLog"], [(True, "Log"), (False, "Linear")])])
+            fields.extend([
                 action("analysis.manual", "Manual refit selected power…", editable and self._analysis_ready()),
                 action("analysis.law", "Fit power law…", editable and self._analysis_ready()),
                 dict(key="analysis.showResults", type="flag", label="Show peak results table", value=values["showResults"], enabled=available),
-                dict(key="peak-identity-note", type="summary", value="Peak 1 is lowest energy. All peaks are fitted together over the full measured spectrum with one linear background per spectrum.")])
+                dict(key="peak-identity-note", type="summary", value="Peak 1 is lowest energy. Click or drag a guess, then Fit all powers. FWHM fields above are initial guesses, not results."),
+                dict(key="peak-fit-range", type="summary", value="Fit range: full measured spectrum per channel. Plot zoom does not change the fit range. All peaks share one fitted linear background per spectrum.")])
         return [dict(key="peak-analysis", title="Peak analysis", fields=fields)]
 
 

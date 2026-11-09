@@ -6,3 +6,7 @@ scipy>=1.17,<1.18
 openpyxl>=3.1,<4
 python-pptx>=1.0,<2
 pywin32>=306; sys_platform == "win32"
+
+# Megasweep MP4 encoding; ships its own FFmpeg executable.
+imageio-ffmpeg>=0.5,<1
+Pillow>=11,<13

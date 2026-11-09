@@ -114,13 +114,21 @@ Basic.Dialog {
                 onActivated: dialog.bridge.setParameter("statusFilter",values[currentIndex])
                 Accessible.name: "Processing status"
             }
+            AppComboBox {
+                colors: dialog.colors
+                visible: dialog.state.workflow === "megasweep"
+                model: ["All", "Optical", "Transport"]
+                currentIndex: model.indexOf(dialog.state.megasweepType || "All")
+                onActivated: dialog.bridge.setParameter("megasweepType", currentText)
+                Accessible.name: "Megasweep measurement type"
+            }
             AppButton { colors: dialog.colors; text: "Refresh"; onClicked: dialog.bridge.invoke("refresh") }
         }
         Flow {
             Layout.fillWidth: true
             spacing: 5
             visible: !dialog.backgroundSelection
-            Basic.CheckBox { text: "Saved DAT results"; checked: dialog.state.savedOnly; onToggled: dialog.bridge.setParameter("savedOnly",checked) }
+            Basic.CheckBox { visible: dialog.state.workflow !== "megasweep"; text: "Saved DAT results"; checked: dialog.state.savedOnly; onToggled: dialog.bridge.setParameter("savedOnly",checked) }
             Basic.CheckBox { visible: dialog.state.workflow === "drr" && !dialog.state.savedOnly; text: "Unprocessed only"; checked: dialog.state.onlyNew; onToggled: dialog.bridge.setParameter("onlyNew",checked) }
             Basic.CheckBox { visible: dialog.state.workflow === "drr" && !dialog.state.savedOnly; text: "Include backgrounds"; checked: dialog.state.includeBackgrounds; onToggled: dialog.bridge.setParameter("includeBackgrounds",checked) }
             Basic.CheckBox { visible: dialog.state.workflow === "drr" && !dialog.state.savedOnly; text: "All experiment folders"; checked: dialog.state.includeAll; onToggled: dialog.bridge.setParameter("includeAll",checked) }

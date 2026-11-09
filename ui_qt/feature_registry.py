@@ -42,3 +42,8 @@ FEATURES: tuple[FeatureSpec, ...] = (
     FeatureSpec("slides", "Slides", "Build a PowerPoint from processed plot PNGs"),
     FeatureSpec("tools", "Tools", "Log / Tools", "_build_tools_tab"),
 )
+
+# Native-only workspaces must not create empty pages in the compatibility shell.
+QUICK_FEATURES = FEATURES[:-2] + (
+    FeatureSpec("megasweep", "Megasweep", "Dual-axis optical and transport sweeps"),
+) + FEATURES[-2:]

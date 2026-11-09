@@ -189,6 +189,375 @@ def _run_isolated():
             self.assertEqual(resets, [])
             self.assertEqual(self.settings.allKeys(), ["unrelated/preserved"])
 
+        def test_guess_edits_and_detection_are_drafts_until_one_batch_apply(self):
+            self.fitted()
+            with patch("ui_qt.quick.power_workflow.fit_peaks", side_effect=AssertionError("A draft triggered fitting")):
+                self.bridge.setParameter("peak.0.width", 26.)
+                self.bridge.setParameter("peak.0.center", 1.411)
+                self.assertTrue(self.bridge.snapshot["analysisDraft"])
+                self.assertFalse(self.bridge.snapshot["analysisExportReady"])
+                self.bridge.setParameter("analysis.enabled", False)
+                self.bridge.setParameter("analysis.enabled", True)
+                self.assertTrue(self.bridge.snapshot["analysisDraft"])
+                self.bridge.invoke("analysis.add")
+                self.bridge.invoke("analysis.remove")
+                self.bridge.invoke("analysis.detect")
+                self.settled()
+                self.plotted()
+                self.assertEqual(len(self.bridge._peak_rows), 2)
+                self.assertTrue(self.bridge.snapshot["analysisDraft"])
+                self.assertEqual(self.bridge.peakResultsModel.rowCount(), 0)
+            from ui_qt.quick.power_workflow import fit_peaks
+            with patch("ui_qt.quick.power_workflow.fit_peaks", wraps=fit_peaks) as run:
+                self.bridge.setParameter("peak.0.width", 24.)
+                self.bridge.setParameter("peak.1.width", 19.)
+                self.bridge.invoke("analysis.fit")
+                self.settled()
+                self.assertEqual(run.call_count, 1)
+            self.assertTrue(self.bridge.snapshot["analysisReady"])
+            self.assertTrue(self.bridge.snapshot["analysisExportReady"])
+
+        def test_display_burst_saves_once_without_redrawing(self):
+            from core.power_analysis_store import save_analysis
+            self.fitted()
+            self.bridge._analysis_flush_saves(wait=True)
+            canvas = self.bridge._canvas
+            draws = canvas.draw_count
+            with patch("core.power_analysis_store.save_analysis", wraps=save_analysis) as save:
+                for _ in range(5):
+                    self.bridge.setParameter("analysis.advanced", not self.bridge._analysis_values["advanced"])
+                self.bridge.setParameter("analysis.pickMode", "add")
+                wait(lambda: not self.bridge._analysis_save_timer.isActive()
+                    and self.bridge._analysis_save_future.done())
+                self.assertEqual(save.call_count, 1)
+                self.assertTrue(save.call_args.kwargs["preferences"]["advanced"])
+            self.assertEqual(canvas.draw_count, draws)
+
+        def test_cached_results_do_not_rewrite_the_saved_arrays(self):
+            self.fitted()
+            self.bridge._analysis_flush_saves(wait=True)
+            from core.power_analysis_store import save_analysis
+            with patch("core.power_analysis_store.save_analysis", wraps=save_analysis) as save:
+                canvas, draws = self.bridge._canvas, self.bridge._canvas.draw_count
+                self.bridge.invoke("analysis.fit")
+                self.settled()
+                self.plotted()
+                self.bridge._analysis_flush_saves(wait=True)
+                self.assertTrue(self.bridge.snapshot["analysisReady"])
+                self.assertEqual(save.call_count, 0)
+                self.assertEqual(canvas.draw_count, draws)
+                self.bridge.invoke("analysis.manual")
+                self.plotted()
+                self.bridge.invoke("analysis.fit")
+                self.settled()
+                self.plotted()
+                self.assertEqual(self.bridge._plot_workspace, "plot")
+                self.assertIs(self.bridge._canvas, canvas)
+                self.assertEqual(save.call_count, 0)
+                self.bridge.close()
+                self.bridge = PowerBridge(settings=self.settings)
+                self.addCleanup(self.bridge.close)
+                self.install()
+                self.bridge.invoke("analysis.fit")
+                self.settled()
+                self.bridge._analysis_flush_saves(wait=True)
+                self.assertTrue(self.bridge.snapshot["analysisReady"])
+                self.assertEqual(save.call_count, 0)
+
+        def test_busy_writer_keeps_latest_snapshot_and_close_flushes_it(self):
+            from core.power_analysis_store import save_analysis
+            self.fitted()
+            self.bridge._analysis_flush_saves(wait=True)
+            started, release = threading.Event(), threading.Event()
+            self.addCleanup(release.set)
+            captured = []
+            def delayed(path, **kwargs):
+                captured.append(kwargs)
+                if len(captured) == 1:
+                    started.set()
+                    if not release.wait(10):
+                        raise AssertionError("Synthetic cache writer was not released")
+                return save_analysis(path, **kwargs)
+            with patch("core.power_analysis_store.save_analysis", side_effect=delayed):
+                self.bridge.setParameter("analysis.advanced", True)
+                self.bridge._analysis_flush_saves()
+                wait(started.is_set)
+                future = self.bridge._analysis_save_future
+                for _ in range(9):
+                    self.bridge.setParameter("analysis.advanced", not self.bridge._analysis_values["advanced"])
+                self.bridge._analysis_flush_saves()
+                self.assertIs(self.bridge._analysis_save_future, future)
+                self.assertEqual(len(self.bridge._analysis_save_pending), 1)
+                release.set()
+                self.bridge.close()
+            self.assertEqual(len(captured), 2)
+            self.assertFalse(captured[-1]["preferences"]["advanced"])
+
+        def test_close_reports_a_failed_debounced_save(self):
+            self.fitted()
+            self.bridge._analysis_flush_saves(wait=True)
+            messages = []
+            self.bridge.logMessage.connect(messages.append)
+            with patch("core.power_analysis_store.save_analysis", side_effect=OSError("synthetic disk full")):
+                self.bridge.setParameter("analysis.advanced", True)
+                self.bridge.close()
+            self.assertTrue(any("synthetic disk full" in message for message in messages))
+            self.assertIn("synthetic disk full", self.bridge._status)
+
+        def test_drag_updates_blit_and_preserve_pixels_outside_the_spectrum(self):
+            import numpy as np
+            from matplotlib.backend_bases import MouseEvent
+            self.fitted()
+            self.bridge._analysis_flush_saves(wait=True)
+            axis, canvas = self.bridge._analysis_spectrum, self.bridge._canvas
+            canvas.draw()
+            before = np.asarray(canvas.buffer_rgba()).copy()
+            draws, blits = canvas.draw_count, canvas.blit_count
+            original = self.bridge._peak_rows[0]["center"]
+            def event(kind, energy):
+                x, y = axis.transData.transform((energy, sum(axis.get_ylim()) / 2))
+                MouseEvent(kind, canvas, x, y, button=1)._process()
+            event("button_press_event", original)
+            for value in np.linspace(original, original+.001, 12):
+                event("motion_notify_event", value)
+                app.processEvents()
+            self.assertEqual(canvas.draw_count, draws)
+            self.assertGreaterEqual(canvas.blit_count-blits, 12)
+            after = np.asarray(canvas.buffer_rgba())
+            box = axis.get_tightbbox(canvas.get_renderer())
+            outside = np.ones(before.shape[:2], bool)
+            x0, x1 = max(0, int(box.x0)-4), min(before.shape[1], int(box.x1)+5)
+            y0, y1 = max(0, before.shape[0]-int(box.y1)-4), min(before.shape[0], before.shape[0]-int(box.y0)+5)
+            outside[y0:y1, x0:x1] = False
+            np.testing.assert_array_equal(after[outside], before[outside])
+            self.assertTrue(np.any(after[~outside] != before[~outside]))
+            event("button_release_event", original+.001)
+            self.assertTrue(self.bridge.snapshot["analysisDraft"])
+
+        def test_drag_refreshes_after_row_change_and_restores_a_returned_seed(self):
+            import numpy as np
+            from matplotlib.backend_bases import MouseEvent
+            self.fitted()
+            self.bridge._analysis_flush_saves(wait=True)
+            axis, canvas = self.bridge._analysis_spectrum, self.bridge._canvas
+            original = self.bridge._peak_rows[0]["center"]
+            def event(kind, energy):
+                x, y = axis.transData.transform((energy, sum(axis.get_ylim()) / 2))
+                MouseEvent(kind, canvas, x, y, button=1)._process()
+            event("button_press_event", original)
+            event("motion_notify_event", original+.001)
+            self.bridge.setParameter("gate", 10.)
+            self.plotted()
+            event("motion_notify_event", original+.0015)
+            drag = self.bridge._analysis_drag
+            self.assertEqual(drag["frame"], canvas.frame_generation)
+            row = self.bridge._analysis_selected_index("Power")
+            np.testing.assert_array_equal(self.bridge._lines["Power"].get_ydata(), self.bridge._products["cubes"]["Power"].Z[row])
+            event("button_release_event", original)
+            self.plotted()
+            self.assertFalse(self.bridge.snapshot["analysisDraft"])
+            self.assertAlmostEqual(self.bridge._analysis_seed_lines[0].get_xdata()[0], original)
+
+        def test_spectrum_click_add_and_drag_change_only_guesses(self):
+            from matplotlib.backend_bases import MouseEvent
+            self.fitted()
+            axis, canvas = self.bridge._analysis_spectrum, self.bridge._canvas
+            def event(kind, energy):
+                x, y = axis.transData.transform((energy, sum(axis.get_ylim()) / 2))
+                MouseEvent(kind, canvas, x, y, button=1)._process()
+            with patch("ui_qt.quick.power_workflow.fit_peaks", side_effect=AssertionError("Dragging triggered fitting")):
+                event("button_press_event", self.bridge._peak_rows[0]["center"])
+                event("motion_notify_event", 1.414)
+                event("button_release_event", 1.414)
+                self.assertAlmostEqual(self.bridge._peak_rows[0]["center"], 1.414, places=3)
+                self.assertTrue(self.bridge.snapshot["analysisDraft"])
+                self.plotted()
+                axis, canvas = self.bridge._analysis_spectrum, self.bridge._canvas
+                self.bridge.setParameter("analysis.pickMode", "add")
+                event("button_press_event", 1.50)
+                event("button_release_event", 1.50)
+                self.assertEqual(len(self.bridge._peak_rows), 3)
+                self.assertAlmostEqual(self.bridge._peak_rows[-1]["center"], 1.50, places=3)
+
+        def test_issue_filter_selection_and_next_issue_use_exact_measured_rows(self):
+            self.fitted(channels=("KK", "KKp"), duplicates=True)
+            self.bridge._analysis_results["KKp"][4].components[0].status = "peak below residual noise"
+            self.bridge._analysis_results["KKp"][5].components[1].status = "width uncertainty too large"
+            self.bridge._analysis_result_rows = self.bridge._analysis_table_rows()
+            self.bridge.setParameter("analysis.issuesOnly", True)
+            self.bridge.setParameter("analysis.showResults", True)
+            self.assertEqual(self.bridge.snapshot["analysisIssueCount"], 2)
+            self.assertEqual(self.bridge.peakResultsModel.rowCount(), 2)
+            self.bridge.setParameter("analysis.selectedResult", 1)
+            self.assertEqual(self.bridge._analysis_selected_channel, "KKp")
+            self.assertEqual(self.bridge._analysis_selected_rows["KKp"], 5)
+            self.bridge.invoke("analysis.manual")
+            self.assertEqual(self.bridge._refit_state["selectedPeak"], 1)
+            self.bridge.invoke("refit.cancel")
+            self.bridge.invoke("analysis.nextIssue")
+            self.assertEqual(self.bridge._analysis_selected_rows["KKp"], 4)
+            self.bridge.invoke("analysis.nextIssue")
+            self.assertEqual(self.bridge._analysis_selected_rows["KKp"], 5)
+            self.bridge.setParameter("analysis.issuesOnly", False)
+            self.assertEqual(self.bridge.peakResultsModel.rowCount(), 52)
+
+        def test_restart_restores_manual_fit_and_preferences_without_refitting(self):
+            import numpy as np
+            self.fitted()
+            self.bridge.invoke("analysis.manual")
+            self.bridge.setParameter("refit.peak.0.width", 26.)
+            self.bridge.invoke("refit.run")
+            self.settled()
+            self.bridge.invoke("refit.apply")
+            self.settled()
+            expected = self.bridge._analysis_results["Power"][0]
+            self.bridge.setParameter("analysis.linewidthLog", False)
+            self.bridge.close()
+            self.bridge = PowerBridge(settings=self.settings)
+            self.addCleanup(self.bridge.close)
+            self.install()
+            with patch("ui_qt.quick.power_workflow.fit_peaks", side_effect=AssertionError("Restoring reran fits")):
+                self.bridge.invoke("analysis.fit")
+                self.settled()
+            restored = self.bridge._analysis_results["Power"][0]
+            self.assertTrue(self.bridge.snapshot["analysisReady"], self.bridge.snapshot["status"])
+            self.assertTrue(restored.manual)
+            self.assertEqual(restored.settings, expected.settings)
+            np.testing.assert_array_equal(restored.fitted, expected.fitted)
+            self.assertFalse(self.bridge._analysis_values["linewidthLog"])
+
+        def test_changed_data_does_not_restore_old_fits(self):
+            self.fitted()
+            self.bridge.close()
+            self.bridge = PowerBridge(settings=self.settings)
+            self.addCleanup(self.bridge.close)
+            cubes = self.install()
+            cubes["Power"].Z[0, 0] += 10.
+            from ui_qt.quick.power_workflow import fit_peaks
+            with patch("ui_qt.quick.power_workflow.fit_peaks", wraps=fit_peaks) as run:
+                self.bridge.invoke("analysis.fit")
+                self.settled()
+                self.assertEqual(run.call_count, 1)
+            self.assertTrue(self.bridge.snapshot["analysisReady"])
+
+        def test_refresh_preserves_drafts_and_cache_checks_source_and_roles(self):
+            from dataclasses import replace
+            self.fitted(channels=("KK", "KKp"))
+            self.bridge.setParameter("peak.0.width", 26.)
+            self.bridge._products = dict(self.bridge._products, cubes={
+                label: replace(cube, energy=cube.energy.copy(), gate=cube.gate.copy(), Z=cube.Z.copy())
+                for label, cube in self.bridge._products["cubes"].items()})
+            with patch("ui_qt.quick.power_workflow.fit_peaks", side_effect=AssertionError("Refresh applied a draft")):
+                self.bridge._analysis_data_changed()
+                self.settled()
+            self.assertTrue(self.bridge.snapshot["analysisDraft"])
+            self.assertEqual(self.bridge._peak_rows[0]["width"], 26.)
+            self.bridge.invoke("analysis.fit")
+            self.settled()
+            key = self.bridge._analysis_base_key()
+            selection = self.bridge._active_selection
+            selection["KK"], selection["KKp"] = selection["KKp"], selection["KK"]
+            self.assertNotEqual(self.bridge._analysis_base_key(), key)
+            selection["KK"], selection["KKp"] = selection["KKp"], selection["KK"]
+            self.bridge._products["cubes"]["KK"].Z[0, 0] += 1.
+            from ui_qt.quick.power_workflow import fit_peaks
+            with patch("ui_qt.quick.power_workflow.fit_peaks", wraps=fit_peaks) as run:
+                self.bridge.invoke("analysis.fit")
+                self.settled()
+                self.assertEqual(run.call_count, 1)
+            source = self.root / "KK.csv"
+            source.write_bytes(source.read_bytes() + b"\n")
+            self.bridge.invoke("analysis.fit")
+            self.settled()
+            self.assertFalse(self.bridge.snapshot["analysisReady"])
+            self.assertIn("changed after loading", self.bridge.snapshot["error"])
+
+        def test_restart_recalculates_pending_law_after_manual_refit(self):
+            from core.power_law_analysis import evaluate_ranges
+            self.fitted()
+            ranges = [dict(channel="Power", peak=1, lower=1., upper=100., suggested=False)]
+            laws = evaluate_ranges(self.bridge._analysis_results, self.bridge._products["records"], ranges)
+            entry = self.bridge._analysis_cache[self.bridge._analysis_current_key]
+            entry.update(ranges=ranges, laws=laws)
+            self.bridge._analysis_law_fits = laws
+            self.bridge.invoke("analysis.manual")
+            self.bridge.invoke("refit.run")
+            self.settled()
+            with patch.object(self.bridge, "_analysis_evaluate_applied_laws"):
+                self.bridge.invoke("refit.apply")
+                self.settled()
+            self.assertEqual(self.bridge._analysis_law_fits, [])
+            self.assertTrue(self.bridge._analysis_law_error)
+            self.bridge.close()
+            self.bridge = PowerBridge(settings=self.settings)
+            self.addCleanup(self.bridge.close)
+            self.install()
+            self.bridge.invoke("analysis.fit")
+            self.settled()
+            self.assertTrue(self.bridge._analysis_results["Power"][0].manual)
+            self.assertEqual(self.bridge._analysis_law_error, "")
+            self.assertEqual(len(self.bridge._analysis_law_fits), 1)
+
+        def test_native_draft_and_issue_controls_render_at_narrow_width(self):
+            from PySide6.QtQml import QQmlApplicationEngine
+            from shiboken6 import isValid
+            from ui_qt.quick.appearance import quick_colors
+            from ui_qt.quick.plot_surface import register_plot_surface
+            register_plot_surface()
+            self.fitted()
+            self.bridge.setParameter("peak.0.width", 26.)
+            self.plotted()
+            engine = QQmlApplicationEngine()
+            engine.setInitialProperties(dict(bridge=self.bridge, colors=quick_colors("light")))
+            qml_folder = Path(__file__).resolve().parents[1] / "ui_qt" / "quick" / "qml"
+            engine.loadData(b'''import QtQuick
+import QtQuick.Window
+import "."
+Window {
+    id: window; required property var bridge; required property var colors
+    width: 640; height: 680; visible: true
+    PowerWorkspace { anchors.fill: parent; bridge: window.bridge; colors: window.colors }
+}''', QUrl.fromLocalFile(str(qml_folder / "PowerDraftTest.qml")))
+            self.assertTrue(engine.rootObjects())
+            window = engine.rootObjects()[0]
+            self.addCleanup(lambda: window.close() if isValid(window) else None)
+            def find(root, name):
+                if root.objectName() == name:
+                    return root
+                for child in root.childItems():
+                    result = find(child, name)
+                    if result is not None:
+                        return result
+                return None
+            wait(lambda: find(window.contentItem(), "power_analysis_fit") is not None)
+            fit = find(window.contentItem(), "power_analysis_fit")
+            self.assertTrue(fit.property("enabled"))
+            self.assertTrue(fit.property("primary"))
+            self.assertFalse(find(window.contentItem(), "power_analysis_next_issue").property("enabled"))
+            self.assertGreater(find(window.contentItem(), "power_plot_surface").height(), 150)
+            review = os.environ.get("DPTK_POWER_ANALYSIS_REVIEW_DIR", "")
+            if review:
+                plot = find(window.contentItem(), "power_plot_surface")
+                wait(lambda: plot.property("presentedGeneration") == self.bridge._canvas.frame_generation)
+                self.assertTrue(window.grabWindow().save(str(Path(review) / "power-draft-narrow.png")))
+            window.setProperty("colors", quick_colors("dark"))
+            self.plotted()
+            app.processEvents()
+            if review:
+                self.assertTrue(window.grabWindow().save(str(Path(review) / "power-draft-dark.png")))
+            fit.forceActiveFocus()
+            QCoreApplication.sendEvent(window, QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier, " "))
+            QCoreApplication.sendEvent(window, QKeyEvent(QEvent.Type.KeyRelease, Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier, " "))
+            self.settled()
+            self.assertTrue(self.bridge.snapshot["analysisReady"])
+            issues = find(window.contentItem(), "power_analysis_issues_only")
+            issues.forceActiveFocus()
+            QCoreApplication.sendEvent(window, QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier, " "))
+            QCoreApplication.sendEvent(window, QKeyEvent(QEvent.Type.KeyRelease, Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier, " "))
+            app.processEvents()
+            self.assertTrue(self.bridge.snapshot["analysisIssuesOnly"])
+            self.assertTrue(self.bridge.snapshot["analysisShowResults"])
+
         def test_manual_preview_provenance_edit_invalidation_and_one_row_apply(self):
             self.fitted(channels=("KK", "KKp"), duplicates=True)
             original = dict(self.bridge._analysis_results)
@@ -245,12 +614,14 @@ def _run_isolated():
                 self.bridge.setParameter("analysis.enabled", True)
                 wait(started.is_set)
                 self.bridge.setParameter("analysis.model", "Gaussian")
+                self.bridge.invoke("analysis.fit")
                 wait(lambda: "fit" not in self.bridge._running)
                 release.set()
                 self.settled()
             self.assertEqual(self.bridge._analysis_settings.model, "Gaussian")
             self.assertEqual(completions.count("fit"), 1)
             self.bridge.setParameter("analysis.model", "Lorentzian")
+            self.bridge.invoke("analysis.fit")
             self.settled()
             self.plotted()
             fit = self.bridge._analysis_results["KKp"][5]
@@ -283,9 +654,11 @@ def _run_isolated():
             first_key = self.bridge._analysis_current_key
             original_center = self.bridge._peak_rows[0]["center"]
             self.bridge.setParameter("peak.0.center", 1.7)
+            self.bridge.invoke("analysis.fit")
             self.settled()
             self.assertFalse(self.bridge.snapshot["analysisExportReady"])
             self.bridge.setParameter("peak.0.center", original_center)
+            self.bridge.invoke("analysis.fit")
             self.settled()
             self.assertEqual(self.bridge._analysis_current_key, first_key)
             self.assertEqual(self.bridge.snapshot["error"], "")

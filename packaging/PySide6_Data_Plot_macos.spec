@@ -10,6 +10,8 @@ project_root = Path(SPECPATH).parent
 icon_path = project_root / "assets" / "icons" / "app_icon.icns"
 icon = str(icon_path) if icon_path.is_file() else None
 pptx_datas = collect_data_files("pptx")
+# Bundle the imageio FFmpeg executable for offline Megasweep MP4 export.
+ffmpeg_datas = collect_data_files("imageio_ffmpeg")
 # Local QML components keep the same relative paths in source and app bundles.
 # PyInstaller's QtQml hook supplies Qt's QML plugins and their native libraries.
 quick_qml_datas = [
@@ -58,12 +60,14 @@ analysis = Analysis(
     datas=[
         (str(project_root / "assets" / "icons"), "assets/icons"),
         *pptx_datas,
+        *ffmpeg_datas,
         *quick_qml_datas,
         *core_source_datas,
         *fluent_datas,
     ],
     hiddenimports=[
         "run_quick",
+        "imageio_ffmpeg",
         "run_peak_analysis_quick",
         "run_drr_analysis_quick",
         "run_mcd_organizer_quick",
