@@ -22,7 +22,7 @@ def child(directory):
     from PySide6.QtTest import QTest
     from ui_qt.quick.application_bridge import QuickApplicationBridge
     from ui_qt.quick.plot_surface import register_plot_surface
-    root=Path(directory); wavelength=np.linspace(800,1000,31); columns=['Vbg','Vtg',*map(str,wavelength)]
+    root=Path(directory).resolve(); wavelength=np.linspace(800,1000,31); columns=['Vbg','Vtg',*map(str,wavelength)]
     rows=[[x,y,*(1000+100*np.exp(-((wavelength-925)/25)**2))] for x in (-1,0,1) for y in (-1,0,1)]
     source=root/'measurement.csv'; pd.DataFrame(rows,columns=columns).to_csv(source,index=False)
     files={}

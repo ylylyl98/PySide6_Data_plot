@@ -26,13 +26,14 @@ def _spec_values(filename):
         "fluent_datas": [],
         "matplotlib_datas": [],
         "pptx_datas": [],
+        "collect_data_files": lambda package: [("collected/" + package, package)],
         "collect_submodules": lambda _package: [],
     }
     for statement in tree.body:
         if not isinstance(statement, ast.Assign):
             continue
         names = {target.id for target in statement.targets if isinstance(target, ast.Name)}
-        for name in ("quick_qml_datas", "core_source_datas"):
+        for name in ("quick_qml_datas", "core_source_datas", "ffmpeg_datas"):
             if name in names:
                 namespace[name] = eval(compile(ast.Expression(statement.value), filename, "eval"), namespace)
         if isinstance(statement.value, ast.Call) and isinstance(statement.value.func, ast.Name) and statement.value.func.id == "Analysis":
@@ -45,6 +46,11 @@ def _spec_values(filename):
 
 
 class QuickDisplayPackagingTests(unittest.TestCase):
+    def test_both_specs_collect_offline_ffmpeg_resources(self):
+        for filename in SPECS:
+            with self.subTest(spec=filename):
+                self.assertIn(("collected/imageio_ffmpeg", "imageio_ffmpeg"), _spec_values(filename)["datas"])
+
     def test_both_specs_preserve_entire_local_qml_tree(self):
         qml_root = ROOT / "ui_qt" / "quick" / "qml"
         self.assertTrue((qml_root / "Display.qml").is_file())

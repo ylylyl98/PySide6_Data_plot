@@ -25,7 +25,7 @@ def wait_for(predicate, seconds=15):
         time.sleep(.01)
     return False
 with TemporaryDirectory() as directory:
-    root = Path(directory); source = root / 'sample.csv'
+    root = Path(directory).resolve(); source = root / 'sample.csv'
     source.write_text('x,y,700,710\n0,0,10,9\n0,1,11,10\n1,0,12,11\n1,1,13,12\n')
     settings = QSettings(str(root / 'test.ini'), QSettings.IniFormat)
     bridge = MegasweepBridge(settings=settings, session_directory=root / 'sessions')

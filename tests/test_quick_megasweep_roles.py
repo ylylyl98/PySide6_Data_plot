@@ -18,7 +18,7 @@ from PySide6.QtGui import QGuiApplication
 from ui_qt.quick.megasweep_bridge import MegasweepBridge
 app = QGuiApplication([])
 with TemporaryDirectory() as directory:
-    root = Path(directory); source = root/'sample.csv'; other = root/'other.csv'
+    root = Path(directory).resolve(); source = root/'sample.csv'; other = root/'other.csv'
     for p in (source, other): p.write_text('x,y,700,710\n0,0,1,2\n')
     folders = {role:root/role for role in ('custom','p','n','bn')}
     for folder in folders.values(): folder.mkdir()

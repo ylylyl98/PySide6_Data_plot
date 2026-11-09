@@ -37,7 +37,7 @@ def main():
             errors.append(text)
     old_handler = qInstallMessageHandler(message)
     with tempfile.TemporaryDirectory(prefix='dptk-megasweep-integration-') as temporary:
-        root = Path(temporary)
+        root = Path(temporary).resolve()
         settings = QSettings(str(root / 'settings.ini'), QSettings.IniFormat)
         bridge = QuickApplicationBridge(settings=settings)
         register_plot_surface()

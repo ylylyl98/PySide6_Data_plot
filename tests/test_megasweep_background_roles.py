@@ -19,7 +19,7 @@ class BackgroundRoleTests(unittest.TestCase):
 
     def test_consistent_calculation_previews_and_exports(self):
         with TemporaryDirectory() as folder:
-            root=Path(folder); wavelengths=np.linspace(700,720,7)
+            root=Path(folder).resolve(); wavelengths=np.linspace(700,720,7)
             columns=['Vbg','Vtg',*map(str,wavelengths)]
             source=root/'sample.csv'
             pd.DataFrame([[x,y,*([20.]*7)] for x in (0,1) for y in (0,1)],columns=columns).to_csv(source,index=False)
@@ -54,7 +54,7 @@ class BackgroundRoleTests(unittest.TestCase):
 
     def test_ibias_and_resistance_do_not_require_or_validate_spectral_reference(self):
         with TemporaryDirectory() as folder:
-            root=Path(folder); source=root/'sample.csv'
+            root=Path(folder).resolve(); source=root/'sample.csv'
             pd.DataFrame({'Vbg':[0,0,1,1], 'Vtg':[0,1,0,1], 'Ibias':[1,2,4,8],
                           'Vbias':[2,4,8,16], '700':[20]*4, '710':[20]*4}).to_csv(source,index=False)
             dataset=load_dataset(source,'Reflection')

@@ -18,7 +18,7 @@ from PySide6.QtGui import QGuiApplication
 from ui_qt.quick.megasweep_bridge import MegasweepBridge
 app = QGuiApplication([])
 with TemporaryDirectory() as directory:
-    root = Path(directory)
+    root = Path(directory).resolve()
     paths = {name: root / name for name in ('experiment','pl','reflection','transport','background','manual')}
     for path in paths.values(): path.mkdir()
     files = {name: paths[name] / (name + '.csv') for name in ('pl','reflection','transport','background')}

@@ -18,7 +18,7 @@ class MegasweepCatalogTests(unittest.TestCase):
 
     def test_candidates_include_scalar_and_optical_but_not_exports(self):
         with TemporaryDirectory() as folder:
-            root = Path(folder)
+            root = Path(folder).resolve()
             (root / 'optical.csv').write_text('Vbg,Vtg,700,701\n0,0,3,4\n')
             (root / 'transport.csv').write_text('# acquisition\nVbg,Vtg,Current\n0,0,1e-9\n')
             output = root / 'Processed Data' / 'Megasweep'
@@ -31,7 +31,7 @@ class MegasweepCatalogTests(unittest.TestCase):
 
     def test_picker_single_selection_and_no_pl_or_drr_filter_leak(self):
         with TemporaryDirectory() as folder:
-            root = Path(folder)
+            root = Path(folder).resolve()
             first, second = root / 'first.csv', root / 'second.csv'
             first.write_text('X,Y,700,701\n0,0,1,2\n')
             second.write_text('X,Y,I\n0,0,3\n')
@@ -56,7 +56,7 @@ class MegasweepCatalogTests(unittest.TestCase):
     def test_scope_selection_mode_isolation_and_reopen(self):
         from time import monotonic, sleep
         with TemporaryDirectory() as folder:
-            root=Path(folder); current=root/'measurement'; nested=current/'nested'; other=root/'other'
+            root=Path(folder).resolve(); current=root/'measurement'; nested=current/'nested'; other=root/'other'
             nested.mkdir(parents=True); other.mkdir()
             paths=[current/'current.csv',nested/'nested.csv',other/'other.csv']
             for path in paths: path.write_text('Vbg,Vtg,700,701\n0,0,1,2\n')
@@ -91,7 +91,7 @@ class MegasweepCatalogTests(unittest.TestCase):
     def test_scanner_defaults_remain_recursive_for_backgrounds(self):
         from core.megasweep_catalog import source_paths
         with TemporaryDirectory() as folder:
-            root=Path(folder); (root/'child').mkdir(); (root/'a.csv').write_text('a,b\n1,2\n'); (root/'child'/'b.csv').write_text('a,b\n1,2\n')
+            root=Path(folder).resolve(); (root/'child').mkdir(); (root/'a.csv').write_text('a,b\n1,2\n'); (root/'child'/'b.csv').write_text('a,b\n1,2\n')
             self.assertEqual(len(list(source_paths(root))),2)
             self.assertEqual(len(list(source_paths(root,recursive=False))),1)
             self.assertEqual(len(inventory(root,recursive=False)),1)
@@ -99,7 +99,7 @@ class MegasweepCatalogTests(unittest.TestCase):
     def test_mode_default_filter_and_selected_exception(self):
         from time import monotonic, sleep
         with TemporaryDirectory() as folder:
-            root=Path(folder); optical=root/'optical.csv'; transport=root/'transport.csv'
+            root=Path(folder).resolve(); optical=root/'optical.csv'; transport=root/'transport.csv'
             optical.write_text('Vbg,Vtg,700,701\n0,0,1,2\n'); transport.write_text('Vbg,Vtg,I\n0,0,1\n')
             picker=SourceCatalogBridge(settings=QSettings(str(root/'test.ini'),QSettings.IniFormat))
             def wait():
@@ -124,7 +124,7 @@ class MegasweepCatalogTests(unittest.TestCase):
         from threading import Event
         from time import monotonic, sleep
         with TemporaryDirectory() as folder:
-            root=Path(folder); nested=root/'nested'; nested.mkdir()
+            root=Path(folder).resolve(); nested=root/'nested'; nested.mkdir()
             (root/'a.csv').write_text('X,Y,700,701\n0,0,1,2\n'); (nested/'b.csv').write_text('X,Y,700,701\n0,0,1,2\n')
             picker=SourceCatalogBridge(settings=QSettings(str(root/'test.ini'),QSettings.IniFormat))
             entered=Event(); release=Event(); original=picker._scan_catalog

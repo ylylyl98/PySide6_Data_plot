@@ -20,7 +20,7 @@ from ui_qt.quick.background_source_catalog import BackgroundSourceCatalogBridge
 
 app = QGuiApplication([])
 with TemporaryDirectory() as directory:
-    root = Path(directory); nested = root / 'nested'; nested.mkdir()
+    root = Path(directory).resolve(); nested = root / 'nested'; nested.mkdir()
     a, b, bg1, bg2 = [root / name for name in ('a.csv', 'b.csv', 'bg1.csv', 'bg2.csv')]
     nested_bg = nested / 'reference.csv'
     for path in (a, b, bg1, bg2, nested_bg):

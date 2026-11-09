@@ -33,7 +33,7 @@ def child(tmp):
     from ui_qt.quick.application_bridge import QuickApplicationBridge
     from ui_qt.quick.plot_surface import register_plot_surface
 
-    base = Path(tmp); experiment = base / 'experiment'; a = experiment / 'A'; nested = a / 'nested'; b = experiment / 'B'; external = base / 'external'
+    base = Path(tmp).resolve(); experiment = base / 'experiment'; a = experiment / 'A'; nested = a / 'nested'; b = experiment / 'B'; external = base / 'external'
     for folder in (a, nested, b, external): folder.mkdir(parents=True)
     wavelengths = np.linspace(800, 1000, 31)
     cols = ['Vbg', 'Vtg', *map(str, wavelengths)]
