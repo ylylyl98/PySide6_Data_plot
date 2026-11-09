@@ -68,6 +68,7 @@ See [troubleshooting](docs/en/troubleshooting.md) if checking or downloading fai
 | Power Dependence | Inspect power sweeps, assign KK/KKp channels, fit supported intensity models | Maps, comparisons, fits and export packages |
 | MCD | Inspect magnetic-field sweeps, extract MCD(B), organize and compare analyses | Map data, traces, diagnostics and settings |
 | SHG | Analyze angular sweeps and compare reference/sample measurements | Excel workbook with angular results and spectra, settings |
+| [Megasweep](docs/en/megasweep.md) | Analyze dual-axis PL/Reflection and scalar transport sweeps, spectral slices and movies | Maps, cuts, CSV/PNG packages and MP4 |
 | Peak Analysis | Detect, fit and inspect spectral branches in a separate workspace | Fits, diagnostics and saved analysis results |
 | Slides | Find exported PNGs and arrange them in PowerPoint | Editable layouts and captions with embedded figures |
 

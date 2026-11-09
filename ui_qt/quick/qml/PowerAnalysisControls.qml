@@ -27,6 +27,32 @@ Rectangle {
             Layout.topMargin: 5
             spacing: 5
             AppButton {
+                objectName: "power_analysis_fit"
+                colors: panel.colors
+                text: panel.state.analysisDraft ? "Apply guesses · Fit all powers" : "Fit all powers"
+                primary: panel.state.analysisDraft === true
+                enabled: panel.state.analysisAvailable && !panel.state.fitBusy && !panel.state.detectBusy && !panel.state.busy
+                onClicked: panel.bridge.invoke("analysis.fit")
+            }
+            AppButton {
+                objectName: "power_analysis_next_issue"
+                colors: panel.colors
+                text: "Next issue (" + (panel.state.analysisIssueCount || 0) + ")"
+                enabled: panel.state.analysisReady === true && panel.state.analysisIssueCount > 0
+                onClicked: panel.bridge.invoke("analysis.nextIssue")
+            }
+            AppButton {
+                objectName: "power_analysis_issues_only"
+                colors: panel.colors
+                text: "Issues only"
+                checked: panel.state.analysisIssuesOnly === true
+                enabled: panel.state.analysisReady === true
+                onClicked: {
+                    panel.bridge.setParameter("analysis.issuesOnly", !panel.state.analysisIssuesOnly)
+                    panel.bridge.setParameter("analysis.showResults", true)
+                }
+            }
+            AppButton {
                 objectName: "power_analysis_manual"
                 colors: panel.colors
                 text: "Manual refit selected power…"

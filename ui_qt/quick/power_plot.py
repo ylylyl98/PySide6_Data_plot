@@ -8,7 +8,8 @@ class PowerPlotMixin:
     _WORKSPACE_FIELDS = ("_canvas", "_navigation", "_grid", "_map_grid", "_spectrum", "_residual",
         "_trend_axes", "_maps", "_lines", "_gate_lines", "_heatmap_renders", "_display_coordinates",
         "_caption", "_background_image", "_background_bounds", "_divider_position", "_spectrum_grid",
-        "_analysis_artists", "_analysis_trends", "_analysis_residual", "_analysis_spectrum", "_plot_tool")
+        "_analysis_artists", "_analysis_trends", "_analysis_residual", "_analysis_spectrum",
+        "_analysis_seed_lines", "_analysis_seed_labels", "_plot_tool")
 
     def _activate_plot_workspace(self, target):
         if target == self._plot_workspace:
@@ -20,7 +21,7 @@ class PowerPlotMixin:
         self._plot_workspaces[self._plot_workspace] = {key: getattr(self, key, None) for key in self._WORKSPACE_FIELDS}
         stored = self._plot_workspaces.get(target, {})
         dictionaries = {"_maps", "_lines", "_gate_lines", "_heatmap_renders", "_display_coordinates"}
-        sequences = {"_trend_axes", "_analysis_artists", "_analysis_trends"}
+        sequences = {"_trend_axes", "_analysis_artists", "_analysis_trends", "_analysis_seed_lines", "_analysis_seed_labels"}
         for key in self._WORKSPACE_FIELDS:
             setattr(self, key, stored.get(key, {} if key in dictionaries else () if key in sequences else "" if key == "_plot_tool" else None))
         self._plot_workspace = target
@@ -30,9 +31,11 @@ class PowerPlotMixin:
 
     def _main_plot_values(self):
         ignored = {"query", "historyFilter", "showOlder", "includeLegacy"}
+        analysis_plot_fields = {"enabled", "model", "metric", "intensityLog", "linewidthLog", "selectedPeak"}
         return (tuple((key, value) for key, value in sorted(self._values.items()) if key not in ignored),
-                tuple(sorted(self._analysis_values.items())), tuple(sorted(self._analysis_selected_rows.items())),
-                tuple(sorted(self._palette.items())), self._analysis_law_error)
+                tuple((key, value) for key, value in sorted(self._analysis_values.items()) if key in analysis_plot_fields),
+                self._analysis_draft, "" if self._analysis_ready() else self._analysis_status,
+                tuple(sorted(self._analysis_selected_rows.items())), tuple(sorted(self._palette.items())), self._analysis_law_error)
 
     def _remember_main_plot(self):
         if self._plot_workspace == "plot" and self._stage == "plot":
@@ -60,6 +63,8 @@ class PowerPlotMixin:
         self._canvas.mpl_connect("draw_event", self._analysis_special_drawn)
         self._canvas.mpl_connect("resize_event", lambda _: self._apply_split())
         self._canvas.mpl_connect("button_press_event", self._on_press)
+        self._canvas.mpl_connect("motion_notify_event", self._analysis_motion)
+        self._canvas.mpl_connect("button_release_event", self._analysis_release)
         self._canvas.backend.drawFailed.connect(lambda message: self._message(message, error=True))
         if ratio != 1.:
             self._canvas.set_logical_size(width, height, ratio)

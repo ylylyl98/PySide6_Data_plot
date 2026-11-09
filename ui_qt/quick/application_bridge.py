@@ -17,7 +17,7 @@ from time import perf_counter
 
 from PySide6.QtCore import QObject, Property, QSettings, QTimer, QUrl, Qt, Signal, Slot
 
-from ui_qt.feature_registry import FEATURES
+from ui_qt.feature_registry import QUICK_FEATURES as FEATURES
 from ui_qt.quick.peak_application import PeakApplicationMixin
 from ui_qt.quick.maintenance_application import MaintenanceApplicationMixin
 from ui_qt.quick.pl_application import PlApplicationMixin
@@ -192,8 +192,15 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             state["busy"] = bool(state["busy"] or child_state.get("analysisBusy", False))
             state["sourceFolderUrl"] = QUrl.fromLocalFile(state["sourcePath"]).toString() if state["sourcePath"] else ""
             state["fileNameFilters"] = {"shg": ["SHG measurements (*.csv)"],
-                "mcd": ["MCD measurements (*.csv)"], "mcd_peak_shift": ["MCD measurements (*.csv)"], "power": ["Power measurements (*.csv)"]}.get(
+                "mcd": ["MCD measurements (*.csv)"], "mcd_peak_shift": ["MCD measurements (*.csv)"], "power": ["Power measurements (*.csv)"], "megasweep": ["Megasweep measurements (*.csv)"]}.get(
                     self._workflow, ["Channel measurements (*.csv *.xlsx)"])
+            if self._workflow == "megasweep":
+                state["sourceSummary"] = child_state.get("sourceFile") or "No measurement selected"
+                state["exportLabel"] = "Save CSV + PNG"
+                state["workspaceTitle"] = "Megasweep · " + child_state.get("mode", "PL")
+                background_folder = child_state.get("backgroundFolder", "")
+                state["backgroundRole"] = child_state.get("backgroundRole", "custom")
+                state["backgroundFolderUrl"] = QUrl.fromLocalFile(background_folder).toString() if background_folder else state["sourceFolderUrl"]
             state["sideBySide"] = self._child_side_by_side(child_state)
             # Native workspaces own their empty, loading and error states too.
             state["workspaceMessage"] = ""
@@ -511,13 +518,13 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
     @Property(QUrl, notify=parameterUrlChanged)
     def parameterUrl(self):
         name = {"pl": "PlParameters.qml", "drr": "DrrParameters.qml", "cmp": "CompareParameters.qml", "shg": "ShgParameters.qml",
-                "mcd": "McdParameters.qml", "mcd_peak_shift": "McdPeakParameters.qml", "power": "PowerParameters.qml"}.get(self._workflow)
+                "mcd": "McdParameters.qml", "mcd_peak_shift": "McdPeakParameters.qml", "power": "PowerParameters.qml", "megasweep": "MegasweepControls.qml"}.get(self._workflow)
         return QUrl.fromLocalFile(str(Path(__file__).with_name("qml") / name)) if name else QUrl()
 
     @Property(QUrl, notify=workspaceUrlChanged)
     def workspaceUrl(self):
         name = {"slides": "Presentation.qml", "tools": "ToolsWorkspace.qml", "cmp": "CompareWorkspace.qml", "shg": "ShgWorkspace.qml",
-                "mcd": "McdWorkspace.qml", "mcd_peak_shift": "McdPeakWorkspace.qml", "power": "PowerWorkspace.qml"}.get(self._workflow)
+                "mcd": "McdWorkspace.qml", "mcd_peak_shift": "McdPeakWorkspace.qml", "power": "PowerWorkspace.qml", "megasweep": "MegasweepWorkspace.qml"}.get(self._workflow)
         return QUrl.fromLocalFile(str(Path(__file__).with_name("qml") / name)) if name else QUrl()
 
     @staticmethod
@@ -580,6 +587,15 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
 
     def _child_file_dialog(self, key, purpose, multiple):
         if key == self._workflow and not self._closed:
+            if key == "megasweep" and purpose in {"sources", "select-files"}:
+                child = self._workflow_bridges[key]
+                state = child.snapshot
+                self._source_catalog.setParameter("megasweepType", "Transport" if state["mode"] == "Transport" else "Optical")
+                self._source_catalog.openMegasweep(state.get("pickerFolder") or self._folder,
+                    state.get("experimentRoot") or self._folder, state["mode"],
+                    state.get("pickerSelected", state.get("selectedSources", [])))
+                self.sourceCatalogRequested.emit()
+                return
             self.fileDialogRequested.emit(purpose, multiple)
 
     def _ensure_workflow_bridge(self, key):
@@ -596,6 +612,9 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             elif key == "mcd_peak_shift":
                 from ui_qt.quick.mcd_peak_bridge import McdPeakBridge
                 child = McdPeakBridge(settings=self.settings, parent=self)
+            elif key == "megasweep":
+                from ui_qt.quick.megasweep_bridge import MegasweepBridge
+                child = MegasweepBridge(settings=self.settings, parent=self)
             elif key == "power":
                 from ui_qt.quick.power_bridge import PowerBridge
                 child = PowerBridge(settings=self.settings, parent=self)
@@ -614,7 +633,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             child.sourceDialogRequested.connect(lambda purpose, multiple: self._child_file_dialog(key, purpose, multiple))
             child.plotBackendChanged.connect(lambda: self.plotBackendChanged.emit() if key == self._workflow else None)
             child.setPalette(self.colors)
-            if self._folder:
+            if self._folder and (key != "megasweep" or not child.snapshot.get("pickerFolder")):
                 child.setExperimentFolder(self._folder)
         child = self._workflow_bridges[key]
         if key in {"mcd", "mcd_peak_shift"} and self._mcd_shared_products is not None:
@@ -657,6 +676,8 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
     def selectWorkflow(self, key):
         if key == self._workflow or key not in {item.key for item in FEATURES}:
             return
+        if self._workflow == "megasweep":
+            self._workflow_bridges["megasweep"].invalidateBackgroundSelection()
         if self._workflow == "drr":
             self._cancel_bn_check()
             self.cancelDrrBackground()
@@ -701,7 +722,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             self._drr_display._flush_changes()
         elif key == "pl":
             self._pl_sync_scales()
-        elif key in {"cmp", "shg", "mcd", "mcd_peak_shift", "power"}:
+        elif key in {"cmp", "shg", "mcd", "mcd_peak_shift", "power", "megasweep"}:
             self._ensure_workflow_bridge(key)
         elif key == "slides":
             if self._slides_bridge is None:
@@ -941,10 +962,10 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         if self._closed or workflow != self._workflow:
             return
         child = self._workflow_bridges.get(workflow)
-        if child is not None:
-            child.openFiles("sources" if purpose == "select-files" else purpose, values)
-        elif purpose == "catalog":
+        if purpose == "catalog":
             self._source_catalog.addExternal(values)
+        elif child is not None:
+            child.openFiles("sources" if purpose == "select-files" else purpose, values)
         elif purpose == "select-background":
             self.selectBackgroundFiles(values)
         else:

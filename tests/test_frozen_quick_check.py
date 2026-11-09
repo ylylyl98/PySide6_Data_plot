@@ -38,13 +38,13 @@ if {log_error!r}:
     (logs/'app-test.log').write_text("Qt: TypeError: late shutdown callback failed")
 ''']
 
-    def test_matrix_covers_nine_workflows_scientific_inputs_and_three_standalones(self):
+    def test_matrix_covers_workflows_scientific_inputs_and_standalones(self):
         fixtures = {key: self.root / key for key in ("pl", "drr", "drr_csv", "peak_snapshot", "drr_snapshot", "drr_analysis_folder", "organizer_folder")}
         fixtures["compare"] = (self.root / "KK.csv", self.root / "KKp.csv")
         cases = build_cases(fixtures)
-        self.assertEqual(len(cases), 18)
+        self.assertEqual(len(cases), 20)
         self.assertEqual({case.workflow for case in cases if case.name.startswith("empty-")}, set(WORKFLOWS))
-        self.assertEqual({case.kind for case in cases}, {"main", "peak", "drr", "organizer"})
+        self.assertEqual({case.kind for case in cases}, {"main", "peak", "drr", "organizer", "megasweep-runtime"})
 
     def test_report_requires_current_qml_frame_no_widgets_and_actual_plot_when_requested(self):
         self.assertEqual(inspect_report(self.shell_report(), SmokeCase("shell", ())), [])
@@ -74,6 +74,16 @@ if {log_error!r}:
         self.assertEqual(inspect_report(report, case), [])
         report["warnings"] = ["Late QML warning"]
         self.assertIn("Late QML warning", inspect_report(report, case))
+
+    def test_megasweep_runtime_requires_bundled_ffmpeg_and_decode(self):
+        case = SmokeCase("megasweep-runtime", ("--check-megasweep-runtime",), kind="megasweep-runtime")
+        report = dict(status="ok", frozen=True, ffmpeg_bundled=True, widgets_imported=False,
+                      modes=["PL", "Reflection", "Transport"], movie={"validation":"FFmpeg full decode passed"})
+        self.assertEqual(inspect_report(report, case), [])
+        for key, value in (("ffmpeg_bundled", False), ("widgets_imported", True),
+                           ("modes", ["PL"]), ("movie", {})):
+            with self.subTest(key=key):
+                self.assertTrue(inspect_report({**report, key:value}, case))
 
     def test_zero_exit_and_clean_report_do_not_hide_windowed_exe_log_errors(self):
         result = run_case(self.fake_target(log_error=True), SmokeCase("late-error", ()), self.root, self.root / "artifacts", 10)

@@ -14,6 +14,8 @@ icon_path = project_root / "assets" / "icons" / "app_icon.ico"
 # and then fails before the Qt window is created.
 matplotlib_datas = collect_data_files("matplotlib", includes=["mpl-data/**"])
 pptx_datas = collect_data_files("pptx")
+# Bundle the imageio FFmpeg executable for offline Megasweep MP4 export.
+ffmpeg_datas = collect_data_files("imageio_ffmpeg")
 # Preserve the relative URLs used by Display.qml and its local components.
 # Qt's own QML plugins are collected by PyInstaller's PySide6.QtQml hook,
 # reached through the three explicit Qt Quick module imports below.
@@ -80,11 +82,13 @@ analysis = Analysis(
         ),
         *matplotlib_datas,
         *pptx_datas,
+        *ffmpeg_datas,
         *quick_qml_datas,
         *core_source_datas,
     ],
     hiddenimports=[
         "run_quick",
+        "imageio_ffmpeg",
         "run_peak_analysis_quick",
         "run_drr_analysis_quick",
         "run_mcd_organizer_quick",

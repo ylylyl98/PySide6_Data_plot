@@ -63,6 +63,7 @@ GitHub 的源码 ZIP 与便携版应用安装包不同。
 | Power Dependence | 查看功率扫描，分配 KK/KKp 通道，拟合受支持的强度模型 | 图谱、比较、拟合及导出结果包 |
 | MCD | 查看磁场扫描，提取 MCD(B)，整理和比较分析结果 | 图谱数据、曲线、诊断及设置 |
 | SHG | 分析角度扫描，比较参考与样品测量 | 含角度结果和光谱的 Excel 工作簿、设置 |
+| [Megasweep](docs/zh-CN/megasweep.md) | 双轴 PL／Reflection、标量输运、光谱切片与视频 | 二维图、线切、CSV／PNG 和 MP4 |
 | Peak Analysis | 在独立工作区检测、拟合和检查光谱分支 | 拟合、诊断及保存的分析结果 |
 | Slides | 查找已导出的 PNG 并编排 PowerPoint | 带有嵌入图片、可编辑布局和文字说明的幻灯片 |
 

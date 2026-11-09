@@ -33,6 +33,7 @@ Controls.ApplicationWindow {
         {key: "mcd", label: "MCD", description: "Magnetic circular dichroism"},
         {key: "mcd_peak_shift", label: "MCD Peak Shift", description: "Track reflection resonance energies versus magnetic field"},
         {key: "shg", label: "SHG", description: "Second harmonic generation processing"},
+        {key: "megasweep", label: "Megasweep", description: "Dual-axis optical and transport sweeps"},
         {key: "slides", label: "Slides", description: "Build a PowerPoint from processed plot PNGs"},
         {key: "tools", label: "Tools", description: "Data tools and application diagnostics"}
     ]
@@ -77,15 +78,19 @@ Controls.ApplicationWindow {
         fileDialogPurpose = purpose
         fileDialogWorkflow = requestState.workflow
         fileDialog.fileMode = multiple ? FileDialog.OpenFiles : FileDialog.OpenFile
-        fileDialog.title = purpose === "select-background" ? "Choose external DRR background files"
+        let megasweepBackground = requestState.workflow === "megasweep" && purpose.startsWith("inline-catalog:")
+        let backgroundRole = requestState.backgroundRole || "custom"
+        let backgroundLabel = backgroundRole === "custom" ? "custom" : backgroundRole.toUpperCase()
+        fileDialog.title = megasweepBackground ? "Choose Megasweep " + backgroundLabel + " background files"
+                         : purpose === "select-background" ? "Choose external DRR background files"
                          : purpose === "settings" ? "Open SHG analysis settings"
                          : purpose === "saved-results" ? "Open a saved DAT result" : "Choose measurement files"
         fileDialog.nameFilters = purpose === "saved-results" ? ["Saved result (*.dat)"]
                                : purpose === "settings" ? ["SHG analysis settings (*.json)"]
-                               : purpose === "select-background" ? ["Background measurements (*.csv)"]
+                               : (purpose === "select-background" || megasweepBackground) ? ["Background measurements (*.csv)"]
                                : (requestState.fileNameFilters || ["Measurement data (*.dat *.csv *.xlsx)", "All files (*)"])
         // Snapshot notifications are batched; read the current request directory now.
-        DialogState.prepareFile(fileDialog, requestState.sourceFolderUrl, "")
+        DialogState.prepareFile(fileDialog, megasweepBackground ? requestState.backgroundFolderUrl : requestState.sourceFolderUrl, "")
         fileDialog.open()
     }
     function chooseFolder(purpose) {

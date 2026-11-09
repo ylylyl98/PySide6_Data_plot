@@ -15,7 +15,7 @@ Basic.Dialog {
 
     function filterSignature() {
         return JSON.stringify([state.query, state.type, state.statusFilter, state.savedOnly,
-            state.onlyNew, state.includeBackgrounds, state.includeAll, state.showAllFiles])
+            state.onlyNew, state.includeBackgrounds, state.includeAll, state.showAllFiles, state.megasweepType, state.megasweepScope, state.megasweepMode])
     }
 
     function cancelReopenPosition() {
@@ -93,7 +93,7 @@ Basic.Dialog {
     }
     contentItem: ColumnLayout {
         spacing: 7
-        Basic.Label { Layout.fillWidth: true; text: dialog.state.folder; color: dialog.colors.muted; elide: Text.ElideMiddle }
+        Basic.Label { Layout.fillWidth: true; text: (dialog.state.workflow === "megasweep" && !dialog.backgroundSelection) ? dialog.state.scanFolder : dialog.state.folder; color: dialog.colors.muted; elide: Text.ElideMiddle }
         RowLayout {
             Layout.fillWidth: true
             Basic.TextField { objectName: "source_catalog_search"; Layout.fillWidth: true; placeholderText: dialog.backgroundSelection ? "Search reference filename / folder…" : "Search filename / gate range / conditions…"; text: dialog.state.query; onTextEdited: dialog.bridge.setParameter("query",text) }
@@ -114,13 +114,35 @@ Basic.Dialog {
                 onActivated: dialog.bridge.setParameter("statusFilter",values[currentIndex])
                 Accessible.name: "Processing status"
             }
+            AppComboBox {
+                objectName: "megasweep_picker_scope"
+                Layout.preferredWidth: 180
+                Layout.minimumWidth: 180
+                colors: dialog.colors
+                visible: dialog.state.workflow === "megasweep" && !dialog.backgroundSelection
+                model: ["Current folder", "Include subfolders", "Entire experiment"]
+                property var values: ["folder", "subfolders", "experiment"]
+                currentIndex: Math.max(0, values.indexOf(dialog.state.megasweepScope || "folder"))
+                onActivated: dialog.bridge.setParameter("megasweepScope", values[currentIndex])
+                Accessible.name: "Megasweep search scope"
+                Basic.ToolTip.visible: hovered
+                Basic.ToolTip.text: currentText
+            }
+            AppComboBox {
+                colors: dialog.colors
+                visible: dialog.state.workflow === "megasweep"
+                model: ["All", "Optical", "Transport"]
+                currentIndex: model.indexOf(dialog.state.megasweepType || "All")
+                onActivated: dialog.bridge.setParameter("megasweepType", currentText)
+                Accessible.name: "Megasweep measurement type"
+            }
             AppButton { colors: dialog.colors; text: "Refresh"; onClicked: dialog.bridge.invoke("refresh") }
         }
         Flow {
             Layout.fillWidth: true
             spacing: 5
             visible: !dialog.backgroundSelection
-            Basic.CheckBox { text: "Saved DAT results"; checked: dialog.state.savedOnly; onToggled: dialog.bridge.setParameter("savedOnly",checked) }
+            Basic.CheckBox { visible: dialog.state.workflow !== "megasweep"; text: "Saved DAT results"; checked: dialog.state.savedOnly; onToggled: dialog.bridge.setParameter("savedOnly",checked) }
             Basic.CheckBox { visible: dialog.state.workflow === "drr" && !dialog.state.savedOnly; text: "Unprocessed only"; checked: dialog.state.onlyNew; onToggled: dialog.bridge.setParameter("onlyNew",checked) }
             Basic.CheckBox { visible: dialog.state.workflow === "drr" && !dialog.state.savedOnly; text: "Include backgrounds"; checked: dialog.state.includeBackgrounds; onToggled: dialog.bridge.setParameter("includeBackgrounds",checked) }
             Basic.CheckBox { visible: dialog.state.workflow === "drr" && !dialog.state.savedOnly; text: "All experiment folders"; checked: dialog.state.includeAll; onToggled: dialog.bridge.setParameter("includeAll",checked) }

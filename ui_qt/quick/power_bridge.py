@@ -747,7 +747,14 @@ class PowerBridge(PowerAnalysisMixin, PowerPlotMixin, QObject):
             self._cancel(kind)
         for task in self._pending.values():
             task.cancel()
-        self._executor.shutdown(wait=True, cancel_futures=True)
+        self._analysis_flush_saves(wait=True)
+        if self._analysis_save_error:
+            self._status = self._analysis_save_error
+            self.logMessage.emit(self._analysis_save_error)
+            self.statusMessage.emit(self._analysis_save_error)
+        # Captured analysis saves must finish, including the most recent manual
+        # correction. Numerical jobs above are already cancelled explicitly.
+        self._executor.shutdown(wait=True, cancel_futures=False)
         self._pending.clear()
         self._disconnect_law_selector()
         canvases = {state.get("_canvas") for state in self._plot_workspaces.values()}
