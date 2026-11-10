@@ -90,9 +90,10 @@ def main(argv=None):
         if initialized:
             return
         initialized = True
-        bridge.restore()
         if args.snapshot:
-            deliver(message)
+            bridge.loadInitialSnapshot(args.snapshot, args.reply_server)
+        else:
+            bridge.restore()
         if args.check:
             QTimer.singleShot(500, check_ready)
     def check_ready():

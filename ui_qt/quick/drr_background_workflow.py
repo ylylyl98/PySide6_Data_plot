@@ -122,6 +122,7 @@ class PreparedBackgroundApplication:
     verification: object = field(repr=False)
     signatures: tuple = field(repr=False)
     _verified: object = field(default=None, repr=False, compare=False)
+    original_bn_choices: tuple = ()
 
 
 def _signatures(context, draft, *, digest=False):
@@ -186,6 +187,10 @@ def _recipe(context, draft):
     mode = ("Self (first frame)" if draft.which == "first" else "Self (last frame)") if draft.kind == "self" else (
         "Fitted (sample)" if draft.kind == "fitted" else "External")
     assignments = tuple(draft.saved_assignments)
+    if draft.calibration and draft.calibration['payload'].get('batch'):
+        from ui_qt.quick.drr_bn_batch_workflow import verify_batch, batch_assignments
+        assignments = batch_assignments(context, verify_batch(context, draft.calibration['payload']),
+                                        original=draft.calibration['original'])
     plan = draft.bn_plan or draft.pn_plan
     if plan is not None:
         assignments = tuple(plan.resolution.assignments)
@@ -202,7 +207,7 @@ def _recipe(context, draft):
                             fixed, draft.auto_bn_compare, draft, context)
 
 
-def prepare_application(context, draft):
+def prepare_application(context, draft, *, original_bn=False):
     """Expensive validation; run in a cancellable worker, never the GUI thread."""
     from core.data_io import _validate_drr_external_spectral_grids
     from core.drr_composite_background import is_composite_background, read_composite_background
@@ -284,7 +289,15 @@ def prepare_application(context, draft):
                 and set(item["path"] for item in source["measurements"]) != set(context.measurements)
                 or str(source["y_axis"]) != str(context.y_axis)):
             raise ValueError("BN comparison belongs to another measurement group or axis.")
-        if draft.calibration["original"]:
+        if payload.get('batch'):
+            from ui_qt.quick.drr_bn_batch_workflow import verify_batch, batch_assignments
+            verification = verify_batch(context, payload)
+            assignments = batch_assignments(context, verification, original=draft.calibration['original'])
+            for item in assignments:
+                _validate_drr_external_spectral_grids(context.folder, (item.measurement_file,), item.baseline_files)
+            draft = replace(draft, files=tuple(dict.fromkeys(n for item in assignments for n in item.baseline_files)),
+                            which='last', fixed=False)
+        elif draft.calibration["original"]:
             draft = replace(draft, files=tuple(item["path"] for item in source["baseline_files"]),
                             which=source["baseline_which"], fixed=False)
             _validate_drr_external_spectral_grids(context.folder, context.measurements, draft.files)
@@ -293,7 +306,7 @@ def prepare_application(context, draft):
             if (verification is None or not verification.fresh or not verification.eligible
                     or (verification.settings.get("derivative_window"), verification.settings.get("derivative_polyorder"))
                     != (context.derivative_window, context.derivative_polyorder)):
-                raise ValueError("BN candidate lacks current joint DR/R + D2E validation at these SG settings.")
+                raise ValueError("BN candidate lacks current joint DR/R or single measurement calibration evidence at these SG settings.")
             draft = replace(draft, files=(portable_source_name(context.folder, verification.csv_path),), which="last", fixed=False)
     elif draft.kind == "fitted":
         from core.drr_fitted_background import validate_recipe
@@ -341,7 +354,23 @@ def prepare_application(context, draft):
     if draft.batch_result is not None:
         from ui_qt.quick.drr_pn_batch_workflow import prepare_pn_batch_proof
         verification = prepare_pn_batch_proof(context, draft.batch_result)
-    return PreparedBackgroundApplication(context, draft, _recipe(context, draft), verification, after, _PREPARED)
+    recipe = _recipe(context, draft)
+    original_choices = ()
+    if original_bn and draft.calibration is None:
+        from core.drr_bn_store import is_bn_calibration_source
+        if draft.kind != "bn" or not recipe.assignments:
+            raise ValueError("Choose a measured BN background first.")
+        if any(item.baseline_mode != "External" or item.regions for item in recipe.assignments):
+            raise ValueError("Apply original BN requires measured references without regional overrides.")
+        references = {(item.baseline_files, item.baseline_which) for item in recipe.assignments}
+        if any(is_bn_calibration_source(context.folder, name) for files, _ in references for name in files):
+            raise ValueError("Select the original measured BN file to apply original BN.")
+        if len(references) != 1:
+            raise ValueError("Different per-measurement BN references require a generated comparison; "
+                             "or apply the reviewed mapping from background settings.")
+        files, which = next(iter(references))
+        original_choices = ((context.measurements, files, which),)
+    return PreparedBackgroundApplication(context, draft, recipe, verification, after, _PREPARED, original_choices)
 
 
 def commit_application(prepared, *, current_context, settings):
@@ -359,6 +388,7 @@ def commit_application(prepared, *, current_context, settings):
         from ui_qt.quick.drr_pn_batch_workflow import pn_batch_proof_is_current
         if not pn_batch_proof_is_current(current_context, draft.batch_result, verification):
             raise ValueError("P/N batch inputs changed after validation; the previous background was retained.")
+    matching_cache = None
     if draft.bn_plan is not None:
         from core.drr_bn_matching import BnMatchCache
         try:
@@ -366,7 +396,7 @@ def commit_application(prepared, *, current_context, settings):
         except (ValueError, TypeError, KeyError):
             cache = BnMatchCache()
         cache.commit_confirm(verification)
-        settings.setValue("drr/confirmed_bn_matches_v1", json.dumps(cache.to_dict()))
+        matching_cache = json.dumps(cache.to_dict())
     elif draft.pn_plan is not None:
         from core.drr_pn_matching import confirmation_is_current
         if not confirmation_is_current(verification):
@@ -377,10 +407,24 @@ def commit_application(prepared, *, current_context, settings):
     elif draft.calibration is not None:
         from core.drr_bn_store import DrrBnStore
         store = DrrBnStore(current_context.folder)
-        if draft.calibration["original"]:
+        if draft.calibration['payload'].get('batch'):
+            original = draft.calibration['original']
+            accepted = tuple(v for v in verification if v.eligible and not original)
+            originals = tuple((tuple(item['path'] for item in v.source_identity['measurements']),
+                tuple(item['path'] for item in v.source_identity['baseline_files']),
+                v.source_identity['baseline_which']) for v in verification if original or not v.eligible)
+            store.activate_many_verified(accepted, original_choices=originals)
+        elif draft.calibration["original"]:
             store.deactivate(current_context.measurements, draft.files, draft.which, restore_original=True)
         else:
             store.activate_verified(verification, measurements=current_context.measurements)
+    if prepared.original_bn_choices:
+        from core.drr_bn_store import DrrBnStore
+        store = DrrBnStore(current_context.folder)
+        measurements, files, which = prepared.original_bn_choices[0]
+        store.deactivate(measurements, files, which, restore_original=True)
+    if matching_cache is not None:
+        settings.setValue("drr/confirmed_bn_matches_v1", matching_cache)
     settings.setValue("drr/bn_auto_compare", draft.auto_bn_compare)
     return prepared.recipe
 
@@ -439,17 +483,24 @@ def load_with_recipe(context, recipe, *, prepared=None, progress=None, log=None,
               if before_signatures is None else before_signatures)
     references = ()
     calibration = recipe.draft.calibration if recipe.draft else None
-    if calibration and not calibration["original"]:
+    batch = bool(calibration and calibration['payload'].get('batch'))
+    if batch:
+        from ui_qt.quick.drr_bn_batch_workflow import verify_batch
+        verify_batch(context, calibration['payload'])
+    if calibration and not calibration["original"] and not batch:
         from core.drr_bn_store import DrrBnStore
         version = DrrBnStore(context.folder).get(calibration["payload"]["version_id"])
-        if (version is None or not version.fresh or not version.eligible or version.validation_status != "accepted"
+        if (version is None or not version.fresh or not version.eligible or version.validation_status not in {"accepted", "single_pair"}
                 or (version.settings.get("derivative_window"), version.settings.get("derivative_polyorder"))
                 != (context.derivative_window, context.derivative_polyorder)):
-            raise ValueError("The active BN candidate needs a fresh joint DR/R + D2E certificate at the current SG settings.")
+            raise ValueError("The active BN candidate needs fresh applicable calibration evidence at the current SG settings.")
     if recipe.mode == "Fitted (sample)":
         from core.drr_fitted_background import load_fitted_group
         cube, references = load_fitted_group(context.folder, context.measurements, recipe.fitted_settings,
             y_axis=context.y_axis, progress=progress, log=log)
+    elif batch and prepared is not None:
+        from ui_qt.quick.drr_bn_batch_workflow import load_batch_trial
+        cube = load_batch_trial(context, calibration['payload'], original=calibration['original'])
     elif calibration and not calibration["original"] and prepared is not None:
         # The normal loading facade requires an activated BN history choice.
         # This trial load uses only the fully verified candidate snapshot, then
@@ -458,12 +509,12 @@ def load_with_recipe(context, recipe, *, prepared=None, progress=None, log=None,
         from core.loader import load_drr_avg
         version = DrrBnStore(context.folder).get(prepared.verification.version_id)
         if (version is None or not version.fresh or not version.eligible
-                or version.validation_status != "accepted"
+                or version.validation_status not in {"accepted", "single_pair"}
                 or version.source_identity.get("y_axis") != str(context.y_axis)
                 or set(item["path"] for item in version.source_identity["measurements"]) != set(context.measurements)
                 or (version.settings.get("derivative_window"), version.settings.get("derivative_polyorder"))
                     != (context.derivative_window, context.derivative_polyorder)):
-            raise ValueError("BN trial loading requires the current exact-group joint DR/R + D2E certificate.")
+            raise ValueError("BN trial loading requires fresh applicable calibration evidence for this exact measurement group.")
         payload = DrrBnStore(context.folder).load_result(version)
         cube = load_drr_avg(context.folder, context.measurements, bg_mode="external", y_axis=context.y_axis,
             external_vector=payload["candidate_background"], external_energy=payload["energy"])
@@ -522,15 +573,24 @@ def generate_pn(context, pair, *, mode="reconstruction", training_files=(), p_wh
     return version, result.document, result.report
 
 
-def compare_bn(context, files, which, *, settings=None, cancellation=None, progress=None, log=None):
+def compare_bn(context, files, which, *, settings=None, cancellation=None, progress=None, log=None,
+               export_products=True):
     from core.drr_bn_service import compare_bn_group
     from core.drr_bn_store import DrrBnStore
-    config = {**dict(settings or {}), "derivative_window": context.derivative_window,
+    from time import perf_counter
+    started = perf_counter()
+    config = {**dict(settings or {}), "single_measurement": len(context.measurements) == 1,
+              "derivative_window": context.derivative_window,
               "derivative_polyorder": context.derivative_polyorder}
     payload = compare_bn_group(context.folder, context.measurements, files, which, config,
         y_axis=context.y_axis, cancellation=cancellation, progress=progress, log=log)
     check_load_cancelled()
     version = DrrBnStore(context.folder).save_result(payload)
+    exports = None
+    if config["single_measurement"] and export_products:
+        from core.drr_bn_single_exports import save_single_pair_products
+        exports = save_single_pair_products(payload, version)
+        check_load_cancelled()
     # Representative mean spectra are an inspector preview, not the unreduced
     # per-repeat/per-gate evidence that determines the core certificate.
     import numpy as np
@@ -541,8 +601,36 @@ def compare_bn(context, files, which, *, settings=None, cancellation=None, progr
     derivative, used = apply_sg_derivative_energy(DataCube(payload["energy"], np.arange(2), ratios,
         "Preview", "Representative mean DRR", "DR/R"), derivative=2,
         window_length=context.derivative_window, polyorder=context.derivative_polyorder)
+    preview = dict(drr=ratios, d2=derivative.Z, energy=derivative.energy, window=used)
+    if config["single_measurement"]:
+        raw_rows = np.asarray(payload["mean_raw"], float)
+        candidates = payload.get("candidate_backgrounds", {})
+        selected = payload.get("selected_candidate")
+        exploratory = candidates.get(selected) if selected and selected != "original" else None
+        if exploratory is None:
+            exploratory = next((candidates[name] for name in ("single_pair", "multi_pair") if name in candidates), None)
+        candidate = np.asarray(exploratory if exploratory is not None else payload["candidate_background"], float)
+        maps = np.stack((raw_rows/np.asarray(payload["original_background"])-1, raw_rows/candidate-1))
+        gate_count = maps.shape[1]
+        maps_d2, used = apply_sg_derivative_energy(DataCube(payload["energy"], np.arange(2*gate_count),
+            maps.reshape(2*gate_count, maps.shape[-1]), "Preview", "Per gate DRR", "DR/R"), derivative=2,
+            window_length=context.derivative_window, polyorder=context.derivative_polyorder)
+        gate_label = "Gate (V)"
+        coordinates = payload.get("input_snapshots", {}).get("measurement_0_coordinates")
+        if coordinates is not None and len(coordinates) >= 2:
+            import re
+            from core.processing_run import _resolve_axis_choice
+            name = context.measurements[0]
+            resolved = _resolve_axis_choice(y_axis=context.y_axis, vbg=coordinates[0], vtg=coordinates[1],
+                vbias=coordinates[2] if len(coordinates) > 2 else None,
+                parts=re.findall(r"\$(.*?)\$", name), stem=Path(name).stem)
+            gate_label = str(resolved["gate_label"])
+        preview.update(maps_drr=maps, maps_d2=maps_d2.Z.reshape(2, gate_count, -1),
+                       maps_energy=maps_d2.energy, gates=np.asarray(payload.get("gates", np.arange(gate_count))),
+                       gate_label=gate_label,
+                       candidate_available=bool(exploratory is not None or payload.get("eligible")), window=used)
     return {**payload, "version_id": version.version_id, "csv_path": str(version.csv_path),
-            "preview": dict(drr=ratios, d2=derivative.Z, energy=derivative.energy, window=used)}
+            "exports": exports, "elapsed_seconds": perf_counter() - started, "preview": preview}
 
 
 def import_pn(context, pair, path, *, p_which="all", n_which="all"):

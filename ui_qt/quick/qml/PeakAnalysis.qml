@@ -15,7 +15,7 @@ Basic.ApplicationWindow {
     objectName: "peak_analysis_window"
     title: state.datasetName ? "Peak Analysis · " + state.datasetName : "Peak Analysis"
     width: 1240; height: 900
-    minimumWidth: 760; minimumHeight: 600
+    minimumWidth: 760; minimumHeight: state.kind === "PL" ? 720 : 600
     visible: true
     color: colors.inset
     palette.window: colors.surface
@@ -45,16 +45,28 @@ Basic.ApplicationWindow {
             Layout.fillWidth: true
             Layout.margins: 6
             spacing: 4
-            Repeater {
-                model: [{key: "export-dialog", label: "Export XLSX + data…"},
-                    {key: "apply-overlay", label: "Apply to main app"}]
-                delegate: AppButton {
-                    required property var modelData
-                    colors: window.colors; text: modelData.label
-                    objectName: "peak_action_" + modelData.key
-                    enabled: !window.state.busy && (modelData.key === "export-dialog" ? window.state.canExport : window.state.canApplyOverlay)
-                    onClicked: window.peakBridge.invoke(modelData.key)
-                }
+            AppButton {
+                colors: window.colors; text: "Save results"
+                objectName: "peak_save_results"
+                enabled: !window.state.busy && window.state.canExport
+                Basic.ToolTip.visible: hovered
+                Basic.ToolTip.text: "Save Excel tables, source plot overlay and analysis JSON" +
+                    (window.state.saveFolder ? "\n" + window.state.saveFolder : "")
+                onClicked: window.peakBridge.invoke("save-results")
+            }
+            AppButton {
+                colors: window.colors; text: "Save figure"
+                objectName: "peak_action_save-figure-auto"
+                enabled: !window.state.busy && window.state.hasDataset
+                Basic.ToolTip.visible: hovered && !!window.state.saveFolder
+                Basic.ToolTip.text: window.state.saveFolder || ""
+                onClicked: window.peakBridge.invoke("save-figure-auto")
+            }
+            AppButton {
+                colors: window.colors; text: "Apply to main app"
+                objectName: "peak_action_apply-overlay"
+                enabled: !window.state.busy && window.state.canApplyOverlay
+                onClicked: window.peakBridge.invoke("apply-overlay")
             }
             AppButton {
                 id: moreButton
@@ -64,6 +76,25 @@ Basic.ApplicationWindow {
                 Basic.Menu {
                     id: moreMenu
                     y: moreButton.height
+                    Basic.MenuItem {
+                        text: "Save results as…"
+                        objectName: "peak_action_export-dialog"
+                        enabled: window.state.canExport && !window.state.busy
+                        onTriggered: window.peakBridge.invoke("export-dialog")
+                    }
+                    Basic.MenuItem {
+                        text: "Save figure as…"
+                        objectName: "peak_action_save-figure"
+                        enabled: window.state.hasDataset && !window.state.busy
+                        onTriggered: window.peakBridge.invoke("save-figure")
+                    }
+                    Basic.MenuItem {
+                        text: "Open save folder"
+                        objectName: "peak_action_open-save-folder"
+                        enabled: !!window.state.saveFolder && !window.state.busy
+                        onTriggered: window.peakBridge.invoke("open-save-folder")
+                    }
+                    Basic.MenuSeparator { }
                     Repeater {
                         model: [{key: "open-workspace", label: "Open workspace…"}, {key: "save-copy", label: "Save copy…"},
                             {key: "results", label: "Results"}, {key: "task-details", label: "Task details"},
@@ -76,15 +107,19 @@ Basic.ApplicationWindow {
                         }
                     }
                     Basic.MenuSeparator { }
+                    Basic.MenuItem {
+                        text: "Show previous datasets"
+                        objectName: "peak_show_previous_datasets"
+                        checkable: true
+                        checked: window.state.showHistory || false
+                        enabled: window.state.historyCount > 0
+                        onTriggered: window.peakBridge.setParameter("showHistory", checked)
+                    }
+                    Basic.MenuSeparator { }
                     Basic.MenuItem { text: "Back"; enabled: window.state.hasDataset; onTriggered: window.peakBridge.invoke("back") }
                     Basic.MenuItem { text: "Forward"; enabled: window.state.hasDataset; onTriggered: window.peakBridge.invoke("forward") }
-                    Basic.MenuItem { text: "Larger peak markers"; enabled: window.state.hasDataset; onTriggered: window.peakBridge.setParameter("markerSize", (window.state.markerSize || 9) + 1) }
-                    Basic.MenuItem { text: "Smaller peak markers"; enabled: window.state.hasDataset; onTriggered: window.peakBridge.setParameter("markerSize", (window.state.markerSize || 9) - 1) }
-                    Basic.MenuItem {
-                        text: "Analyze full map"
-                        enabled: window.state.hasDataset && !window.state.busy
-                        onTriggered: window.peakBridge.setParameter("analysisScope", "map")
-                    }
+                    Basic.MenuItem { text: "Larger peak markers"; enabled: window.state.hasDataset; onTriggered: window.peakBridge.setParameter("markerSize", (window.state.markerSize || 4) + 1) }
+                    Basic.MenuItem { text: "Smaller peak markers"; enabled: window.state.hasDataset; onTriggered: window.peakBridge.setParameter("markerSize", (window.state.markerSize || 4) - 1) }
                 }
             }
         }
@@ -101,10 +136,29 @@ Basic.ApplicationWindow {
                     delegate: AppButton {
                         required property var modelData
                         colors: window.colors; text: modelData.label; checked: modelData.active
+                        width: Math.min(320, Math.max(160, implicitWidth))
+                        description: modelData.label
                         objectName: "peak_dataset_" + modelData.key
                         enabled: !window.state.busy
                         onClicked: window.peakBridge.setParameter("dataset", modelData.key)
                     }
+                }
+            }
+        }
+        Flow {
+            Layout.fillWidth: true; Layout.leftMargin: 8; Layout.rightMargin: 8; Layout.bottomMargin: 5
+            visible: window.state.kind === "PL"
+            spacing: 6
+            Repeater {
+                model: [{key: "find", label: "1  Find peaks"}, {key: "branches", label: "2  Check peaks"},
+                        {key: "fit", label: "3  Fit"}, {key: "results", label: "4  Results"}]
+                delegate: AppButton {
+                    required property var modelData
+                    objectName: "peak_step_" + modelData.key
+                    text: modelData.label; colors: window.colors
+                    checked: window.state.controlsPage === modelData.key
+                    enabled: window.state.hasDataset && !window.state.busy
+                    onClicked: window.peakBridge.setParameter("controlsPage", modelData.key)
                 }
             }
         }
@@ -117,9 +171,11 @@ Basic.ApplicationWindow {
             orientation: Qt.Horizontal
             ColumnLayout {
                 Basic.SplitView.fillWidth: true
+                Layout.minimumWidth: 0
                 spacing: 2
-                RowLayout {
+                Flow {
                     Layout.fillWidth: true; Layout.margins: 4
+                    spacing: 4
                     Repeater {
                         model: window.state.products || []
                         delegate: AppButton {
@@ -129,43 +185,78 @@ Basic.ApplicationWindow {
                             onClicked: window.peakBridge.setParameter("product", modelData.channel)
                         }
                     }
-                    Item { Layout.fillWidth: true }
-                    Basic.Label { text: window.state.scanLabel || "Scan"; color: window.colors.muted }
-                    Basic.SpinBox {
-                        objectName: "peak_scan_row"
-                        from: 0; to: window.state.rowMaximum || 0
-                        value: window.state.row || 0
-                        editable: true; enabled: window.state.hasDataset && !window.state.busy
-                        Accessible.name: "Measured spectrum row"
-                        onValueModified: window.peakBridge.setParameter("row", value)
+                    RowLayout {
+                        spacing: 6
+                        Basic.Label { text: "Inspect spectrum"; color: window.colors.muted }
+                        Basic.SpinBox {
+                            objectName: "peak_scan_row"
+                            from: 0; to: window.state.rowMaximum || 0
+                            value: window.state.row || 0
+                            editable: true; enabled: window.state.hasDataset && !window.state.busy
+                            Accessible.name: "Measured spectrum row"
+                            onValueModified: window.peakBridge.setParameter("row", value)
+                        }
+                        Basic.Label {
+                            text: (window.state.scanLabel || "Scan") + " = " + Number(window.state.scanValue || 0).toPrecision(5)
+                            color: window.colors.text
+                            Layout.maximumWidth: 150
+                            elide: Text.ElideRight
+                        }
                     }
-                    Basic.Label { text: Number(window.state.scanValue || 0).toPrecision(5); color: window.colors.text }
                 }
                 Flow {
                     Layout.fillWidth: true
                     spacing: 2
                     Repeater {
-                        model: ["home", "pan", "zoom", "save-figure"]
+                        model: ["home", "pan", "zoom"]
                         delegate: AppButton {
                             required property string modelData
                             colors: window.colors
-                            text: modelData === "save-figure" ? "Save figure…" : modelData.charAt(0).toUpperCase() + modelData.slice(1)
+                            text: modelData.charAt(0).toUpperCase() + modelData.slice(1)
                             checked: window.state.plotTool === modelData
+                            Basic.ToolTip.visible: hovered
+                            Basic.ToolTip.text: "Wheel: zoom · Middle-drag: pan · Home: full range"
                             enabled: window.state.hasDataset && !window.state.busy
                             onClicked: window.peakBridge.invoke(modelData)
                         }
                     }
                     Basic.CheckBox {
-                        text: "Show peaks"; checked: window.state.showOverlay
+                        text: "Show positions"; checked: window.state.showOverlay
                         enabled: window.state.hasDataset
                         onToggled: window.peakBridge.setParameter("showOverlay", checked)
                     }
-                    Basic.SpinBox {
-                        visible: window.width >= 900
-                        from: 1; to: 64; value: window.state.markerSize || 9
-                        enabled: window.state.hasDataset
-                        Accessible.name: "Peak marker size"
-                        onValueModified: window.peakBridge.setParameter("markerSize", value)
+                    RowLayout {
+                        spacing: 4
+                        Basic.Label { text: "Size"; color: window.colors.muted }
+                        Basic.SpinBox {
+                            objectName: "peak_marker_size"
+                            from: 1; to: 64; value: window.state.markerSize || 4
+                            enabled: window.state.hasDataset
+                            Accessible.name: "Position marker size"
+                            Basic.ToolTip.visible: hovered
+                            Basic.ToolTip.text: "Change the size of position markers on the map"
+                            onValueModified: window.peakBridge.setParameter("markerSize", value)
+                        }
+                    }
+                    RowLayout {
+                        spacing: 4
+                        Basic.Label { text: "Map size"; color: window.colors.muted }
+                        Basic.Slider {
+                            objectName: "peak_map_height"
+                            implicitWidth: 100
+                            from: 20; to: 80; stepSize: 1
+                            value: window.state.mapHeightPercent || 69
+                            enabled: window.state.hasDataset && !window.state.busy
+                            Accessible.name: "Map height percentage; remaining height is for the spectrum"
+                            onMoved: window.peakBridge.setParameter("mapHeightPercent", value)
+                        }
+                        Basic.Label { text: (window.state.mapHeightPercent || 69) + "%"; color: window.colors.text }
+                        AppButton {
+                            text: "Auto"; colors: window.colors; compact: true
+                            description: "Restore automatic map and spectrum heights"
+                            enabled: window.state.hasDataset && !window.state.busy
+                            onClicked: window.peakBridge.setParameter("mapHeightPercent", "auto")
+                        }
                     }
                 }
                 PlotSurface {
@@ -199,7 +290,7 @@ Basic.ApplicationWindow {
                 }
             }
             PeakAnalysisControls {
-                Basic.SplitView.preferredWidth: 330
+                Basic.SplitView.preferredWidth: window.width >= 1000 ? 330 : 280
                 Basic.SplitView.minimumWidth: 250
                 Basic.SplitView.maximumWidth: 520
                 bridge: window.peakBridge; colors: window.colors
@@ -255,7 +346,7 @@ Basic.ApplicationWindow {
         parentWindow: window
         id: exportDialog
         objectName: "peak_export_dialog"
-        title: "Export complete analysis package"
+        title: "Save Excel, source plot overlay and JSON"
         onAccepted: window.peakBridge.exportTo(selectedFolder.toString())
     }
     Connections {

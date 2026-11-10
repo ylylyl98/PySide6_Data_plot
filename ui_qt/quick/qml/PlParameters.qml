@@ -41,7 +41,7 @@ Rectangle {
             Layout.fillWidth: true
             Layout.fillHeight: true
             currentIndex: root.page
-            PlDisplay { id: display; bridge: root.bridge.plDisplayBridge; colors: root.colors }
+            PlDisplay { id: display; bridge: root.bridge.plDisplayBridge; colors: root.colors; colorRangesInFooter: true; colorRangeController: root.bridge.colorRangeController }
             AppParameterPane {
                 objectName: "pl_options"
                 bridge: root.bridge; colors: root.colors

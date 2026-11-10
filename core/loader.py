@@ -790,9 +790,8 @@ def load_drr_resolved_avg(
     correction, with NaN outside coverage.
     """
     selected = tuple(str(item) for item in files)
-    from core.drr_bn_store import validate_bn_background_usage
-    validate_bn_background_usage(user_folder, selected, tuple(dict.fromkeys(
-        source for item in assignments for source in item.baseline_source_files)), y_axis=y_axis)
+    from core.drr_bn_store import validate_bn_assignment_usage
+    validate_bn_assignment_usage(user_folder, selected, assignments, y_axis=y_axis)
     by_measurement = {item.measurement_file: item for item in assignments}
     if (
         not selected

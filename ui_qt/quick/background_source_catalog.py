@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from collections import OrderedDict
+from threading import Lock
 
 from PySide6.QtCore import Property, Signal, Slot, QUrl
 
@@ -34,6 +36,46 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
         self._selection_token = 0
         self._only_new = False
         self._include_backgrounds = True
+        self._bn_header_cache = OrderedDict()
+        self._bn_header_lock = Lock()
+
+    def _protect_measured_bn(self):
+        return self._inventory_kind == 'drr' and self._source_kind == 'bn' and self._role == 'background'
+
+    def _is_generated_bn(self, value):
+        """Inspect only the CSV header; cache by file identity, not filename."""
+        path = Path(value)
+        if any(part.casefold() == '.drr_bn_calibration' for part in path.parts):
+            return True
+        if path.suffix.casefold() != '.csv':
+            return False
+        try:
+            stat = path.stat()
+            identity = (str(path.resolve()).casefold(), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+            with self._bn_header_lock:
+                if identity in self._bn_header_cache:
+                    self._bn_header_cache.move_to_end(identity)
+                    return self._bn_header_cache[identity]
+            with path.open('r', encoding='utf-8-sig', errors='replace') as stream:
+                generated = 'BNCalibrationVersion' in stream.readline()
+        except OSError:
+            # An unreadable selection cannot be certified as measured BN.
+            return True
+        with self._bn_header_lock:
+            self._bn_header_cache[identity] = generated
+            self._bn_header_cache.move_to_end(identity)
+            while len(self._bn_header_cache) > 4096:
+                self._bn_header_cache.popitem(last=False)
+        return generated
+
+    def _reject_generated_bn(self, paths):
+        if self._protect_measured_bn() and any(self._is_generated_bn(path) for path in paths):
+            self._error = ('Choose an original measured BN file; calibrated BN belongs to its measurement. '
+                           'Use Auto trend to generate or reuse its correction.')
+            self._refresh_models()
+            return True
+        self._error = ''
+        return False
 
     @Property("QVariantMap", notify=SourceCatalogBridge.snapshotChanged)
     def snapshot(self):
@@ -41,6 +83,9 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
         label = self._role if self._role in {"P", "N"} else _LABELS[self._source_kind]
         can_accept = bool(self._selected) if self._multiple else len(self._selected) == 1
         can_accept = can_accept or not self._selected and self._selection_touched
+        hidden_selected = self._protect_measured_bn() and any(self._is_generated_bn(path) for path in self._selected)
+        if hidden_selected:
+            can_accept = False
         state.update(backgroundSelection=True, selectionTitle=f"Choose {label} references",
                      sourceKindLabel=label, acceptLabel="Use selected", showAllFiles=self._show_all_files,
                      multipleSelection=self._multiple,
@@ -49,7 +94,9 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
                      selectionOpen=self._selection_open, selectionToken=self._selection_token,
                      canAccept=self._selection_open and self._editing_enabled and can_accept,
                      canAddGroup=False,
-                     status="Listing reference files…" if self._busy else f"{len(self._files.rows)} files · {len(self._selected)} chosen")
+                     status=("Listing reference files…" if self._busy else
+                         "A calibrated BN is hidden; choose an original measured BN." if hidden_selected else
+                         f"{len(self._files.rows)} files · {len(self._selected)} chosen"))
         return state
 
     def open_selection(self, folder, kind, selected, *, role="background", multiple=False):
@@ -90,7 +137,11 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
         self._resume_selection_catalog(reuse_catalog)
 
     def _can_reuse_catalog(self, root):
-        return self._folder == str(root) and self._catalog_validated and not self._include_all
+        # Older in-memory snapshots have no verified header marker. Re-scan
+        # them rather than keeping a permanently empty filtered catalog.
+        marked = (self._inventory_kind != 'drr' or
+                  all('generatedBN' in row for row in self._catalog['files']))
+        return self._folder == str(root) and self._catalog_validated and not self._include_all and marked
 
     def _resume_selection_catalog(self, reuse_catalog):
         self._watch_active = True
@@ -162,6 +213,7 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
                 relative_parent = str(Path(name).parent).replace("\\", "/")
                 rows.append(dict(id=str(identity), source=name,
                                  name=path.name, kind=label, status="", saved=False,
+                                 generatedBN=self._is_generated_bn(identity) if self._inventory_kind == 'drr' else False,
                                  modified=stat.st_mtime, size=stat.st_size, processedAt="",
                                  background=label != "CSV",
                                  summary=f"{label} · {modified} · {relative_parent}",
@@ -199,6 +251,10 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
         selected = set(self._selected)
         rows = []
         for row in self._catalog["files"]:
+            # Old optimistic caches predate this marker; hide unknown entries
+            # until the worker rechecks their headers, even when selected.
+            if self._protect_measured_bn() and row.get('generatedBN') is not False:
+                continue
             if not self._show_all_files and not self._matches_kind(row) and row["id"] not in selected:
                 continue
             searchable = (row["source"] + " " + row["detail"]).casefold().replace("−", "-")
@@ -208,6 +264,20 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
         self._groups.replace([])
         self._files.replace(rows)
         self._refresh_selection()
+
+    def _refresh_selection(self):
+        """Keep previous draft identities, but never show a managed BN as raw."""
+        selected = set(self._selected)
+        self._files.replace([row if (row['selected'] == (row['id'] in selected)
+            and row['focused'] == (row['id'] == self._focused)) else
+            {**row, 'selected': row['id'] in selected, 'focused': row['id'] == self._focused}
+            for row in self._files.rows])
+        visible = [path for path in self._selected
+                   if not self._protect_measured_bn() or not self._is_generated_bn(path)]
+        self._chosen.replace([{**self._lookup.get(path, dict(id=path, name=Path(path).name,
+            source=path, status='external', detail='Selected external file')), 'selected': True}
+            for path in visible])
+        self.snapshotChanged.emit()
 
     @Slot(str, "QVariant")
     def setParameter(self, key, value):
@@ -224,6 +294,8 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
         if not self._selection_open or not self._editing_enabled:
             return
         path = self._local_path(path, Path(self._folder))
+        if selected and self._reject_generated_bn((path,)):
+            return
         self._selection_touched = True
         if selected:
             if not self._multiple:
@@ -242,19 +314,21 @@ class BackgroundSourceCatalogBridge(SourceCatalogBridge):
     @Slot("QVariantList")
     def addExternal(self, values):
         if not self._selection_open or not self._editing_enabled or not values:
-            return
+            return False
         paths = [self._local_path(value, Path(self._folder)) for value in values]
+        if self._reject_generated_bn(paths):
+            return False
         self._selected = list(dict.fromkeys([*self._selected, *paths])) if self._multiple else paths[-1:]
         self._explicit_selected = set(self._selected)
         self._focused, self._selection_touched = paths[-1], True
         self._refresh_models()
         self.selectionEdited.emit(list(self._selected))
+        return True
 
     def accept_external(self, token, values):
         if not self._selection_open or not self._editing_enabled or token != self._selection_token:
             return False
-        self.addExternal(values)
-        return True
+        return self.addExternal(values) is True
 
     def _stop_selection(self):
         self._selection_open = False

@@ -21,7 +21,13 @@ def update_heatmap_colors(render, cube, params):
     if len(layers) != len(render.images):
         raise ValueError("Color update requires unchanged heatmap regions.")
     for image, (values, norm) in zip(render.images, layers):
-        image.set_array(values)
+        # Matplotlib copies and masks the entire array in set_array. Compare
+        # actual values, not source identity: scientific arrays can be edited
+        # in place, and clipped values must be restored when vmax increases.
+        current = image.get_array()
+        if (current is None or np.ma.is_masked(current)
+                or not np.array_equal(np.ma.getdata(current), values)):
+            image.set_array(values)
         if type(norm) is type(image.norm):
             image.set_clim(norm.vmin, norm.vmax)
         else:
@@ -33,4 +39,9 @@ def update_heatmap_colors(render, cube, params):
             if bar:
                 bar.locator, bar.formatter = locator, formatter
                 bar.update_ticks()
-        image.set_cmap(params.cmap)
+        # set_cmap emits a change even for an equivalent registry colormap;
+        # on a colorbar this rebuilds its artists for every unchanged region.
+        from matplotlib import colormaps
+        cmap = colormaps.get_cmap(params.cmap)
+        if image.get_cmap() != cmap:
+            image.set_cmap(cmap)

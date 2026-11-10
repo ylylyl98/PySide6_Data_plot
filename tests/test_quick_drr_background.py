@@ -48,6 +48,12 @@ def _cold_settings():
             assert bridge.draft.which == "first"
             assert bridge.canvas is None and bridge.plotBackend is None
             assert bridge.snapshot["plotTool"] == ""
+            # Entering BN calibration or choosing a method must stay lazy.
+            bridge.open(context, BackgroundDraft(kind="bn", files=("BNbackground.csv",), which="all"))
+            bridge.invoke("page:bn")
+            bridge.setChoice("bnCalibrationMethod", 0)
+            bridge.setChoice("bnCalibrationMethod", 1)
+            assert bridge.canvas is None and not bridge.snapshot["busy"]
             forbidden = {"core.loader", "core.processing_run", "core.drr_bn_calibration", "core.drr_fitted_background"}
             unexpected = [name for name in sys.modules if name in forbidden
                 or name.split(".", 1)[0] in {"scipy", "matplotlib"}]
@@ -169,6 +175,105 @@ def _isolated():
             wrong.write_text("Vbg,Vtg,1.5,1.6\n0,0,1,2\n")
             with self.assertRaisesRegex(ValueError, "spectral|grid"):
                 prepare_application(self.context, replace(draft, files=(wrong.name,)))
+
+        def test_direct_bn_original_applies_without_generating_a_candidate(self):
+            draft = BackgroundDraft(kind="bn", files=(self.bn,), which="all")
+            self.bridge.open(self.context, draft)
+            self.wait()
+            signals = []
+            self.bridge.applyRequested.connect(signals.append)
+            self.bridge.invoke("apply-bn-original")
+            self.wait()
+            self.assertEqual(len(signals), 1)
+            self.assertEqual(signals[0].recipe.files, (self.bn,))
+            self.assertIsNone(signals[0].draft.calibration)
+            self.assertEqual(self.bridge.draft, draft)
+            self.assertFalse(self.settings.contains("drr/bn_auto_compare"))
+            from core.drr_bn_store import DrrBnStore
+            store = DrrBnStore(self.root)
+            self.assertFalse(store.has_original_choice(self.context.measurements, (self.bn,), "all"))
+            commit_application(signals[0], current_context=self.context, settings=self.settings)
+            self.assertTrue(store.has_original_choice(self.context.measurements, (self.bn,), "all"))
+
+        def test_direct_bn_candidate_is_transactional_and_requires_current_preview(self):
+            draft = BackgroundDraft(kind="bn", files=(self.bn,), which="all")
+            self.bridge.open(self.context, draft)
+            self.wait()
+            signals = []
+            self.bridge.applyRequested.connect(signals.append)
+            self.bridge.invoke("apply-bn-candidate")
+            self.assertIn("eligible calibration preview", self.bridge.snapshot["error"])
+            payload = dict(eligible=True, candidates=[], report={})
+            self.bridge._bn_payload = payload
+            with patch.object(self.bridge, "_run", side_effect=lambda work, complete, message: complete(work(None))), \
+                 patch("ui_qt.quick.drr_background_bridge.prepare_application", side_effect=ValueError("source changed")):
+                self.bridge.invoke("apply-bn-candidate")
+            self.assertIn("source changed", self.bridge.snapshot["error"])
+            self.assertEqual(signals, [])
+            self.assertEqual(self.bridge.draft, draft)
+            prepared = object()
+            with patch.object(self.bridge, "_run", side_effect=lambda work, complete, message: complete(work(None))), \
+                 patch("ui_qt.quick.drr_background_bridge.prepare_application", return_value=prepared) as prepare:
+                self.bridge.invoke("apply-bn-candidate")
+                proposal = prepare.call_args.args[1]
+                self.assertEqual(proposal.calibration, dict(payload=payload, original=False))
+                self.assertEqual(signals, [prepared])
+                self.assertEqual(self.bridge.draft, draft)
+                self.bridge.invoke("apply-bn-original")
+                self.assertTrue(prepare.call_args.args[1].calibration["original"])
+            self.bridge.setChoice("bnCalibrationMethod", 0)
+            self.bridge.invoke("apply-bn-candidate")
+            self.assertIn("eligible calibration preview", self.bridge.snapshot["error"])
+            self.assertEqual(len(signals), 2)
+            self.assertFalse(self.settings.contains("drr/bn_auto_compare"))
+
+        def test_direct_original_bn_commit_failure_retains_selection(self):
+            from core.drr_bn_store import DrrBnStore
+            store = DrrBnStore(self.root)
+            store.deactivate(self.context.measurements, (self.n,), "first", restore_original=True)
+            before = store.manifest_path.read_bytes()
+            draft = BackgroundDraft(kind="bn", files=(self.bn,), which="all")
+            prepared = prepare_application(self.context, draft, original_bn=True)
+            self.assertEqual(store.manifest_path.read_bytes(), before)
+            with patch.object(DrrBnStore, "_atomic_json", side_effect=OSError("disk full")):
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    commit_application(prepared, current_context=self.context, settings=self.settings)
+            self.assertEqual(store.manifest_path.read_bytes(), before)
+            self.assertFalse(self.settings.contains("drr/bn_auto_compare"))
+            with self.assertRaisesRegex(ValueError, "context"):
+                commit_application(prepared, current_context=replace(self.context, measurements=(self.sample,)), settings=self.settings)
+            self.assertEqual(store.manifest_path.read_bytes(), before)
+
+        def test_direct_original_bn_requires_common_measured_sources_without_preview(self):
+            from core.drr_sources import DrrMeasurementAssignment
+            assignments = tuple(DrrMeasurementAssignment(name, "External", (source,), "all")
+                                for name, source in zip(self.context.measurements, (self.bn, self.n)))
+            draft = BackgroundDraft(kind="bn", saved_assignments=assignments)
+            with self.assertRaisesRegex(ValueError, "generated comparison"):
+                prepare_application(self.context, draft, original_bn=True)
+
+        def test_direct_bn_apply_rejects_duplicate_and_obsolete_requests(self):
+            draft = BackgroundDraft(kind="bn", files=(self.bn,), which="all")
+            self.bridge.open(self.context, draft)
+            self.wait()
+            release, started = Event(), Event()
+            self.addCleanup(release.set)
+            signals = []
+            self.bridge.applyRequested.connect(signals.append)
+            def prepare(context, proposal, **kwargs):
+                started.set()
+                release.wait(3)
+                return "obsolete"
+            with patch("ui_qt.quick.drr_background_bridge.prepare_application", side_effect=prepare) as work:
+                self.bridge.invoke("apply-bn-original")
+                self.assertTrue(started.wait(1))
+                self.bridge.invoke("apply-bn-original")
+                self.assertEqual(work.call_count, 1)
+                self.bridge.open(replace(self.context, measurements=(self.sample,)), draft)
+                release.set()
+                self.wait()
+                settle(100)
+            self.assertEqual(signals, [])
 
         def test_fixed_common_recipe_rebinds_without_reusing_group_assignments(self):
             first = prepare_application(self.context, BackgroundDraft(kind="bn", files=(self.bn,), which="all", fixed=True))
@@ -459,6 +564,404 @@ def _isolated():
             self.assertEqual(parse_regions("1.5 1.6; 1.7, 1.8"), ((1.5, 1.6), (1.7, 1.8)))
             with self.assertRaises(ValueError):
                 parse_regions("1.8 1.7")
+
+        def test_multiple_bn_per_file_default_preview_and_joint_option(self):
+            from types import ModuleType
+            from core.drr_sources import DrrMeasurementAssignment
+            original = [DrrMeasurementAssignment(name, "External", (self.bn,), "all") for name in self.context.measurements]
+            candidate = [DrrMeasurementAssignment(self.sample, "External", ("managed.csv",), "last"), original[1]]
+            payload = dict(batch=True, eligible=True, status="per_measurement", summary="One candidate eligible",
+                source_identity=dict(root=str(self.root), measurements=[dict(path=v) for v in self.context.measurements], y_axis=self.context.y_axis),
+                settings=dict(derivative_window=self.context.derivative_window, derivative_polyorder=self.context.derivative_polyorder),
+                original_assignments=[v.to_dict() for v in original], candidate_assignments=[v.to_dict() for v in candidate],
+                items=[dict(measurement=self.sample, version_id="v1", status="single_pair", eligible=True, summary="eligible"),
+                       dict(measurement=self.sample2, version_id="v2", status="original", eligible=False, summary="fallback")],
+                energy=self.energy, gates=np.arange(3), original_drr=np.ones((3, len(self.energy))),
+                candidate_drr=np.full((3, len(self.energy)), 2.), original_d2=np.ones((3, len(self.energy))),
+                candidate_d2=np.full((3, len(self.energy)), 2.), candidates=[], report={}, exports={}, elapsed_seconds=1.)
+            module = ModuleType("ui_qt.quick.drr_bn_batch_workflow")
+            calls = []
+            def compare(*args, **kwargs):
+                calls.append((args, kwargs))
+                return payload
+            module.compare_bn_batch = compare
+            self.bridge.open(self.context, BackgroundDraft(kind="bn", files=(self.bn,), which="all"))
+            self.assertTrue(self.bridge.snapshot["bnIndividualCalibration"])
+            with patch.dict(sys.modules, {"ui_qt.quick.drr_bn_batch_workflow": module}), \
+                 patch.object(self.bridge, "_run", side_effect=lambda work, complete, message: complete(work(None))):
+                self.bridge.invoke("page:bn")
+                self.bridge._compare_bn()
+                self.bridge._refresh()
+                self.assertEqual(len(calls), 1)
+                self.assertTrue(calls[0][1]["settings"]["single_full_range"])
+                self.assertEqual(len(self.bridge.canvas.figure.axes), 6)
+                axes = self.bridge.canvas.figure.axes
+                self.assertEqual([axis.collections[0].get_clim() for axis in axes[:3]], [(1., 2.)]*3)
+                self.assertEqual([axis.collections[0].get_clim() for axis in axes[3:]], [(-2., 2.)]*3)
+                self.assertIn("not applied", axes[2].get_title())
+                self.assertIn("Original BN retained", self.bridge.snapshot["bnBatchItems"][1]["status"])
+                self.assertTrue(self.bridge.snapshot["canUseCalibrated"])
+                self.bridge.invoke("use-bn-candidate")
+                self.assertEqual(self.bridge._raw_assignments(), tuple(candidate))
+                draft = self.bridge.draft
+                self.bridge.open(self.context, draft)
+                self.assertTrue(self.bridge.restore_comparison(payload))
+                wrong = dict(payload, source_identity={**payload["source_identity"], "y_axis": "wrong"})
+                self.assertFalse(self.bridge.restore_comparison(wrong))
+                self.bridge.invoke("page:bn")
+                engine = QQmlEngine()
+                component = QQmlComponent(engine, QUrl.fromLocalFile(str(Path(__file__).resolve().parents[1]/"ui_qt"/"quick"/"qml"/"DrrBackgroundSettings.qml")))
+                item = component.createWithInitialProperties(dict(bridge=self.bridge, colors=colors))
+                self.assertIsNotNone(item, "\n".join(error.toString() for error in component.errors()))
+                window = QQuickWindow()
+                window.resize(1020, 720)
+                item.setParentItem(window.contentItem())
+                item.setSize(window.size())
+                window.show()
+                settle(35)
+                self.assertTrue(item.findChild(QQuickItem, "drr_background_flag_bn.per_measurement").isVisible())
+                self.assertFalse(item.findChild(QQuickItem, "drr_background_flag_bn.single_full_range").isVisible())
+                item.findChild(QQuickItem, "drr_bn_advanced_toggle").clicked.emit()
+                settle()
+                self.assertTrue(item.findChild(QQuickItem, "drr_background_flag_bn.single_full_range").isVisible())
+                self.assertFalse(item.findChild(QQuickItem, "bn_weak_feature_warning").isVisible())
+                item.findChild(QQuickItem, "drr_bn_details_toggle").clicked.emit()
+                settle()
+                self.assertTrue(item.findChild(QQuickItem, "bn_weak_feature_warning").isVisible())
+                self.bridge.setFlag("bn.per_measurement", False)
+                settle()
+                self.assertFalse(item.findChild(QQuickItem, "drr_background_flag_bn.single_full_range").isVisible())
+                window.close()
+                item.deleteLater()
+                settle()
+                self.assertFalse(self.bridge.snapshot["bnIndividualCalibration"])
+                self.assertFalse(self.bridge.snapshot["canUseCalibrated"])
+                with patch("ui_qt.quick.drr_background_workflow.compare_bn", return_value=payload) as joint:
+                    self.bridge._compare_bn()
+                    joint.assert_called_once()
+
+        def test_single_bn_trend_settings_route_and_invalidate_preview(self):
+            context = replace(self.context, measurements=(self.sample,))
+            self.bridge.open(context, BackgroundDraft(kind="bn", files=(self.bn,), which="all"))
+            self.assertFalse(self.bridge.snapshot["flags"]["bn.single_trend_enabled"])
+            self.assertEqual(self.bridge.snapshot["choices"]["bnCalibrationMethod"]["current"], 1)
+            self.assertEqual(self.bridge.snapshot["choices"]["bnTrendOrder"]["current"], 0)
+            self.bridge._bn_payload = dict(eligible=True, candidates=[], report={})
+            self.bridge._refresh()
+            self.assertTrue(self.bridge.snapshot["canUseCalibrated"])
+            self.bridge.setChoice("bnCalibrationMethod", 0)
+            self.assertFalse(self.bridge.snapshot["canUseCalibrated"])
+            self.bridge.setText("bn.single_trend_regions", "1.46 1.53; 1.94 2.02")
+            self.bridge.setChoice("bnTrendOrder", 2)
+            self.bridge.setNumber("bn.single_trend_max_sensitivity", .03)
+            with patch("ui_qt.quick.drr_background_workflow.compare_bn") as compare, \
+                 patch.object(self.bridge, "_run", side_effect=lambda work, complete, message: work(None)):
+                self.bridge._compare_bn()
+                config = compare.call_args.kwargs["settings"]
+                self.assertTrue(config["single_trend_enabled"])
+                self.assertEqual(config["single_trend_regions"], ((1.46, 1.53), (1.94, 2.02)))
+                self.assertEqual(config["single_trend_order"], "quadratic")
+                self.assertEqual(config["single_trend_max_sensitivity"], .03)
+                self.assertNotIn("single_regions", config)
+            self.bridge.setFlag("bn.single_trend_enabled", False)
+            with patch("ui_qt.quick.drr_background_workflow.compare_bn") as compare, \
+                 patch.object(self.bridge, "_run", side_effect=lambda work, complete, message: work(None)):
+                self.bridge._compare_bn()
+                self.assertFalse(compare.call_args.kwargs["settings"]["single_trend_enabled"])
+            from types import ModuleType
+            module = ModuleType("ui_qt.quick.drr_bn_batch_workflow")
+            from unittest.mock import Mock
+            module.compare_bn_batch = Mock()
+            self.bridge.open(self.context, BackgroundDraft(kind="bn", files=(self.bn,), which="all"))
+            self.bridge.setFlag("bn.single_trend_enabled", True)
+            with patch.dict(sys.modules, {"ui_qt.quick.drr_bn_batch_workflow": module}), \
+                 patch.object(self.bridge, "_run", side_effect=lambda work, complete, message: work(None)):
+                self.bridge._compare_bn()
+                self.assertTrue(module.compare_bn_batch.call_args.kwargs["settings"]["single_trend_enabled"])
+                self.assertEqual(module.compare_bn_batch.call_args.kwargs["settings"]["single_trend_order"], "quadratic")
+
+        def test_single_bn_trend_report_restores_settings_and_diagnostics(self):
+            context = replace(self.context, measurements=(self.sample,))
+            self.bridge.open(context, BackgroundDraft(kind="bn", files=(self.bn,), which="all"))
+            payload = dict(eligible=True, candidates=[], summary="Trend ready", status="single_pair", reasons=[],
+                source_identity=dict(root=str(self.root), measurements=[dict(path=self.sample)],
+                    baseline_files=[dict(path=self.bn)], baseline_which="all", y_axis=context.y_axis),
+                settings=dict(derivative_window=context.derivative_window, derivative_polyorder=context.derivative_polyorder,
+                    single_trend_enabled=True, single_trend_order="linear", single_trend_regions=((1.46,1.53),(1.94,2.02)),
+                    single_trend_max_sensitivity=.03),
+                report=dict(optimization_policy="shared_bn_trend_v1", selected_candidate="trend_linear",
+                    models=dict(trend_linear=dict(cv_original_rms=.1,cv_candidate_rms=.04,max_sensitivity=.012,sensitivity_pass=True))))
+            with patch.object(self.bridge, "_draw_preview"):
+                self.assertTrue(self.bridge.restore_comparison(payload))
+            state=self.bridge.snapshot
+            self.assertTrue(state["flags"]["bn.single_trend_enabled"])
+            self.assertEqual(state["choices"]["bnCalibrationMethod"]["current"], 0)
+            self.assertEqual(state["choices"]["bnTrendOrder"]["current"], 1)
+            self.assertEqual(state["numbers"]["bn.single_trend_max_sensitivity"], .03)
+            self.assertEqual(parse_regions(state["texts"]["bn.single_trend_regions"]), ((1.46,1.53),(1.94,2.02)))
+            self.assertIn("Shared linear trend", state["bnModelSummary"])
+            self.assertIn("1.20%", state["bnModelSummary"])
+            self.assertIn("D2 not validated", state["bnModelSummary"])
+            payload["report"] = dict(optimization_policy="shared_bn_trend_v2", selected_candidate="trend_linear",
+                models=dict(trend_linear=dict(strength=.375, eligible=True, d2_guard=dict(max_relative_change=.049))))
+            with patch.object(self.bridge, "_draw_preview"):
+                self.assertTrue(self.bridge.restore_comparison(payload))
+            self.assertIn("Adaptive linear", self.bridge.snapshot["bnModelSummary"])
+            self.assertIn("4.9%", self.bridge.snapshot["bnModelSummary"])
+            self.bridge.setChoice("bnTrendOrder", 2)
+            self.assertFalse(self.bridge.snapshot["canUseCalibrated"])
+
+        def test_single_bn_full_range_setting_reaches_comparison(self):
+            context = replace(self.context, measurements=(self.sample,))
+            self.bridge.open(context, BackgroundDraft(kind="bn", files=(self.bn,), which="all"))
+            with patch("ui_qt.quick.drr_background_workflow.compare_bn") as compare, \
+                 patch.object(self.bridge, "_run", side_effect=lambda work, complete, message: work(None)):
+                self.bridge._compare_bn()
+                self.assertTrue(compare.call_args.kwargs["settings"]["single_full_range"])
+                self.bridge.setFlag("bn.single_full_range", False)
+                self.bridge._compare_bn()
+                self.assertFalse(compare.call_args.kwargs["settings"]["single_full_range"])
+
+        def test_single_bn_payload_renders_output_and_weak_feature_warning(self):
+            context = replace(self.context, measurements=(self.sample,))
+            with patch("core.drr_bn_single_exports.save_single_pair_products", return_value=dict(
+                    status="preview_only", paths={"comparison_png": "comparison.png"}, directory=str(self.root), elapsed_seconds=0.1)):
+                payload = compare_bn(context, (self.bn,), "all")
+            self.bridge.open(context, BackgroundDraft(kind="bn", files=(self.bn,), which="all"))
+            payload["report"]["optimization_policy"] = "multi_bn_single_v1"
+            self.bridge._bn_payload = payload
+            self.bridge.invoke("page:bn")
+            self.bridge._refresh()
+            self.assertEqual(len(self.bridge.canvas.figure.axes), 6)
+            np.testing.assert_allclose(payload["preview"]["maps_drr"][0],
+                                       payload["mean_raw"]/payload["original_background"]-1)
+            axes = self.bridge.canvas.figure.axes
+            self.assertEqual(axes[0].collections[0].get_clim(), axes[1].collections[0].get_clim())
+            self.assertEqual(axes[2].collections[0].get_clim(), axes[3].collections[0].get_clim())
+            self.assertEqual(axes[2].collections[0].get_clim()[0], -axes[2].collections[0].get_clim()[1])
+            self.assertEqual(axes[4].get_ylabel(), "DR/R")
+            self.assertEqual(axes[5].get_ylabel(), "D2 (eV⁻²)")
+            self.assertEqual(axes[0].get_ylabel(), payload["preview"]["gate_label"])
+            payload["eligible"] = False
+            payload["preview"]["candidate_available"] = True
+            self.bridge._draw_preview()
+            self.assertIn("not eligible", self.bridge.canvas.figure.axes[1].get_title())
+            payload["eligible"] = True
+            self.bridge._draw_preview()
+            self.assertIn("Eligible within-scan", self.bridge.canvas.figure.axes[1].get_title())
+            payload["eligible"] = False
+            self.bridge._draw_preview()
+            self.assertIn("Multi BN measured texture templates", self.bridge.snapshot["bnModelSummary"])
+            payload["report"] = {"single_pair_scope": {"model": "phase_ten_knots"}}
+            self.bridge._refresh()
+            self.assertIn("smooth energy-dependent phase", self.bridge.snapshot["bnModelSummary"])
+            payload["report"]["single_pair_scope"]["model"] = "phase_with_shared_high_frequency"
+            self.bridge._refresh()
+            self.assertIn("phase and shared fine-response correction", self.bridge.snapshot["bnModelSummary"])
+            self.assertTrue(self.bridge.snapshot["bnSingleMeasurement"])
+            self.assertIn("comparison.png", self.bridge.snapshot["bnOutputSummary"])
+            self.assertEqual(self.bridge.snapshot["canUseCalibrated"], payload["eligible"])
+            engine = QQmlEngine()
+            warnings = []
+            engine.warnings.connect(lambda messages: warnings.extend(message.toString() for message in messages))
+            path = Path(__file__).resolve().parents[1]/"ui_qt"/"quick"/"qml"/"DrrBackgroundSettings.qml"
+            component = QQmlComponent(engine, QUrl.fromLocalFile(str(path)))
+            item = component.createWithInitialProperties(dict(bridge=self.bridge, colors=colors))
+            self.assertIsNotNone(item, "\n".join(error.toString() for error in component.errors()))
+            window = QQuickWindow()
+            window.resize(1020, 720)
+            item.setParentItem(window.contentItem())
+            item.setWidth(1020)
+            item.setHeight(720)
+            window.show()
+            settle(35)
+            capture = os.environ.get("DPTK_BN_CAPTURE")
+            if capture:
+                settle(500)
+                window.grabWindow().save(capture)
+            warning = item.findChild(QQuickItem, "bn_weak_feature_warning")
+            outputs = item.findChild(QQuickItem, "bn_outputs")
+            self.assertFalse(warning.isVisible())
+            self.assertFalse(item.findChild(QQuickItem, "bn_model_summary").isVisible())
+            with patch.object(self.bridge, "_draw_preview") as draw:
+                item.findChild(QQuickItem, "drr_bn_details_toggle").clicked.emit()
+                settle()
+                draw.assert_not_called()
+            self.assertTrue(warning.isVisible())
+            self.assertIn("Real sample peaks and weak features", warning.property("text"))
+            self.assertTrue(item.findChild(QQuickItem, "bn_model_summary").isVisible())
+            self.assertTrue(outputs.isVisible())
+            self.assertIn("1 file generated", outputs.property("text"))
+            self.assertNotIn("comparison.png", outputs.property("text"))
+            self.assertIn("comparison.png", self.bridge.snapshot["bnOutputSummary"])
+            self.assertEqual(self.bridge.snapshot["bnOutputCount"], 1)
+            self.assertTrue(item.findChild(QQuickItem, "drr_background_open-bn-output-folder").isVisible())
+            with patch("PySide6.QtGui.QDesktopServices.openUrl", return_value=True) as opener:
+                self.bridge.invoke("open-bn-output-folder")
+                opener.assert_called_once()
+            multi_note = item.findChild(QQuickItem, "bn_multi_reference_explanation")
+            self.assertTrue(multi_note.isVisible())
+            self.bridge.setFlag("bn.single_trend_enabled", True)
+            settle()
+            trend_note = item.findChild(QQuickItem, "bn_trend_explanation")
+            self.assertTrue(trend_note.isVisible())
+            self.assertIn("Changes absolute DR/R", trend_note.property("text"))
+            self.assertFalse(item.findChild(QQuickItem, "drr_background_apply").isVisible())
+            self.assertTrue(item.findChild(QQuickItem, "drr_background_generate-bn").isVisible())
+            self.assertTrue(item.findChild(QQuickItem, "drr_background_compare-bn").isVisible())
+            self.assertTrue(item.findChild(QQuickItem, "drr_background_choice_bnCalibrationMethod").isVisible())
+            self.assertFalse(item.findChild(QQuickItem, "drr_background_editor_bn.single_trend_regions").isVisible())
+            item.findChild(QQuickItem, "drr_bn_advanced_toggle").clicked.emit()
+            settle()
+            self.assertTrue(item.findChild(QQuickItem, "drr_background_editor_bn.single_trend_regions").isVisible())
+            self.assertFalse(item.findChild(QQuickItem, "drr_background_editor_bn.taper_width").isVisible())
+            self.assertFalse(item.findChild(QQuickItem, "drr_background_flag_bn.single_full_range").isVisible())
+            self.bridge.setFlag("bn.single_trend_enabled", False)
+            settle()
+            self.assertIn("One measured BN file is enough", multi_note.property("text"))
+            self.assertIn("not independent sample repeats", multi_note.property("text"))
+            self.assertTrue(self.bridge.snapshot["flags"]["bn.single_full_range"])
+            self.assertFalse(item.findChild(QQuickItem, "drr_background_editor_bn.single_regions").isVisible())
+            self.assertFalse(item.findChild(QQuickItem, "drr_background_editor_bn.protected_regions").isVisible())
+            self.bridge.setFlag("bn.single_full_range", False)
+            settle()
+            self.assertTrue(item.findChild(QQuickItem, "drr_background_editor_bn.single_regions").isVisible())
+            self.assertTrue(item.findChild(QQuickItem, "drr_background_editor_bn.protected_regions").isVisible())
+            self.assertFalse(self.bridge.snapshot["canUseCalibrated"])
+            self.assertFalse(item.findChild(QQuickItem, "drr_background_editor_bn.uncertain_regions").isVisible())
+            self.assertFalse(item.findChild(QQuickItem, "drr_background_editor_bn.trusted_regions").isVisible())
+            self.assertIsNone(item.findChild(QQuickItem, "drr_background_editor_bn.train_region.low"))
+            self.assertFalse(warnings, "\n".join(warnings))
+            window.close()
+            item.deleteLater()
+            settle()
+
+        def test_direct_bn_button_generates_automatic_trend_without_method_page(self):
+            context = replace(self.context, measurements=(self.sample,))
+            self.bridge.open(context, BackgroundDraft(kind="bn", files=(self.bn,), which="all"))
+            self.bridge.setChoice("bnCalibrationMethod", 1)
+            self.bridge.setChoice("bnTrendOrder", 2)
+            self.bridge.setText("bn.single_trend_regions", "1.45 1.55; 1.95 2.05")
+            self.bridge._bn_payload = dict(summary="old texture", eligible=True)
+            payload = dict(summary="automatic trend", eligible=True, candidates=[], report={}, settings=dict(single_trend_enabled=True))
+            self.bridge.set_current_background_label("Original BN")
+            generated = []
+            self.bridge.calibrationGenerated.connect(generated.append)
+            applications = []
+            self.bridge.applyRequested.connect(applications.append)
+            engine = QQmlEngine()
+            path = Path(__file__).resolve().parents[1]/"ui_qt"/"quick"/"qml"/"DrrBackgroundSettings.qml"
+            component = QQmlComponent(engine, QUrl.fromLocalFile(str(path)))
+            item = component.createWithInitialProperties(dict(bridge=self.bridge, colors=colors))
+            self.assertIsNotNone(item)
+            window = QQuickWindow()
+            window.resize(760, 640)
+            item.setParentItem(window.contentItem())
+            item.setWidth(760)
+            item.setHeight(640)
+            window.show()
+            settle(100)
+            button = item.findChild(QQuickItem, "drr_background_calibrate-bn")
+            self.assertTrue(button.isVisible())
+            self.assertTrue(button.isEnabled())
+            self.assertEqual(button.property("text"), "Calibrate & use · Auto trend")
+            self.assertFalse(item.findChild(QQuickItem, "drr_background_choice_bnCalibrationMethod").isVisible())
+            capture = os.environ.get("DPTK_BN_DIRECT_CAPTURE")
+            if capture:
+                window.grabWindow().save(capture)
+            with patch("ui_qt.quick.drr_background_workflow.compare_bn", return_value=payload) as compare, \
+                 patch("ui_qt.quick.drr_background_bridge.prepare_application", return_value="prepared") as prepare, \
+                 patch.object(self.bridge, "_run", side_effect=lambda work, complete, message: complete(work(None))), \
+                 patch.object(self.bridge, "_draw_preview") as draw:
+                button.clicked.emit()
+                self.assertEqual(generated, [payload])
+                self.assertEqual(applications, ["prepared"])
+                self.assertFalse(prepare.call_args.args[1].calibration["original"])
+                self.assertEqual(self.bridge.snapshot["page"], "settings")
+                self.assertEqual(compare.call_args.args[1:3], ((self.bn,), "all"))
+                config = compare.call_args.kwargs["settings"]
+                self.assertTrue(config["single_trend_enabled"])
+                self.assertEqual(config["single_trend_order"], "auto")
+                self.assertEqual(config["single_trend_regions"], ())
+                self.assertFalse(compare.call_args.kwargs["export_products"])
+                settle()
+                current = item.findChild(QQuickItem, "bn_current_background")
+                ready = item.findChild(QQuickItem, "bn_generated_background")
+                self.assertEqual(current.property("text"), "Current: Original BN")
+                self.assertEqual(ready.property("text"), "Ready: Auto trend · not applied")
+                self.assertTrue(ready.isVisible())
+                self.assertFalse(item.findChild(QQuickItem, "drr_background_apply").isVisible())
+                self.assertIsNone(item.findChild(QQuickItem, "drr_background_export-bn"))
+                if capture:
+                    window.grabWindow().save(capture.replace(".png", "-ready.png"))
+                draw.assert_not_called()
+                self.bridge.invoke("page:bn")
+                self.bridge.setChoice("bnCalibrationMethod", 1)
+                self.bridge.invoke("generate-bn")
+                self.assertFalse(compare.call_args.kwargs["settings"]["single_trend_enabled"])
+                self.assertEqual(applications, ["prepared"])
+            window.close()
+            item.setParentItem(None)
+            item.deleteLater()
+            settle()
+            window.deleteLater()
+            QGuiApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            settle()
+
+        def test_direct_bn_batch_and_failure_do_not_reuse_previous_candidate(self):
+            self.bridge.open(self.context, BackgroundDraft(kind="bn", files=(self.bn,), which="all"))
+            self.bridge.setFlag("bn.per_measurement", False)
+            self.bridge._bn_payload = dict(summary="old texture", eligible=True)
+            generated = []
+            self.bridge.calibrationGenerated.connect(generated.append)
+            with patch("ui_qt.quick.drr_bn_batch_workflow.compare_bn_batch", side_effect=ValueError("failed current inputs")) as compare, \
+                 patch.object(self.bridge, "_run", side_effect=lambda work, complete, message: complete(work(None))):
+                self.bridge.invoke("calibrate-bn")
+                compare.assert_called_once()
+                self.assertTrue(compare.call_args.kwargs["settings"]["single_trend_enabled"])
+                self.assertTrue(self.bridge.snapshot["flags"]["bn.per_measurement"])
+                self.assertEqual(generated, [])
+                self.assertIn("failed current inputs", self.bridge.snapshot["error"])
+                self.assertFalse(self.bridge.snapshot["canUseCalibrated"])
+
+        def test_bn_picker_uses_measured_inputs_of_applied_calibration(self):
+            context = replace(self.context, measurements=(self.sample,))
+            generated = self.root / "copy_BNbackground.csv"
+            generated.write_text("Vbg,Vtg,BNCalibrationVersion,730\n0,0,bn_test,10\n", encoding="utf-8")
+            payload = dict(source_identity=dict(baseline_files=[dict(path=self.bn)], baseline_which="all"))
+            draft = BackgroundDraft(kind="bn", files=(generated.name,),
+                                    calibration=dict(payload=payload, original=False))
+            self.bridge.open(context, draft)
+            self.assertEqual(self.bridge._background_files(), (self.bn,))
+            self.assertEqual(self.bridge.snapshot["files"], [self.bn])
+            self.assertIsNotNone(self.bridge.draft.calibration)
+            self.bridge.selectFiles("background", [str(generated)])
+            self.assertIn("measurement-specific", self.bridge.snapshot["error"])
+            self.assertEqual(self.bridge.draft, draft)
+            result = dict(summary="recalibrated", eligible=False, candidates=[], report={})
+            with patch("ui_qt.quick.drr_background_workflow.compare_bn", return_value=result) as compare, \
+                 patch.object(self.bridge, "_run", side_effect=lambda work, complete, message: complete(work(None))):
+                self.bridge.invoke("calibrate-bn")
+                self.assertEqual(compare.call_args.args[1:3], ((self.bn,), "all"))
+
+        def test_bn_generation_returns_result_without_mandatory_preview_or_refit(self):
+            context = replace(self.context, measurements=(self.sample,))
+            self.bridge.open(context, BackgroundDraft(kind="bn", files=(self.bn,), which="all"))
+            payload = dict(summary="generated", eligible=True, candidates=[], report={})
+            generated = []
+            self.bridge.calibrationGenerated.connect(generated.append)
+            with patch("ui_qt.quick.drr_background_workflow.compare_bn", return_value=payload) as compare, \
+                 patch.object(self.bridge, "_run", side_effect=lambda work, complete, message: complete(work(None))), \
+                 patch.object(self.bridge, "_draw_preview") as draw:
+                self.bridge.invoke("generate-bn")
+                self.assertEqual(generated, [payload])
+                draw.assert_not_called()
+                self.bridge.invoke("generate-bn")
+                compare.assert_called_once()
+                self.assertEqual(len(generated), 2)
+                self.bridge.invoke("compare-bn")
+                compare.assert_called_once()
+                draw.assert_called_once()
 
         def test_real_qml_pages_render_without_widgets_or_errors(self):
             engine = QQmlEngine()

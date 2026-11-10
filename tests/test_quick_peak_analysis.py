@@ -214,6 +214,109 @@ def _run_isolated():
             self.idle()
             self.assertEqual(self.bridge.snapshot["resultCount"], 10)
 
+        def test_pl_manual_editor_preserves_edits_and_fits_fixed_center(self):
+            dataset = self.install()
+            self.detect()
+            self.bridge.setParameter('controlsPage', 'branches')
+            row = dataset['row']
+            point = next(p for p in dataset['result']['points'] if p['row_index'] == row)
+            identity = point['branch_id']
+            self.bridge.setParameter('manual.target', identity)
+            center = point['energy'] + .00012
+            self.bridge.setParameter('manual.energy', center)
+            self.bridge.setParameter('manual.fixed', True)
+            self.bridge.invoke('manual-move'); self.idle()
+            self.assertEqual(dataset['manual_peak_edits'][0]['energy'], center)
+            self.bridge.setParameter('model', 'Asymmetric Lorentzian'); self.idle()
+            self.bridge.invoke('fit'); self.idle()
+            moved = next(p for p in dataset['result']['points'] if p['row_index'] == row and p['branch_id'] == identity)
+            self.assertEqual(moved['fit_center'], center)
+            self.assertTrue(moved['fit_center_fixed'])
+            self.assertTrue(dataset['result']['fits'])
+            self.bridge.invoke('manual-exclude'); self.idle()
+            self.assertFalse(dataset['result']['fits'])
+            self.bridge.invoke('detect'); self.idle()
+            self.assertFalse(any(p['row_index'] == row and abs(p['energy']-center) < .0003 for p in dataset['result']['points']))
+            self.bridge.setParameter('manual.energy', 1.452123)
+            self.bridge.setParameter('manual.fixed', False)
+            self.bridge.invoke('manual-add'); self.idle()
+            added = [p for p in dataset['result']['points'] if p.get('manual')]
+            self.assertEqual(len(added), 1)
+            self.assertEqual(added[0]['energy'], 1.452123)
+            self.assertEqual(added[0]['row_index'], row)
+            saved = self.root / 'manual.npz'
+            self.bridge.saveWorkspace(str(saved)); self.idle()
+            self.assertEqual(load_workspace(saved)[0][0]['manual_peak_edits'], dataset['manual_peak_edits'])
+            engine = QQmlApplicationEngine()
+            engine.setInitialProperties({'peakBridge': self.bridge})
+            engine.load(QUrl.fromLocalFile(str(Path(__file__).resolve().parents[1] / 'ui_qt/quick/qml/PeakAnalysis.qml')))
+            window = engine.rootObjects()[0]
+            self.addCleanup(lambda: (window.setVisible(False), engine.deleteLater(), app.processEvents()))
+            window.setWidth(1200); window.setHeight(1000); self.idle()
+            self.assertIsNotNone(find(window.contentItem(), 'app_parameter_manual.energy'))
+            self.assertTrue(find(window.contentItem(), 'app_parameter_manual-pick').property('visible'))
+            self.assertTrue(find(window.contentItem(), 'peak_workflow_primary').property('visible'))
+            if os.environ.get('DPTK_PEAK_REVIEW_DIR'):
+                path = Path(os.environ['DPTK_PEAK_REVIEW_DIR']); path.mkdir(parents=True, exist_ok=True)
+                window.grabWindow().save(str(path / 'pl-manual-editor.png'))
+            self.bridge.invoke('manual-restore'); self.idle()
+            self.assertFalse(dataset.get('manual_peak_edits'))
+
+        def test_pl_four_step_workflow_and_stale_result_guards(self):
+            dataset = self.install()
+            engine = QQmlApplicationEngine()
+            engine.setInitialProperties({'peakBridge': self.bridge})
+            engine.load(QUrl.fromLocalFile(str(Path(__file__).resolve().parents[1] / 'ui_qt/quick/qml/PeakAnalysis.qml')))
+            window = engine.rootObjects()[0]
+            self.addCleanup(lambda: (window.setVisible(False), engine.deleteLater(), app.processEvents()))
+            def capture(page):
+                self.bridge.setParameter('controlsPage', page); self.idle()
+                self.assertTrue(find(window.contentItem(), 'peak_step_'+page).property('checked'))
+                if os.environ.get('DPTK_PEAK_REVIEW_DIR'):
+                    path = Path(os.environ['DPTK_PEAK_REVIEW_DIR']); path.mkdir(parents=True, exist_ok=True)
+                    window.grabWindow().save(str(path / f'journey-{page}.png'))
+            capture('find')
+            self.assertFalse(self.bridge.snapshot['canFit'])
+            self.bridge.invoke('workflow-find'); self.idle()
+            self.assertEqual(self.bridge.snapshot['controlsPage'], 'branches')
+            capture('branches')
+            self.bridge.setParameter('min_snr', .1); self.idle()
+            self.assertTrue(self.bridge.snapshot['filtersPending'])
+            self.assertFalse(self.bridge.snapshot['canFit'])
+            self.assertFalse(self.bridge.snapshot['canExport'])
+            self.bridge.invoke('filter'); self.idle()
+            self.assertTrue(self.bridge.snapshot['canFit'])
+            capture('fit')
+            before = [(p['row_index'], p['energy']) for p in dataset['result']['points']]
+            with patch('core.peak_candidates.filter_heatmap', side_effect=AssertionError('Fit must use checked peaks')):
+                self.bridge.invoke('workflow-fit'); self.idle()
+            self.assertEqual(self.bridge.snapshot['controlsPage'], 'results')
+            self.assertEqual(before, [(p['row_index'], p['energy']) for p in dataset['result']['points']])
+            capture('results')
+            self.assertTrue(self.bridge.snapshot['canExport'])
+            pool = dataset['candidates']; auto = dataset.get('auto_filters')
+            self.bridge.setParameter('model', 'Gaussian'); self.idle()
+            self.assertIs(pool, dataset['candidates'])
+            self.assertEqual(auto, dataset.get('auto_filters'))
+            self.assertFalse(dataset['result']['fits'])
+            self.assertFalse(self.bridge.snapshot['filtersPending'])
+            self.bridge.setParameter('detection_method', 'sg'); self.idle()
+            self.assertTrue(dataset['detection_dirty'])
+            self.assertFalse(self.bridge.snapshot['canExport'])
+            self.assertFalse(self.bridge.snapshot['canFit'])
+            self.bridge.invoke('workflow-find'); self.idle()
+            self.assertFalse(dataset['detection_dirty'])
+            for width, height, theme in ((760, 600, 'light'), (1240, 900, 'dark')):
+                window.setWidth(width); window.setHeight(height)
+                self.bridge._appearance.setMode(theme); self.idle()
+                for page in ('find', 'branches', 'fit', 'results'):
+                    self.bridge.setParameter('controlsPage', page); self.idle()
+                    primary = find(window.contentItem(), 'peak_manual_fit' if page == 'fit' else 'peak_workflow_primary')
+                    self.assertTrue(primary.property('visible'))
+                    self.assertGreater(primary.width(), 100)
+                    if os.environ.get('DPTK_PEAK_REVIEW_DIR'):
+                        window.grabWindow().save(str(Path(os.environ['DPTK_PEAK_REVIEW_DIR']) / f'journey-{page}-{width}-{theme}.png'))
+
         def test_sources_fingerprint_versions_and_vp_exclusion(self):
             original = cube()
             sources = [dict(cube=original, kind="PL", channel=channel, source=channel, name=channel, row=3,
@@ -230,10 +333,28 @@ def _run_isolated():
             self.assertEqual(len(self.bridge.datasets), 2)
             self.assertEqual(prepared[0]["view"]["display"]["cmap"], "viridis")
 
+        def test_new_pl_handoff_defaults_to_full_map(self):
+            source = dict(cube=cube(), kind="PL", channel="PL", source="full-pl.csv", name="PL", row=2,
+                          view={"xlim": [1.40, 1.45], "ylim": [1, 3]})
+            dataset = prepare_sources([source])[0]
+            self.assertEqual(dataset["analysis_scope"], "map")
+            self.assertEqual(dataset["scope"], 0)
+            self.assertEqual(dataset["settings"]["x_min"], dataset["cube"].energy.min())
+            self.assertEqual(dataset["settings"]["y_min"], dataset["cube"].gate.min())
+            self.bridge.addDatasets([dataset])
+            self.bridge.invoke("find-fit"); self.idle()
+            result = self.bridge.dataset["result"]
+            self.assertEqual(self.bridge.dataset["candidates"]["detected_rows"], list(range(5)))
+            self.assertEqual({p["row_index"] for p in result["points"]}, set(range(5)))
+            self.bridge.setParameter("row", 4); self.idle()
+            self.assertIs(self.bridge.dataset["result"], result)
+            self.assertEqual(self.bridge.dataset["row"], 4)
+
         def test_drr_group_raw_second_mixed_without_derivative(self):
             raw, second = cube(), cube(multiplier=-1.)
             sources = [dict(cube=item, group_cube=raw, kind="DRR", channel=channel, source="drr.csv", name=channel,
-                source_name="DRR file", product_label="Mixed derivative" if channel == "second" else "ΔR/R")
+                source_name="DRR file", product_label="Mixed derivative" if channel == "second" else "Î”R/R",
+                view={"xlim": [1.40, 1.45], "ylim": [1, 2]})
                 for item, channel in ((raw, "raw"), (second, "second"))]
             datasets = prepare_sources(sources)
             self.assertEqual(datasets[0]["group_id"], datasets[1]["group_id"])
@@ -241,13 +362,277 @@ def _run_isolated():
             with patch("core.peak_candidates.savgol_filter", side_effect=AssertionError("Extra derivative or smoothing")):
                 result = analyze_dataset(datasets[1], "detect")
             self.assertTrue(result["result"]["points"])
-            self.assertEqual({point["row_index"] for point in result["result"]["points"]}, {0})
+            self.assertEqual(datasets[1]["analysis_scope"], "map")
+            self.assertEqual(datasets[1]["scope"], 0)
+            self.assertEqual(result["candidates"]["detected_rows"], list(range(5)))
+            self.assertEqual({point["row_index"] for point in result["result"]["points"]}, set(range(5)))
+            self.assertTrue(any(point["energy"] > 1.45 for point in result["result"]["points"]))
             self.assertIn("dip", {point["polarity"] for point in result["result"]["points"]})
             self.bridge.addDatasets(datasets)
             self.assertEqual(len(self.bridge.snapshot["datasetChoices"]), 1)
             self.assertEqual(self.bridge.snapshot["products"][1]["label"], "Mixed derivative")
             self.bridge.setParameter("product", "raw")
             self.assertEqual(self.bridge.dataset["channel"], "raw")
+
+        def test_figure_save_requires_applied_filters(self):
+            from unittest.mock import patch
+            source = dict(cube=cube(multiplier=-1), kind="DRR", channel="second", source="drr.csv", name="DRR")
+            self.bridge.addDatasets(prepare_sources([source])); self.idle()
+            dataset = self.bridge.dataset
+            with patch.object(self.bridge, "_start") as start, patch.object(self.bridge, "_message") as message:
+                self.bridge.saveFigure(str(self.root / "empty.png"))
+                start.assert_called_once()
+                start.reset_mock()
+                dataset["filters_pending"] = True
+                self.bridge.saveFigure(str(self.root / "pending.png"))
+                start.assert_not_called()
+                self.assertIn("Apply filters", message.call_args.args[0])
+                self.bridge.invoke("save-figure")
+                self.assertIn("Apply filters", message.call_args.args[0])
+                dataset["filters_pending"] = False
+                dataset["detection_dirty"] = True
+                self.bridge.saveFigure(str(self.root / "dirty.png"), automatic=True)
+                start.assert_not_called()
+                self.assertIn("Find peaks", message.call_args.args[0])
+                self.bridge.invoke("save-figure-auto")
+                self.assertIn("Find peaks", message.call_args.args[0])
+
+        def test_drr_full_dataset_controls_and_inspection(self):
+            source = dict(cube=cube(multiplier=-1), kind="DRR", channel="second", source="drr.csv",
+                name="DRR · second · " + "long_measurement_name_" * 6, product_label="2nd derivative")
+            self.bridge.addDatasets(prepare_sources([source]))
+            self.bridge.invoke("detect"); self.idle()
+            result = self.bridge.dataset["result"]
+            self.assertTrue(self.bridge.snapshot["autoFilters"])
+            self.assertIn("Automatic starting filters", self.bridge.dataset["auto_filter_summary"])
+            for key in ("min_snr", "min_width_mev", "neighbor_support", "neighbor_tolerance_mev"):
+                self.assertEqual(self.bridge.dataset["settings"][key], result["settings"][key])
+            self.bridge.setParameter("row", 3); self.idle()
+            self.assertIs(self.bridge.dataset["result"], result)
+            self.assertEqual(self.bridge.dataset["candidates"]["detected_rows"], list(range(5)))
+            engine = QQmlApplicationEngine()
+            engine.setInitialProperties({"peakBridge": self.bridge})
+            engine.load(QUrl.fromLocalFile(str(Path(__file__).resolve().parents[1] / "ui_qt/quick/qml/PeakAnalysis.qml")))
+            window = engine.rootObjects()[0]
+            self.addCleanup(lambda: (window.setVisible(False), engine.deleteLater(), app.processEvents()))
+            marker_size = find(window.contentItem(), "peak_marker_size")
+            self.assertIsNotNone(marker_size)
+            self.assertTrue(marker_size.property("visible"))
+            self.assertEqual(self.bridge.snapshot["markerSize"], 4)
+            self.bridge.setParameter("markerSize", 9); self.idle()
+            self.assertEqual(self.bridge.snapshot["markerSize"], 9)
+            self.bridge.setParameter("markerSize", 4); self.idle()
+            for width, height, theme in ((1240, 900, "light"), (760, 600, "light"), (760, 600, "dark")):
+                window.setWidth(width); window.setHeight(height)
+                self.bridge._appearance.setMode(theme)
+                self.idle()
+                surface = window.findChild(QObject, "peak_plot_surface")
+                wait(lambda: surface.property("presentedGeneration") > 0 and not surface._size_timer.isActive()
+                     and not self.bridge._canvas.backend._timer.isActive())
+                scope = find(window.contentItem(), "app_parameter_analysisScope")
+                self.assertTrue(scope.property("visible"))
+                button = find(window.contentItem(), "app_parameter_detect")
+                self.assertEqual(button.property("text"), "Find candidates")
+                apply = find(window.contentItem(), "app_parameter_filter")
+                self.assertTrue(apply.property("visible"))
+                self.assertTrue(apply.property("enabled"))
+                groups = {group["key"]: group for group in self.bridge.snapshot["parameterGroups"]}
+                self.assertEqual([group["key"] for group in self.bridge.snapshot["parameterGroups"]][:3],
+                                 ["find-candidates", "detection-settings", "filters"])
+                find_fields = {field["key"]: field for field in groups["find-candidates"]["fields"]}
+                fields = {field["key"]: field for field in groups["filters"]["fields"]}
+                self.assertTrue({"analysisScope", "detect", "candidate-explanation"}.issubset(find_fields))
+                self.assertTrue({"polarity", "scope", "filterPreset", "showRejected"}.issubset(fields))
+                self.assertEqual(fields["polarity"]["label"], "Keep")
+                self.assertEqual(fields["scope"]["label"], "Keep range")
+                self.assertTrue(all(not fields[key].get("visible", True) for key in ("x_min", "x_max", "y_min", "y_max")))
+                for key in ("filter-settings", "detection-settings", "details"):
+                    self.assertTrue(groups[key].get("advanced") or groups[key].get("collapsible"))
+                    self.assertFalse(find(window.contentItem(), "app_parameter_group_body_" + key).property("visible"))
+                from PySide6.QtCore import QPointF
+                panel = window.findChild(QObject, "peak_analysis_controls")
+                position = button.mapToItem(panel, QPointF(0, 0))
+                self.assertGreaterEqual(position.y(), 0)
+                self.assertLessEqual(position.y() + button.height(), panel.height())
+                self.assertGreater(self.bridge._heat.bbox.height, self.bridge._spectrum.bbox.height)
+                if os.environ.get("DPTK_PEAK_REVIEW_DIR"):
+                    path = Path(os.environ["DPTK_PEAK_REVIEW_DIR"])
+                    path.mkdir(parents=True, exist_ok=True)
+                    window.grabWindow().save(str(path / f"drr-map-{width}-{theme}.png"))
+            slider = find(window.contentItem(), "peak_map_height")
+            slider.setProperty("value", 40)
+            QMetaObject.invokeMethod(slider, "moved")
+            self.idle()
+            self.assertAlmostEqual(self.bridge._heat.bbox.height / self.bridge._spectrum.bbox.height, 40 / 60, places=2)
+            pool = self.bridge.dataset["candidates"]
+            self.bridge.setParameter("scope", 2); self.idle()
+            groups = {group["key"]: group for group in self.bridge.snapshot["parameterGroups"]}
+            fields = {field["key"]: field for field in groups["filters"]["fields"]}
+            self.assertTrue(all(fields[key].get("visible", True) for key in ("x_min", "x_max", "y_min", "y_max")))
+            heading = find(window.contentItem(), "app_parameter_group_filter-settings")
+            QMetaObject.invokeMethod(heading, "clicked")
+            wait(lambda: find(window.contentItem(), "app_parameter_group_body_filter-settings").property("visible"))
+            self.assertTrue(find(window.contentItem(), "app_parameter_min_snr").property("visible"))
+            if os.environ.get("DPTK_PEAK_REVIEW_DIR"):
+                window.grabWindow().save(str(Path(os.environ["DPTK_PEAK_REVIEW_DIR"]) / "drr-expanded-custom.png"))
+            self.bridge.setParameter("x_max", 1.44)
+            self.bridge.setParameter("y_min", 1.)
+            self.bridge.setParameter("y_max", 2.)
+            self.idle()
+            self.assertIs(self.bridge.dataset["result"], result, "Filter drafts must wait for Apply filters")
+            self.assertTrue(self.bridge.snapshot["filtersPending"])
+            self.assertFalse(self.bridge.snapshot["autoFilters"])
+            self.assertFalse(self.bridge.snapshot["canExport"])
+            with patch("core.peak_candidates.detect_heatmap", side_effect=AssertionError("Apply filters redetected")):
+                QMetaObject.invokeMethod(find(window.contentItem(), "app_parameter_filter"), "clicked")
+                self.idle()
+            self.assertIs(self.bridge.dataset["candidates"], pool)
+            self.assertFalse(self.bridge.snapshot["filtersPending"])
+            self.assertTrue(self.bridge.dataset["result"]["points"])
+            self.assertTrue(all(p["energy"] <= 1.44 and 1 <= p["y"] <= 2 for p in self.bridge.dataset["result"]["points"]))
+            self.bridge.setParameter("polarity", "dips")
+            self.bridge.invoke("reset-filters")
+            self.assertEqual(self.bridge.dataset["settings"]["x_max"], 1.44)
+            self.assertEqual(self.bridge.dataset["settings"]["y_min"], 1.)
+            self.assertEqual(self.bridge.dataset["settings"]["polarity"], "dips")
+            self.bridge.setParameter("polarity", "both")
+            self.bridge.setParameter("scope", 0)
+            self.bridge.invoke("filter"); self.idle()
+            self.assertEqual(len(self.bridge.dataset["result"]["points"]), len(pool["points"]))
+            with patch("core.peak_candidates.detect_heatmap", side_effect=AssertionError("Polarity filter redetected")):
+                for polarity in ("peaks", "dips", "both"):
+                    previous = self.bridge.dataset["result"]
+                    self.bridge.setParameter("polarity", polarity); self.idle()
+                    self.assertIs(self.bridge.dataset["result"], previous)
+                    self.assertTrue(self.bridge.snapshot["filtersPending"])
+                    self.bridge.invoke("filter"); self.idle()
+                    kept = self.bridge.dataset["result"]["points"]
+                    self.assertTrue(kept)
+                    self.assertEqual({point["polarity"] for point in kept},
+                        {"peak", "dip"} if polarity == "both" else {polarity[:-1]})
+                    self.assertIs(self.bridge.dataset["candidates"], pool)
+                    self.assertFalse(self.bridge.snapshot["filtersPending"])
+                self.assertEqual(len(kept), len(pool["points"]))
+                self.bridge.invoke("auto-filter"); self.idle()
+                self.assertTrue(self.bridge.snapshot["autoFilters"])
+                self.assertIs(self.bridge.dataset["candidates"], pool)
+                self.assertFalse(self.bridge.snapshot["filtersPending"])
+            from ui_qt.quick.figure_canvas import QuickNavigationToolbar
+            self.assertIsInstance(self.bridge._navigation, QuickNavigationToolbar)
+            saved = self.root / "layout.npz"
+            self.bridge.saveWorkspace(str(saved)); self.idle()
+            self.assertEqual(load_workspace(saved)[0][0]["map_height_percent"], 40)
+            self.bridge.setParameter("mapHeightPercent", "auto"); self.idle()
+            self.assertGreater(self.bridge._heat.bbox.height, self.bridge._spectrum.bbox.height)
+            self.bridge.setParameter("analysisScope", "spectrum"); self.idle()
+            self.assertTrue(find(window.contentItem(), "app_parameter_analysisScope").property("visible"))
+            self.bridge.setParameter("scope", 2); self.idle()
+            groups = {group["key"]: group for group in self.bridge.snapshot["parameterGroups"]}
+            fields = {field["key"]: field for field in groups["filters"]["fields"]}
+            self.assertTrue(fields["x_min"].get("visible", True))
+            self.assertFalse(fields["y_min"].get("visible", True))
+            self.assertFalse(fields["y_max"].get("visible", True))
+            self.bridge.invoke("detect"); self.idle()
+            self.assertEqual(self.bridge.dataset["candidates"]["detected_rows"], [3])
+
+        def test_drr_preview_explains_applied_filters_and_restores(self):
+            source = dict(cube=cube(multiplier=-1), kind='DRR', channel='second', source='preview.csv', name='Filter preview')
+            self.bridge.addDatasets(prepare_sources([source]))
+            self.bridge.invoke('detect'); self.idle()
+            self.bridge.setParameter('min_width_mev', 100.)
+            self.bridge.invoke('filter'); self.idle()
+            self.bridge.setParameter('showRejected', True); self.idle()
+            dataset = self.bridge.dataset
+            preview = dataset['result']['filter_preview']
+            self.assertTrue(preview['reasons'])
+            self.assertTrue(self.bridge.snapshot['showRejected'])
+            marker = next(p for p in dataset['candidates']['points'] if preview['reasons'].get(p['candidate_id']) == 'min_width')
+            heat = self.bridge._heat
+            before_draws = self.bridge._canvas.draw_count
+            self.bridge._cursor_motion(SimpleNamespace(inaxes=heat, xdata=marker['energy'], ydata=marker['y']))
+            self.bridge._cursor_flush()
+            self.assertIn('Excluded', self.bridge.cursor['text'])
+            self.assertIn('minimum width', self.bridge.cursor['tooltip'])
+            self.assertEqual(self.bridge._canvas.draw_count, before_draws)
+            self.bridge.setParameter('min_width_mev', 0.); self.idle()
+            self.assertIn('last applied', self.bridge._filter_preview_summary(dataset))
+            self.assertIs(dataset['result']['filter_preview'], preview)
+            engine = QQmlApplicationEngine()
+            engine.setInitialProperties({'peakBridge': self.bridge})
+            engine.load(QUrl.fromLocalFile(str(Path(__file__).resolve().parents[1] / 'ui_qt/quick/qml/PeakAnalysis.qml')))
+            window = engine.rootObjects()[0]
+            self.addCleanup(lambda: (window.setVisible(False), engine.deleteLater(), app.processEvents()))
+            for theme in ('light', 'dark'):
+                window.setWidth(1080); window.setHeight(800)
+                self.bridge._appearance.setMode(theme); self.idle()
+                self.assertTrue(find(window.contentItem(), 'app_parameter_showRejected').property('visible'))
+                if os.environ.get('DPTK_PEAK_REVIEW_DIR'):
+                    path = Path(os.environ['DPTK_PEAK_REVIEW_DIR']); path.mkdir(parents=True, exist_ok=True)
+                    window.grabWindow().save(str(path / f'drr-filter-preview-{theme}.png'))
+            saved = self.root / 'preview.npz'
+            self.bridge.saveWorkspace(str(saved)); self.idle()
+            restored = load_workspace(saved)[0][0]
+            self.assertTrue(restored['show_rejected'])
+            self.assertEqual(restored['result']['filter_preview'], preview)
+
+        def test_scatter_filter_is_manual_reversible_and_not_a_detection_setting(self):
+            self.bridge.addDatasets(prepare_sources([dict(cube=cube(multiplier=-1), kind='DRR',
+                channel='second', source='scatter.csv', name='Scatter controls')]))
+            self.bridge.invoke('detect'); self.idle()
+            dataset = self.bridge.dataset
+            result, pool = dataset['result'], dataset['candidates']
+            self.bridge.setParameter('remove_scatter', True); self.idle()
+            self.assertIs(dataset['result'], result)
+            self.assertTrue(dataset['filters_pending'])
+            self.assertFalse(dataset['auto_filters'])
+            with patch('core.peak_candidates.detect_heatmap', side_effect=AssertionError('Scatter filter redetected')):
+                self.bridge.invoke('filter'); self.idle()
+            self.assertIs(dataset['candidates'], pool)
+            self.assertTrue(dataset['result']['settings']['remove_scatter'])
+            saved = self.root / 'scatter.npz'
+            self.bridge.saveWorkspace(str(saved)); self.idle()
+            self.assertTrue(load_workspace(saved)[0][0]['settings']['remove_scatter'])
+            self.bridge.invoke('preset:Sensitive'); self.idle()
+            self.assertFalse(dataset['settings']['remove_scatter'])
+            self.bridge.setParameter('remove_scatter', True)
+            self.bridge.invoke('reset-filters'); self.idle()
+            self.assertFalse(dataset['settings']['remove_scatter'])
+            self.bridge.invoke('filter'); self.idle()
+            self.assertEqual(len(dataset['result']['points']), len(pool['points']))
+
+        def test_width_adaptive_filter_is_pending_reversible_and_saved(self):
+            self.bridge.addDatasets(prepare_sources([dict(cube=cube(multiplier=-1), kind='DRR',
+                channel='second', source='adaptive.csv', name='Adaptive controls')]))
+            self.bridge.invoke('detect'); self.idle()
+            dataset = self.bridge.dataset
+            result, pool = dataset['result'], dataset['candidates']
+            self.assertTrue(dataset['settings']['neighbor_adaptive'])
+            field = next(f for g in self.bridge._parameter_groups() for f in g['fields']
+                         if f['key'] == 'neighbor_adaptive')
+            self.assertTrue(field['visible'])
+            self.bridge.setParameter('neighbor_adaptive', False); self.idle()
+            self.assertIs(dataset['result'], result)
+            self.assertTrue(dataset['filters_pending'])
+            self.assertFalse(dataset['auto_filters'])
+            with patch('core.peak_candidates.detect_heatmap', side_effect=AssertionError('Redetected')):
+                self.bridge.invoke('filter'); self.idle()
+                off_ids = {p['candidate_id'] for p in dataset['result']['points']}
+                self.bridge.setParameter('neighbor_adaptive', True)
+                self.bridge.invoke('filter'); self.idle()
+                self.assertIs(dataset['candidates'], pool)
+                self.assertTrue(dataset['result']['settings']['neighbor_adaptive'])
+                saved = self.root / 'adaptive.npz'
+                self.bridge.saveWorkspace(str(saved)); self.idle()
+                self.assertTrue(load_workspace(saved)[0][0]['settings']['neighbor_adaptive'])
+                self.bridge.setParameter('neighbor_adaptive', False)
+                self.bridge.invoke('filter'); self.idle()
+                self.assertEqual(off_ids, {p['candidate_id'] for p in dataset['result']['points']})
+            self.bridge.setParameter('neighbor_adaptive', True)
+            self.bridge.invoke('preset:Sensitive'); self.idle()
+            self.assertFalse(dataset['settings']['neighbor_adaptive'])
+            self.bridge.setParameter('neighbor_adaptive', True)
+            self.bridge.invoke('reset-filters'); self.idle()
+            self.assertFalse(dataset['settings']['neighbor_adaptive'])
 
         def test_detection_cache_filters_preserve_branch_identity(self):
             dataset = self.install()
@@ -292,6 +677,7 @@ def _run_isolated():
             history=len(self.bridge._navigation._nav_stack)
             draws,blits=canvas.draw_count,canvas.blit_count
             self.bridge.setParameter("min_snr",.1);self.idle()
+            self.bridge.invoke('filter'); self.idle()
             self.assertIs(self.bridge._heat,heat)
             self.assertIs(heat.collections[0],mesh)
             self.assertEqual(canvas.draw_count,draws)
@@ -304,6 +690,9 @@ def _run_isolated():
             self.assertTrue(self.bridge._overlay_artists)
             self.assertTrue(all(artist.get_animated() for artist in self.bridge._overlay_artists))
             self.bridge.setParameter("showResidual",True);self.idle()
+            self.assertIs(self.bridge._heat,heat)
+            self.assertIsNone(self.bridge._residual)
+            self.bridge.invoke('fit');self.idle()
             self.assertIsNot(self.bridge._heat,heat)
             self.assertIsNotNone(self.bridge._residual)
             self.assertGreater(canvas.draw_count,draws)
@@ -330,20 +719,22 @@ def _run_isolated():
             self.bridge.setParameter("analysisPlot", "spectra")
             self.idle()
             self.assertIsNotNone(self.bridge._heat)
+            self.bridge.dataset.setdefault('view', {})['display'] = dict(cmap='viridis', vmin=0., vmax=2.)
             self.bridge.exportTo(str(self.root))
             self.idle()
-            exported = list(self.root.glob("*_peaks_*"))
-            self.assertEqual(len(exported), 1)
-            self.assertEqual({path.name for path in exported[0].iterdir()}, {"peaks.csv", "analysis.json", "peaks.png", "fit_trends.png", "Gaussian_PLfit.xlsx"})
+            exported = [Path(path) for path in self.bridge.snapshot['resultPaths']]
+            self.assertEqual({path.name for path in exported}, {"Gaussian_analysis_settings.json", "Gaussian_peak_overlay.png", "Gaussian_peak_results.xlsx"})
+            self.assertTrue(all(path.parent == self.root for path in exported))
             from openpyxl import load_workbook
-            workbook = load_workbook(exported[0] / "Gaussian_PLfit.xlsx", read_only=True)
+            workbook = load_workbook(self.root / "Gaussian_peak_results.xlsx", read_only=True)
             try:
-                headers = next(workbook['Results'].values)
-                self.assertIn('P1_center_err_eV', headers)
-                self.assertIn('P1_FWHM_err_meV', headers)
+                self.assertEqual(set(workbook.sheetnames), {'Detected_peaks', 'Fitted_peaks', 'FWHM', 'Height', 'Area'})
+                self.assertTrue(any('eV' in str(header) for header in next(workbook['Fitted_peaks'].values)))
+                self.assertTrue(any('meV' in str(header) for header in next(workbook['FWHM'].values)))
             finally:
                 workbook.close()
-            self.assertIn("fit_center", (exported[0] / "peaks.csv").read_text(encoding="utf-8-sig"))
+            self.assertFalse((self.root / "Gaussian_peak_details.csv").exists())
+            self.assertIn('fit_center', (self.root / 'Gaussian_analysis_settings.json').read_text(encoding='utf-8'))
             self.bridge.saveWorkspace(str(self.root / "copy.npz"))
             self.idle()
             restored, active = load_workspace(self.root / "copy.npz")
@@ -352,18 +743,18 @@ def _run_isolated():
             self.assertTrue(all(len(item["result"]["fits"]) == 5 for item in restored))
             self.assertEqual(self.settings.value("unrelated/preserved"), "keep")
 
-        def test_manual_seed_connect_and_fit(self):
+        def test_manual_seed_current_spectrum_and_fit(self):
             dataset = self.install()
             self.bridge._start_seed(1.415)
             self.idle()
             self.assertEqual(len(dataset["branches"]), 1)
-            self.assertTrue(dataset["manual_seeds"])
-            self.bridge.invoke("track")
-            self.idle()
-            self.assertEqual(len(dataset["result"]["points"]), 5)
+            self.assertTrue(dataset['manual_peak_edits'])
+            self.assertEqual(len(dataset["result"]["points"]), 1)
+            self.assertEqual(dataset['result']['points'][0]['energy'], 1.415)
             self.bridge.invoke("fit")
             self.idle()
             self.assertTrue(dataset["result"]["fits"])
+            self.assertEqual({f['row_index'] for f in dataset['result']['fits']}, {dataset['row']})
 
         def test_cursor_marker_and_row_selection_retain_heatmap(self):
             dataset = self.install()
@@ -487,7 +878,7 @@ def _run_isolated():
 
         def test_simple_spectrum_custom_filters_and_scope(self):
             datasets = prepare_sources([dict(cube=cube(), kind="PL", channel="PL", source="simple.csv", name="PL sample",
-                row=2, view={"xlim": [1.40, 1.45], "ylim": [0, 4]})])
+                row=2, analysis_scope="spectrum", view={"xlim": [1.40, 1.45], "ylim": [0, 4]})])
             self.bridge.addDatasets(datasets)
             dataset = self.bridge.dataset
             self.assertEqual(dataset["analysis_scope"], "spectrum")
@@ -500,7 +891,9 @@ def _run_isolated():
             window = engine.rootObjects()[0]
             self.addCleanup(lambda: (window.setVisible(False), engine.deleteLater(), app.processEvents()))
             self.idle()
-            wait(lambda: find(window.contentItem(), "app_parameter_find-fit") is not None)
+            self.bridge.setParameter('controlsPage', 'branches'); self.idle()
+            wait(lambda: find(window.contentItem(), "peak_workflow_primary") is not None)
+            QMetaObject.invokeMethod(find(window.contentItem(), 'app_parameter_group_review-filters'), 'clicked', Qt.ConnectionType.DirectConnection)
             snr = lambda: find(window.contentItem(), "app_parameter_min_snr")
             self.assertFalse(snr().property("visible"))
             self.bridge.setParameter("filterPreset", "Custom")
@@ -511,7 +904,7 @@ def _run_isolated():
             self.assertEqual({point["row_index"] for point in dataset["result"]["points"]}, {2})
             self.assertTrue(dataset["result"]["fits"])
             self.assertEqual(dataset["result"]["settings"]["neighbor_support"], 0)
-            self.assertFalse(find(window.contentItem(), "app_parameter_group_body_advanced").property("visible"))
+            self.assertTrue(find(window.contentItem(), "app_parameter_group_body_review-filters").property("visible"))
             surface = window.findChild(QObject, "peak_plot_surface")
             wait(lambda: surface.property("presentedGeneration") > 0)
             control = window.findChild(QObject, "peak_analysis_controls")
@@ -552,7 +945,7 @@ def _run_isolated():
 
         def test_single_spectrum_drr_product_and_handoff_clear_stale_results(self):
             sources = [dict(cube=cube(multiplier=sign), group_cube=cube(), kind="DRR", channel=channel,
-                source="products.csv", name=channel, row=0) for sign, channel in ((1, "raw"), (-1, "second"))]
+                source="products.csv", name=channel, row=0, analysis_scope="spectrum") for sign, channel in ((1, "raw"), (-1, "second"))]
             datasets = prepare_sources(sources)
             self.bridge.addDatasets(datasets)
             self.bridge.invoke("detect"); self.idle()
@@ -598,13 +991,13 @@ def _run_isolated():
             surface = window.findChild(QObject, "peak_plot_surface")
             wait(lambda: surface.property("presentedGeneration") > 0)
             self.bridge.invoke("results")
-            self.bridge.setParameter("controlsPage", "branches")
+            self.bridge.setParameter("controlsPage", "fit")
             wait(lambda: find(window.contentItem(), "app_parameter_model") is not None)
             self.assertTrue(window.findChild(QObject, "peak_analysis_results").property("visible"))
             self.assertFalse(window.grabWindow().isNull())
             self.bridge.setParameter("controlsPage", "find")
             wait(lambda: find(window.contentItem(), "app_parameter_detection_method") is not None)
-            self.assertTrue(find(window.contentItem(), "app_parameter_detect").property("enabled"))
+            self.assertTrue(find(window.contentItem(), "peak_workflow_primary").property("enabled"))
             from tests.quick_selection_checks import assert_text_selection_palette
             for mode in ("light", "dark", "high-contrast"):
                 self.bridge._appearance.setMode(mode); self.idle(); app.processEvents()

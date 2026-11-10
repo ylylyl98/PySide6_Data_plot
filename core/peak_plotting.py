@@ -8,8 +8,7 @@ from matplotlib.figure import Figure
 
 from core.plotting import HeatmapParams, SplitColorScale, plot_heatmap
 from core.colormaps import register_colormaps
-from core.power_multi_peaks import multi_peak_model
-from core.power_peaks import peak_model
+from core.pl_fit_models import evaluate_fit, evaluate_component
 
 
 def branch_color(branch):
@@ -24,7 +23,8 @@ def overlay_payload(dataset):
                       if k not in ('assignments','segment_assignments','branch_catalog','fits')}
     if dataset.get('show_rejected') and dataset.get('candidates'):
         packet['show_rejected']=True
-        packet['candidates']={'points':[{k:p[k] for k in ('candidate_id','energy','y')} for p in dataset['candidates']['points']]}
+        from core.peak_filter_preview import excluded_candidates
+        packet['candidates']={'points':[{k:p[k] for k in ('candidate_id','energy','y','polarity') if k in p} for p in excluded_candidates(dataset)]}
     return packet
 
 
@@ -55,27 +55,48 @@ def overlay_series(dataset):
 
 def draw_overlay(ax, dataset, transform_y=None):
     artists = []
-    size=float(dataset.get('marker_size',9))
+    size=float(dataset.get('marker_size',4))
     result=dataset.get('result') or {}
     branches={b['id']:b for b in dataset['branches']}
     if dataset.get('show_rejected') and dataset.get('candidates'):
-        kept={p.get('candidate_id') for p in result.get('points',[])}
-        rejected=[p for p in dataset['candidates']['points'] if p['candidate_id'] not in kept]
+        from core.peak_filter_preview import excluded_candidates
+        rejected=excluded_candidates(dataset)
         if rejected:
             y=np.asarray([p['y'] for p in rejected])
             artist=ax.scatter([p['energy'] for p in rejected],transform_y(y) if transform_y else y,
-                marker='x',s=size*.32,c='0.5',alpha=.4,linewidths=.35,zorder=13,label='Rejected candidates')
+                marker='x',s=max(1., size*.6),c='0.5',alpha=.55,linewidths=.4,zorder=13,label='Rejected candidates')
             artist.set_gid('peak-rejected');artists.append(artist)
     if result.get('candidate_mode'):
         for polarity,marker in (('peak','^'),('dip','v')):
-            points=[p for p in result.get('points',[]) if p['polarity']==polarity and branches.get(p['branch_id'],{}).get('enabled',True)]
+            points=[p for p in result.get('points',[]) if p['polarity']==polarity and p.get('candidate_origin') != 'curvature' and branches.get(p['branch_id'],{}).get('enabled',True)]
             if not points:continue
             y=np.asarray([p['y'] for p in points])
             artist=ax.scatter([p['energy'] for p in points],transform_y(y) if transform_y else y,
                 marker=marker,s=size,c=[branch_color(branches[p['branch_id']]) for p in points],
                 edgecolors='white',linewidths=.25,zorder=15,label='Peaks' if polarity=='peak' else 'Dips')
             artist.set_gid('peak-candidates');artists.append(artist)
+        shoulders = [p for p in result.get('points', []) if p.get('candidate_origin') == 'curvature'
+                     and branches.get(p['branch_id'], {}).get('enabled', True)]
+        if shoulders:
+            y = np.asarray([p['y'] for p in shoulders])
+            artist = ax.scatter([p['energy'] for p in shoulders], transform_y(y) if transform_y else y,
+                                marker='D', s=size, facecolors='none', edgecolors='#ed9b28', linewidths=.8,
+                                zorder=15, label='Provisional shoulders')
+            artist.set_gid('peak-shoulders');artists.append(artist)
         return artists
+    if dataset.get('kind') == 'PL' and result.get('pl_fit_version', 0) >= 2 and dataset.get('overlay_position') == 'fitted':
+        visible = [p for p in result.get('points', []) if branches.get(p['branch_id'], {}).get('enabled', True)]
+        for points, color, marker, label, gid in (
+                (visible, '#00bcd4', 'o', 'Detected positions', 'peak-detected-reference'),
+                ([p for p in visible if p.get('fit_status') != 'ok' or p.get('status') != 'accepted'],
+                 '#ed9b28', 'x', 'Unconfirmed: detected position', 'peak-fit-review')):
+            if points:
+                y = np.asarray([p['y'] for p in points])
+                style = dict(facecolors='none', edgecolors=color) if marker == 'o' else dict(c=color)
+                artist = ax.scatter([p['energy'] for p in points], transform_y(y) if transform_y else y,
+                                    marker=marker, s=size, linewidths=.65, zorder=14, label=label, **style)
+                artist.set_gid(gid)
+                artists.append(artist)
     for branch, x, y in overlay_series(dataset):
         if transform_y:
             y = transform_y(y)
@@ -97,8 +118,8 @@ def draw_overlay(ax, dataset, transform_y=None):
 def resize_overlay(ax, size):
     """Resize existing peak artists without touching data or heatmap meshes."""
     for artist in ax.collections:
-        if artist.get_gid() in ('peak-candidates','peak-uncertain','peak-rejected'):
-            artist.set_sizes([size*(.32 if artist.get_gid()=='peak-rejected' else 1)])
+        if artist.get_gid() in ('peak-candidates','peak-uncertain','peak-rejected', 'peak-detected-reference', 'peak-fit-review', 'peak-shoulders'):
+            artist.set_sizes([max(1., size*.6) if artist.get_gid()=='peak-rejected' else size])
     for line in ax.lines:
         if line.get_gid()=='peak-track':line.set_markersize(np.sqrt(size))
 
@@ -111,6 +132,14 @@ def draw_spectrum(dataset, row, ax, residual_ax=None):
     if pool and pool['settings']['detection_method']=='sg':
         from core.peak_candidates import detection_spectrum
         ax.plot(x,detection_spectrum(x,spectrum,pool['settings']),lw=1,label='SG detection signal')
+    if dataset.get('show_rejected'):
+        from core.peak_filter_preview import excluded_candidates
+        rejected = [p for p in excluded_candidates(dataset) if p.get('row_index') == row]
+        if rejected:
+            energies = [p['energy'] for p in rejected]
+            artist = ax.scatter(energies, np.interp(energies, x, spectrum), marker='x',
+                s=18, color='0.5', alpha=.65, linewidths=.7, zorder=8)
+            artist.set_gid('peak-rejected')
     fit = next((f for f in result.get('fits', []) if f['row_index'] == row), None)
     branches = {b['id']: b for b in dataset['branches']}
     if residual_ax is not None:
@@ -119,13 +148,13 @@ def draw_spectrum(dataset, row, ax, residual_ax=None):
     if fit:
         mask = (x >= fit['x_min']) & (x <= fit['x_max'])
         xf = x[mask]; p = fit['parameters']
-        yf = multi_peak_model(xf, p, model=fit['model'], origin=fit['origin'])
+        yf = evaluate_fit(xf, fit)
         ax.plot(xf, yf, '--', lw=1.3, label='Total fit')
         baseline = p[0]+p[1]*(xf-fit['origin'])
         for i, branch_id in enumerate(fit['branch_ids']):
             b = branches.get(branch_id)
             if b and b.get('enabled', True):
-                c = peak_model(xf, 0, 0, *p[2+3*i:5+3*i], model=fit['model'], origin=fit['origin'])
+                c = evaluate_component(xf, fit, i)
                 ax.plot(xf, baseline+c, lw=1, color=branch_color(b), label=b['name'])
         if residual_ax is not None:
             residual_ax.plot(xf, spectrum[mask]-yf, lw=.8)
@@ -201,9 +230,13 @@ def build_fit_trends(dataset, figure=None):
 def build_figure(dataset, row=0, show_overlay=True, show_residual=False, figure=None):
     fig = figure if figure is not None else Figure(figsize=(8, 7))
     fig.clear()
+    height_ratios = (([1.25, 3, .8] if show_residual else [1.25, 3])
+        if dataset.get('analysis_scope') == 'spectrum' else ([3, 1.35, .55] if show_residual else [3, 1.35]))
+    if 'map_height_percent' in dataset:
+        share = max(20, min(80, float(dataset['map_height_percent'])))
+        height_ratios = [share, (100 - share) * .8, (100 - share) * .2] if show_residual else [share, 100 - share]
     gs = fig.add_gridspec(3 if show_residual else 2, 2, width_ratios=[1, .025],
-                         height_ratios=([1.25, 3, .8] if show_residual else [1.25, 3])
-                         if dataset.get('analysis_scope') == 'spectrum' else ([3, 1.35, .55] if show_residual else [3, 1.35]),
+                         height_ratios=height_ratios,
                          left=.11, right=.9, top=.95, bottom=.09, hspace=.5, wspace=.05)
     heat = fig.add_subplot(gs[0, 0]); cax = fig.add_subplot(gs[0, 1])
     spectrum = fig.add_subplot(gs[1, 0]); residual = fig.add_subplot(gs[2, 0], sharex=spectrum) if show_residual else None

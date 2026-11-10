@@ -51,7 +51,7 @@ class WorkbookTests(unittest.TestCase):
         d['result']['fits'] = [f for f in d['result']['fits'] if f['row_index'] != 1]
         d['result']['points'] = [p for p in d['result']['points'] if p['row_index'] != 1]
         with tempfile.TemporaryDirectory() as tmp:
-            path = export_peak_workbook(tmp, d)
+            path = export_peak_workbook(tmp, d, compact=False)
             book = self.read(path)
             rows = list(book['Results'].values); head = rows[0]
             self.assertIn('P1_fit_area_full', head); self.assertIn('P1_center_err_eV', head)
@@ -67,14 +67,14 @@ class WorkbookTests(unittest.TestCase):
     def test_drr_separate_aliases_and_no_false_fit_for_current_unanalyzed(self):
         d = self.dataset('DRR')
         with tempfile.TemporaryDirectory() as tmp:
-            book = self.read(export_peak_workbook(tmp, d))
+            book = self.read(export_peak_workbook(tmp, d, compact=False))
             self.assertIn('P1_detected_eV', next(book['Peaks'].values))
             self.assertIn('D1_detected_eV', next(book['Dips'].values))
             book.close()
         d = self.dataset('PL'); d['row'] = 1
         d['result']['fits'] = [f for f in d['result']['fits'] if f['row_index'] != 1]
         with tempfile.TemporaryDirectory() as tmp:
-            book = self.read(export_peak_workbook(tmp, d))
+            book = self.read(export_peak_workbook(tmp, d, compact=False))
             rows = list(book['Curves'].values); head=rows[0]
             self.assertTrue(all(row[head.index('Total_fit')] is None and row[head.index('Fit_status')] == 'not fitted' for row in rows[1:]))
             self.assertEqual(len(list(book['Components'].values)), 1)
@@ -85,14 +85,14 @@ class WorkbookTests(unittest.TestCase):
         self.assertGreaterEqual(len(d['result']['branches']), 2)
         first, second = d['result']['branches'][:2]
         with tempfile.TemporaryDirectory() as tmp:
-            book = self.read(export_peak_workbook(tmp, d))
+            book = self.read(export_peak_workbook(tmp, d, compact=False))
             initial = next(book['Results'].values)
             self.assertIn('P2_detected_eV', initial); book.close()
             reduced = deepcopy(d)
             reduced['result']['branches'] = [second]
             reduced['branches'] = [second]
             reduced['result']['points'] = [p for p in reduced['result']['points'] if p['branch_id'] == second['id']]
-            book = self.read(export_peak_workbook(tmp, reduced))
+            book = self.read(export_peak_workbook(tmp, reduced, compact=False))
             header = next(book['Results'].values)
             self.assertIn('P2_detected_eV', header); self.assertNotIn('P1_detected_eV', header)
             self.assertNotEqual(first['id'], second['id']); book.close()
@@ -102,7 +102,7 @@ class WorkbookTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(InterruptedError): export_peak_workbook(tmp, d, cancelled=lambda: True)
             self.assertEqual(list(Path(tmp).iterdir()), [])
-            path = export_peak_workbook(tmp, d)
+            path = export_peak_workbook(tmp, d, compact=False)
             self.assertLessEqual(len(path.name), 180)
             book = self.read(path); self.assertEqual(book['Settings'].title, 'Settings'); book.close()
 

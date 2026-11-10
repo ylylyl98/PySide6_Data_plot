@@ -9,6 +9,7 @@ from ui_qt.theme_tokens import resolved_aliases
 MODES = {"system", "light", "dark", "high-contrast"}
 _ROLES = dict(surface="surface_secondary", control="surface_background", text="text_primary",
     muted="text_secondary", border="border_primary", accent="brand_background",
+    accentHover="brand_background_hover", accentPressed="brand_background_pressed",
     hover="surface_background_hover", pressed="surface_background_pressed",
     disabled="text_disabled", selectedText="text_on_brand", inset="surface_tertiary",
     divider="border_subtle", focus="focus_border", accentText="brand_foreground",
@@ -47,6 +48,7 @@ def quick_colors(mode="light", *, hints=None, palette=None):
             background, control, text, accent, on_accent, muted = "#000000", "#000000", "#FFFFFF", "#FFFF00", "#000000", "#BFBFBF"
         colors.update(surface=background, control=control, inset=background, text=text, muted=text,
             border=text, borderHover=accent, divider=text, focus=accent, accent=accent,
+            accentHover=accent, accentPressed=accent,
             accentText=accent, selectedText=on_accent, selected=background, selectedBorder=accent,
             hover=background, pressed=background, disabled=muted, borderDisabled=muted,
             controlDisabled=background, error=text, errorSurface=background)

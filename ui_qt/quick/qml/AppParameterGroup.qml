@@ -18,10 +18,12 @@ ColumnLayout {
 
     Basic.ToolButton {
         id: heading
+        visible: group.descriptor.hideHeading !== true
         objectName: "app_parameter_group_" + group.schema.key
         Layout.fillWidth: true
         implicitHeight: Math.max(28, (contentItem ? contentItem.implicitHeight : 0) + 8)
-        padding: 0
+        padding: group.collapsible ? 6 : 0
+        hoverEnabled: group.collapsible
         focusPolicy: group.collapsible ? Qt.StrongFocus : Qt.NoFocus
         Accessible.role: group.collapsible ? Accessible.Button : Accessible.Heading
         Accessible.name: group.descriptor.title || group.schema.key
@@ -47,9 +49,11 @@ ColumnLayout {
         }
         background: Rectangle {
             radius: 4
-            color: group.collapsible && heading.hovered ? group.colors.hover : "transparent"
-            border.width: heading.visualFocus ? 2 : 0
-            border.color: group.colors.focus
+            color: !group.collapsible ? "transparent"
+                 : heading.down ? group.colors.pressed
+                 : heading.hovered ? group.colors.hover : group.colors.control
+            border.width: heading.visualFocus ? 2 : group.collapsible ? 1 : 0
+            border.color: heading.visualFocus ? group.colors.focus : group.colors.border
         }
     }
     ColumnLayout {
@@ -72,7 +76,9 @@ ColumnLayout {
                 readonly property var descriptor: group.descriptors[modelData.key] || ({})
                 Layout.fillWidth: true
                 Layout.minimumWidth: 0
-                visible: modelData.type === "pair" || modelData.type === "actions" || descriptor.visible !== false
+                visible: modelData.type === "pair"
+                    ? ((group.descriptors[modelData.first] || {}).visible !== false || (group.descriptors[modelData.second] || {}).visible !== false)
+                    : modelData.type === "actions" || descriptor.visible !== false
                 sourceComponent: modelData.type === "pair" ? pairEditor : modelData.type === "actions" ? actionsEditor : singleEditor
                 Component {
                     id: pairEditor

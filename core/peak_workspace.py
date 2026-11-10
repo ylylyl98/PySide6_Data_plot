@@ -6,9 +6,10 @@ import json
 import os
 from pathlib import Path
 from uuid import uuid4
+from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 
 import numpy as np
-from core.peak_profiles import filter_presets, recommended_detection_method
+from core.peak_profiles import drr_initial_filter_settings, filter_presets, recommended_detection_method
 
 from core.loader import DataCube
 
@@ -55,7 +56,7 @@ def create_dataset(cube, kind, channel, source, name, view=None):
                     noise_sigma=3., max_gap=2, max_peaks=8, polarity='both' if kind == 'DRR' else 'peaks',
                     model='Lorentzian', detection_method=recommended_detection_method(kind,channel),
                     smoothing_window=11, candidate_floor=.01,
-                    max_width_mev=0., max_per_row=0)
+                    max_width_mev=0., max_per_row=0, remove_scatter=False, neighbor_adaptive=False)
     settings.update(filter_presets(snapshot, kind, channel)['Balanced'])
     return dict(key=fingerprint(snapshot, kind, channel, source), kind=kind, channel=str(channel),
                 source=str(source), name=str(name), cube=snapshot, settings=settings, branches=[], result=None,
@@ -112,11 +113,22 @@ def save_workspace(path, datasets, active_key=None):
         records.append(record)
         for field in ('energy', 'gate', 'Z'):
             arrays[f'{index}_{field}'] = getattr(d['cube'], field)
-    arrays['metadata'] = np.array(json.dumps(_json_clean(dict(schema=1, datasets=records, active_key=active_key)), allow_nan=False))
+    metadata = json.dumps(_json_clean(dict(schema=2, datasets=records, active_key=active_key)), allow_nan=False).encode('utf-8')
     temporary = path.with_name(path.name + '.' + uuid4().hex + '.tmp')
     try:
         with temporary.open('wb') as stream:
-            np.savez(stream, **arrays); stream.flush(); os.fsync(stream.fileno())
+            # Keep numeric members uncompressed and independently readable by
+            # np.load. Metadata is UTF-8, avoiding NumPy's four-byte Unicode
+            # representation, and is the only member worth compressing.
+            with ZipFile(stream, 'w', compression=ZIP_STORED, allowZip64=True) as archive:
+                for name, array in arrays.items():
+                    with archive.open(name + '.npy', 'w', force_zip64=True) as member:
+                        np.lib.format.write_array(member, np.asanyarray(array), allow_pickle=False)
+                archive.compression = ZIP_DEFLATED
+                archive.compresslevel = 1
+                with archive.open('metadata.npy', 'w', force_zip64=True) as member:
+                    np.lib.format.write_array(member, np.frombuffer(metadata, dtype=np.uint8), allow_pickle=False)
+            stream.flush(); os.fsync(stream.fileno())
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -130,8 +142,10 @@ def load_workspace(path, *, fresh_snapshot=False):
     """
     try:
         with np.load(path, allow_pickle=False) as archive:
-            meta = json.loads(str(archive['metadata'].item()))
-            if meta['schema'] != 1:
+            metadata = archive['metadata']
+            text = metadata.tobytes().decode('utf-8') if metadata.dtype == np.uint8 else str(metadata.item())
+            meta = json.loads(text)
+            if meta['schema'] not in (1, 2):
                 raise ValueError('Unsupported Peak Analysis session version.')
             datasets = []
             for index, record in enumerate(meta['datasets']):
@@ -148,6 +162,12 @@ def load_workspace(path, *, fresh_snapshot=False):
                     d['settings'].update(min_snr=0.,neighbor_support=0)
                 if fresh_snapshot and not (d.get('result') or d.get('candidates') or d['branches']):
                     d['settings'].update(filter_presets(d['cube'], d['kind'], d['channel'], d.get('product_label',''))['Balanced'])
+                    if d['kind'] == 'DRR':
+                        d['settings'].update(drr_initial_filter_settings(d['cube']))
+                    else:
+                        from core.pl_peak_profiles import pl_initial_filter_settings
+                        d['settings'].update(pl_initial_filter_settings(d['cube']))
+                        d['auto_filters'] = True
                     d['settings']['detection_method']=recommended_detection_method(d['kind'],d['channel'],d.get('product_label',''))
                 validate_result(d, d['result']); datasets.append(d)
         return datasets, meta.get('active_key')

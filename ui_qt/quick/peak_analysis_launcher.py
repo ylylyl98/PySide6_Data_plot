@@ -10,7 +10,7 @@ import sys
 from uuid import uuid4
 
 from PySide6.QtCore import QObject, Property, QProcess, QSettings, Signal, Slot
-from ui_qt.peak_analysis_ipc import MessageServer
+from ui_qt.peak_analysis_ipc import MessageServer, send_message
 from ui_qt.quick.settings_storage import analysis_session_path,appearance_preference
 
 
@@ -46,6 +46,7 @@ class QuickPeakAnalysisLauncher(QObject):
         super().__init__(parent)
         self.settings = settings
         self.session_path = Path(session_path or analysis_session_path(settings,"peak")).resolve()
+        self._per_file_history = session_path is None
         self.settings_path = self.session_path.parent / "quick.ini"
         self.settings_path.parent.mkdir(parents=True, exist_ok=True)
         child_settings = QSettings(str(self.settings_path), QSettings.Format.IniFormat)
@@ -116,7 +117,10 @@ class QuickPeakAnalysisLauncher(QObject):
             self._pending_open = False
             return
         from ui_qt.quick.peak_analysis_workflow import prepare_sources
-        revision, sources = self._revision, list(self._sources)
+        revision, sources = self._revision, [dict(source) for source in self._sources]
+        if self._per_file_history:
+            for source in sources:
+                source['history_root'] = str(self.session_path.parent)
         self._pending_open = self._refresh_pending = False
         destination = self.session_path.parent / "inbox" / (uuid4().hex + ".npz")
         reply = self.server_name
@@ -142,10 +146,18 @@ class QuickPeakAnalysisLauncher(QObject):
                 self._captured = sources
                 self._keys = {index: dataset["key"] for index, dataset in enumerate(datasets)}
                 self._paint()
-            if path:
-                executable, arguments, cwd = launch_arguments(path, self.session_path, self.server_name, self.settings_path)
-                launched, _ = QProcess.startDetached(executable, arguments, cwd)
-                self._message("Peak Analysis opened with a numeric snapshot." if launched else "Could not launch native Peak Analysis.")
+            elif path:
+                # The plotted data changed while the snapshot was being built.
+                # Never hand that stale snapshot to the child process.
+                Path(path).unlink(missing_ok=True)
+                self._pending_open = bool(self._sources)
+            if path and revision == self._revision:
+                if send_message(server_name(self.session_path), dict(snapshot=path, reply_server=self.server_name), timeout=100):
+                    self._message('Numeric snapshot sent to the open Peak Analysis window.')
+                else:
+                    executable, arguments, cwd = launch_arguments(path, self.session_path, self.server_name, self.settings_path)
+                    launched, _ = QProcess.startDetached(executable, arguments, cwd)
+                    self._message("Peak Analysis opened with a numeric snapshot." if launched else "Could not launch native Peak Analysis.")
         elif result[0] == "packet":
             self.accept_overlay(result[1])
         self.snapshotChanged.emit()
@@ -158,10 +170,13 @@ class QuickPeakAnalysisLauncher(QObject):
 
     @Slot(dict)
     def receive(self, message):
-        if self._closed or not message.get("overlay"):
+        if self._closed or not (message.get("overlay") or message.get('export_display')):
             return
         if self._busy:
             self._packets.append(message)
+            return
+        if message.get('export_display'):
+            self._export_display(message['export_display'])
             return
         path = Path(message["overlay"]).resolve()
         try:
@@ -177,6 +192,33 @@ class QuickPeakAnalysisLauncher(QObject):
             finally:
                 path.unlink(missing_ok=True)
         self._start(read)
+
+    def _export_display(self, request):
+        """Capture live main-plot settings; validate its numeric key off-thread."""
+        from core.peak_workspace import atomic_json
+        response = Path(request.get('response', '')).resolve()
+        try:
+            response.relative_to((self.session_path.parent / 'display_requests').resolve())
+        except ValueError:
+            self._message('Rejected display request outside the analysis workspace.')
+            return
+        provider = getattr(self.parent(), '_capture_peak_sources', None)
+        sources = provider() if callable(provider) else list(self._sources)
+        def work():
+            from ui_qt.quick.peak_analysis_workflow import prepare_sources
+            try:
+                datasets = prepare_sources(sources)
+                current = next((d for d in datasets if d['key'] == request.get('key')), None)
+                if current is None:
+                    raise ValueError('Main plot data changed. Reopen analysis from the matching main plot before saving.')
+                if not current.get('source_export'):
+                    raise ValueError('Main plot export settings are unavailable. Reopen analysis from the main plot.')
+                payload = dict(source_export=current['source_export'])
+            except Exception as exception:
+                payload = dict(error=str(exception))
+            atomic_json(response, payload)
+            return ('display',)
+        self._start(work)
 
     def accept_overlay(self, packet):
         try:

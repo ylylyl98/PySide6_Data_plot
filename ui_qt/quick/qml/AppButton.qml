@@ -32,12 +32,18 @@ Basic.ToolButton {
     }
     background: Rectangle {
         radius: 4
-        color: control.primary ? control.colors.accent
+        color: !control.enabled ? (control.colors.controlDisabled || control.colors.control)
+             : control.primary ? (control.down ? (control.colors.accentPressed || control.colors.accent)
+                                  : control.hovered ? (control.colors.accentHover || control.colors.accent)
+                                  : control.colors.accent)
              : control.down ? control.colors.pressed
              : control.checked ? control.colors.selected
-             : control.hovered ? control.colors.hover : "transparent"
-        border.width: control.visualFocus ? 2 : control.checked || control.primary ? 1 : 0
+             : control.hovered ? control.colors.hover : control.colors.control
+        border.width: control.visualFocus ? 2 : 1
         border.color: control.visualFocus ? control.colors.focus
-                    : control.checked ? control.colors.selectedBorder : control.colors.accent
+                    : !control.enabled ? (control.colors.borderDisabled || control.colors.border)
+                    : control.checked ? control.colors.selectedBorder
+                    : control.primary ? control.colors.accent
+                    : control.hovered ? (control.colors.borderHover || control.colors.border) : control.colors.border
     }
 }

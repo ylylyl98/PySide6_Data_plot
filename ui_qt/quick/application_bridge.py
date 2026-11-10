@@ -139,6 +139,17 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         self.requestFinished.connect(self._finish_request, Qt.ConnectionType.QueuedConnection)
         self._pl_init()
         self._shell_init()
+        from ui_qt.quick.color_range_controller import ColorRangeController
+        from ui_qt.quick.main_color_adapter import MainColorAdapter
+        self._color_range_controller = ColorRangeController(MainColorAdapter(self), self)
+        self.snapshotChanged.connect(self._color_range_controller.refresh)
+        self._pl_display.snapshotChanged.connect(self._color_range_controller.refresh)
+        if self._drr_display is not None:
+            self._drr_display.snapshotChanged.connect(self._color_range_controller.refresh)
+
+    @Property(QObject, constant=True)
+    def colorRangeController(self):
+        return self._color_range_controller
 
     @Property(QObject, constant=True)
     def sourceCatalogBridge(self):
@@ -163,6 +174,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
                     resultText=self._result, logText="\n".join(self._log),
                     sourceSummary=self._source_summary(),
                     backgroundSummary=self._background_summary(),
+                    bnReferenceChoice=self._bn_reference_choice(),
                     backgroundRequired=self._workflow == "drr" and self._drr_background_required,
                     bnBusy=self._workflow == "drr" and self._bn_controller is not None and self._bn_controller.running,
                     canConfigureBackground=self._workflow == "drr" and bool(self._sources) and
@@ -294,6 +306,33 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             return "External: " + ", ".join(Path(name).name for name in self._drr_backgrounds)
         return "Background: " + {"self-first": "Self (first frame)", "self-last": "Self (last frame)",
             "external": "Select external files", "fitted": "Fitted (sample)"}[self._drr_processing["backgroundMode"]]
+
+    def _current_background_label(self):
+        """Describe the applied recipe, independently of any editable draft."""
+        if self._drr_products is not None and self._drr_products.request.background_mode == "imported":
+            return "Imported map"
+        recipe = self._drr_background_recipe
+        draft = recipe.draft if recipe is not None else None
+        if draft is not None:
+            calibration = draft.calibration
+            if calibration and draft.kind == "bn":
+                if calibration.get("original"):
+                    return "Original BN"
+                settings = calibration.get("payload", {}).get("settings", {})
+                return "Auto trend" if settings.get("single_trend_enabled") else "Texture-corrected BN"
+            if draft.kind == "bn":
+                return "Original BN"
+            if draft.kind == "self":
+                return "Self (first frame)" if draft.which == "first" else "Self (last frame)"
+            return draft.kind.upper()
+        if self._drr_processing["backgroundMode"] == "external" and self._drr_backgrounds:
+            from core.drr_measured_bn import is_measured_bn_name
+            if all(is_measured_bn_name(name) for name in self._drr_backgrounds):
+                return "Original BN"
+            return "External"
+        return {"self-first": "Self (first frame)", "self-last": "Self (last frame)",
+                "external": "No background selected", "fitted": "Fitted"}.get(
+                    self._drr_processing["backgroundMode"], "Background")
 
     def _background_context(self):
         from ui_qt.quick.drr_background_workflow import BackgroundContext
@@ -428,6 +467,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             if self._drr_background_bridge is None:
                 background = self._drr_background_bridge = DrrBackgroundBridge(settings=self.settings, auto_compare_supported=True, parent=self)
                 background.applyRequested.connect(self._apply_background)
+                background.calibrationGenerated.connect(self._bn_generated)
                 background.applicationCancelRequested.connect(self._cancel_background_application)
                 background.closeRequested.connect(self._close_background_dialog)
                 background.requestFiles.connect(self.backgroundFileDialogRequested)
@@ -441,6 +481,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
                 raw_snapshot=self._drr_products.raw_snapshot if self._drr_products is not None else None,
                 initial_error=self._drr_background_notice if self._drr_background_required else "",
                 source_drafts=self._drr_matching_drafts if self._drr_matching_folder == context.folder else None)
+            self._drr_background_bridge.set_current_background_label(self._current_background_label())
             self._drr_background_bridge.restore_comparison(self._bn_payload or
                 (current.calibration["payload"] if current.calibration is not None else None))
             self._background_open = True
@@ -449,6 +490,77 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             self.backgroundDialogRequested.emit()
         except (ValueError, OSError) as exc:
             self._message(str(exc))
+
+    def _bn_reference_choice(self):
+        """Describe an existing comparison without loading files or refitting."""
+        result = dict(visible=False, items=[], current=-1, enabled=False)
+        payload = self._bn_payload
+        if self._workflow != "drr" or not self._sources or not payload:
+            return result
+        try:
+            context = self._background_context()
+            source, config = payload["source_identity"], payload.get("settings", {})
+            if (Path(source["root"]).resolve() != Path(context.folder)
+                    or tuple(item["path"] for item in source["measurements"]) != context.measurements
+                    or str(source["y_axis"]) != context.y_axis
+                    or (config.get("derivative_window"), config.get("derivative_polyorder"))
+                    != (context.derivative_window, context.derivative_polyorder)):
+                return result
+            items = ["Original BN"]
+            if payload.get("eligible"):
+                trend = config.get("single_trend_enabled", False)
+                items.append("Auto trend" if trend else "Texture-corrected BN")
+            recipe = self._drr_background_recipe
+            calibration = recipe.draft.calibration if recipe and recipe.draft else None
+            current = -1
+            if calibration and calibration["payload"].get("version_id") == payload.get("version_id"):
+                current = 0 if calibration["original"] else (1 if len(items) > 1 else -1)
+            elif (not payload.get("batch") and recipe and recipe.mode == "External" and not calibration
+                    and recipe.files == tuple(item["path"] for item in source["baseline_files"])
+                    and recipe.which == source["baseline_which"]):
+                current = 0
+            return dict(visible=True, items=items, current=current,
+                        enabled=not self._busy and not self._background_open)
+        except (ValueError, KeyError, TypeError):
+            return result
+
+    def _bn_generated(self, payload):
+        background = self._drr_background_bridge
+        if (not self._background_open or self._workflow != "drr" or self._busy
+                or background.context != self._background_context()):
+            return
+        self._bn_payload = payload
+        self._bn_checked_scope = self._bn_scope()
+        self._message("BN background generated; the current background is unchanged until you apply a choice."
+                      if payload.get("eligible") else
+                      "No eligible corrected BN was generated; the current background remains unchanged.")
+
+    def _switch_bn_reference(self, index):
+        from dataclasses import replace
+        from core.load_cancellation import LoadCancellation, load_scope
+        from ui_qt.quick.drr_background_workflow import BackgroundDraft, prepare_application
+        from ui_qt.quick.drr_workflow import load_drr
+        state = self._bn_reference_choice()
+        if not state["enabled"] or index not in range(len(state["items"])):
+            self._publish()
+            return
+        if index == state["current"]:
+            self._publish()
+            return
+        self._cancel_bn_check()
+        context, payload, request = self._background_context(), self._bn_payload, self._drr_request()
+        draft = BackgroundDraft(kind="bn", which="all", auto_bn_compare=self._automatic_bn_enabled(),
+            calibration=dict(payload=payload, original=index == 0))
+        cancellation = self._load_cancellation = LoadCancellation()
+        def load():
+            with load_scope(cancellation):
+                prepared = prepare_application(context, draft)
+                recipe = prepared.recipe
+                captured = replace(request, background_mode="external", background_frame=recipe.which,
+                                   backgrounds=recipe.files, background_recipe=recipe)
+                products = load_drr(captured, prepared_background=prepared)
+                return prepared, replace(products, history_candidates=None)
+        self._submit("load-drr-bn-choice", load)
 
     @Slot()
     def cancelDrrBackground(self):
@@ -790,6 +902,8 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             self._drr_display = DrrDisplayState(settings=self.settings, parent=self)
             self._drr_display.parameterChanged.connect(self._drr_parameter_changed)
             self._drr_display.actionRequested.connect(self._drr_action)
+            if hasattr(self, '_color_range_controller'):
+                self._drr_display.snapshotChanged.connect(self._color_range_controller.refresh)
 
     def _drr_parameter_changed(self, key, value):
         if self._workflow != "drr":
@@ -797,7 +911,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         if key.startswith("yaxis.") and key != "yaxis.right" and self._sources:
             self._load_drr()
         else:
-            self._schedule_plot(colors_only=key.startswith(("raw.", "second.")) or key in {"log", "zero", "clip"})
+            self._schedule_plot(colors_only=key.startswith(("raw.", "second.", "recommend.overall.", "recommend.weak.")) or key in {"log", "zero", "clip"})
         self._publish()
 
     def _drr_action(self, action):
@@ -1185,9 +1299,11 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             if auto_open:
                 self.openDrrBackground()
             return
-        if kind == "load-drr-fixed" and not error:
+        preserve_bn_view = kind == "load-drr-bn-choice"
+        background_applied = kind in {"load-drr-background", "load-drr-bn-choice"}
+        if kind in {"load-drr-fixed", "load-drr-bn-choice"} and not error:
             prepared, result = result
-        if kind in {"load-drr-background", "load-drr-fixed"}:
+        if kind in {"load-drr-background", "load-drr-fixed", "load-drr-bn-choice"}:
             from_dialog = kind == "load-drr-background"
             try:
                 if error:
@@ -1235,7 +1351,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
                 kind = "load-drr"
             self._drr_products = result
             self._source = Path(result.request.files[0]) if result.request.files else None
-            self.set_cube(result.raw)
+            self.set_cube(result.raw, preserve_view=preserve_bn_view)
             if result.history_candidates is not None:
                 self._drr_display.set_memory_status("Checking saved display settings…", available=True)
                 self._drr_display.restore_candidates(result.history_candidates,
@@ -1246,9 +1362,15 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             self._export_valid = True
             self._source_catalog.recordLoaded("drr", self._folder, list(result.request.files))
             self._message(f"Loaded DRR in {elapsed:.3f} s." +
+                (f" Current background: {self._current_background_label()}." if background_applied else "") +
                 (f" Derivative unavailable: {result.second_error}" if result.second_error else ""))
         else:
+            export_context = self._maintenance_export_contexts.get(sequence)
+            same_product = export_context is not None and export_context == self._maintenance_context()
             result = self._unwrap_export(sequence, result)
+            if same_product:
+                from ui_qt.quick.peak_source_adapters import bind_exported_paths
+                bind_exported_paths(self, result)
             self._log_export_paths(self._workflow, result.values())
             self._message(f"Export completed in {elapsed:.3f} s.")
             if self._workflow == "drr" and self._drr_export_state is not None:
@@ -1256,24 +1378,29 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
                 self._drr_display.set_memory_status("Saved this file's display settings.", available=True)
             elif self._workflow == "pl":
                 self._pl_export_completed(result)
+        if preserve_bn_view:
+            self._bn_checked_scope = self._bn_scope()
         self.operationCompleted.emit(kind, elapsed * 1000)
         self._maybe_check_bn()
 
-    def set_cube(self, cube):
+    def set_cube(self, cube, *, preserve_view=False):
         """Publish a validated domain cube; also used by isolated parity tests."""
         import numpy as np
         if cube.Z.shape != (len(cube.gate), len(cube.energy)):
             raise ValueError("Measurement dimensions do not match energy and gate axes.")
+        preserve_view = bool(preserve_view and self._cube is not None
+            and np.array_equal(cube.energy, self._cube.energy) and np.array_equal(cube.gate, self._cube.gate))
         self._cube = cube
-        self._values.update(xmin=float(np.min(cube.energy)), xmax=float(np.max(cube.energy)),
-                            ymin=float(np.min(cube.gate)), ymax=float(np.max(cube.gate)),
-                            gate=float(cube.gate[np.argmin(np.abs(cube.gate))]))
+        if not preserve_view:
+            self._values.update(xmin=float(np.min(cube.energy)), xmax=float(np.max(cube.energy)),
+                                ymin=float(np.min(cube.gate)), ymax=float(np.max(cube.gate)),
+                                gate=float(cube.gate[np.argmin(np.abs(cube.gate))]))
         if self._workflow == "pl":
             self._pl_loaded(cube)
         else:
             self._ensure_drr_display()
             second = self._drr_products.second if self._drr_products is not None else None
-            self._drr_display.sync_cube(cube, second, axis_coordinates=getattr(cube, "gate_coordinates", {}))
+            self._drr_display.sync_cube(cube, second, axis_coordinates=getattr(cube, "gate_coordinates", {}), preserve_view=preserve_view)
         self._schedule_plot()
         self._publish()
 
@@ -1365,6 +1492,10 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             return
         if hasattr(value, "toVariant"):
             value = value.toVariant()
+        if key == "bnReference" and self._workflow == "drr":
+            if isinstance(value, int) and not isinstance(value, bool):
+                self._switch_bn_reference(value)
+            return
         if key == "autoUpdateCheck":
             self._ensure_update_bridge().setAutomatic(bool(value))
             return
@@ -1878,6 +2009,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         if self._closed:
             return
         self._closed = True
+        self._color_range_controller.close()
         self._appearance.close()
         self._pl_close()
         self._close_peak()

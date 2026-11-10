@@ -249,6 +249,66 @@ def _run_isolated():
             self.assertEqual(canvas.frame_generation, generation, "Reading coordinates must not publish image frames")
             self.assertFalse(canvas.backend._timer.isActive())
 
+        def test_zoom_rectangle_is_visible_reversible_and_not_in_agg_frame(self):
+            from ui_qt.quick.figure_canvas import QuickNavigationToolbar
+            for ratio in (1., 2.):
+                canvas, axes = self.make_canvas(320, 200)
+                axes.set_position((0, 0, 1, 1))
+                axes.set_xlim(0, 10); axes.set_ylim(0, 10)
+                surface = self.make_surface(canvas, 320, 200)
+                canvas.set_logical_size(320, 200, ratio)
+                canvas.draw()
+                toolbar = QuickNavigationToolbar(canvas)
+                toolbar.zoom()
+                def mouse(kind, point, button, buttons):
+                    event = QMouseEvent(kind, QPointF(*point), QPointF(*point), button, buttons, Qt.KeyboardModifier.NoModifier)
+                    {QEvent.Type.MouseButtonPress: surface.mousePressEvent,
+                     QEvent.Type.MouseMove: surface.mouseMoveEvent,
+                     QEvent.Type.MouseButtonRelease: surface.mouseReleaseEvent}[kind](event)
+                def painted():
+                    target = QImage(320, 200, QImage.Format.Format_RGBA8888)
+                    target.fill(Qt.GlobalColor.transparent)
+                    painter = QPainter(target)
+                    surface.paint(painter)
+                    painter.end()
+                    return target
+                before = pixels(painted())
+                original_frame = pixels(canvas.image)
+                draws = canvas.draw_count
+                left, none = Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton
+                # Reverse dragging exercises both endpoint ordering and y-flip.
+                mouse(QEvent.Type.MouseButtonPress, (240, 160), left, left)
+                mouse(QEvent.Type.MouseMove, (80, 60), none, left)
+                np.testing.assert_allclose(canvas.backend.rubberband, (.25, .3, .5, .5))
+                selected = painted()
+                changed = pixels(selected).reshape(200, 320, 4) != before.reshape(200, 320, 4)
+                self.assertTrue(changed[58:63, 85:235].any(), "Zoom top border was not drawn")
+                self.assertTrue(changed[65:155, 78:83].any(), "Zoom left border was not drawn")
+                np.testing.assert_array_equal(pixels(canvas.image), original_frame)
+                self.assertEqual(canvas.draw_count, draws, "Dragging selection must not redraw the scientific figure")
+                if os.environ.get("DPTK_PEAK_REVIEW_DIR"):
+                    review = Path(os.environ["DPTK_PEAK_REVIEW_DIR"])
+                    review.mkdir(parents=True, exist_ok=True)
+                    selected.save(str(review / f"zoom-selection-{int(ratio)}x.png"))
+                mouse(QEvent.Type.MouseButtonRelease, (80, 60), left, none)
+                self.assertIsNone(canvas.backend.rubberband)
+                np.testing.assert_allclose(axes.get_xlim(), (2.5, 7.5))
+                np.testing.assert_allclose(axes.get_ylim(), (2., 7.))
+                settle()
+                limits = axes.get_xlim(), axes.get_ylim()
+                mouse(QEvent.Type.MouseButtonPress, (80, 60), left, left)
+                mouse(QEvent.Type.MouseMove, (240, 160), none, left)
+                self.assertIsNotNone(canvas.backend.rubberband)
+                surface.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier))
+                mouse(QEvent.Type.MouseButtonRelease, (240, 160), left, none)
+                self.assertIsNone(canvas.backend.rubberband)
+                self.assertEqual((axes.get_xlim(), axes.get_ylim()), limits)
+                mouse(QEvent.Type.MouseButtonPress, (80, 60), left, left)
+                mouse(QEvent.Type.MouseMove, (240, 160), none, left)
+                toolbar.pan()
+                self.assertIsNone(canvas.backend.rubberband)
+                self.assertIsNone(toolbar._zoom_info)
+
         def test_cursor_uses_data_axes_and_clears_on_view_lifecycle_changes(self):
             canvas, axes = self.make_canvas()
             axes.set_xscale("log")

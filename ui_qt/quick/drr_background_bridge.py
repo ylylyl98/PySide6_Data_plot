@@ -20,6 +20,28 @@ from ui_qt.quick.drr_background_workflow import BackgroundContext, BackgroundDra
 _KINDS = ("bn", "p", "n", "pn", "self", "fitted", "custom")
 _KIND_LABELS = ("BN measured", "P only", "N only", "P + N composite", "Self", "Fitted sample", "Custom composite")
 _FRAMES = ("first", "last", "all")
+
+
+def _trend_summary(payload):
+    report = payload.get("report", {}) if payload else {}
+    policy = report.get("optimization_policy")
+    if policy not in ("shared_bn_trend_v1", "shared_bn_trend_v2"):
+        return ""
+    name = report.get("selected_candidate", report.get("selected_method", "original"))
+    model = report.get("models", {}).get(name, {})
+    if not model:
+        return "Shared trend normalization · no eligible fitted candidate"
+    try:
+        if policy == "shared_bn_trend_v2":
+            return (f"Adaptive {name.replace('trend_', '')} · strength {float(model['strength']):.0%} · "
+                    f"local D2 change {float(model['d2_guard']['max_relative_change']):.1%} · "
+                    f"{'checks passed' if model.get('eligible') else 'keep original BN'}")
+        return (f"Shared {name.replace('trend_', '')} trend · same-scan background CV RMS "
+                f"{float(model['cv_original_rms']):.4g} → {float(model['cv_candidate_rms']):.4g} · "
+                f"window sensitivity {float(model['max_sensitivity']):.2%} · "
+                f"{'passed' if model.get('sensitivity_pass') else 'failed'} · D2 not validated")
+    except (KeyError, TypeError, ValueError):
+        return "Shared trend normalization · inspect the report for fit diagnostics"
 _GENERATORS = ("saved", "reconstruction", "assisted", "pn-only")
 
 
@@ -30,6 +52,7 @@ class DrrBackgroundBridge(QObject):
     requestFiles = Signal(str, bool)
     requestSave = Signal(str, str)
     applyRequested = Signal(object)
+    calibrationGenerated = Signal(object)
     closeRequested = Signal()
     applicationCancelRequested = Signal()
     _finished = Signal(int, object, str)
@@ -40,6 +63,7 @@ class DrrBackgroundBridge(QObject):
     def __init__(self, *, settings, auto_compare_supported=False, parent=None):
         super().__init__(parent)
         self.settings = settings
+        self._bn_current_background = "Unchanged"
         self.auto_compare_supported = bool(auto_compare_supported)
         self._context = None
         self._draft = BackgroundDraft()
@@ -134,13 +158,19 @@ class DrrBackgroundBridge(QObject):
         for key in ("train_region", "validation_region", "core_region"):
             self._numbers["bn." + key + ".low"], self._numbers["bn." + key + ".high"] = bn[key]
         self._numbers["bn.taper_width"] = bn["taper_width"]
+        self._numbers["bn.single_trend_max_sensitivity"] = bn.get("single_trend_max_sensitivity", .02)
         self._flags = dict(automatic_protection=False, shared_texture=True, periodic_texture=False,
                            allow_stale=False, fixed=False, auto_bn_compare=False, acknowledged=False,
                            group_composite=False, reconstruct_gaps=False, preserve_regions=True)
+        self._flags["bn.single_full_range"] = bn.get("single_full_range", True)
+        self._flags["bn.per_measurement"] = True
+        self._flags["bn.single_trend_enabled"] = bn.get("single_trend_enabled", False)
+        self._bn_trend_order = bn.get("single_trend_order", "auto")
         self._texts = dict(regions="", featureProtection="", texture_reference_source="", templateName="",
                            rawSource="", report="")
-        for key in ("train_regions", "protected_regions", "uncertain_regions", "trusted_regions"):
+        for key in ("train_regions", "protected_regions", "uncertain_regions", "trusted_regions", "single_regions"):
             self._texts["bn." + key] = "; ".join(f"{lo:g} {hi:g}" for lo, hi in bn[key])
+        self._texts["bn.single_trend_regions"] = "; ".join(f"{lo:g} {hi:g}" for lo, hi in bn.get("single_trend_regions", ()))
         self._fit_method = "spline"
         self._raw_role = "measurement"
         self._raw_scope = "single"
@@ -327,7 +357,37 @@ class DrrBackgroundBridge(QObject):
         from core.drr_sources import resolve_source_path
         try:
             context = self._context
-            source, config = payload["source_identity"], payload["settings"]
+            source = payload["source_identity"]
+            if payload.get("batch"):
+                original_assignments = self._batch_display_assignments(payload, original=True)
+                candidate_assignments = self._batch_display_assignments(payload, original=False)
+                calibration = self._draft.calibration
+                if calibration and calibration.get("payload", {}).get("batch"):
+                    selected = calibration["payload"]
+                    if ([v["version_id"] for v in selected["items"]] != [v["version_id"] for v in payload["items"]]
+                            or self._batch_display_assignments(selected, original=True) != original_assignments
+                            or self._batch_display_assignments(selected, original=False) != candidate_assignments):
+                        return False
+                    expected = original_assignments if calibration["original"] else candidate_assignments
+                    selected_files = {resolve_source_path(context.folder, n) for n in self._draft.files}
+                    expected_files = {resolve_source_path(context.folder, n) for item in expected for n in item.baseline_files}
+                    original_files = {resolve_source_path(context.folder, n) for item in original_assignments for n in item.baseline_files}
+                    if selected_files not in (expected_files, original_files):
+                        return False
+                else:
+                    plan = self._draft.bn_plan
+                    current = tuple(plan.resolution.assignments) if plan else self._draft.saved_assignments
+                    if current:
+                        def recipes(items):
+                            return [(v.measurement_file, tuple(v.baseline_files), v.baseline_which) for v in items]
+                        if recipes(current) != recipes(original_assignments):
+                            return False
+                    elif any(tuple(v.baseline_files) != tuple(self._draft.files) or v.baseline_which != self._draft.which for v in original_assignments):
+                        return False
+                self._flags["bn.per_measurement"] = True
+                config = payload["settings"]
+            else:
+                config = payload["settings"]
             if (Path(source["root"]).resolve() != Path(context.folder)
                     or {item["path"] for item in source["measurements"]} != set(context.measurements)
                     or source["y_axis"] != context.y_axis
@@ -335,25 +395,33 @@ class DrrBackgroundBridge(QObject):
                         != (context.derivative_window, context.derivative_polyorder)):
                 return False
             files, which = self._draft.files, self._draft.which
-            if self._draft.bn_plan is not None:
+            if payload.get("batch"):
+                files = None
+            elif self._draft.bn_plan is not None:
                 choices = {(item.baseline_files, item.baseline_which) for item in self._draft.bn_plan.resolution.assignments}
                 if len(choices) != 1:
                     return False
                 files, which = next(iter(choices))
-            current = {resolve_source_path(context.folder, name) for name in files}
-            original = {resolve_source_path(context.folder, item["path"]) for item in source["baseline_files"]}
-            candidate = {resolve_source_path(context.folder, payload["csv_path"])} if payload.get("csv_path") else set()
-            if not (current == original and which == source["baseline_which"] or current == candidate):
-                return False
+            if files is not None:
+                current = {resolve_source_path(context.folder, name) for name in files}
+                original = {resolve_source_path(context.folder, item["path"]) for item in source["baseline_files"]}
+                candidate = {resolve_source_path(context.folder, payload["csv_path"])} if payload.get("csv_path") else set()
+                if not (current == original and which == source["baseline_which"] or current == candidate):
+                    return False
             from core.drr_bn_settings import BnCalibrationSettings
             values = {**asdict(BnCalibrationSettings()), **config}
             for key in ("train_region", "validation_region", "core_region"):
                 self._numbers["bn."+key+".low"], self._numbers["bn."+key+".high"] = values[key]
-            for key in ("train_regions", "protected_regions", "uncertain_regions", "trusted_regions"):
+            for key in ("train_regions", "protected_regions", "uncertain_regions", "trusted_regions", "single_regions"):
                 self._texts["bn."+key] = "; ".join(f"{lo:.12g} {hi:.12g}" for lo, hi in values[key])
             self._numbers["bn.taper_width"] = values["taper_width"]
+            self._flags["bn.single_full_range"] = values.get("single_full_range", True)
+            self._flags["bn.single_trend_enabled"] = values.get("single_trend_enabled", False)
+            self._bn_trend_order = values.get("single_trend_order", "auto")
+            self._texts["bn.single_trend_regions"] = "; ".join(f"{lo:.12g} {hi:.12g}" for lo, hi in values.get("single_trend_regions", ()))
+            self._numbers["bn.single_trend_max_sensitivity"] = values.get("single_trend_max_sensitivity", .02)
             self._bn_payload = payload
-            self._texts["report"] = json.dumps({key: payload.get(key) for key in ("summary", "status", "reasons", "candidates", "report")}, indent=2, default=str)
+            self._texts["report"] = json.dumps({key: payload.get(key) for key in ("summary", "status", "reasons", "candidates", "report", "exports", "elapsed_seconds")}, indent=2, default=str)
             self._draw_preview()
             self._refresh()
             return True
@@ -454,7 +522,7 @@ class DrrBackgroundBridge(QObject):
             training_files, training_summary = (), "P/N-only generation does not use sample measurements."
         self._snapshot = dict(opened=self._opened, busy=self._busy, page=self._page, status=self._status, error=self._error,
             measurementSummary=f"{len(self._context.measurements)} original measurements" if self._context else "No measurements",
-            files=list(self._draft.files), kind=self._draft.kind, method=self._method,
+            files=list(self._background_files() if self._draft.kind == "bn" and self._draft.calibration else self._draft.files), kind=self._draft.kind, method=self._method,
             recommendMatching=self._draft.kind in {"bn", "p", "n", "pn"} and self._method == "common" and len(self._draft.files) > 1 and self._draft.kind not in self._explicit_methods,
             selectedCandidates=(list(self._background_files()) if self._draft.saved_assignments else
                 list(self._draft.bn_candidates or ()) if self._draft.kind == "bn" else list(self._draft.pn_candidates or ())),
@@ -469,6 +537,8 @@ class DrrBackgroundBridge(QObject):
                          pFrame=choice(("First", "Last", "All"), _FRAMES.index(self._pn_frames["P"])),
                          nFrame=choice(("First", "Last", "All"), _FRAMES.index(self._pn_frames["N"])),
                          fitMethod=choice(("Spline", "Polynomial"), int(self._fit_method == "polynomial")),
+                         bnCalibrationMethod=choice(("Shared trend normalization", "BN texture correction"), 0 if self._flags["bn.single_trend_enabled"] else 1),
+                         bnTrendOrder=choice(("Automatic", "Linear", "Quadratic"), ("auto", "linear", "quadratic").index(self._bn_trend_order)),
                          fitView=choice(("Background / envelope", "Second derivative comparison", "Applied texture correction (%)", "Texture coverage"), self._fit_view),
                          rawRole=choice(("Measurements", "Background sources"), int(self._raw_role == "background")),
                          rawScope=choice(("Single file", "Equal weight average", "Reference used") if self._raw_role == "background" else ("Single file", "Equal weight average"), ("single", "average", "reference").index(self._raw_scope)),
@@ -514,12 +584,39 @@ class DrrBackgroundBridge(QObject):
                         or self._page == "raw" and self._raw_preview is not None or (self._page in {"pn", "composite"} or self._page == "settings" and self._draft.kind == "pn") and self._document is not None),
             plotTool=str(self._navigation.mode) if self._navigation is not None else "",
             canUndo=bool(self._undo), canUseVersion=self._version is not None,
-            canCalibrate=self._draft.kind == "bn" and bool(self._draft.files),
+            canCalibrate=self._draft.kind == "bn" and bool(self._draft.files or self._draft.bn_plan),
             canFix=can_fix,
             autoCompareSupported=self.auto_compare_supported,
             canUseCalibrated=bool(self._bn_payload and self._bn_payload["eligible"]),
+            bnCurrentBackground=self._bn_current_background,
+            bnGeneratedLabel=("Auto trend" if self._bn_payload and self._bn_payload.get("settings", {}).get("single_trend_enabled") else "BN correction"),
+            bnSingleMeasurement=bool(self._context and len(self._context.measurements) == 1),
+            bnIndividualCalibration=bool(self._context and (len(self._context.measurements) == 1 or self._flags["bn.per_measurement"])),
+            bnBatchItems=[dict(measurement=str(item.get("measurement", "")), status=("Candidate eligible" if item.get("eligible") else "Original BN retained") + " · " + str(item.get("status", "")),
+                               detail=str(item.get("summary", ""))) for item in self._bn_payload.get("items", ())]
+                         if self._bn_payload and self._bn_payload.get("batch") else [],
+            bnOutputSummary=("\n".join(f"{key}: {value}" for key, value in self._bn_payload["exports"].get("paths", {}).items())
+                             if self._bn_payload and self._bn_payload.get("exports") else ""),
+            bnOutputDirectory=(str(self._bn_payload["exports"].get("directory", ""))
+                               if self._bn_payload and self._bn_payload.get("exports") else ""),
+            bnOutputCount=(len(self._bn_payload["exports"].get("paths", {}))
+                           if self._bn_payload and self._bn_payload.get("exports") else 0),
+            bnHasOutputs=bool(self._bn_payload and self._bn_payload.get("exports")),
+            bnOutputStatus=(str(self._bn_payload["exports"].get("status", ""))
+                            if self._bn_payload and self._bn_payload.get("exports") else ""),
+            bnHasComparison=bool(self._bn_payload),
+            bnElapsedSummary=(f"Completed in {self._bn_payload['elapsed_seconds']:.1f} s"
+                              if self._bn_payload and self._bn_payload.get("elapsed_seconds") is not None else ""),
+            bnModelSummary=(_trend_summary(self._bn_payload) or ("Multi BN measured texture templates · original reference is the selected BN mean · within-scan evidence"
+                            if self._bn_payload and self._bn_payload.get("report", {}).get("optimization_policy") == "multi_bn_single_v1" else
+                            "One BN · phase and shared fine-response correction · within-scan checks"
+                            if self._bn_payload and self._bn_payload.get("report", {}).get("single_pair_scope", {}).get("model") == "phase_with_shared_high_frequency" else
+                            "One BN · smooth energy-dependent phase and amplitude · within-scan checks"
+                            if self._bn_payload and self._bn_payload.get("report", {}).get("single_pair_scope", {}).get("model") == "phase_ten_knots" else "")),
+            bnConditionWarning=("Acquisition labels differ: " + ", ".join(self._bn_payload["report"]["acquisition_condition_check"]["differences"])
+                                if self._bn_payload and self._bn_payload.get("report", {}).get("acquisition_condition_check", {}).get("differences") else ""),
             bnCandidates=[dict(name=str(row.get("name", "Candidate")).replace("_", " "),
-                status="Passed joint validation" if row.get("eligible") else "Original baseline" if row.get("name") == "original" else "Preview only",
+                status=("Eligible individual corrections with original fallbacks" if self._bn_payload.get("batch") else "Passed within-scan criteria" if self._bn_payload.get("status") == "single_pair" else "Passed joint validation") if row.get("eligible") else "Original baseline" if row.get("name") == "original" else "Preview only",
                 detail=str(row.get("reason", ""))) for row in self._bn_payload.get("candidates", ())] if self._bn_payload else [],
             gateMaximum=gate_maximum,
             gateDescription=f"{preview_cube.gate_label}: {preview_cube.gate[self._numbers['gate']]:.9g}" if preview_cube is not None else "",
@@ -1022,6 +1119,12 @@ class DrrBackgroundBridge(QObject):
                 if self._pn_frames[role] != _FRAMES[index]:
                     self._invalidate_pn_preview()
                 self._pn_frames[role] = _FRAMES[index]
+            elif key == "bnCalibrationMethod":
+                self._flags["bn.single_trend_enabled"] = index == 0
+                self._bn_payload = None
+            elif key == "bnTrendOrder":
+                self._bn_trend_order = ("auto", "linear", "quadratic")[index]
+                self._bn_payload = None
             elif key == "fitMethod":
                 self._fit_method = ("spline", "polynomial")[index]
                 self._invalidate_fit()
@@ -1068,9 +1171,11 @@ class DrrBackgroundBridge(QObject):
         try:
             if key not in self._numbers or not math.isfinite(value):
                 raise ValueError("Enter a finite numeric value.")
-            ranges = dict(spline_intervals=(4, 40), smoothing=(.000001, 10), polynomial_degree=(2, 4), periodic_components=(1, 5), maxGapMeV=(1, 1000))
+            ranges = dict(spline_intervals=(4, 40), smoothing=(.000001, 10), polynomial_degree=(2, 4), periodic_components=(1, 5), maxGapMeV=(1, 1000), **{"bn.single_trend_max_sensitivity": (0, 1)})
             if key in ranges and not ranges[key][0] <= value <= ranges[key][1]:
                 raise ValueError(f"{key}: valid range {ranges[key][0]}–{ranges[key][1]}.")
+            if key == "bn.single_trend_max_sensitivity" and not 0 < value < 1:
+                raise ValueError("Maximum trend sensitivity must be greater than 0 and less than 1.")
             if key in {"gate", "spline_intervals", "polynomial_degree", "periodic_components"} and value != int(value):
                 raise ValueError("Enter an integer value.")
             if key == "gate" and not 0 <= value <= self._snapshot["gateMaximum"]:
@@ -1160,6 +1265,8 @@ class DrrBackgroundBridge(QObject):
                     self._invalidate_pn_preview()
         elif key in self._flags:
             self._flags[key] = value
+            if key in {"bn.single_full_range", "bn.per_measurement", "bn.single_trend_enabled"}:
+                self._bn_payload = None
             if key in {"fixed", "auto_bn_compare", "allow_stale"}:
                 self._draft = replace(self._draft, **{key: value})
             elif key == "acknowledged":
@@ -1186,6 +1293,12 @@ class DrrBackgroundBridge(QObject):
         return url.toLocalFile() if url.isLocalFile() else str(value)
 
     def _background_files(self):
+        if self._draft.kind == "bn" and self._draft.calibration:
+            # Reference pickers edit measured inputs. The applied generated
+            # version remains attached to the draft and the main-plot choice.
+            source = self._draft.calibration.get("payload", {}).get("source_identity", {})
+            if source.get("baseline_files"):
+                return tuple(item["path"] for item in source["baseline_files"])
         if self._draft.saved_assignments:
             return tuple(dict.fromkeys(name for item in self._draft.saved_assignments
                 for name in item.baseline_source_files))
@@ -1317,6 +1430,10 @@ class DrrBackgroundBridge(QObject):
                     self._schedule_pn_batch_plan()
                 self._status = "P/N selection updated. Generate explicitly or choose a saved version."
             elif role in {"background", "background-add"}:
+                if self._draft.kind == "bn":
+                    from core.drr_bn_store import is_bn_calibration_source
+                    if any(is_bn_calibration_source(self._context.folder, name) for name in names):
+                        raise ValueError("This is a measurement-specific calibrated BN. Use its Auto trend choice, and select an original measured BN here.")
                 self._set_background_files(tuple(dict.fromkeys((*self._background_files(), *names))) if role == "background-add" else names)
             elif role == "texture":
                 self._texts["texture_reference_source"] = names[0]
@@ -1400,6 +1517,11 @@ class DrrBackgroundBridge(QObject):
             bn_plan=None, pn_plan=None, saved_assignments=(), batch_result=None, bn_warnings_acknowledged=False,
             pn_warnings_acknowledged=False, fixed=False, **changes)
 
+    def set_current_background_label(self, label):
+        """The owner supplies the applied background, not the generated draft."""
+        self._bn_current_background = str(label)
+        self._refresh()
+
     @Slot(str)
     def invoke(self, action):
         if action == "cancel-task":
@@ -1416,7 +1538,7 @@ class DrrBackgroundBridge(QObject):
             return
         if self._busy or not self._context:
             return
-        if action == "apply" and (self._matching or self._match_timer.isActive()):
+        if action in {"apply", "apply-bn-original", "apply-bn-candidate"} and (self._matching or self._match_timer.isActive()):
             self._error = "Wait for matching to finish before applying."
             self._refresh()
             return
@@ -1537,14 +1659,47 @@ class DrrBackgroundBridge(QObject):
             elif action == "composite-save":
                 self._require_document()
                 self.requestSave.emit("composite-save", str(Path(self._context.folder) / "custom-background.csv"))
+            elif action == "open-bn-output-folder":
+                directory = (self._bn_payload or {}).get("exports", {}).get("directory", "")
+                if not directory or not Path(directory).is_dir():
+                    raise ValueError("Generated result folder is unavailable. Generate the comparison again.")
+                from PySide6.QtGui import QDesktopServices
+                if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(directory).resolve()))):
+                    raise ValueError("Could not open the generated result folder.")
+            elif action == "calibrate-bn":
+                if self._draft.kind != "bn":
+                    raise ValueError("Choose a measured BN background first.")
+                if self._matching or self._match_timer.isActive():
+                    raise ValueError("Wait for BN matching to finish before calibrating.")
+                # The direct entry is always the automatic trend preset. Custom
+                # methods remain available through the advanced generation page.
+                self._flags["bn.single_trend_enabled"] = True
+                self._flags["bn.per_measurement"] = True
+                self._bn_trend_order = "auto"
+                self._texts["bn.single_trend_regions"] = ""
+                self._numbers["bn.single_trend_max_sensitivity"] = .02
+                self._invalid_numbers.discard("bn.single_trend_max_sensitivity")
+                # Re-enter the service cache so sources, settings and algorithm
+                # identity are checked; never reuse a previous texture preview.
+                self._bn_payload = None
+                self._compare_bn(show_preview=False, apply_when_ready=True)
+            elif action == "generate-bn":
+                if self._bn_payload is not None:
+                    self.calibrationGenerated.emit(self._bn_payload)
+                else:
+                    self._compare_bn(show_preview=False)
             elif action == "compare-bn":
-                self._compare_bn()
+                if self._bn_payload is not None:
+                    self._page = "bn"
+                    self._draw_preview()
+                else:
+                    self._compare_bn()
             elif action in {"use-bn-original", "use-bn-candidate"}:
                 if not self._bn_payload:
                     raise ValueError("Compare the current BN group first.")
                 original = action == "use-bn-original"
                 if not original and not self._bn_payload["eligible"]:
-                    raise ValueError("This candidate has not passed joint DR/R and D2E validation.")
+                    raise ValueError("This candidate has not passed the applicable calibration criteria.")
                 self._select_common_background("bn", calibration=dict(payload=self._bn_payload, original=original), version=None)
                 self._page, self._status = "settings", "BN choice retained in this draft; apply to change the main DRR result."
             elif action == "preview-raw":
@@ -1553,15 +1708,35 @@ class DrrBackgroundBridge(QObject):
                 mode = action.split(":", 1)[1]
                 if self._navigation is not None and mode in {"pan", "zoom", "home", "back", "forward"}:
                     getattr(self._navigation, mode)()
-            elif action == "apply":
+            elif action in {"apply", "apply-bn-original", "apply-bn-candidate"}:
                 if self._invalid_numbers:
                     raise ValueError("Correct the invalid numeric draft before applying.")
                 context = self._context
                 draft = replace(self._draft, fixed=self._flags["fixed"], auto_bn_compare=self._flags["auto_bn_compare"])
+                original = action == "apply-bn-original"
+                if action != "apply":
+                    if draft.kind != "bn":
+                        raise ValueError("Choose a measured BN background first.")
+                    payload = self._bn_payload
+                    if not original and (not payload or not payload.get("eligible")):
+                        raise ValueError("Generate an eligible calibration preview before applying calibrated BN.")
+                    if original and payload is None and draft.calibration:
+                        payload = draft.calibration["payload"]
+                    if payload is not None:
+                        # Prepare a separate proposal. The visible draft and active
+                        # reference remain intact until the owner's trial/commit.
+                        draft = replace(draft, calibration=dict(payload=payload, original=original),
+                            assignment_method="common", assignment_method_explicit=True,
+                            relaxed_conditions=(), saved_matching_review=None,
+                            bn_candidates=None, pn_candidates=None, bn_plan=None, pn_plan=None,
+                            saved_assignments=(), batch_result=None, version=None, fixed=False,
+                            bn_warnings_acknowledged=False, pn_warnings_acknowledged=False)
+                def prepare(token):
+                    return prepare_application(context, draft, original_bn=True) if original else prepare_application(context, draft)
                 def complete(value):
                     self._status = "Background verified; awaiting the owning selection's final context check."
                     self.applyRequested.emit(value)
-                self._run(lambda token: prepare_application(context, draft), complete, "Verifying background inputs before application…")
+                self._run(prepare, complete, "Verifying background inputs before application…")
             self._error = ""
         except (ValueError, OSError, KeyError, TypeError) as exc:
             self._error = str(exc)
@@ -1872,29 +2047,61 @@ class DrrBackgroundBridge(QObject):
             self._page, self._status = "settings", "Native composite saved with source snapshots; Apply background to use this draft."
         self._run(lambda token: save_composite_background(path, document, overwrite=False), complete, "Saving a new composite CSV and its recipe metadata…")
 
-    def _compare_bn(self):
+    def _compare_bn(self, *, show_preview=True, apply_when_ready=False):
         from ui_qt.quick.drr_background_workflow import compare_bn
         context, draft = self._context, self._draft
         files, which = draft.files, draft.which
-        if draft.bn_plan is not None:
-            recipes = {(item.baseline_files, item.baseline_which) for item in draft.bn_plan.resolution.assignments}
+        batch = len(context.measurements) > 1 and self._flags["bn.per_measurement"]
+        assignments = tuple(draft.bn_plan.resolution.assignments) if draft.bn_plan is not None else ()
+        if draft.calibration:
+            saved = draft.calibration["payload"]
+            if saved.get("batch"):
+                assignments = self._batch_display_assignments(saved, original=True)
+            else:
+                source = saved["source_identity"]
+                files = tuple(item["path"] for item in source["baseline_files"])
+                which = source["baseline_which"]
+        if assignments and not batch:
+            recipes = {(item.baseline_files, item.baseline_which) for item in assignments}
             if len(recipes) != 1:
-                raise ValueError("BN calibration requires one common measured reference for the group.")
+                raise ValueError("Joint BN calibration requires one common measured reference for the group.")
             files, which = next(iter(recipes))
-        if not files:
+        if not files and not assignments:
             raise ValueError("Choose common measured BNback / BNbackground files first.")
-        config = {key: (self._numbers["bn." + key + ".low"], self._numbers["bn." + key + ".high"])
-                  for key in ("train_region", "validation_region", "core_region")}
-        config.update({key: parse_regions(self._texts["bn." + key])
-                       for key in ("train_regions", "protected_regions", "uncertain_regions", "trusted_regions")})
-        config["taper_width"] = self._numbers["bn.taper_width"]
+        trend_enabled = bool(self._flags["bn.single_trend_enabled"] and (len(context.measurements) == 1 or batch))
+        config = {"single_trend_enabled": trend_enabled, "single_trend_order": self._bn_trend_order,
+                  "single_trend_max_sensitivity": self._numbers["bn.single_trend_max_sensitivity"]}
+        if trend_enabled:
+            config["single_trend_regions"] = parse_regions(self._texts["bn.single_trend_regions"])
+        else:
+            config.update({key: (self._numbers["bn." + key + ".low"], self._numbers["bn." + key + ".high"])
+                           for key in ("train_region", "validation_region", "core_region")})
+            config.update({key: parse_regions(self._texts["bn." + key])
+                           for key in ("train_regions", "protected_regions", "uncertain_regions", "trusted_regions", "single_regions")})
+            config["taper_width"] = self._numbers["bn.taper_width"]
+            config["single_full_range"] = self._flags["bn.single_full_range"]
         def complete(payload):
             self._bn_payload = payload
-            self._texts["report"] = json.dumps({key: payload[key] for key in ("summary", "status", "reasons", "candidates", "report")}, indent=2, default=str)
+            self._texts["report"] = json.dumps({key: payload.get(key) for key in ("summary", "status", "reasons", "candidates", "report", "exports", "elapsed_seconds")}, indent=2, default=str)
             self._status = payload["summary"]
-            self._draw_preview()
-        self._run(lambda token: compare_bn(context, files, which, settings=config, cancellation=token), complete,
-                  "Comparing measured BN with the conservative joint DR/R + D2E protocol…")
+            if show_preview:
+                self._draw_preview()
+            else:
+                label = "Auto trend" if trend_enabled else "BN correction"
+                self._status = (f"{label} ready. Current background unchanged."
+                                if payload.get("eligible") else "No eligible correction. Current background unchanged.")
+                self.calibrationGenerated.emit(payload)
+                if apply_when_ready and payload.get("eligible"):
+                    self.invoke("apply-bn-candidate")
+        if batch:
+            from ui_qt.quick.drr_bn_batch_workflow import compare_bn_batch
+            self._run(lambda token: compare_bn_batch(context, files, which, settings=config, assignments=assignments, cancellation=token, export_products=False),
+                      complete, "Calibrating each measurement before averaging DR/R…")
+        else:
+            self._run(lambda token: compare_bn(context, files, which, settings=config, cancellation=token, export_products=False), complete,
+                      ("Generating automatic BN trend…" if trend_enabled else
+                       "Comparing this measurement and BN using within-scan matching…" if len(context.measurements) == 1 else
+                       "Comparing measured BN with the conservative joint DR/R + D2E protocol…"))
 
     def _raw_sources(self):
         if not self._context:
@@ -1906,10 +2113,26 @@ class DrrBackgroundBridge(QObject):
         return list(dict.fromkeys(source for item in self._raw_assignments() for source in
             (item.baseline_source_files if item.baseline_mode == "External" else (item.measurement_file,))))
 
+    def _batch_display_assignments(self, payload, *, original):
+        """Read display mappings without disk I/O; application re-verifies them."""
+        from core.drr_sources import DrrMeasurementAssignment
+        key = "original_assignments" if original else "candidate_assignments"
+        values = tuple(DrrMeasurementAssignment.from_mapping(v) for v in payload[key])
+        if tuple(v.measurement_file for v in values) != self._context.measurements:
+            raise ValueError("Batch preview belongs to another measurement selection.")
+        return values
+
     def _raw_assignments(self):
         """Describe draft references without importing any intensity loader."""
         from core.drr_sources import DrrMeasurementAssignment
         draft = self._draft
+        calibration = draft.calibration
+        if calibration and calibration.get("payload", {}).get("batch"):
+            try:
+                return self._batch_display_assignments(calibration["payload"], original=calibration["original"])
+            except (KeyError, TypeError, ValueError):
+                # Refuse a misleading common-reference preview without a valid mapping.
+                return ()
         plan = draft.bn_plan or draft.pn_plan
         assignments = tuple(plan.resolution.assignments) if plan else draft.saved_assignments
         if not assignments and draft.kind != "fitted":
@@ -1925,7 +2148,7 @@ class DrrBackgroundBridge(QObject):
         draft = self._draft
         plan = draft.bn_plan or draft.pn_plan
         return RawSnapshot(self._context.folder, self._context.measurements, self._raw_assignments(), self._context.y_axis,
-                           "fitted_raw_average" if draft.kind == "fitted" else "heterogeneous" if plan else "common")
+                           "fitted_raw_average" if draft.kind == "fitted" else "heterogeneous" if plan or draft.calibration and draft.calibration["payload"].get("batch") else "common")
 
     def _preview_raw(self):
         from core.drr_raw_preview import load_preview
@@ -2029,7 +2252,66 @@ class DrrBackgroundBridge(QObject):
             axes.set_title(f"Gate {raw.gate[gate]:g}; drag to protect energy intervals")
         elif self._page == "bn" and self._bn_payload:
             value = self._bn_payload
+            if value.get("batch"):
+                figure.clear()
+                panels = figure.subplots(2, 3, sharex=True, sharey=True)
+                energy, gates = np.asarray(value["energy"]), np.asarray(value["gates"])
+                order = np.argsort(gates)
+                for row, product in enumerate(("drr", "d2")):
+                    values = [np.asarray(value["original_" + product]), np.asarray(value["candidate_" + product]),
+                              np.asarray(value.get("trial_" + product, value["candidate_" + product]))]
+                    finite = np.concatenate([a[np.isfinite(a)] for a in values])
+                    if product == "drr" and finite.size:
+                        lo, hi = map(float, np.percentile(finite, [1, 99]))
+                        if hi <= lo:
+                            padding = max(abs(lo)*1e-6, 1e-12)
+                            lo, hi = lo-padding, hi+padding
+                    else:
+                        limit = max(float(np.percentile(np.abs(finite), 99)) if finite.size else 1., 1e-12)
+                        lo, hi = -limit, limit
+                    for col, data in enumerate(values):
+                        panel = panels[row, col]
+                        panel.pcolormesh(energy, gates[order], data[order], shading="auto", cmap="RdBu_r", vmin=lo, vmax=hi)
+                        panel.set_title(("Original mean" if col == 0 else "Eligible + original fallbacks" if col == 1 else "All candidates · exploratory only, not applied") + ("\nMean DR/R" if row == 0 else "\nD2 of mean DR/R"), fontsize=8)
+                        panel.set_ylabel("Gate")
+                        if row == 1: panel.set_xlabel("Photon energy (eV)")
+                self.canvas.draw_idle()
+                return
             preview = value.get("preview")
+            if preview and "maps_drr" in preview:
+                figure.clear()
+                panels = figure.subplots(2, 2, sharex=True, sharey=True)
+                energy, gates = np.asarray(preview["maps_energy"]), np.asarray(preview["gates"])
+                order = np.argsort(gates)
+                if not preview.get("candidate_available", True):
+                    candidate_label = "No candidate · original retained"
+                elif value.get("eligible"):
+                    candidate_label = "Eligible within-scan candidate"
+                else:
+                    candidate_label = "Exploratory candidate · not eligible"
+                for row, product in enumerate(("maps_drr", "maps_d2")):
+                    data = np.asarray(preview[product])
+                    finite = data[np.isfinite(data)]
+                    if row == 0 and finite.size:
+                        lo, hi = map(float, np.percentile(finite, [1, 99]))
+                        if hi <= lo:
+                            padding = max(abs(lo)*1e-6, 1e-12)
+                            lo, hi = lo-padding, hi+padding
+                    else:
+                        limit = max(float(np.percentile(np.abs(finite), 99)) if finite.size else 1., 1e-12)
+                        lo, hi = -limit, limit
+                    for col, label in enumerate(("Original measured BN", candidate_label)):
+                        panel = panels[row, col]
+                        mesh = panel.pcolormesh(energy, gates[order], data[col, order], shading="auto", cmap="RdBu_r", vmin=lo, vmax=hi)
+                        panel.set_title(label + (" · DR/R" if row == 0 else " · D2"), fontsize=8)
+                        panel.set_ylabel(preview.get("gate_label", "Gate (V)"))
+                        if row == 1:
+                            panel.set_xlabel("Photon energy (eV)")
+                    colorbar = figure.colorbar(mesh, ax=list(panels[row]), label="DR/R" if row == 0 else "D2 (eV⁻²)")
+                    colorbar.ax.tick_params(labelsize=7)
+                    colorbar.ax.yaxis.label.set_size(8)
+                self.canvas.draw_idle()
+                return
             if preview:
                 figure.clear()
                 axes, drr_axes, derivative_axes = figure.subplots(3, 1, sharex=True)
@@ -2046,7 +2328,7 @@ class DrrBackgroundBridge(QObject):
             axes.plot(value["energy"], value["original_background"], label="Original measured BN")
             axes.plot(value["energy"], value["candidate_background"], label="Selected candidate")
             axes.set_ylabel("BN intensity")
-            axes.set_title("Representative means — eligibility comes from full joint validation", fontsize=9)
+            axes.set_title("Representative means — " + ("within-scan checks" if value.get("report", {}).get("optimization_policy") in {"single_pair_v1", "multi_bn_single_v1"} else "joint validation"), fontsize=9)
         elif self._page == "raw" and self._raw_preview:
             cube = self._raw_preview.cube
             gate = int(np.clip(self._numbers["gate"], 0, len(cube.gate)-1))

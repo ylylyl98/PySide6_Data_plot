@@ -101,11 +101,11 @@ def _validate_managed_settings(request):
         if not is_bn_calibration_source(folder, name):
             continue
         version = DrrBnStore(folder).version_for_csv(name)
-        if (not version.fresh or not version.eligible or version.validation_status != "accepted"
+        if (not version.fresh or not version.eligible or version.validation_status not in ("accepted", "single_pair")
                 or version.source_identity.get("y_axis") != request.y_axis
                 or (version.settings.get("derivative_window"), version.settings.get("derivative_polyorder"))
                     != (request.window, request.polyorder)):
-            raise ValueError("The managed BN reference needs current joint DR/R + D2E validation at these SG settings.")
+            raise ValueError("The managed BN reference needs current joint DR/R + D2E validation or single-measurement calibration checks at these SG settings.")
 
 
 def process_drr(source, request: DrrRequest, *, input_signatures=(), background_references=(), raw_snapshot=None) -> DrrProducts:

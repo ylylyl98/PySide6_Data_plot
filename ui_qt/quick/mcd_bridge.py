@@ -112,6 +112,14 @@ class McdBridge(QObject):
         self._feature_timer = QTimer(self); self._feature_timer.setSingleShot(True); self._feature_timer.setInterval(90); self._feature_timer.timeout.connect(self._analyze_feature)
         self._review_timer = QTimer(self); self._review_timer.setSingleShot(True); self._review_timer.setInterval(90); self._review_timer.timeout.connect(self._calculate_review)
         self._plot_timer = QTimer(self); self._plot_timer.setSingleShot(True); self._plot_timer.timeout.connect(self._render)
+        from ui_qt.quick.color_range_controller import ColorRangeController
+        from ui_qt.quick.color_range_adapters import McdColorAdapter
+        self._color_range_controller = ColorRangeController(McdColorAdapter(self), self)
+        self.snapshotChanged.connect(self._color_range_controller.refresh)
+
+    @Property(QObject, constant=True)
+    def colorRangeController(self):
+        return self._color_range_controller
 
     @Property(QObject, notify=plotBackendChanged)
     def plotBackend(self):
@@ -523,7 +531,12 @@ class McdBridge(QObject):
                 getattr(self._navigation,action)()
                 if action in {"home","back","forward"}:self._fit_spectrum_y()
                 self._publish()
-            elif action=="auto-ranges":self._values.update(fixX=False,fixY=False,fixColors=False);self._auto_ranges();self._queue_plot()
+            elif action=="auto-ranges":
+                fixed_colors=self._values["fixColors"]
+                self._values.update(fixX=False,fixY=False,fixColors=True)
+                try:self._auto_ranges()
+                finally:self._values["fixColors"]=fixed_colors
+                self._queue_plot()
             elif action=="toggle-spectrum":self.setParameter("spectrumVisible",not self._values["spectrumVisible"])
             elif action=="toggle-table":
                 self._values["showTable"]=not self._values["showTable"];self._sheet="diagnostics" if self._values["showTable"] else "";self._publish()
@@ -655,7 +668,7 @@ class McdBridge(QObject):
             dict(key="display",title="Display",advanced=True,fields=[choice("spectraSource","Displayed paired spectra"),choice("featureMetric","Feature versus B"),flag("featureOverlay","Overlay feature trajectories"),
                 flag("spectrumVisible","Show spectrum below compact map"),number("heatmapFraction","Heatmap height fraction"),
                 flag("showIncreasing","Increasing sweep"),flag("showDecreasing","Decreasing sweep"),choice("map","MCD map",tuple(self._products.result.maps) if self._products else ("Combo",)),
-                choice("cmap","Color map"),flag("centerZero","Center colors at zero"),number("vmin","Color minimum",pair="color"),number("vmax","Color maximum",pair="color"),flag("fixColors","Keep color limits"),
+                choice("cmap","Color map"),flag("centerZero","Center colors at zero"),
                 number("xmin","Energy min (eV)",pair="xrange"),number("xmax","Energy max (eV)",pair="xrange"),flag("fixX","Keep energy range"),
                 number("ymin","Field min (T)",pair="yrange"),number("ymax","Field max (T)",pair="yrange"),flag("fixY","Keep field range"),action("auto-ranges","Automatic plot ranges",loaded)]),
             dict(key="retained",title="Retained results and export",fields=[action("retain-window","Retain current window",self._window is not None),action("retain-feature","Retain selected feature",bool(self._feature_payload)),
@@ -1055,6 +1068,7 @@ class McdBridge(QObject):
 
     def close(self):
         if self._closed:return
+        self._color_range_controller.close()
         self._cancel_all();self._cancel("export");self._closed=True
         self._plot_timer.stop();self._publish_timer.stop();self._executor.shutdown(wait=False,cancel_futures=True)
         if self._plot_blitter:self._plot_blitter.disconnect()

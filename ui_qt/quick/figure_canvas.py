@@ -4,12 +4,53 @@ from __future__ import annotations
 import math
 import time
 
-from matplotlib.backend_bases import CloseEvent, ResizeEvent
+from matplotlib.backend_bases import CloseEvent, ResizeEvent, NavigationToolbar2
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from PySide6.QtCore import QCoreApplication
 from PySide6.QtGui import QImage
 from core.typography import apply_figure_font, matplotlib_font_context
 from ui_qt.quick.plot_surface import _CanvasBackend, _gui_thread
+
+
+class QuickNavigationToolbar(NavigationToolbar2):
+    """Native Quick zoom feedback without modifying the Agg image or exports."""
+
+    def __init__(self, canvas):
+        super().__init__(canvas)
+        canvas.mpl_connect("resize_event", self._cancel_zoom)
+        canvas.mpl_connect("close_event", self._cancel_zoom)
+        canvas.mpl_connect("key_press_event", self._key_pressed)
+
+    def draw_rubberband(self, event, x0, y0, x1, y1):
+        width, height = self.canvas.figure.bbox.size
+        self.canvas.backend.set_rubberband((min(x0, x1) / width,
+            (height - max(y0, y1)) / height, abs(x1 - x0) / width, abs(y1 - y0) / height))
+
+    def remove_rubberband(self):
+        self.canvas.backend.set_rubberband(None)
+
+    def _cancel_zoom(self, event=None):
+        info = getattr(self, "_zoom_info", None)
+        if info is not None:
+            self.canvas.mpl_disconnect(info.cid)
+            self._zoom_info = None
+        self.remove_rubberband()
+
+    def _key_pressed(self, event):
+        if event.key == "escape":
+            self._cancel_zoom()
+
+    def zoom(self, *args):
+        self._cancel_zoom()
+        super().zoom(*args)
+
+    def pan(self, *args):
+        self._cancel_zoom()
+        super().pan(*args)
+
+    def update(self):
+        self._cancel_zoom()
+        super().update()
 
 
 class QuickFigureCanvas(FigureCanvasAgg):

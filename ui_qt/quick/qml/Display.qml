@@ -8,6 +8,8 @@ import QtQuick.Window
 Rectangle {
     id: root
     required property var bridge
+    property bool colorRangesInFooter: false
+    property var colorRangeController: null
     property var colors: ({
         "surface": "#f3f5f8", "control": "#ffffff", "text": "#20242b",
         "muted": "#606978", "border": "#c6cbd3", "accent": "#0067c0",
@@ -182,6 +184,24 @@ Rectangle {
                 maximumKey: "axis.xmax"
                 autoAction: "auto.x"
             }
+            DisplayButton {
+                objectName: "drr_action_recommend.x"
+                Layout.fillWidth: true
+                colors: root.colors
+                visible: root.displayState.actions["recommend.x"] !== undefined
+                enabled: (root.displayState.actions["recommend.x"] || {}).enabled === true
+                text: "Trim empty X edges"
+                tooltip: (root.displayState.actions["recommend.x"] || {}).tooltip || ""
+                onClicked: root.bridge.invoke("recommend.x")
+            }
+            Text {
+                Layout.fillWidth: true
+                text: (root.displayState.texts["recommend.x"] || {}).text || ""
+                visible: text.length > 0
+                color: root.colors.muted
+                font.pointSize: 8
+                wrapMode: Text.Wrap
+            }
             RangeEditor {
                 Layout.fillWidth: true
                 bridge: viewBridge
@@ -323,12 +343,32 @@ Rectangle {
             }
             // Both panels stay alive when values or the selected product change.
             // A snapshot refresh must never replace an active numeric editor.
+            ColumnLayout {
+                Layout.fillWidth: true
+                visible: !root.colorRangesInFooter && root.displayState.choices["recommendStrength"] !== undefined
+                spacing: 5
+                Text { text: "Weak feature contrast"; color: root.colors.muted; font.pointSize: 8 }
+                ChoiceEditor {
+                    Layout.fillWidth: true
+                    bridge: viewBridge
+                    colors: root.colors
+                    fieldKey: "recommendStrength"
+                }
+                Text {
+                    Layout.fillWidth: true
+                    text: "Choose contrast, then click Weak features in a region. Strong peaks may saturate."
+                    color: root.colors.muted
+                    font.pointSize: 8
+                    wrapMode: Text.Wrap
+                }
+            }
             ColorEditor {
                 Layout.fillWidth: true
                 visible: root.displayState.colorProduct === 0
                 bridge: viewBridge
                 colors: root.colors
                 product: "raw"
+                showRanges: !root.colorRangesInFooter
             }
             ColorEditor {
                 Layout.fillWidth: true
@@ -336,6 +376,12 @@ Rectangle {
                 bridge: viewBridge
                 colors: root.colors
                 product: "second"
+                showRanges: !root.colorRangesInFooter
+            }
+            ColorRangeSidebar {
+                Layout.fillWidth: true
+                controller: root.colorRangeController
+                colors: root.colors
             }
 
             Divider { }
@@ -344,7 +390,7 @@ Rectangle {
                 objectName: "drr_more_display_settings"
                 Layout.fillWidth: true
                 implicitHeight: 44
-                leftPadding: 0
+                leftPadding: 8
                 rightPadding: 8
                 checkable: true
                 checked: false
@@ -391,9 +437,9 @@ Rectangle {
                 }
                 background: Rectangle {
                     radius: 6
-                    color: moreButton.down ? root.colors.pressed : moreButton.hovered ? root.colors.hover : "transparent"
-                    border.width: moreButton.visualFocus ? 2 : 0
-                    border.color: root.colors.focus
+                    color: moreButton.down ? root.colors.pressed : moreButton.hovered ? root.colors.hover : root.colors.control
+                    border.width: moreButton.visualFocus ? 2 : 1
+                    border.color: moreButton.visualFocus ? root.colors.focus : root.colors.border
                 }
             }
             ColumnLayout {

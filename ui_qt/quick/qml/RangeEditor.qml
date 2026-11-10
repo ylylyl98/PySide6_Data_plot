@@ -3,6 +3,7 @@ import QtQuick.Layouts
 
 ColumnLayout {
     id: control
+    property string recommendationTarget: ""
     required property var bridge
     required property var colors
     required property string title
@@ -36,6 +37,41 @@ ColumnLayout {
             Accessible.name: "Automatic " + control.title + " limits"
             onClicked: control.bridge.invoke(control.autoAction)
         }
+    }
+    RowLayout {
+        Layout.fillWidth: true
+        visible: control.recommendationTarget.length > 0
+                 && control.bridge.snapshot.actions["recommend.overall." + control.recommendationTarget] !== undefined
+        spacing: 6
+        DisplayButton {
+            objectName: "drr_action_recommend.overall." + control.recommendationTarget
+            Layout.fillWidth: true
+            colors: control.colors
+            text: "Overall"
+            enabled: (control.bridge.snapshot.actions["recommend.overall." + control.recommendationTarget] || {}).enabled === true
+            tooltip: (control.bridge.snapshot.actions["recommend.overall." + control.recommendationTarget] || {}).tooltip || ""
+            Accessible.name: "Recommend overall colors for " + control.title
+            onClicked: control.bridge.invoke("recommend.overall." + control.recommendationTarget)
+        }
+        DisplayButton {
+            objectName: "drr_action_recommend.weak." + control.recommendationTarget
+            Layout.fillWidth: true
+            colors: control.colors
+            text: "Weak features"
+            enabled: (control.bridge.snapshot.actions["recommend.weak." + control.recommendationTarget] || {}).enabled === true
+            tooltip: (control.bridge.snapshot.actions["recommend.weak." + control.recommendationTarget] || {}).tooltip || ""
+            Accessible.name: "Recommend weak feature colors for " + control.title
+            onClicked: control.bridge.invoke("recommend.weak." + control.recommendationTarget)
+        }
+    }
+    Text {
+        Layout.fillWidth: true
+        visible: control.recommendationTarget.length > 0 && text.length > 0
+        text: (control.bridge.snapshot.texts["recommend." + control.recommendationTarget] || {}).text || ""
+        font.pointSize: 8
+        color: control.colors.muted
+        wrapMode: Text.Wrap
+        Accessible.name: text
     }
     GridLayout {
         Layout.fillWidth: true

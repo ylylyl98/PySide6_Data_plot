@@ -8,5 +8,6 @@ AppParameterPane {
     readonly property var state: bridge.snapshot
     groups: state.parameterGroups || []
     message: state.error || ""
+    colorRangeController: bridge.colorRangeController
     Accessible.name: "Compare parameters"
 }

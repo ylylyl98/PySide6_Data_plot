@@ -39,3 +39,20 @@ class BnCalibrationSettings:
     protected_regions: tuple[tuple[float, float], ...] = ((1.580, 1.860),)
     protection_guard_pixels: int = 12
     train_regions: tuple[tuple[float, float], ...] = ()
+
+    single_measurement: bool = False
+    single_regions: tuple[tuple[float, float], ...] = ((1.45, 1.56), (1.90, 1.97))
+
+    single_max_shift_pixels: float = 10.0
+
+    single_full_range: bool = True
+
+    single_smooth_gain_bounds: tuple[float, float] = (0.1, 2.0)
+
+    # Shared BN broad-trend normalization; never a gate-dependent background.
+    single_trend_enabled: bool = False
+    single_trend_regions: tuple[tuple[float, float], ...] = ()
+    single_trend_order: str = 'auto'
+    single_trend_max_sensitivity: float = .02
+    single_trend_adaptive: bool = True
+    single_trend_max_d2_change: float = .05

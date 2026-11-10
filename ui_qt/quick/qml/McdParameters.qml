@@ -7,5 +7,6 @@ AppParameterPane {
     readonly property var state: bridge ? bridge.viewState : ({})
     groups: state.parameterGroups || []
     message: state.error || ""
+    colorRangeController: bridge ? bridge.colorRangeController : null
     Accessible.name: "MCD processing, backgrounds, feature analysis and retained results"
 }

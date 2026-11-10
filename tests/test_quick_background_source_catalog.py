@@ -102,6 +102,81 @@ def _isolated():
         def visible_paths(self):
             return {row["id"] for row in self.catalog.filesModel.rows}
 
+        def test_generated_bn_is_hidden_and_cannot_be_browsed_as_measured(self):
+            alias = self.raw / 'copied_BNbackground.csv'
+            alias.write_text('Vbg,Vtg,BNCalibrationVersion,730\n0,0,bn_generated,123\n', encoding='utf-8')
+            managed = self.root / '.drr_bn_calibration' / 'bn_generated.csv'
+            managed.parent.mkdir(parents=True)
+            managed.write_text('Vbg,Vtg,BNCalibrationVersion,730\n0,0,bn_generated,123\n', encoding='utf-8')
+            self.open_catalog()
+            self.assertNotIn(str(alias), self.visible_paths())
+            self.catalog.setParameter('showAllFiles', True)
+            self.assertNotIn(str(alias), self.visible_paths())
+            self.assertIn(str(self.bn[0]), self.visible_paths())
+            before = list(self.catalog.snapshot['selected'])
+            self.catalog.selectFile(str(alias), True)
+            self.assertEqual(before, self.catalog.snapshot['selected'])
+            self.assertIn('original measured BN', self.catalog.snapshot['error'])
+            self.assertFalse(self.catalog.accept_external(self.catalog.snapshot['selectionToken'], [str(managed)]))
+            self.assertEqual(before, self.catalog.snapshot['selected'])
+            # Optimistic snapshots produced by older builds lack this field.
+            self.catalog._catalog['files'].append(dict(id=str(alias), source=self.portable(alias),
+                name=alias.name, kind='BN', detail='old cache', saved=False))
+            self.catalog._refresh_models()
+            self.assertNotIn(str(alias), self.visible_paths())
+            # A pre-existing selected calibration is hidden and cannot be
+            # accepted as raw BN, but it is not silently removed from the draft.
+            self.catalog.rebind_inline_selection([str(managed)])
+            self.assertEqual(self.background.draft.files, (self.portable(self.bn[0]),))
+
+        def test_inline_generated_bn_and_non_bn_roles(self):
+            alias = self.raw / 'renamed_BNbackground.csv'
+            alias.write_text('Vbg,Vtg,BNCalibrationVersion,730\n0,0,bn_generated,123\n', encoding='utf-8')
+            chooser = BackgroundSourceCatalogBridge(settings=self.settings, inline=True)
+            self.addCleanup(chooser.close)
+            chooser.open_inline_selection(str(self.root), 'bn', [str(alias)])
+            self.wait(lambda: not chooser.snapshot['busy'])
+            chooser.setParameter('showAllFiles', True)
+            self.assertNotIn(str(alias), {row['id'] for row in chooser.filesModel.rows})
+            self.assertFalse(chooser.snapshot['canAccept'])
+            self.assertEqual(chooser.snapshot['selected'], [str(alias)])
+            self.assertNotIn(str(alias), {row['id'] for row in chooser.chosenModel.rows})
+            chooser.rebind_inline_selection([str(self.bn[0])])
+            self.assertFalse(chooser.accept_external(chooser.snapshot['selectionToken'], [str(alias)]))
+            self.assertEqual(chooser.snapshot['selected'], [str(self.bn[0])])
+            chooser.invoke('cancel')
+            chooser.open_inline_selection(str(self.root), 'custom', [])
+            self.wait(lambda: not chooser.snapshot['busy'])
+            chooser.setParameter('showAllFiles', True)
+            self.assertIn(str(alias), {row['id'] for row in chooser.filesModel.rows})
+
+        def test_legacy_cached_rows_are_rescanned_before_reuse(self):
+            chooser = BackgroundSourceCatalogBridge(settings=self.settings, inline=True)
+            self.addCleanup(chooser.close)
+            chooser.open_inline_selection(str(self.root), 'bn', [str(self.bn[0])])
+            self.wait(lambda: not chooser.snapshot['busy'])
+            for row in chooser._catalog['files']:
+                row.pop('generatedBN', None)
+            chooser.invoke('cancel')
+            with patch.object(chooser, '_scan_catalog', wraps=chooser._scan_catalog) as scan:
+                chooser.open_inline_selection(str(self.root), 'bn', [str(self.bn[0])])
+                self.wait(lambda: not chooser.snapshot['busy'])
+                self.assertEqual(scan.call_count, 1)
+                self.assertEqual({row['id'] for row in chooser.filesModel.rows}, {str(path) for path in self.bn})
+
+        def test_bn_header_cache_rechecks_changed_file(self):
+            path = self.raw / 'candidate_BNbackground.csv'
+            path.write_text('Vbg,Vtg,730\n0,0,1\n', encoding='utf-8')
+            original_open = Path.open
+            with patch.object(Path, 'open', autospec=True, side_effect=original_open) as opened:
+                self.assertFalse(self.catalog._is_generated_bn(path))
+                self.assertFalse(self.catalog._is_generated_bn(path))
+                self.assertEqual(opened.call_count, 1)
+                path.write_text('Vbg,Vtg,BNCalibrationVersion,730\n0,0,bn_new,1\n', encoding='utf-8')
+                self.assertTrue(self.catalog._is_generated_bn(path))
+                # write_text also opens the path; the second read is the last call.
+                self.assertEqual(opened.call_count, 3)
+
         def test_metadata_inventory_search_and_multiple_selection_never_scan_spectra(self):
             with patch("core.drr_sources.discover_drr_sources", side_effect=AssertionError("Full experiment inspected")) as discover, \
                  patch("core.drr_sources.inspect_csv_gate", side_effect=AssertionError("CSV grid inspected")) as inspect, \

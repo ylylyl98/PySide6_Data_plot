@@ -245,6 +245,135 @@ def _run_isolated():
             drain_until(lambda: not background.snapshot["busy"])
             self.assertEqual(background.draft.files, ())
 
+        def test_generated_bn_switches_main_products_without_refit_and_preserves_view(self):
+            import numpy as np
+            from core.drr_bn_store import DrrBnStore, source_records
+            from tests.bn_joint_fixtures import accepted_joint_report
+            source, background, dialog = self.open_drr_background()
+            context = self.bridge._background_context()
+            wave = np.linspace(630., 690., 41)
+            baseline = np.full(len(wave), 100.)
+            candidate = baseline * 1.1
+            bn = self.root / "sample_BNbackground.csv"
+            np.savetxt(bn, np.column_stack((np.zeros((3, 2)), np.tile(baseline, (3, 1)))), delimiter=",",
+                header="Vbg,Vtg," + ",".join(map(str, wave)), comments="")
+            original = np.loadtxt(source, delimiter=",", skiprows=1)[:, 2:][:, ::-1]
+            identity = dict(schema_version=1, root=str(self.root),
+                measurements=source_records(self.root, context.measurements),
+                baseline_files=source_records(self.root, (bn.name,)), baseline_which="all",
+                spectral_columns=wave.tolist(), y_axis=context.y_axis,
+                repeat_order=list(context.measurements), ordering={})
+            payload = dict(source_identity=identity, report=accepted_joint_report(),
+                settings=dict(model=1, derivative_window=context.derivative_window,
+                              derivative_polyorder=context.derivative_polyorder),
+                energy=(1240/wave)[::-1], gates=self.bridge._cube.gate, original_background=baseline,
+                candidate_background=candidate, candidate_backgrounds=dict(original=baseline, local_shift=candidate),
+                mean_raw=original, input_snapshots={}, eligible=True, status="accepted",
+                selected_candidate="local_shift", summary="test", reasons=[], candidates=[])
+            store = DrrBnStore(self.root)
+            version = store.save_result(payload)
+            payload.update(version_id=version.version_id, csv_path=str(version.csv_path))
+            before = self.bridge._drr_products
+            self.bridge._bn_generated(payload)
+            self.assertTrue(dialog.isVisible())
+            self.assertIs(self.bridge._drr_products, before)
+            self.assertIn("unchanged", self.bridge.snapshot["status"])
+            self.assertTrue(self.bridge.snapshot["bnReferenceChoice"]["visible"])
+            self.assertEqual(background.snapshot["bnCurrentBackground"], "Self (last frame)")
+            dialog.close()
+            settle()
+            self.assertIsNone(store.find_applied(context.measurements))
+            self.bridge._values["gate"] = float(self.bridge._cube.gate[-2])
+            self.bridge._drr_display.setNumber("raw.vmin", "-0.7")
+            self.bridge._drr_display.setNumber("raw.vmax", "1.3")
+            self.bridge._drr_display.setNumber("second.vmin", "-700")
+            self.bridge._drr_display.setNumber("second.vmax", "900")
+            self.bridge._drr_display.setNumber("axis.xmin", "1.85")
+            self.bridge._drr_display.setNumber("axis.xmax", "1.95")
+            ranges = dict(self.bridge._drr_display._numbers)
+            gate = self.bridge._values["gate"]
+            with patch("core.drr_bn_service.compare_bn_group", side_effect=AssertionError("switch must not refit")), \
+                 patch.object(self.bridge, "_automatic_bn_enabled", return_value=True), \
+                 patch.object(self.bridge, "_start_bn_check") as auto_check:
+                self.bridge.setParameter("bnReference", 1)
+                drain_until(lambda: not self.bridge.snapshot["busy"] and not self.bridge._pending)
+                self.assertEqual(self.bridge.snapshot["bnReferenceChoice"]["current"], 1, self.bridge.snapshot["status"])
+                products = self.bridge._drr_products
+                np.testing.assert_allclose(products.source.Z, original/candidate-1, atol=1e-12)
+                self.assertFalse(products.request.background_recipe.draft.calibration["original"])
+                with patch("ui_qt.quick.drr_workflow.export_drr", return_value={}) as exported:
+                    self.bridge.invoke("export")
+                    drain_until(lambda: not self.bridge.snapshot["busy"] and not self.bridge._pending)
+                self.assertIs(exported.call_args.args[0], products)
+                np.testing.assert_allclose(exported.call_args.args[0].source.Z, original/candidate-1, atol=1e-12)
+                self.assertEqual(self.bridge._drr_display._numbers, ranges)
+                self.assertEqual(self.bridge._values["gate"], gate)
+                before_manifest = store.manifest_path.read_bytes()
+                with patch("ui_qt.quick.drr_workflow.load_drr", side_effect=ValueError("switch trial failed")):
+                    self.bridge.setParameter("bnReference", 0)
+                    drain_until(lambda: not self.bridge.snapshot["busy"] and not self.bridge._pending)
+                self.assertIn("switch trial failed", self.bridge.snapshot["status"])
+                self.assertIs(self.bridge._drr_products, products)
+                self.assertEqual(self.bridge.snapshot["bnReferenceChoice"]["current"], 1)
+                self.assertEqual(store.manifest_path.read_bytes(), before_manifest)
+                self.bridge.setParameter("bnReference", 0)
+                drain_until(lambda: not self.bridge.snapshot["busy"] and not self.bridge._pending)
+                self.assertEqual(self.bridge.snapshot["bnReferenceChoice"]["current"], 0, self.bridge.snapshot["status"])
+                np.testing.assert_allclose(self.bridge._drr_products.source.Z, original/baseline-1, atol=1e-12)
+                self.assertTrue(self.bridge._drr_products.request.background_recipe.draft.calibration["original"])
+                original_products = self.bridge._drr_products
+                with patch("ui_qt.quick.drr_workflow.export_drr", return_value={}) as exported:
+                    self.bridge.invoke("export")
+                    drain_until(lambda: not self.bridge.snapshot["busy"] and not self.bridge._pending)
+                self.assertIs(exported.call_args.args[0], original_products)
+                np.testing.assert_allclose(exported.call_args.args[0].source.Z, original/baseline-1, atol=1e-12)
+                self.assertTrue(store.has_original_choice(context.measurements, (bn.name,), "all"))
+                self.assertEqual(self.bridge._drr_display._numbers, ranges)
+                self.assertEqual(self.bridge._values["gate"], gate)
+                auto_check.assert_not_called()
+            self.bridge._drr_processing["sgWindow"] += 2
+            self.assertFalse(self.bridge.snapshot["bnReferenceChoice"]["visible"])
+
+        def test_direct_bn_calibration_applies_and_exports_selected_products(self):
+            import numpy as np
+            from core.drr_bn_store import DrrBnStore, source_records
+            from tests.bn_joint_fixtures import accepted_joint_report
+            source, background, dialog = self.open_drr_background()
+            context = self.bridge._background_context()
+            wave = np.linspace(630., 690., 41)
+            baseline = np.full(len(wave), 100.)
+            candidate = baseline * 1.1
+            bn = self.root / "sample_BNbackground.csv"
+            np.savetxt(bn, np.column_stack((np.zeros((3, 2)), np.tile(baseline, (3, 1)))), delimiter=",",
+                header="Vbg,Vtg," + ",".join(map(str, wave)), comments="")
+            original = np.loadtxt(source, delimiter=",", skiprows=1)[:, 2:][:, ::-1]
+            identity = dict(schema_version=1, root=str(self.root), measurements=source_records(self.root, context.measurements),
+                baseline_files=source_records(self.root, (bn.name,)), baseline_which="all", spectral_columns=wave.tolist(),
+                y_axis=context.y_axis, repeat_order=list(context.measurements), ordering={})
+            payload = dict(source_identity=identity, report=accepted_joint_report(),
+                settings=dict(model=1, derivative_window=context.derivative_window, derivative_polyorder=context.derivative_polyorder),
+                energy=(1240/wave)[::-1], gates=self.bridge._cube.gate, original_background=baseline,
+                candidate_background=candidate, candidate_backgrounds=dict(original=baseline, local_shift=candidate),
+                mean_raw=original, input_snapshots={}, eligible=True, status="accepted", selected_candidate="local_shift",
+                summary="test", reasons=[], candidates=[])
+            version = DrrBnStore(self.root).save_result(payload)
+            payload.update(version_id=version.version_id, csv_path=str(version.csv_path))
+            background._select_common_background("bn", files=(bn.name,), which="all")
+            with patch("ui_qt.quick.drr_background_workflow.compare_bn", return_value=payload) as compare:
+                background.invoke("calibrate-bn")
+                drain_until(lambda: not background.snapshot["busy"] and not self.bridge.snapshot["busy"] and not self.bridge._pending)
+                drain_until(lambda: not dialog.isVisible())
+            self.assertTrue(compare.call_args.kwargs["settings"]["single_trend_enabled"])
+            self.assertEqual(self.bridge.snapshot["bnReferenceChoice"]["current"], 1)
+            np.testing.assert_allclose(self.bridge._drr_products.source.Z, original/candidate-1, atol=1e-12)
+            with patch("ui_qt.quick.drr_workflow.export_drr", return_value={}) as exported:
+                self.bridge.invoke("export")
+                drain_until(lambda: not self.bridge.snapshot["busy"] and not self.bridge._pending)
+            self.assertIs(exported.call_args.args[0], self.bridge._drr_products)
+            self.bridge.setParameter("bnReference", 0)
+            drain_until(lambda: not self.bridge.snapshot["busy"] and not self.bridge._pending)
+            np.testing.assert_allclose(self.bridge._drr_products.source.Z, original/baseline-1, atol=1e-12)
+
         def test_drr_native_background_failure_and_cancel_retain_applied_result(self):
             _source, background, dialog = self.open_drr_background()
             external = self.write_drr_csv("external.csv", offset=40.)
