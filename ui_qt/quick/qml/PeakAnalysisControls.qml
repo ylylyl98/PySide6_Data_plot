@@ -18,7 +18,7 @@ Rectangle {
             objectName: "peak_workflow_status"
             Layout.fillWidth: true; Layout.margins: 10
             visible: panel.state.kind === "PL" && panel.state.hasDataset
-            text: panel.state.workflow ? panel.state.workflow.status : ""
+            text: panel.state.hasDataset && panel.state.workflow ? panel.state.workflow.status : ""
             wrapMode: Text.WordWrap; color: panel.colors.text
         }
         Basic.Label {

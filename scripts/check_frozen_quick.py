@@ -102,6 +102,11 @@ def create_fixtures(root):
     output["drr_csv"] = root / "synthetic_REF_730nmc.csv"
     output["drr_csv"].write_bytes(channels[0].read_bytes())
     dataset = create_dataset(pl, "PL", "PL", str(output["pl"]), "Synthetic fitted PL")
+    # Match a current, explicitly selected single-spectrum handoff. An
+    # unversioned implicit handoff is intentionally migrated to map mode,
+    # which invalidates its old fit during snapshot restoration.
+    dataset.update(analysis_scope="spectrum", analysis_scope_explicit=True,
+                   analysis_workflow_version=3, scope=2)
     dataset["settings"].update(min_snr=0., neighbor_support=0)
     dataset = analyze_dataset(analyze_dataset(dataset, "detect"), "fit")
     dataset["show_residual"] = True
@@ -204,6 +209,19 @@ def inspect_report(report, case):
     return errors
 
 
+def peak_workspace_evidence(session):
+    """Inspect both legacy scalar and current UTF-8 Peak workspace metadata."""
+    import numpy as np
+    with np.load(session, allow_pickle=False) as archive:
+        metadata = archive["metadata"]
+        text = metadata.tobytes().decode("utf-8") if metadata.dtype == np.uint8 else str(metadata.item())
+        datasets = json.loads(text)["datasets"]
+        if not datasets or not any((dataset.get("result") or {}).get("fits") for dataset in datasets):
+            raise ValueError("The fitted synthetic snapshot was not restored")
+        shapes = [list(archive[f"{index}_Z"].shape) for index in range(len(datasets))]
+    return dict(datasets=len(datasets), shapes=shapes)
+
+
 def run_case(prefix, case, temporary, artifacts, timeout):
     case_root, case_artifacts = Path(temporary) / case.name, Path(artifacts) / case.name
     case_root.mkdir(parents=True)
@@ -272,15 +290,8 @@ def run_case(prefix, case, temporary, artifacts, timeout):
             evidence["errors"].append("No valid captured window frame: " + str(error))
     if case.kind == "peak":
         try:
-            import numpy as np
-            with np.load(session, allow_pickle=False) as archive:
-                metadata = json.loads(str(archive["metadata"].item()))
-                datasets = metadata["datasets"]
-                shapes = [list(archive[f"{index}_Z"].shape) for index in range(len(datasets))]
-            if not datasets:
-                raise ValueError("The fitted synthetic snapshot was not restored")
-            evidence["restored_workspace"] = dict(datasets=len(datasets), shapes=shapes)
-        except (OSError, ValueError, KeyError) as error:
+            evidence["restored_workspace"] = peak_workspace_evidence(session)
+        except (OSError, ValueError, KeyError, TypeError) as error:
             evidence["errors"].append("The Peak workspace was not saved after restoring its synthetic snapshot: " + str(error))
     evidence["scope"] = ({"main": "QML page, isolated settings, no Widgets import, captured window; real data cases additionally require a presented scientific plot.",
         "drr": "Synthetic DRR workspace loaded, QGuiApplication/QML and at least one Agg scientific render; no Widgets import, warnings or reported errors.",

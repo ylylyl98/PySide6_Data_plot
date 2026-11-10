@@ -255,8 +255,12 @@ class AnalysisWindowTests(unittest.TestCase):
         pl = w.dataset
         raw = create_dataset(sample('DRR'), 'DRR', 'raw', 'profiles.csv', 'Raw')
         second = create_dataset(sample('DRR'), 'DRR', 'second', 'profiles.csv', 'Second')
+        second['settings'].update(remove_scatter=True, neighbor_adaptive=True)
         w.add_datasets([raw, second])
         c.preset_buttons['Balanced'].click()
+        self.assertTrue(second['settings']['remove_scatter'])
+        self.assertTrue(second['settings']['neighbor_adaptive'])
+        self.assertTrue(c.preset_buttons['Balanced'].isChecked())
         self.assertEqual((second['settings']['min_snr'], second['settings']['prominence'],
                           second['settings']['neighbor_support']), (7., .1, 4))
         self.assertIn('2nd derivative', c.filter_heading.text())
@@ -328,15 +332,15 @@ class AnalysisWindowTests(unittest.TestCase):
         axes=w.heat_ax;result=d['result'];generation=w.generation
         heatmaps=[a for a in axes.collections if a.get_gid()!='peak-candidates']
         with patch('ui_qt.peak_analysis_window.build_figure',side_effect=AssertionError('Size rebuilt heatmap')):
-            w.marker_size.setValue(4);self.app.processEvents()
+            w.marker_size.setValue(6);self.app.processEvents()
         self.assertIs(w.heat_ax,axes);self.assertIs(d['result'],result)
         self.assertIs(d['candidates'],pool);self.assertEqual(w.generation,generation)
-        self.assertEqual(d['marker_size'],4)
-        self.assertTrue(all(float(a.get_sizes()[0])==4 for a in axes.collections if a.get_gid()=='peak-candidates'))
+        self.assertEqual(d['marker_size'],6)
+        self.assertTrue(all(float(a.get_sizes()[0])==6 for a in axes.collections if a.get_gid()=='peak-candidates'))
         self.assertTrue(all(a in axes.collections for a in heatmaps))
         w.request_restart();self.wait_idle()
         saved,_=load_workspace(self.path)
-        self.assertEqual(next(x for x in saved if x['key']==d['key'])['marker_size'],4)
+        self.assertEqual(next(x for x in saved if x['key']==d['key'])['marker_size'],6)
 
     def test_legacy_custom_range_survives_scope_switch(self):
         w=self.window;d=create_dataset(sample(),'PL','PL','legacy.csv','Legacy')

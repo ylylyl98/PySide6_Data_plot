@@ -42,7 +42,7 @@ with TemporaryDirectory() as temporary:
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         app.processEvents()
-        button = window.findChild(QObject, "app_parameter_find-fit")
+        button = window.findChild(QObject, "peak_workflow_primary")
         surface = window.findChild(QObject, "peak_plot_surface")
         if (button and button.property("visible") and button.property("height") > 0
                 and surface.property("presentedGeneration") > 0
@@ -57,12 +57,12 @@ with TemporaryDirectory() as temporary:
     assert 0 <= position.y() and position.y() + button.property("height") <= panel.property("height")
     label = bridge._spectrum.xaxis.label.get_window_extent(bridge._canvas.get_renderer())
     assert label.y0 >= 0, f"Clipped: label={label.bounds}, fig={bridge._canvas.figure.bbox.bounds}, inches={bridge._canvas.figure.get_figheight()}, dpi={bridge._canvas.figure.dpi}, margins={bridge._heat.get_subplotspec().get_gridspec().bottom}, font={bridge._spectrum.xaxis.label.get_fontsize()}"
-    assert window.findChild(QObject, "app_parameter_detect").property("visible")
+    assert button.property("text") == "Find peaks"
     if os.environ.get("DPTK_PEAK_REVIEW_DIR"):
         Path(os.environ["DPTK_PEAK_REVIEW_DIR"]).mkdir(parents=True, exist_ok=True)
         window.grabWindow().save(str(Path(os.environ["DPTK_PEAK_REVIEW_DIR"])/"pl-compact-custom.png"))
     bridge.dataset['settings']['model'] = 'Gaussian'
-    bridge.invoke('find-fit')
+    bridge.invoke('workflow-find')
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
         app.processEvents()
@@ -70,6 +70,21 @@ with TemporaryDirectory() as temporary:
             break
         time.sleep(.01)
     assert bridge.dataset.get('result')
+    assert bridge.snapshot['controlsPage'] == 'branches'
+    bridge.setParameter('controlsPage', 'fit')
+    app.processEvents()
+    fit_button = window.findChild(QObject, 'peak_manual_fit')
+    assert fit_button and fit_button.property('visible') and fit_button.property('enabled')
+    position = fit_button.mapToItem(panel, QPointF(0, 0))
+    assert 0 <= position.y() and position.y() + fit_button.property('height') <= panel.property('height')
+    bridge.invoke('workflow-fit')
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        app.processEvents()
+        if not bridge.snapshot['busy'] and bridge.dataset['result'].get('fits'):
+            break
+        time.sleep(.01)
+    assert bridge.dataset['result'].get('fits')
     bridge.setParameter('analysisPlot', 'trends')
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
