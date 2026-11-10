@@ -724,7 +724,7 @@ def _run_isolated():
             self.idle()
             exported = [Path(path) for path in self.bridge.snapshot['resultPaths']]
             self.assertEqual({path.name for path in exported}, {"Gaussian_analysis_settings.json", "Gaussian_peak_overlay.png", "Gaussian_peak_results.xlsx"})
-            self.assertTrue(all(path.parent == self.root for path in exported))
+            self.assertTrue(all(path.parent.samefile(self.root) for path in exported))
             from openpyxl import load_workbook
             workbook = load_workbook(self.root / "Gaussian_peak_results.xlsx", read_only=True)
             try:
@@ -978,6 +978,20 @@ def _run_isolated():
                 window.setWidth(760); window.setHeight(600)
                 app.processEvents()
                 self.assertTrue(window.grabWindow().save(str(Path(review) / "drr-compact.png")))
+
+        def test_empty_qml_workflow_status_before_dataset_arrives(self):
+            engine = QQmlApplicationEngine()
+            engine.setInitialProperties({"peakBridge": self.bridge})
+            engine.load(QUrl.fromLocalFile(str(Path(__file__).resolve().parents[1] / "ui_qt/quick/qml/PeakAnalysis.qml")))
+            self.assertTrue(engine.rootObjects())
+            window = engine.rootObjects()[0]
+            self.addCleanup(lambda: (window.setVisible(False), engine.deleteLater(), app.processEvents()))
+            status = find(window, "peak_workflow_status")
+            self.assertIsNotNone(status)
+            self.assertEqual(status.property("text"), "")
+            self.install()
+            self.idle()
+            self.assertEqual(status.property("text"), self.bridge.snapshot["workflow"]["status"])
 
         def test_populated_qml_native_surface_controls_and_results(self):
             self.install()

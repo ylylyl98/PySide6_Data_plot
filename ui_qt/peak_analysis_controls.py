@@ -221,6 +221,7 @@ class PeakControls(QWidget):
         widgets={**self.numeric,'neighbor_support':self.support,'neighbor_tolerance_mev':self.neighbor_tolerance,
                  'max_width_mev':self.max_width,'max_per_row':self.max_count}
         for key,value in self._presets[name].items():
+            if key not in widgets: continue
             control=widgets[key];old=control.blockSignals(True);control.setValue(value);control.blockSignals(old)
         self.settings_changed.emit()
 
@@ -229,7 +230,7 @@ class PeakControls(QWidget):
                  'max_width_mev':self.max_width,'max_per_row':self.max_count}
         selected=None
         for name,values in self._presets.items():
-            checked=all(abs(widgets[key].value()-value)<1e-9 for key,value in values.items())
+            checked=all(abs(widgets[key].value()-value)<1e-9 for key,value in values.items() if key in widgets)
             self.preset_buttons[name].setChecked(checked)
             set_fluent_property(self.preset_buttons[name],'fluentAppearance','primary' if checked else 'secondary')
             if checked:selected=name

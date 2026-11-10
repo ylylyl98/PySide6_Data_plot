@@ -15,7 +15,7 @@ class QuickBackgroundSourceCatalogProcessTests(unittest.TestCase):
             environment = dict(os.environ, QT_QPA_PLATFORM="offscreen", QT_QUICK_BACKEND="software",
                 QT_SCALE_FACTOR="1", MPLBACKEND="agg", MPLCONFIGDIR=temporary, LOCALAPPDATA=temporary,
                 XDG_CONFIG_HOME=temporary, XDG_CACHE_HOME=temporary, QML_DISK_CACHE_PATH=temporary,
-                PYTHONIOENCODING="utf-8")
+                PYTHONIOENCODING="utf-8", PYTHONFAULTHANDLER="1")
             result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--isolated"],
                 cwd=Path(__file__).resolve().parents[1], env=environment, capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

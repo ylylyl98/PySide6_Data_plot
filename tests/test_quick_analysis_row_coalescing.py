@@ -30,9 +30,10 @@ class AnalysisRowCoalescingTests(unittest.TestCase):
                 self.assertTrue(peak._row_timer.isActive())
                 with patch.object(peak, "_start") as start:
                     peak.saveFigure(str(root / "peak.png"))
-                with patch("core.peak_plotting.build_figure") as build, patch("ui_qt.quick.peak_analysis_bridge.save_figure"):
+                with patch("ui_qt.quick.peak_analysis_workflow.refresh_source_export", side_effect=lambda dataset, *_args, **_kwargs: dataset) as refresh, \
+                     patch("core.peak_figure_export.export_source_figures"):
                     start.call_args.args[1](None, None)
-                self.assertEqual(build.call_args.args[1], 4)
+                self.assertEqual(refresh.call_args.args[0]["row"], 4)
 
                 drr.setParameter("tab", 1)
                 drr.p2p["pending"] = False

@@ -8,7 +8,7 @@ import sys
 from tempfile import TemporaryDirectory
 import unittest
 
-from scripts.check_frozen_quick import SmokeCase, WORKFLOWS, build_cases, inspect_report, png_evidence, run_case
+from scripts.check_frozen_quick import SmokeCase, WORKFLOWS, build_cases, inspect_report, peak_workspace_evidence, png_evidence, run_case
 
 PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6VDAAAAAASUVORK5CYII="
 
@@ -110,6 +110,22 @@ if {log_error!r}:
         path.write_bytes(base64.b64decode(PNG)[:-12])
         with self.assertRaises(ValueError):
             png_evidence(path)
+
+    def test_peak_workspace_checks_both_metadata_encodings_and_restored_fit(self):
+        import numpy as np
+        path = self.root / "workspace.npz"
+        payload = json.dumps({"datasets": [{"result": {"fits": [{"center": 1.7}]}}]})
+        for metadata in (np.array(payload), np.frombuffer(payload.encode("utf-8"), dtype=np.uint8)):
+            with self.subTest(dtype=metadata.dtype):
+                np.savez(path, metadata=metadata, **{"0_Z": np.zeros((2, 3))})
+                self.assertEqual(peak_workspace_evidence(path), {"datasets": 1, "shapes": [[2, 3]]})
+                np.savez(path, metadata=metadata)
+                with self.assertRaises(KeyError):
+                    peak_workspace_evidence(path)
+        np.savez(path, metadata=np.frombuffer(b'{"datasets":[{"result":{"fits":[]}}]}', dtype=np.uint8),
+                 **{"0_Z": np.zeros((2, 3))})
+        with self.assertRaisesRegex(ValueError, "fitted synthetic snapshot"):
+            peak_workspace_evidence(path)
 
 
 if __name__ == "__main__":
