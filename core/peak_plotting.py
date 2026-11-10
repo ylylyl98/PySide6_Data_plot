@@ -1,6 +1,7 @@
 """Shared branch overlays and spectra for the desktop window and PNG export."""
 from dataclasses import replace
 from copy import deepcopy
+from collections import defaultdict
 import numpy as np
 from matplotlib import rcParams
 from matplotlib.figure import Figure
@@ -32,11 +33,14 @@ def overlay_series(dataset):
     if not result:
         return []
     fitted = dataset.get('overlay_position') == 'fitted'
+    by_branch = defaultdict(list)
+    for point in result['points']:
+        by_branch[point['branch_id']].append(point)
     output = []
     for branch in dataset['branches']:
         if not branch.get('enabled', True):
             continue
-        points = sorted([p for p in result['points'] if p['branch_id'] == branch['id']], key=lambda p: p['y'])
+        points = sorted(by_branch.get(branch['id'], ()), key=lambda p: p['y'])
         x, y, previous = [], [], None
         for p in points:
             value = p.get('fit_center') if fitted else p['energy']
@@ -147,11 +151,59 @@ def draw_spectrum(dataset, row, ax, residual_ax=None):
     ax.legend(fontsize=7, loc='upper right'); ax.grid(alpha=.15)
 
 
+def build_fit_trends(dataset, figure=None):
+    """Fitted position and linewidth versus the original scan, with valid SEs."""
+    fig = figure if figure is not None else Figure(figsize=(8, 7))
+    fig.clear()
+    axes = fig.subplots(2, 1, sharex=True)
+    fig.subplots_adjust(left=.14, right=.96, bottom=.11, top=.93, hspace=.18)
+    result = dataset.get('result') or {}
+    settings = result.get('settings', dataset['settings'])
+    rows = np.flatnonzero((dataset['cube'].gate >= settings['y_min']) & (dataset['cube'].gate <= settings['y_max']))
+    rows = rows[np.argsort(dataset['cube'].gate[rows])]
+    grouped = {}
+    for point in result.get('points', []):
+        grouped.setdefault(point['branch_id'], {})[point['row_index']] = point
+    count = 0
+    for branch in dataset.get('branches', []):
+        if not branch.get('enabled', True):
+            continue
+        points = grouped.get(branch['id'], {})
+        for axis, field, error_field in zip(axes, ('fit_center', 'fwhm_mev'), ('center_error_ev', 'fwhm_error_mev')):
+            values, errors = [], []
+            for row in rows:
+                point = points.get(int(row), {})
+                valid = point.get('fit_status') == 'ok'
+                values.append(point.get(field) if valid and point.get(field) is not None else np.nan)
+                errors.append(point.get(error_field) if valid and point.get(error_field) is not None else np.nan)
+            values, errors = np.asarray(values, float), np.asarray(errors, float)
+            if not np.isfinite(values).any():
+                continue
+            x = dataset['cube'].gate[rows]
+            axis.plot(x, values, 'o-', markersize=3, linewidth=.8, color=branch_color(branch), label=branch['name'])
+            valid = np.isfinite(values) & np.isfinite(errors) & (errors >= 0)
+            if valid.any():
+                axis.errorbar(x[valid], values[valid], yerr=errors[valid], fmt='none', capsize=2, color=branch_color(branch))
+            count += 1
+    axes[0].set_ylabel('Fit center (eV)'); axes[1].set_ylabel('FWHM (meV)')
+    axes[1].set_xlabel(dataset['cube'].gate_label)
+    axes[0].set_title('Fitted peaks · error bars: ±1 fit standard error', fontsize=10)
+    for axis in axes:
+        axis.grid(alpha=.15)
+        if axis.lines:
+            axis.legend(fontsize=7)
+    if not count:
+        text = axes[0].text(.5, .5, 'No valid fitted peaks in this analysis range', transform=axes[0].transAxes, ha='center')
+        text._use_theme_text = True
+    return axes
+
+
 def build_figure(dataset, row=0, show_overlay=True, show_residual=False, figure=None):
     fig = figure if figure is not None else Figure(figsize=(8, 7))
     fig.clear()
     gs = fig.add_gridspec(3 if show_residual else 2, 2, width_ratios=[1, .025],
-                         height_ratios=[3, 1.35, .55] if show_residual else [3, 1.35],
+                         height_ratios=([1.25, 3, .8] if show_residual else [1.25, 3])
+                         if dataset.get('analysis_scope') == 'spectrum' else ([3, 1.35, .55] if show_residual else [3, 1.35]),
                          left=.11, right=.9, top=.95, bottom=.09, hspace=.5, wspace=.05)
     heat = fig.add_subplot(gs[0, 0]); cax = fig.add_subplot(gs[0, 1])
     spectrum = fig.add_subplot(gs[1, 0]); residual = fig.add_subplot(gs[2, 0], sharex=spectrum) if show_residual else None

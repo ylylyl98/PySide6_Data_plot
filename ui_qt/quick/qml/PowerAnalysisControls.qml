@@ -29,8 +29,8 @@ Rectangle {
             AppButton {
                 objectName: "power_analysis_fit"
                 colors: panel.colors
-                text: panel.state.analysisDraft ? "Apply guesses · Fit all powers" : "Fit all powers"
-                primary: panel.state.analysisDraft === true
+                text: "1 Fit spectra"
+                primary: true
                 enabled: panel.state.analysisAvailable && !panel.state.fitBusy && !panel.state.detectBusy && !panel.state.busy
                 onClicked: panel.bridge.invoke("analysis.fit")
             }
@@ -38,6 +38,7 @@ Rectangle {
                 objectName: "power_analysis_next_issue"
                 colors: panel.colors
                 text: "Next issue (" + (panel.state.analysisIssueCount || 0) + ")"
+                visible: panel.state.analysisIssueCount > 0
                 enabled: panel.state.analysisReady === true && panel.state.analysisIssueCount > 0
                 onClicked: panel.bridge.invoke("analysis.nextIssue")
             }
@@ -45,6 +46,7 @@ Rectangle {
                 objectName: "power_analysis_issues_only"
                 colors: panel.colors
                 text: "Issues only"
+                visible: panel.state.analysisAdvanced === true
                 checked: panel.state.analysisIssuesOnly === true
                 enabled: panel.state.analysisReady === true
                 onClicked: {
@@ -55,23 +57,31 @@ Rectangle {
             AppButton {
                 objectName: "power_analysis_manual"
                 colors: panel.colors
-                text: "Manual refit selected power…"
+                text: "Manual refit selected spectrum…"
+                visible: panel.state.analysisAdvanced === true
                 enabled: panel.state.analysisReady === true && !panel.state.fitBusy
                 onClicked: panel.bridge.invoke("analysis.manual")
             }
             AppButton {
                 objectName: "power_analysis_law"
                 colors: panel.colors
-                text: "Fit power law…"
+                text: "2 Power law…"
                 enabled: panel.state.analysisReady === true && !panel.state.fitBusy
                 onClicked: panel.bridge.invoke("analysis.law")
             }
             AppButton {
                 objectName: "power_analysis_toggle_results"
                 colors: panel.colors
-                text: "Results table"
+                text: "Results"
                 checked: panel.state.analysisShowResults === true
                 onClicked: panel.bridge.setParameter("analysis.showResults", !panel.state.analysisShowResults)
+            }
+            AppButton {
+                objectName: "power_analysis_advanced"
+                colors: panel.colors
+                text: panel.state.analysisAdvanced ? "Hide advanced" : "Advanced"
+                checked: panel.state.analysisAdvanced === true
+                onClicked: panel.bridge.setParameter("analysis.advanced", !panel.state.analysisAdvanced)
             }
         }
         Text {
@@ -91,7 +101,7 @@ Rectangle {
             visible: panel.state.analysisShowResults === true
             Layout.fillWidth: true
             Layout.fillHeight: true
-            contentWidth: Math.max(width, 1180)
+            contentWidth: Math.max(width, 1490)
             contentHeight: height
             clip: true
             boundsBehavior: Flickable.StopAtBounds
@@ -111,9 +121,9 @@ Rectangle {
                     color: panel.colors.surface
                     Row {
                         Repeater {
-                            model: [{text: "Channel / peak", size: 120}, {text: "Power (uW)", size: 105}, {text: "Area (a.u. eV)", size: 115},
+                            model: [{text: "Channel / peak", size: 120}, {text: "Power (uW)", size: 105}, {text: "Measured-range area (a.u. eV)", size: 165}, {text: "Full area ± SE (a.u. eV)", size: 190},
                                 {text: "Height (a.u.)", size: 110}, {text: "FWHM ± SE (meV)", size: 150},
-                                {text: "Center (eV)", size: 110}, {text: "Status / manual", size: 185}, {text: "Source / row", size: 285}]
+                                {text: "Center ± SE (eV)", size: 170}, {text: "Status / manual", size: 185}, {text: "Source / row", size: 285}]
                             delegate: Text {
                                 required property var modelData
                                 width: modelData.size; height: 28
@@ -145,10 +155,11 @@ Rectangle {
                     contentItem: Row {
                         Repeater {
                             model: [{text: fitRow.modelData.channel + " / Peak " + fitRow.modelData.peak, size: 120},
-                                {text: panel.number(fitRow.modelData.power), size: 105}, {text: panel.number(fitRow.modelData.area), size: 115},
+                                {text: panel.number(fitRow.modelData.power), size: 105}, {text: panel.number(fitRow.modelData.area), size: 165},
+                                {text: panel.number(fitRow.modelData.areaFull) + " ± " + panel.number(fitRow.modelData.areaFullError), size: 190},
                                 {text: panel.number(fitRow.modelData.height), size: 110},
                                 {text: panel.number(fitRow.modelData.fwhm) + " ± " + panel.number(fitRow.modelData.fwhmError), size: 150},
-                                {text: panel.number(fitRow.modelData.center), size: 110},
+                                {text: panel.number(fitRow.modelData.center) + " ± " + panel.number(fitRow.modelData.centerError), size: 170},
                                 {text: fitRow.modelData.status + (fitRow.modelData.manual ? " · manual" : ""), size: 185},
                                 {text: fitRow.modelData.source + " / " + fitRow.modelData.sourceRow, size: 285}]
                             delegate: Text {

@@ -116,6 +116,13 @@ def _run_isolated():
         def fields(self):
             return {field["key"]: field for group in self.bridge.snapshot["parameterGroups"] for field in group["fields"]}
 
+        def test_export_clipping_is_independent_and_defaults_off(self):
+            self.assertFalse(self.fields()["exportClippedData"]["value"])
+            self.bridge.setParameter("exportClippedData", True)
+            self.bridge.setParameter("clip", False)
+            self.assertTrue(self.fields()["exportClippedData"]["value"])
+            self.assertFalse(self.fields()["clip"]["value"])
+
         def test_00_lazy_constructor_and_widgets_free_contract(self):
             self.assertNotIn("numpy", initial_imports)
             self.assertNotIn("matplotlib", initial_imports)
@@ -391,6 +398,7 @@ def _run_isolated():
             self.assertTrue(all(axis.get_xlabel() == "Photon Energy (eV)" for axis in self.bridge._maps.values()))
             self.bridge.invoke("toggle-spectrum")
             self.plotted()
+            self.bridge.setParameter("exportClippedData", True)
             self.bridge.invoke("export")
             wait(lambda: not self.bridge._pending, timeout=60)
             self.assertEqual(self.bridge.snapshot["error"], "", self.bridge.snapshot["status"])

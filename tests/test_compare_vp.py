@@ -432,6 +432,18 @@ class CompareExportTests(unittest.TestCase):
             self.assertEqual(data_lines[0], "Photon energy\t0\t1")
             self.assertEqual(data_lines[1], "1\t4\t2")
             self.assertEqual(data_lines[2], "2\t8\t6")
+            # Display clipping must not truncate the default numerical export.
+            params.vmax = 5.0
+            for legacy in (False, True):
+                with tempfile.TemporaryDirectory() as target:
+                    outputs = export_compare_panels(
+                        target, cubes={"KK": cubes["KK"]}, source_files={"KK": sources["KK"]},
+                        params=params, scale_tag="linear", clip_outliers=not legacy,
+                        correction_background=1.0, export_vp=False, export_clipped_data=legacy,
+                    )
+                    exported = next(path for path in outputs if path.suffix == ".dat").read_text()
+                    self.assertIn("# numeric_data_policy=" + ("display_clipped" if legacy else "background_corrected_full"), exported)
+                    self.assertIn("2\t5\t5" if legacy else "2\t8\t6", exported)
             vp_dat = next(Path(tmp, "Processed Data", name) for name in names if name.startswith("VP_") and name.endswith(".dat"))
             vp_lines = vp_dat.read_text().splitlines()
             self.assertEqual(vp_lines[0], "# panel=VP")

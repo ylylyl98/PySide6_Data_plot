@@ -44,18 +44,26 @@ def detect_heatmap(dataset, settings, cancelled=None, progress=None):
     cube=dataset['cube'];x=cube.energy;points=[]
     detector=PeakAnalysisSettings(float(x.min()),float(x.max()),float(cube.gate.min()),float(cube.gate.max()),
                                   source='raw',polarity='peaks' if dataset['kind']=='PL' else 'both')
-    for row,values in enumerate(cube.Z):
+    scope=dataset.get('analysis_scope', 'map')
+    if scope not in ('map', 'spectrum'):raise ValueError('Unknown analysis scope.')
+    row_indices=[int(dataset['row'])] if scope=='spectrum' else list(range(len(cube.gate)))
+    if any(row<0 or row>=len(cube.gate) for row in row_indices):raise ValueError('Select a measured spectrum first.')
+    for n,row in enumerate(row_indices):
+        values=cube.Z[row]
         if cancelled and cancelled():raise RuntimeError('Peak analysis cancelled.')
         signal=detection_spectrum(x,values,config)
-        for p in _detect(x,signal,detector,retain_candidates=True):
+        detected=_detect(x,signal,detector,retain_candidates=True)
+        # Detector energies are exact samples on the increasing workspace axis.
+        positions=np.searchsorted(x, [p['energy'] for p in detected])
+        for p,index in zip(detected,positions):
             if p['prominence_fraction']<config['candidate_floor']:continue
-            index=int(np.argmin(abs(x-p['energy'])))
+            index=int(index)
             p.update(candidate_id=f'{row}:{index}:{p["polarity"]}',row_index=row,y=float(cube.gate[row]))
             points.append(p)
-        if progress:progress(int((row+1)*80/len(cube.gate)))
+        if progress:progress(int((n+1)*80/len(row_indices)))
     if cancelled and cancelled():raise RuntimeError('Peak analysis cancelled.')
     pool = dict(dataset_key=dataset['key'],points=points,settings=config,method=METHODS[config['detection_method']],
-                rows=len(cube.gate),width_definition='Full width at half prominence (meV)',
+                rows=len(cube.gate),detected_rows=row_indices,width_definition='Full width at half prominence (meV)',
                 processing='Supplied product; no derivative applied. SG order 2 uses finite segments; segments under 5 samples are unsmoothed.')
     return prepare_quality_cache(dataset,pool,cancelled,lambda n:progress(80+n//5) if progress else None)
 

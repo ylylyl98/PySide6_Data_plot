@@ -7,7 +7,7 @@ import numpy as np
 from scipy.optimize import curve_fit, OptimizeWarning
 from scipy.signal import find_peaks, peak_widths, savgol_filter
 
-from core.power_peaks import PeakFit, peak_model
+from core.power_peaks import PeakFit, peak_model, covariance_in_units, propagated_error, full_peak_area
 
 
 @dataclass(frozen=True)
@@ -39,6 +39,10 @@ class SpectrumFit:
     residual: np.ndarray | None = field(default=None, repr=False)
     baseline: np.ndarray | None = field(default=None, repr=False)
     component_curves: tuple[np.ndarray, ...] = field(default=(), repr=False)
+    covariance: np.ndarray | None = field(default=None, repr=False)
+    spectrum_area_roi: float = np.nan
+    spectrum_area_roi_domain: tuple[float, float] | None = None
+    spectrum_area_roi_method: str = ""
 
 
 def detect_peak_seeds(cube, max_peaks=8) -> tuple[PeakSeed, ...]:
@@ -270,11 +274,20 @@ def fit_multi_spectrum(energy, spectrum, power, settings, *, manual=False) -> Sp
         actual[:2] *= scale
         actual[2::3] *= scale
         result.parameters = tuple(float(value) for value in actual)
+        unit_scales = np.ones(len(parameters)); unit_scales[:2] = scale; unit_scales[2::3] = scale
+        result.covariance, uncertainty_status = covariance_in_units(covariance, unit_scales, parameters, lower, upper)
+        result.spectrum_area_roi = float(np.trapezoid(y - result.baseline, x))
+        result.spectrum_area_roi_domain = (float(x[0]), float(x[-1]))
+        result.spectrum_area_roi_method = "Trapezoidal integration of finite measured samples minus fitted linear baseline"
         curves = []
+        area_jacobian = (multi_peak_jacobian(x, actual, model=settings.model, origin=origin)
+                         if result.covariance is not None else None)
         for index, component in enumerate(components):
             offset = 2 + 3 * index
             height, center, width = actual[offset:offset + 3]
-            error = float(np.sqrt(covariance[offset + 2, offset + 2]))
+            diagonal = covariance[offset + 2, offset + 2]
+            error = float(np.sqrt(diagonal)) if diagonal >= 0 else np.nan
+            component.uncertainty_status = uncertainty_status
             curve = peak_model(x, 0., 0., height, center, width, model=settings.model, origin=origin)
             curves.append(curve)
             component.center_ev, component.rms = float(center), result.rms
@@ -293,6 +306,20 @@ def fit_multi_spectrum(energy, spectrum, power, settings, *, manual=False) -> Sp
                 component.fwhm_error_mev = error * 1000
                 component.height = float(height)
                 component.area = float(np.trapezoid(curve, x))
+                component.fit_area_full, factor = full_peak_area(height, width, settings.model)
+                if result.covariance is not None:
+                    component.center_error_ev = float(np.sqrt(result.covariance[offset + 1, offset + 1]))
+                    component.height_error = float(np.sqrt(result.covariance[offset, offset]))
+                    full_gradient = np.zeros(len(actual)); full_gradient[offset] = factor * width
+                    full_gradient[offset + 2] = factor * height
+                    component.fit_area_full_error = propagated_error(full_gradient, result.covariance)
+                    gradient = np.zeros(len(actual))
+                    gradient[offset:offset+3] = np.trapezoid(area_jacobian[:, offset:offset+3], x, axis=0)
+                    component.area_error = propagated_error(gradient, result.covariance)
+                else:
+                    component.fwhm_error_mev = np.nan
+            if component.status != "ok" and component.uncertainty_status == "ok":
+                component.uncertainty_status = "fit not valid: " + component.status
         result.component_curves = tuple(curves)
         count = sum(component.status == "ok" for component in components)
         result.status = "ok" if count == len(components) else f"{count}/{len(components)} peaks valid"

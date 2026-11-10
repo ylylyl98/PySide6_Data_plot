@@ -14,8 +14,10 @@ Rectangle {
     function number(value) { return value === undefined || value === null ? "—" : Number(value).toPrecision(6) }
     function cells(point) {
         return [point.branch, point.row_index, number(point.y), number(point.energy), point.polarity, point.status,
-            number(point.snr), number(point.width_mev), number(point.fit_center), point.fit_status || "—",
-            number(point.fwhm_mev), number(point.height), number(point.area), number(point.rms)]
+            number(point.snr), number(point.width_mev), number(point.fit_center), number(point.center_error_ev),
+            number(point.fwhm_mev), number(point.fwhm_error_mev), number(point.height), number(point.height_error),
+            number(point.fit_area_full), number(point.fit_area_full_error), number(point.area), number(point.rms),
+            point.fit_status || "—", point.uncertainty_status || "unavailable"]
     }
     ColumnLayout {
         anchors.fill: parent; spacing: 2
@@ -27,11 +29,11 @@ Rectangle {
         Basic.ScrollView {
             id: scroll
             Layout.fillWidth: true; Layout.fillHeight: true
-            contentWidth: 1540
+            contentWidth: 2400
             clip: true
             ListView {
                 id: results
-                width: Math.max(scroll.availableWidth, 1540)
+                width: Math.max(scroll.availableWidth, 2400)
                 height: scroll.availableHeight
                 model: panel.bridge.resultsModel
                 clip: true
@@ -40,10 +42,10 @@ Rectangle {
                     z: 2; width: results.width; height: 31; color: panel.colors.control
                     Row {
                         Repeater {
-                            model: ["Branch", "Row", panel.state.scanLabel || "Scan", "Energy (eV)", "Polarity", "Status", "SNR", "Width (meV)", "Fit center", "Fit status", "FWHM (meV)", "Height", "Area", "RMS"]
+                            model: ["Branch", "Row", panel.state.scanLabel || "Scan", "Detected (eV)", "Polarity", "Status", "SNR", "Width (meV)", "Center (eV)", "Center SE (eV)", "FWHM (meV)", "FWHM SE", "Height", "Height SE", "Fit area (full)", "Fit area SE", "Fit area (ROI)", "RMS", "Fit status", "Uncertainty"]
                             delegate: Text {
                                 required property string modelData
-                                width: 110; height: 31; leftPadding: 7
+                                width: 120; height: 31; leftPadding: 7
                                 text: modelData; color: panel.colors.muted
                                 verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight; font.pixelSize: 11
                             }
@@ -67,7 +69,7 @@ Rectangle {
                             model: panel.cells(pointRow.entry)
                             delegate: Text {
                                 required property var modelData
-                                width: 110; height: 29; leftPadding: 7
+                                width: 120; height: 29; leftPadding: 7
                                 text: String(modelData); color: panel.colors.text
                                 verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight; font.pixelSize: 11
                             }

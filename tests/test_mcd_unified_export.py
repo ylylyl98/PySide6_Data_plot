@@ -191,7 +191,11 @@ class UnifiedMcdExportTests(unittest.TestCase):
             self.assertEqual({Path(path).stem.removesuffix('_' + result['export_id']) for path in result["plot_pngs"]}, {"MCD_map", "MCD_vs_B_w1", "MCD_vs_B_w2", "feature_energy", "feature_shift"})
             workbook = load_workbook(result["xlsx"], data_only=False)
             self.assertLessEqual(len(workbook.sheetnames), 5)
-            self.assertEqual(workbook.sheetnames, ["MCD", "Slopes", "Energy", "Shift"])
+            self.assertEqual(workbook.sheetnames, ["MCD", "Slopes", "Slope details", "Energy", "Shift"])
+            details = list(workbook["Slope details"].values)
+            detail_headers = list(details[0])
+            self.assertEqual(details[1][detail_headers.index("slope_SE_MCD_per_T")], 0.01)
+            self.assertEqual(details[1][detail_headers.index("difference_SE_MCD_per_T")], 0.004)
             self.assertNotIn("Settings", workbook.sheetnames)
             self.assertNotIn("Links", workbook.sheetnames)
             mcd_headers = [cell.value for cell in workbook["MCD"][1]]

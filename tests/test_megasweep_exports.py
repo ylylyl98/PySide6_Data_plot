@@ -16,7 +16,30 @@ class MegasweepExportTests(unittest.TestCase):
             repeated=export_result(analyze(ds,params),p/'out')
             self.assertNotEqual(paths[1],repeated[1]); self.assertEqual(original,Path(paths[1]).read_bytes())
             paths=export_batch(ds,params,(),p/'out')
-            self.assertEqual(len(paths),6); self.assertTrue(all(Path(x).is_file() for x in paths))
+            self.assertEqual(len(paths),7); self.assertTrue(all(Path(x).is_file() for x in paths))
+            index = pd.read_csv(paths[0])
+            self.assertEqual(index['status'].tolist(), ['completed', 'completed'])
+            self.assertTrue(all(len(__import__('json').loads(value)) == 3 for value in index['exported_files']))
+
+    def test_batch_index_replace_failure_retains_previous_snapshot(self):
+        import os
+        from unittest.mock import patch
+        with TemporaryDirectory() as d:
+            p=Path(d); src=p/'sample.csv'
+            pd.DataFrame({'x':[0,0,1,1], 'y':[0,1,0,1], '700':[10,11,12,13], '710':[9,10,11,12]}).to_csv(src,index=False)
+            real_replace=os.replace
+            calls=[]
+            def fail_second(source, destination):
+                calls.append(destination)
+                if len(calls) == 2:
+                    raise OSError('simulated index replace failure')
+                return real_replace(source, destination)
+            with patch('os.replace', side_effect=fail_second):
+                with self.assertRaisesRegex(OSError, 'simulated index'):
+                    export_batch(load_dataset(src), {'cut_type':'x'}, (), p/'out')
+            index=next((p/'out').glob('*_batch_index.csv'))
+            self.assertEqual(pd.read_csv(index)['status'].tolist(), ['pending', 'pending'])
+            self.assertFalse(list((p/'out').glob('.batch-index-*.tmp')))
 
     def test_preview_cache_and_cancellation(self):
         from core.megasweep.workflow import MoviePreviewSession
@@ -56,7 +79,9 @@ class MegasweepExportTests(unittest.TestCase):
                 return calls[0]>=4
             with self.assertRaises(BatchCancelled) as cm:
                 export_batch(load_dataset(src),{'cut_type':'x'},(),p/'out',cancelled=cancel)
-            self.assertEqual(len(cm.exception.completed_paths),3)
+            self.assertEqual(len(cm.exception.completed_paths),4)
+            index = pd.read_csv(cm.exception.completed_paths[0])
+            self.assertEqual(index['status'].tolist(), ['completed', 'cancelled'])
             self.assertTrue(all(Path(path).is_file() for path in cm.exception.completed_paths))
             self.assertFalse(any(item.name.startswith('.megasweep-export-') for item in (p/'out').iterdir()))
 

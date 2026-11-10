@@ -120,7 +120,7 @@ class CompareBridge(QObject):
         self._values = dict(view="intensity", preset="kk", sourceFilter="pl", historyFilter="all", query="",
             rotationMapping=mapping if mapping in {"rot1_input", "rot1_output"} else "rot1_input",
             inK=0., inKp=45., outK=0., outKp=45., angleTolerance=15., powerTolerance=5.,
-            autoBackground=True, background=0., log=False, clip=True, cmap="turbo", exportVP=True,
+            autoBackground=True, background=0., log=False, clip=True, cmap="turbo", exportVP=True, exportClippedData=False,
             xmin=0., xmax=1., ymin=0., ymax=1., gate=0., vmin=0., vmax=1., vpMin=-1., vpMax=1.,
             yAxis="auto", yA=1., yB=-1., yC=0., split=False, splitX=.5,
             leftMin=0., leftMax=1., rightMin=0., rightMax=1., showBoundary=True,
@@ -892,7 +892,7 @@ class CompareBridge(QObject):
                 raise ValueError("A Compare source changed after loading. Reload before exporting.")
             return export_compare_panels(folder, cubes=cubes, source_files=sources, params=params,
                 scale_tag="log" if values["log"] else "linear", clip_outliers=values["clip"],
-                correction_background=background, export_vp=values["exportVP"] or values["view"] == "vp",
+                correction_background=background, export_clipped_data=values["exportClippedData"], export_vp=values["exportVP"] or values["view"] == "vp",
                 vp_vmin=values["vpMin"], vp_vmax=values["vpMax"], processed_name="Processed Data/Compare")
         self._sequence += 1
         sequence, context = self._sequence, self.maintenanceContext
@@ -1206,6 +1206,8 @@ class CompareBridge(QObject):
                 *pair("leftMin", "leftMax", "Left colors"), action("auto-left", "Auto left"),
                 *pair("rightMin", "rightMax", "Right colors"), action("auto-right", "Auto right"), flag("showBoundary", "Show boundary"),
                 *[flag("fix." + key, "Fix " + key, self._fixed[key]) for key in ("leftMin", "leftMax", "rightMin", "rightMax")]]),
+            dict(key="export-options", title="Export options", advanced=True, fields=[
+                flag("exportClippedData", "Clip exported intensity data to color limits (legacy)")]),
             dict(key="previews", title="Export titles and filenames", advanced=True, fields=previews)]
 
     @Slot()

@@ -77,6 +77,7 @@ class ProcessedMcdRecord:
     temperature_measured_k: float | None = None
     workbook_columns: dict[str, str] | None = None
     high_field_slopes: dict[str, dict[str, float]] = field(default_factory=dict)
+    slope_diagnostics: list[dict[str, object]] = field(default_factory=list)
 
     def condition_value(self, label: str) -> float | None:
         bounds = self.acquisition_conditions.get(label)
@@ -130,9 +131,9 @@ class McdSeries:
     fixed_conditions: dict[str, float | None]
 
 
-_CATALOG_SCHEMA_VERSION = 8
+_CATALOG_SCHEMA_VERSION = 9
 _CATALOG_NAME = ".mcd_extract_catalog.json"
-_SQLITE_CATALOG_SCHEMA_VERSION = 8
+_SQLITE_CATALOG_SCHEMA_VERSION = 9
 _SQLITE_CATALOG_NAME = ".mcd_catalog.sqlite3"
 _SERIES_VARIABLES = ("E-field", "Temperature", "Doping", "Vtg", "Vbg", "Vbias", "Energy")
 MCD_DEFAULT_TEMPERATURE_K = 1.67
@@ -382,6 +383,7 @@ def _record_to_catalog(record: ProcessedMcdRecord, signature: tuple[int, int]) -
         "temperature_measured_k": record.temperature_measured_k,
         "workbook_columns": record.workbook_columns,
         "high_field_slopes": record.high_field_slopes,
+        "slope_diagnostics": record.slope_diagnostics,
     }
 
 
@@ -426,6 +428,7 @@ def _record_from_catalog(
         temperature_measured_k=_finite_or_none(value.get("temperature_measured_k")),
         workbook_columns=value.get("workbook_columns"),
         high_field_slopes=value.get("high_field_slopes", {}),
+        slope_diagnostics=value.get("slope_diagnostics", []),
     )
 
 
@@ -643,13 +646,17 @@ def _record_from_settings_payload(
         and abs(float(w["width_mev"]) - width) <= 1e-9
     }
     slopes = payload.get("slopes", [])
+    differences = slopes.get("differences", []) if isinstance(slopes, dict) else []
+    if isinstance(differences, dict):
+        differences = list(differences.values())
     if isinstance(slopes, dict):
         slopes = slopes.get("fits", [])
     if isinstance(slopes, dict):
         slopes = list(slopes.values())
     high_field_slopes = {}
+    slope_diagnostics = []
     for fit in slopes if isinstance(slopes, list) else []:
-        if not isinstance(fit, dict) or fit.get("status", "ok") != "ok":
+        if not isinstance(fit, dict):
             continue
         region = {"high+": "high_positive", "high-": "high_negative"}.get(fit.get("region"), fit.get("region"))
         if region not in {"low", "high_positive", "high_negative"}:
@@ -668,6 +675,9 @@ def _record_from_settings_payload(
                 continue
         elif (fit_center is None or fit_width is None) and len(windows) > 1:
             continue
+        slope_diagnostics.append(dict(fit))
+        if fit.get("status", "ok") != "ok":
+            continue
         slope = _finite_or_none(fit.get("slope"))
         if region != "low":
             if slope is not None and fit.get("branch") in BRANCHES:
@@ -677,6 +687,23 @@ def _record_from_settings_payload(
             increasing = slope
         if fit.get("branch") == "B decreasing" and decreasing is None:
             decreasing = slope
+    for difference in differences if isinstance(differences, list) else []:
+        if not isinstance(difference, dict):
+            continue
+        difference_center = _finite_or_none(difference.get("center_ev"))
+        difference_width = _finite_or_none(difference.get("width_mev"))
+        if difference_center is not None and abs(difference_center - center) > 1e-9:
+            continue
+        if difference_width is not None and abs(difference_width - width) > 1e-9:
+            continue
+        window_id = difference.get("window_id")
+        if window_id and str(window_id) not in matching_ids:
+            continue
+        if not window_id and (difference_center is None or difference_width is None) and len(windows) > 1:
+            continue
+        item = dict(difference)
+        item["category"] = "differences"
+        slope_diagnostics.append(item)
     if increasing is None and trace_path.suffix.casefold() == ".csv":
         increasing = _slope_from_csv(trace_path, "low_field_mcd_slope_increasing_per_T")
     if decreasing is None and trace_path.suffix.casefold() == ".csv":
@@ -791,6 +818,7 @@ def _record_from_settings_payload(
         temperature_measured_k=measured_temperature,
         workbook_columns=workbook_columns,
         high_field_slopes=high_field_slopes,
+        slope_diagnostics=slope_diagnostics,
     )
 
 
@@ -2062,6 +2090,25 @@ def export_mcd_extract(
         _write_dataframe_sheet(
             summary_workbook, "Slopes", compact_slope_table(ordered_records, comparison_variable, slope_metrics, BRANCHES, resolved_groups)
         )
+    if slope_metrics:
+        from core.mcd_unified_export import _slope_table
+        detail_rows = []
+        detail_columns = []
+        for record in ordered_records:
+            columns, rows = _slope_table({"slopes": record.slope_diagnostics})
+            if columns:
+                detail_columns = columns
+                detail_rows.extend([[record.source_file, str(record.settings_path), *row] for row in rows])
+            else:
+                detail_rows.append([record.source_file, str(record.settings_path)])
+        if not detail_columns:
+            detail_columns, _ = _slope_table({"slopes": [{"status": "unavailable"}]})
+        import pandas as pd
+        padded = [row + [None] * (2 + len(detail_columns) - len(row)) for row in detail_rows]
+        for row in padded:
+            if all(value is None for value in row[2:]):
+                row[2 + detail_columns.index("status")] = "unavailable"
+        _write_dataframe_sheet(summary_workbook, "Slope details", pd.DataFrame(padded, columns=["source_file", "settings_path", *detail_columns]))
     _write_dataframe_sheet(
         summary_workbook, "Conditions", compact_conditions_table(ordered_records, comparison_variable)
     )

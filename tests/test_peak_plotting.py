@@ -18,6 +18,19 @@ class CountingPoints(list):
 
 
 class SpectrumPlotTests(unittest.TestCase):
+    def test_overlay_groups_points_once_and_keeps_gaps_order_and_disabled_branches(self):
+        from core.peak_plotting import overlay_series
+        dataset = dict(branches=[dict(id=str(i), enabled=i != 2) for i in range(80)])
+        points = CountingPoints(dict(branch_id=str(i), y=float(row), energy=1.6 + row * .01,
+            status='accepted' if row != 1 else 'uncertain', segment=0 if row < 2 else 1)
+            for row in (2, 0, 1) for i in range(80))
+        dataset['result'] = dict(points=points)
+        series = overlay_series(dataset)
+        self.assertEqual(len(series), 79)
+        self.assertLessEqual(points.visits, len(points), 'Overlay must not scan all points for each branch')
+        np.testing.assert_allclose(series[0][1], [1.6, np.nan, np.nan, 1.62], equal_nan=True)
+        np.testing.assert_allclose(series[0][2], [0, 1, np.nan, 2], equal_nan=True)
+
     def test_small_marker_size_is_shared_by_overlay_packet_and_plot(self):
         from core.peak_candidates import detect_heatmap,filter_heatmap
         from core.peak_plotting import draw_overlay,overlay_payload

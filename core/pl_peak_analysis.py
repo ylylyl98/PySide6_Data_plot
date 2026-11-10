@@ -37,12 +37,19 @@ def fit(dataset, result, settings, cancelled=None, progress=None):
         for p, component in zip(points, fitted.components):
             p.update(fit_status=component.status, fit_center=component.center_ev,
                      fwhm_mev=component.fwhm_mev, fwhm_error_mev=component.fwhm_error_mev,
-                     height=component.height, area=component.area, rms=fitted.rms)
+                     height=component.height, area=component.area, rms=fitted.rms,
+                     center_error_ev=component.center_error_ev, height_error=component.height_error,
+                     fit_area_full=component.fit_area_full, fit_area_full_error=component.fit_area_full_error,
+                     area_error=component.area_error, uncertainty_status=component.uncertainty_status)
         if fitted.parameters:
             result['fits'].append(dict(row_index=row, parameters=list(fitted.parameters),
                 origin=float(np.mean(x[np.isfinite(cube.Z[row, mask])])),
                 x_min=float(x[0]), x_max=float(x[-1]), model=settings['model'],
-                branch_ids=[p['branch_id'] for p in points], status=fitted.status))
+                branch_ids=[p['branch_id'] for p in points], status=fitted.status,
+                covariance=fitted.covariance.tolist() if fitted.covariance is not None else None,
+                spectrum_area_roi=fitted.spectrum_area_roi,
+                spectrum_area_roi_domain=fitted.spectrum_area_roi_domain,
+                spectrum_area_roi_method=fitted.spectrum_area_roi_method))
         if progress:
             progress(int((n+1)*100/len(by_row)))
     if cancelled and cancelled():

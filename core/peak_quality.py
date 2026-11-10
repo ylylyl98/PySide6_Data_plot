@@ -26,7 +26,8 @@ def prepare_quality_cache(dataset, pool, cancelled=None, progress=None):
     for point in points:
         rows[point['row_index']].append(point)
     x = dataset['cube'].energy
-    for row, values in enumerate(dataset['cube'].Z):
+    for row_number, row in enumerate(sorted(rows)):
+        values = dataset['cube'].Z[row]
         if cancelled and cancelled():
             raise RuntimeError('Peak quality calculation cancelled.')
         # Always use the cached detector settings, including when new settings
@@ -44,13 +45,18 @@ def prepare_quality_cache(dataset, pool, cancelled=None, progress=None):
             residual = uniform - savgol_filter(uniform, window, 2)
             sigma = float(np.median(abs(residual - np.median(residual))) / .67448975)
             noise[start:end] = max(sigma, float(np.ptp(uniform)) * 1e-12, np.finfo(float).tiny)
-        for point in rows[row]:
-            index = int(np.argmin(abs(x - point['energy'])))
+        # Legacy caches may contain interpolated coordinates: retain argmin's
+        # lower-index tie behavior while searching all row positions at once.
+        energies = np.asarray([point['energy'] for point in rows[row]])
+        right = np.clip(np.searchsorted(x, energies), 0, len(x) - 1)
+        left = np.maximum(right - 1, 0)
+        indices = np.where(abs(x[left] - energies) <= abs(x[right] - energies), left, right)
+        for point, index in zip(rows[row], indices):
             sigma = float(noise[index])
             point['noise_sigma'] = sigma if np.isfinite(sigma) else None
             point['snr'] = float(point['prominence'] / sigma) if np.isfinite(sigma) else None
         if progress:
-            progress(int((row + 1) * 100 / len(dataset['cube'].gate)))
+            progress(int((row_number + 1) * 100 / len(rows)))
     if cancelled and cancelled():
         raise RuntimeError('Peak quality calculation cancelled.')
     return {**pool, 'points': points, 'quality': dict(version=QUALITY_VERSION,

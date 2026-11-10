@@ -134,6 +134,59 @@ column mappings, units, and the output manifest. Existing SHG CSV/JSON packages
 remain readable and are not renamed. The legacy CSV export APIs remain available
 to scripts. New paths include a Windows-compatible length budget; overly deep
 experiment roots receive an actionable error.
+### Analysis workbooks and uncertainty
+
+Peak Analysis exports an XLSX alongside CSV, JSON and PNG. PL combines detection
+and fitting in `Results`; DRR uses `Peaks` and `Dips`, with matching scan rows.
+Each feature occupies adjacent columns. Stable branch IDs, source rows and full
+source names are recorded. Missing values stay blank. PL keeps its original scan
+coordinate and does not infer excitation power.
+
+`Curves` contains measured signal, baseline, total fit and residual; `Components`
+contains individual fitted components. Advanced **Export curves** defaults to
+the current spectrum; all analyzed spectra is an explicit choice. Result tables
+always cover the analysis range. Excel capacity overflow raises an error rather
+than truncating data. Workbook names retain source conditions where the path
+budget permits; long names receive a hash and remain complete in Settings.
+
+- `Spectrum_area_roi`: measured signal minus the common fitted linear baseline,
+  trapezoid-integrated over finite sampled fit points, once per spectrum.
+- `fit_area_full`: analytic whole-domain area of an individual fitted Lorentzian
+  or Gaussian; excludes baseline and extrapolates model tails.
+- PL `fit_area_roi` and Power `area_legacy`: preserve previous finite-domain
+  areas. Legacy single-peak Power uses measured signal minus baseline; multi-peak
+  analysis integrates fitted components on the measured fit axis.
+
+Area units are signal units times eV. Export applies no exposure normalization
+or wavelength-to-energy spectral-density correction. Integration connects finite
+samples, including across internal missing samples. Errors are approximate
+one-standard-error fit covariance estimates, excluding calibration/systematic
+errors. Unreliable estimates are blank with a status. Legacy single-peak
+measured-area error includes only baseline covariance, not measurement-noise
+integration uncertainty. PL Advanced **Analysis plot** shows fitted center and
+FWHM trends with these error bars.
+
+Power's main workflow is **1 Fit spectra → 2 Power law**. Results and Advanced
+share one action row; initial guesses, model controls and manual per-spectrum
+refitting are available under Advanced rather than duplicated across the page.
+The power-law page keeps range selection and alpha in view; area-definition
+changes, local slopes and exploratory suggestions are under Advanced.
+
+Power workbooks add `PowerLaw`, `FitData` and `Sources`. Interval entry or dragging
+updates alpha after a short pause without refitting spectra. Legacy area remains
+the default; **Full fitted peak area** is an explicit choice. **Apply intervals**
+commits the fit; **Keep interval result** retains a comparison and its captured
+inputs. The near-alpha-one suggestion is exploratory and lives under Advanced.
+Old histories without input snapshots are marked unavailable, not reconstructed
+from newer spectra. Alpha error is the OLS log-log slope standard error; area
+errors are not regression weights. Repeated powers/source rows remain distinct.
+
+Compare DAT defaults to full background-corrected values, independent of display
+color clipping. A separate legacy clipped-data option is recorded in metadata.
+MCD includes detailed slope diagnostics in XLSX; Organizer retains available
+errors, fit ranges and status. Megasweep batches add a CSV slice index including
+filenames and completion/cancellation status. SHG structure is unchanged.
+
 ### Power package names
 
 Power packages use one of:

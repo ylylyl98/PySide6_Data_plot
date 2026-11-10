@@ -9,11 +9,13 @@ class PeakAnalysisPlotMixin:
         self._canvas = self._navigation = None
         self._heat = self._spectrum = self._residual = self._gate_line = None
         self._spectrum_pool = None
+        self._trend_axes = ()
         self._background_image = self._background_bounds = None
         self._plot_signature = None
         self._overlay_artists = []
         self._building_plot = False
         self._plot_tool = ""
+        self._last_painted_row = None
         self._cursor_pending = None
         self._cursor_state = dict(text="Cursor · X: — · Y: — · Z: —", tooltip="Move over a plot to read mouse coordinates. Hovering does not change the selected spectrum or analysis.")
         self._cursor_last_tip = ""
@@ -31,7 +33,7 @@ class PeakAnalysisPlotMixin:
         self._canvas.mpl_connect("axes_leave_event", self._cursor_leave)
         self._canvas.mpl_connect("figure_leave_event", self._cursor_leave)
         self._canvas.mpl_connect("draw_event", self._plot_drawn)
-        self._canvas.mpl_connect("resize_event", lambda event: self._clear_plot_background())
+        self._canvas.mpl_connect("resize_event", self._resize_plot)
         self._canvas.backend.drawFailed.connect(lambda message: self._message("Peak Analysis plot: " + message, error=True))
         self.plotBackendChanged.emit()
 
@@ -41,6 +43,21 @@ class PeakAnalysisPlotMixin:
 
     def _clear_plot_background(self):
         self._background_image = self._background_bounds = None
+
+    def _resize_plot(self, event=None):
+        self._clear_plot_background()
+        if self._heat is not None:
+            # Keep room for tick labels and axis titles when the Quick surface
+            # shrinks; fixed fractional margins clip labels in compact windows.
+            height = max(self._canvas.figure.get_figheight(), 1.)
+            self._heat.get_subplotspec().get_gridspec().update(
+                bottom=max(.09, min(.24, .52 / height)), top=min(.95, 1 - .28 / height))
+            # These embedded figures have no pyplot manager for GridSpec.update
+            # to reposition; apply the revised subplot boxes directly.
+            for axis in self._canvas.figure.axes:
+                spec = axis.get_subplotspec()
+                if spec is not None:
+                    axis.set_position(spec.get_position(self._canvas.figure))
 
     def _style_figure(self):
         palette = self._colors
@@ -77,6 +94,20 @@ class PeakAnalysisPlotMixin:
             self._ensure_plot()
             self._building_plot = True
             self._cursor_clear()
+            if dataset.get('plot_view') == 'trends' and dataset['kind'] == 'PL':
+                from core.peak_plotting import build_fit_trends
+                self._clear_plot_background()
+                self._heat = self._spectrum = self._residual = self._gate_line = None
+                self._spectrum_pool = None
+                self._overlay_artists = []
+                self._plot_signature = None
+                self._trend_axes = tuple(build_fit_trends(dataset, self._canvas.figure))
+                self._style_figure()
+                self._navigation.update()
+                self._canvas.draw_idle()
+                self._publish()
+                return
+            self._trend_axes = ()
             if self._plot_signature == self._static_plot_signature(dataset) and self._spectrum_pool is not None:
                 # Detection/filtering/fitting replace peak metadata, not the
                 # measured grid. Keep the mesh, colorbars, axes and navigation
@@ -90,6 +121,7 @@ class PeakAnalysisPlotMixin:
                 self._spectrum_pool.update(dataset, dataset["row"], self._colors)
                 self._gate_line.set_ydata([float(dataset["cube"].gate[dataset["row"]])] * 2)
                 self._redraw_dynamic()
+                self._last_painted_row = (dataset["key"], dataset["row"])
                 self._publish()
                 return
             self._clear_plot_background()
@@ -97,6 +129,7 @@ class PeakAnalysisPlotMixin:
             figure.set_layout_engine(None)
             self._heat, self._spectrum, self._residual, self._gate_line = build_figure(dataset, dataset["row"],
                 dataset.get("show_overlay", True), dataset.get("show_residual", False) and dataset["kind"] == "PL", figure)
+            self._resize_plot()
             from ui_qt.quick.peak_analysis_spectrum import RetainedPeakSpectrum
             self._spectrum_pool = RetainedPeakSpectrum(self._spectrum, self._residual, dataset, dataset["row"], self._colors)
             for axis in (self._spectrum, self._residual):
@@ -115,6 +148,7 @@ class PeakAnalysisPlotMixin:
             self._navigation.update()
             self._plot_tool = str(self._navigation.mode.name).lower() if self._navigation.mode else ""
             self._canvas.draw_idle()
+            self._last_painted_row = (dataset["key"], dataset["row"])
             self._publish()
         except (ValueError, RuntimeError) as error:
             self._message(str(error), error=True)
@@ -124,6 +158,7 @@ class PeakAnalysisPlotMixin:
     def _static_plot_signature(self, dataset):
         view = dataset.get("view") or {}
         return (dataset["key"], id(dataset["cube"]), dataset["name"], dataset.get("product_label"),
+            dataset.get("analysis_scope", "map"),
             bool(dataset.get("show_residual", False) and dataset["kind"] == "PL"),
             repr(view), repr(self._colors))
 
@@ -146,14 +181,21 @@ class PeakAnalysisPlotMixin:
         self._draw_dynamic()
 
     def _select_plot_row(self):
+        if self._plot_timer.isActive():
+            return
         dataset = self.dataset
+        if dataset and dataset.get('plot_view') == 'trends':
+            return
         if dataset is None or self._spectrum is None:
             self._schedule_plot()
+            return
+        if self._last_painted_row == (dataset["key"], dataset["row"]):
             return
         self._cursor_clear()
         self._spectrum_pool.update(dataset, dataset["row"], self._colors)
         self._gate_line.set_ydata([float(dataset["cube"].gate[dataset["row"]])] * 2)
         self._redraw_dynamic()
+        self._last_painted_row = (dataset["key"], dataset["row"])
 
     def _redraw_dynamic(self):
         if self._background_image is not None and self._background_bounds == self._canvas.figure.bbox.bounds and not self._canvas.backend._timer.isActive():

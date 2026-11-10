@@ -35,6 +35,13 @@ class PeakFit:
     x: np.ndarray | None = field(default=None, repr=False)
     fitted: np.ndarray | None = field(default=None, repr=False)
     residual: np.ndarray | None = field(default=None, repr=False)
+    center_error_ev: float = np.nan
+    height_error: float = np.nan
+    fit_area_full: float = np.nan
+    fit_area_full_error: float = np.nan
+    area_error: float = np.nan
+    uncertainty_status: str = "unavailable"
+    covariance: np.ndarray | None = field(default=None, repr=False)
 
 
 def peak_model(x, baseline, slope, height, center, fwhm, *, model, origin):
@@ -46,6 +53,35 @@ def peak_model(x, baseline, slope, height, center, fwhm, *, model, origin):
     else:
         raise ValueError("Choose Lorentzian or Gaussian.")
     return baseline + slope * (np.asarray(x) - origin) + peak
+
+
+def covariance_in_units(covariance, scales, parameters, lower, upper):
+    """Return physical-unit covariance only when identifiable and interior."""
+    cov = np.asarray(covariance, dtype=float)
+    scales = np.asarray(scales, dtype=float)
+    if cov.shape != (len(scales), len(scales)) or not np.isfinite(cov).all():
+        return None, "nonfinite covariance"
+    diagonal = np.diag(cov)
+    if np.any(diagonal <= 0):
+        return None, "singular covariance"
+    corr = cov / np.sqrt(np.outer(diagonal, diagonal))
+    if not np.allclose(corr, corr.T, rtol=1e-7, atol=1e-10) or np.linalg.eigvalsh((corr + corr.T) / 2).min() <= 1e-12:
+        return None, "singular covariance"
+    for value, lo, hi in zip(parameters, lower, upper):
+        if ((np.isfinite(lo) and value - lo <= 1e-7 * max(1., abs(value), abs(lo))) or
+                (np.isfinite(hi) and hi - value <= 1e-7 * max(1., abs(value), abs(hi)))):
+            return None, "parameter at constraint"
+    return cov * np.outer(scales, scales), "ok"
+
+
+def propagated_error(gradient, covariance):
+    variance = float(np.asarray(gradient) @ covariance @ np.asarray(gradient))
+    return float(np.sqrt(max(0., variance))) if np.isfinite(variance) and variance >= -1e-14 else np.nan
+
+
+def full_peak_area(height, width, model):
+    factor = np.pi / 2 if model == "Lorentzian" else np.sqrt(np.pi / (4 * np.log(2.)))
+    return float(factor * height * width), factor
 
 
 def fit_power_peaks(cube: DataCube, settings: PeakSettings, *, cancelled=None) -> tuple[PeakFit, ...]:
@@ -123,6 +159,11 @@ def fit_power_peaks(cube: DataCube, settings: PeakSettings, *, cancelled=None) -
             width_error = float(np.sqrt(covariance[4, 4])) if covariance[4, 4] >= 0 else np.nan
             height = float(p[2] * scale)
             fit.center_ev = float(p[3])
+            physical_cov, fit.uncertainty_status = covariance_in_units(
+                covariance, [scale, scale, scale, 1., 1.], p,
+                [-np.inf, -np.inf, 0., lower_center, min_width],
+                [np.inf, np.inf, np.inf, upper_center, span])
+            fit.covariance = physical_cov
             if p[4] <= dx or p[4] >= span * 0.95:
                 fit.status = "width unresolved or reaches window limit"
             elif min(p[3] - lower_center, upper_center - p[3]) < dx * 0.25:
@@ -138,6 +179,16 @@ def fit_power_peaks(cube: DataCube, settings: PeakSettings, *, cancelled=None) -
                 fit.height = height
                 local_baseline = (p[0] + p[1] * (x - center)) * scale
                 fit.area = float(np.trapezoid(y - local_baseline, x))
+                fit.fit_area_full, factor = full_peak_area(height, p[4], settings.model)
+                if physical_cov is not None:
+                    fit.center_error_ev = float(np.sqrt(physical_cov[3, 3]))
+                    fit.height_error = float(np.sqrt(physical_cov[2, 2]))
+                    fit.fit_area_full_error = propagated_error([0, 0, factor*p[4], 0, factor*height], physical_cov)
+                    fit.area_error = propagated_error([-float(x[-1]-x[0]), -float(np.trapezoid(x-center, x)), 0, 0, 0], physical_cov)
+                else:
+                    fit.fwhm_error_mev = np.nan
+            if fit.status != "ok" and fit.uncertainty_status == "ok":
+                fit.uncertainty_status = "fit not valid: " + fit.status
         except (ValueError, RuntimeError, FloatingPointError) as exc:
             fit.status = f"fit failed: {exc}"
     return tuple(results)
@@ -160,7 +211,8 @@ def draw_peak_trends(axes, results, *, log_power: bool, metric: str, power_limit
             lo, hi = power_limits
             if lo < hi and (not log_power or lo > 0):
                 axis.set_xlim(lo, hi)
-    axes[0].set_ylabel("Peak height (a.u.)" if metric == "Peak height" else "Integrated PL (a.u. eV)")
+    axes[0].set_ylabel("Peak height (a.u.)" if metric == "Peak height" else
+                       "Full fitted area (a.u. eV)" if metric == "Full fitted area" else "Integrated PL (a.u. eV)")
     axes[1].set_ylabel("FWHM (meV)")
     series = {}
     series_records = {}
@@ -175,7 +227,9 @@ def draw_peak_trends(axes, results, *, log_power: bool, metric: str, power_limit
         power = np.array([fit.power_uw for fit in fits])
         shown = np.isfinite(power) & ((power > 0) if log_power else True)
         # NaNs deliberately break curves at failed fits.
-        intensity = np.array([fit.height if metric == "Peak height" else fit.area for fit in fits], dtype=float)
+        intensity = np.array([fit.height if metric == "Peak height" else
+                              getattr(fit, "fit_area_full", np.nan) if metric == "Full fitted area" else fit.area
+                              for fit in fits], dtype=float)
         width = np.array([fit.fwhm_mev for fit in fits], dtype=float)
         errors = np.array([fit.fwhm_error_mev for fit in fits])
         for axis, values, log_y in ((axes[0], intensity, log_intensity), (axes[1], width, log_linewidth)):
@@ -213,6 +267,43 @@ def draw_peak_trends(axes, results, *, log_power: bool, metric: str, power_limit
 
 
 def export_peak_analysis(folder, payload):
+    """Stage every analysis output before publishing a collision-safe family."""
+    import os
+    from tempfile import TemporaryDirectory
+    from core.load_cancellation import check_load_cancelled
+    from core.power_workbook import export_power_workbook
+    from core.analysis_workbook import analysis_filename
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    sources = list(dict.fromkeys(str(getattr(record, 'file_name', '')) for rows in payload.get('records', {}).values() for record in rows))
+    source = sources[0] if len(sources) == 1 and sources[0] else folder.name
+    with TemporaryDirectory(prefix='.power-analysis-', dir=folder) as temporary:
+        stage = Path(temporary)
+        csv_path = _export_peak_analysis_files(stage, payload)
+        export_power_workbook(stage, payload, name=analysis_filename(source, '_PowerAnalysis', stage))
+        check_load_cancelled()
+        files = list(stage.iterdir())
+        suffix = 0
+        while True:
+            tag = '' if suffix == 0 else f'_{suffix:02d}'
+            names = {p: folder / (p.stem + tag + p.suffix) for p in files}
+            if not any(p.exists() for p in names.values()):
+                break
+            suffix += 1
+        published = []
+        try:
+            for source, target in names.items():
+                check_load_cancelled()
+                os.replace(source, target)
+                published.append(target)
+        except BaseException:
+            for path in published:
+                path.unlink(missing_ok=True)
+            raise
+    return names[csv_path]
+
+
+def _export_peak_analysis_files(folder, payload):
     """Export exactly the analyzed rows, including failed fits and provenance."""
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -226,7 +317,8 @@ def export_peak_analysis(folder, payload):
     settings = payload["settings"]
     fields = ["channel", "peak", "power_uW", "intensity_area_au_eV", "peak_height_au", "FWHM_meV",
               "FWHM_error_meV", "center_eV", "residual_rms", "status", "model", "window_min_eV",
-              "window_max_eV", "source_file", "source_row", "source_provenance", "manual_refit"]
+              "window_max_eV", "source_file", "source_row", "source_provenance", "manual_refit",
+              "center_error_eV", "height_error", "fit_area_full", "fit_area_full_error", "area_error", "uncertainty_status"]
     with base.with_suffix(".csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
@@ -245,7 +337,8 @@ def export_peak_analysis(folder, payload):
                         peak.fwhm_mev, peak.fwhm_error_mev, peak.center_ev, peak.rms, peak.status,
                         fit_settings.model, lo, hi,
                         getattr(record, "file_name", ""), getattr(record, "row_index", ""),
-                        getattr(record, "source_provenance", ""), getattr(fit, "manual", False)])))
+                        getattr(record, "source_provenance", ""), getattr(fit, "manual", False),
+                        *[getattr(peak, k, None) for k in ('center_error_ev', 'height_error', 'fit_area_full', 'fit_area_full_error', 'area_error', 'uncertainty_status')]])))
     metadata = {"settings": asdict(settings), "power_axis": "log" if payload["log_power"] else "linear",
                 "intensity_axis": "log" if payload.get("log_intensity", True) else "linear",
                 "linewidth_axis": "log" if payload.get("log_linewidth", True) else "linear",
@@ -257,10 +350,14 @@ def export_peak_analysis(folder, payload):
                 "power_limits": payload["power_limits"]}
     metadata['power_law_fits'] = payload.get('power_laws', [])
     metadata['power_law_ranges'] = payload.get('power_law_ranges', [])
+    metadata['power_law_history'] = payload.get('power_law_history', [])
+    metadata['schema'] = 'power-analysis-export/2'
+    metadata['area_definitions'] = dict(legacy=metadata['area'], full='Analytic whole-domain fitted component area; excludes baseline; extrapolated tails.')
+    metadata['curve_scope'] = payload.get('export_curve_scope', 'current')
     metadata['power_law_uncertainty'] = 'OLS log-log standard error; excludes gain calibration uncertainty. Suggested intervals are exploratory.'
     if payload.get('power_laws'):
         law_path = base.with_name(base.name + '_power_law.csv')
-        fields_law = list(payload['power_laws'][0])
+        fields_law = list(dict.fromkeys(k for law in payload['power_laws'] for k in law))
         with law_path.open('w', newline='', encoding='utf-8') as stream:
             writer = csv.DictWriter(stream, fieldnames=fields_law)
             writer.writeheader()
@@ -278,7 +375,7 @@ def export_peak_analysis(folder, payload):
                      metric=payload["metric"], power_limits=payload["power_limits"],
                      log_intensity=payload.get("log_intensity", True),
                      log_linewidth=payload.get("log_linewidth", True), records=payload.get("records"))
-    if payload['metric'] == 'Integrated area':
+    if payload['metric'] in {'Integrated area', 'Full fitted area'}:
         from core.power_law_analysis import draw_power_laws
         draw_power_laws(axes[0], payload.get('power_laws', []))
     save_figure(figure, base.with_suffix(".png"), dpi=200)
