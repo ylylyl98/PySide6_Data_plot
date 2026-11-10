@@ -25,7 +25,7 @@ class ProvenanceTests(unittest.TestCase):
         working.write_bytes(b'original')
         return canonical, working
 
-    def test_unchanged_load_verification_reuses_content_hashes(self):
+    def test_unchanged_load_verification_rehashes_content(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _, working = self.pair(root)
@@ -33,7 +33,7 @@ class ProvenanceTests(unittest.TestCase):
             with patch.object(provenance, 'sha256_file', wraps=provenance.sha256_file) as digest:
                 record = verify_initial_data_working_file(working, root, workflow='DRR', role='measurement')
             self.assertTrue(record.provenance_verified)
-            self.assertEqual(digest.call_count, 0)
+            self.assertEqual(digest.call_count, 2)
 
     def test_same_size_and_restored_mtime_change_invalidates_load_hash(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -44,6 +44,16 @@ class ProvenanceTests(unittest.TestCase):
             working.write_bytes(b'modified')
             os.utime(working, ns=(before.st_atime_ns, before.st_mtime_ns))
             record = verify_initial_data_working_file(working, root, workflow='DRR', role='measurement')
+            self.assertFalse(record.provenance_verified)
+
+    def test_signature_collision_does_not_reuse_stale_digest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, working = self.pair(root)
+            with patch.object(provenance, '_digest_signature', return_value=('unchanged',)):
+                self.assertTrue(verify_initial_data_working_file(working, root, workflow='DRR', role='measurement').provenance_verified)
+                working.write_bytes(b'modified')
+                record = verify_initial_data_working_file(working, root, workflow='DRR', role='measurement')
             self.assertFalse(record.provenance_verified)
 
     def test_replacement_and_missing_file_invalidate_load_hash(self):

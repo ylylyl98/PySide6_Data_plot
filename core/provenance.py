@@ -1,15 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from collections import OrderedDict
 import hashlib
 import os
 from pathlib import Path
 import shutil
-from threading import RLock
-
-_DIGEST_CACHE = OrderedDict()
-_DIGEST_LOCK = RLock()
 
 if os.name == 'nt':
     import ctypes
@@ -52,26 +47,13 @@ def _digest_signature(path):
     return stat.st_mtime_ns, stat.st_size, stat.st_dev, stat.st_ino, change
 
 
-def _cached_load_digest(path):
-    """Reuse stable digests for loading; cleanup always calls sha256_file."""
+def _stable_load_digest(path):
+    """Hash each load; metadata stamps alone cannot prove content is unchanged."""
     path = Path(path).resolve()
     before = _digest_signature(path)
-    with _DIGEST_LOCK:
-        cached = _DIGEST_CACHE.get(path)
-        if before is not None and cached is not None and cached[0] == before:
-            _DIGEST_CACHE.move_to_end(path)
-            return cached[1]
     digest = sha256_file(path)
     after = _digest_signature(path)
-    if before != after:
-        return None
-    if digest is not None and before is not None:
-        with _DIGEST_LOCK:
-            _DIGEST_CACHE[path] = before, digest
-            _DIGEST_CACHE.move_to_end(path)
-            while len(_DIGEST_CACHE) > 512:
-                _DIGEST_CACHE.popitem(last=False)
-    return digest
+    return digest if before is not None and before == after else None
 
 
 @dataclass(frozen=True)
@@ -167,7 +149,7 @@ def verify_initial_data_working_file(
         is_canonical_file = False
 
     if is_canonical_file or working.parent != root:
-        digest = _cached_load_digest(working)
+        digest = _stable_load_digest(working)
         return WorkingCopyRecord(
             canonical_source_path=str(working),
             working_copy_path=str(working),
@@ -184,8 +166,8 @@ def verify_initial_data_working_file(
         )
 
     canonical = initial_root / working.name
-    working_hash = _cached_load_digest(working)
-    canonical_hash = _cached_load_digest(canonical)
+    working_hash = _stable_load_digest(working)
+    canonical_hash = _stable_load_digest(canonical)
     is_root_file = working.parent == root
     verified = (
         is_root_file

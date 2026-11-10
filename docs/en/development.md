@@ -275,8 +275,10 @@ and reparses only changed sidecars when new exports appear. The small history
 JSON files are checked by content hash as well as filesystem stamps, so rapid
 same-size edits with restored timestamps still invalidate the cache. External edits, source
 path changes, and deleted records invalidate the cache. Disabling both memory
-options skips history queries. Loading also reuses unchanged source-file hashes;
-source cleanup always checks fresh hashes.
+options skips history queries. Source provenance verification and source cleanup
+always compute fresh full-file hashes: filesystem timestamps alone cannot detect
+every same-size rewrite, including rapid Windows ChangeTime collisions. Repeated
+source verification therefore reads the files again; parsed-data caches are separate.
 
 In raw view, hidden second-derivative computation and regional Auto colors are
 deferred until switching to second/both, pressing a second-product Auto button,
