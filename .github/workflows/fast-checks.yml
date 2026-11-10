@@ -199,6 +199,15 @@ jobs:
           tests.test_plot_system_font
           tests.test_plot_typography
           tests.test_partial_plot_typography
+      # QGuiApplication cannot host the legacy QWidget tests below. Keep
+      # native peak interactions in a separate process without reducing coverage.
+      - name: Run native peak interaction tests
+        run: >-
+          python -m unittest -v
+          tests.test_pl_plot_direct_edit
+          tests.test_peak_plot_navigation
+          tests.test_peak_save_workflow
+          tests.test_peak_live_export
       - name: Run representative core tests
         run: >-
           python -m unittest -v
@@ -218,16 +227,12 @@ jobs:
           tests.test_pl_fit_models
           tests.test_pl_manual_peaks
           tests.test_peak_analysis_state
-          tests.test_pl_plot_direct_edit
-          tests.test_peak_plot_navigation
-          tests.test_peak_save_workflow
           tests.test_peak_file_history
           tests.test_peak_workspace_storage
           tests.test_peak_processed_paths
           tests.test_peak_output_names
           tests.test_peak_flat_export
           tests.test_peak_source_figure
-          tests.test_peak_live_export
           tests.test_peak_simple_workbook
           tests.test_pl_analysis_contracts
           tests.test_peak_performance_correctness
