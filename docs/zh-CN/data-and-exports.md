@@ -81,6 +81,49 @@ SHG 默认导出 `shg.xlsx` 和 `analysis_settings.json`。工作簿首先打开
 
 JSON 保存完整来源标识、处理与拟合设置、光谱列映射、单位及输出清单。旧 SHG CSV/JSON 包仍可读取且不会被重命名，供脚本使用的旧 CSV 导出 API 继续保留。新路径考虑 Windows 路径长度预算；实验根目录过深时会给出可操作的错误提示。
 
+### 分析工作簿与误差
+
+Peak Analysis 的 CSV、JSON、PNG 包现在同时包含 XLSX。PL 在 `Results`
+中合并寻峰和拟合；DRR 分为 `Peaks`、`Dips`，两张表保持相同扫描行顺序。
+每个峰的参数相邻排列，保留稳定分支 ID、源行和完整源文件名。缺失数值留空。
+PL 使用原始扫描坐标，不提取激发功率。
+
+`Curves` 保存实测信号、baseline、总拟合和残差；`Components` 保存独立拟合
+分量。Advanced 的 **Export curves** 默认当前光谱，也可显式选择全部已分析
+光谱；结果表始终覆盖分析范围。超过 Excel 容量会报错，不会静默截断。
+文件名在路径长度允许时保留原始实验条件，过长时缩短并加哈希，Settings
+始终保留完整名称。
+
+- `Spectrum_area_roi`：实测谱减共同拟合线性背景，在有限有效采样点上梯形
+  积分，每条光谱只保存一次。
+- `fit_area_full`：单个 Lorentz/Gaussian 拟合分量的全定义域解析面积，不含
+  baseline，包含模型外推尾部。
+- PL 的 `fit_area_roi`、Power 的 `area_legacy` 保留原来的有限范围面积。
+  旧单峰 Power 为实测扣背景积分；多峰为拟合分量在测量拟合轴上的积分。
+
+面积单位为信号单位乘 eV。导出不额外进行曝光归一化或波长到能量的谱密度
+修正。积分会连接保留的有效采样点，包括跨内部缺失点。误差是拟合协方差
+给出的近似一标准误差，不含标定等系统误差；不可靠时留空并记录原因。
+旧单峰实测面积误差仅包含 baseline 协方差贡献，不含实测噪声积分误差。
+PL Advanced 的 **Analysis plot** 可以显示带误差棒的峰位/FWHM 趋势。
+
+Power 主流程简化为 **1 Fit spectra → 2 Power law**。Results 和 Advanced
+位于同一操作区；初值、模型设置及逐谱重拟合放在 Advanced 中，不在页面多处
+重复提供入口。Power law 页面常驻范围和 α，面积口径、本地斜率及探索建议
+按需展开。
+
+Power 工作簿增加 `PowerLaw`、`FitData`、`Sources`。修改范围或拖选后短暂
+暂停即更新 α，不重新拟合光谱。默认保留旧面积，完整拟合面积需显式选择。
+**Apply intervals** 应用结果；**Keep interval result** 保留区间比较及当时
+输入快照。接近 α=1 的区间建议位于 Advanced，仅用于探索。旧历史没有输入
+快照时标记不可用，不用新光谱反推。α 误差来自 log–log 普通最小二乘，
+面积误差不作为回归权重。重复功率和源行独立保留。
+
+Compare DAT 默认保存完整扣背景数值，不受显示色阶裁剪影响；另有显式的
+旧式裁剪数据选项，处理方式写入元数据。MCD 工作簿增加详细斜率诊断；
+Organizer 保留可用的误差、拟合范围和状态。Megasweep 批量输出增加切片
+索引 CSV，记录文件名和完成/取消状态。SHG 结构保持不变。
+
 ### Power 包命名
 
 Power 包名称为 `<group>_PowerDep`、`<KK-group>_vs_<KKp-group>_IntensityCompare` 或 `<KK-group>_vs_<KKp-group>_VP`。名称经过 Windows/macOS 文件名安全处理；相关数值文件、元数据、图像和诊断保存在同一包中。

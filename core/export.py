@@ -2065,6 +2065,7 @@ def export_compare_panels(
     scale_tag: str,
     clip_outliers: bool,
     correction_background: float = 0.0,
+    export_clipped_data: bool = False,
     export_vp: bool = True,
     vp_vmin: float = -1.0,
     vp_vmax: float = 1.0,
@@ -2097,8 +2098,10 @@ def export_compare_panels(
         png_path = _unique_path(out_dir, base, ".png")
         _save_heatmap_png(png_path, cube, panel_params, drr=False)
         z_out = np.asarray(cube.Z, float)
-        if clip_outliers and params.split_scale is not None:
+        data_clipped = False
+        if export_clipped_data and params.split_scale is not None:
             split_index, _boundary = resolve_split_boundary(cube.energy, params.split_scale.split_x)
+            data_clipped = True
             z_out = z_out.copy()
             z_out[:, :split_index] = np.clip(
                 z_out[:, :split_index],
@@ -2110,8 +2113,9 @@ def export_compare_panels(
                 params.split_scale.right_vmin,
                 params.split_scale.right_vmax,
             )
-        elif clip_outliers and np.isfinite(params.vmin) and np.isfinite(params.vmax) and params.vmax > params.vmin:
+        elif export_clipped_data and np.isfinite(params.vmin) and np.isfinite(params.vmax) and params.vmax > params.vmin:
             z_out = np.clip(z_out, params.vmin, params.vmax)
+            data_clipped = True
         dat_path = save_heatmap_dat_streamlit(
             png_path.with_suffix(".dat"),
             cube.energy,
@@ -2126,6 +2130,7 @@ def export_compare_panels(
                 f"background_constant={correction_background}",
                 f"log_scale={params.log_scale}",
                 f"clip_outliers={clip_outliers}",
+                f"numeric_data_policy={'display_clipped' if data_clipped else 'background_corrected_full'}",
                 f"vmin={params.vmin}",
                 f"vmax={params.vmax}",
                 f"xlim={params.xlim}",
@@ -2143,6 +2148,7 @@ def export_compare_panels(
                 "scale": scale_tag,
                 "background_constant": correction_background,
                 "clip_outliers": clip_outliers,
+                "numeric_data_policy": "display_clipped" if data_clipped else "background_corrected_full",
                 "compare_source_mapping": dict(source_files),
             },
             plot=panel_params,

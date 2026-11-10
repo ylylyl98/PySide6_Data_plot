@@ -11,6 +11,7 @@ Rectangle {
     required property var colors
     readonly property var state: bridge ? bridge.snapshot.law : ({})
     objectName: "power_analysis_law"
+    property bool advancedOpen: false
     color: colors.inset
     Accessible.role: Accessible.Pane
     Accessible.name: "Power law intervals and local slopes"
@@ -28,12 +29,52 @@ Rectangle {
                 onClicked: page.bridge.setParameter("law.shared", checked)
                 Accessible.name: text
             }
+            AppButton {
+                objectName: "power_law_keep"
+                text: "Keep interval result"
+                colors: page.colors
+                enabled: page.state.canApply === true && (page.state.rows || []).some(function(row) { return row.selected })
+                onClicked: page.bridge.invoke("law.keep")
+            }
+            AppButton {
+                objectName: "power_law_advanced"
+                text: page.advancedOpen ? "Hide advanced" : "Advanced"
+                colors: page.colors
+                onClicked: page.advancedOpen = !page.advancedOpen
+            }
+            AppButton {
+                objectName: "power_law_apply"
+                text: "Apply power law"
+                colors: page.colors
+                primary: true
+                enabled: page.state.canApply === true
+                onClicked: page.bridge.invoke("law.apply")
+            }
+            AppButton {
+                objectName: "power_law_cancel"
+                text: "Back"
+                colors: page.colors
+                onClicked: page.bridge.invoke("law.cancel")
+            }
+        }
+        Flow {
+            Layout.fillWidth: true; Layout.leftMargin: 8; Layout.rightMargin: 8
+            spacing: 8
+            visible: page.advancedOpen
             Basic.CheckBox {
                 objectName: "power_law_local"
                 text: "Show local slope"
                 checked: page.state.local === true
                 onClicked: page.bridge.setParameter("law.local", checked)
                 Accessible.name: text
+            }
+            Basic.ComboBox {
+                objectName: "power_law_area_metric"
+                implicitWidth: 210
+                model: ["Area · measured range", "Area · full fitted peak"]
+                currentIndex: page.state.areaMetric === "full" ? 1 : 0
+                Accessible.name: "Power law area definition"
+                onActivated: function(index) { page.bridge.setParameter("law.areaMetric", index === 1 ? "full" : "legacy") }
             }
             AppButton {
                 objectName: "power_law_suggest"
@@ -42,26 +83,21 @@ Rectangle {
                 enabled: !page.state.busy
                 onClicked: page.bridge.invoke("law.suggest")
             }
-            AppButton {
-                objectName: "power_law_apply"
-                text: "Apply intervals"
-                colors: page.colors
-                primary: true
-                enabled: page.state.canApply === true
-                onClicked: page.bridge.invoke("law.apply")
-            }
-            AppButton {
-                objectName: "power_law_cancel"
-                text: "Cancel / Back"
-                colors: page.colors
-                onClicked: page.bridge.invoke("law.cancel")
-            }
+            Text { width: Math.min(300, parent.width); text: "Measured range preserves earlier results. The suggestion is exploratory; review the interval."; color: page.colors.muted; wrapMode: Text.Wrap }
+        }
+        Text {
+            Layout.fillWidth: true; Layout.leftMargin: 9; Layout.rightMargin: 9
+            visible: (page.state.history || []).length > 0
+            text: "Kept intervals: " + (page.state.history || []).map(function(fit) {
+                return fit.name + " [" + Number(fit.lower).toPrecision(4) + ", " + Number(fit.upper).toPrecision(4) + "] α=" + Number(fit.alpha).toPrecision(4) + " (" + (fit.intensity_metric || "area") + ")"
+            }).join("; ")
+            color: page.colors.muted; wrapMode: Text.Wrap; elide: Text.ElideRight; maximumLineCount: 2
         }
         Text {
             Layout.fillWidth: true
             Layout.leftMargin: 9
             Layout.rightMargin: 9
-            text: "Select peaks, then enter limits or drag the interval on the plot. Dragging adjusts the highlighted row, or all selected peaks when ranges are shared. Limits are independent of the plot axis bounds."
+            text: (page.state.areaMetric === "full" ? "Area · full fitted peak. " : "Area · measured range. ") + "Select peaks, then enter limits or drag the interval on the plot. Dragging adjusts the highlighted row, or all selected peaks when ranges are shared. Limits are independent of the plot axis bounds."
             color: page.colors.muted
             wrapMode: Text.Wrap
             font.pixelSize: 11
@@ -76,7 +112,11 @@ Rectangle {
             contentHeight: 31 + (page.state.rows || []).length * 66
             clip: true
             boundsBehavior: Flickable.StopAtBounds
-            Basic.ScrollBar.horizontal: Basic.ScrollBar { }
+            Basic.ScrollBar.horizontal: Basic.ScrollBar {
+                objectName: "power_law_interval_horizontal_scrollbar"
+                visible: editor.contentWidth > editor.width
+                policy: editor.contentWidth > editor.width ? Basic.ScrollBar.AlwaysOn : Basic.ScrollBar.AsNeeded
+            }
             Basic.ScrollBar.vertical: Basic.ScrollBar { }
             Column {
                 width: editor.contentWidth
@@ -160,7 +200,8 @@ Rectangle {
             objectName: "power_law_message"
             Layout.fillWidth: true
             Layout.margins: 9
-            text: page.state.message || ""
+            text: !page.advancedOpen && (page.state.message || "").indexOf("Selecting intervals near alpha") === 0
+                ? "Error = 1 fit standard error." : page.state.message || "Error = 1 fit standard error."
             color: page.colors.muted
             font.pixelSize: 11
             wrapMode: Text.Wrap

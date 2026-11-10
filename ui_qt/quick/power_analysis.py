@@ -58,7 +58,7 @@ class _PeakResultsModel(QAbstractListModel):
 
 class PowerAnalysisMixin:
     def _analysis_init(self):
-        self._analysis_values = dict(enabled=False, model="Lorentzian", metric="Integrated area",
+        self._analysis_values = dict(enabled=False, model="Lorentzian", metric="Integrated area", areaMetric="legacy", curveScope="current",
             intensityLog=True, linewidthLog=True, selectedPeak=0, showResults=False,
             issuesOnly=False, advanced=False, pickMode="move")
         self._analysis_draft = False
@@ -97,6 +97,10 @@ class PowerAnalysisMixin:
         self._law_series = []
         self._law_fits = []
         self._law_local = {}
+        self._law_timer = QTimer(self)
+        self._law_timer.setSingleShot(True)
+        self._law_timer.setInterval(200)
+        self._law_timer.timeout.connect(self._analysis_run_law_draft)
         self._law_version = 0
         self._law_selector = self._special_spectrum = None
         self._special_plot_key = self._special_plot_context = None
@@ -104,7 +108,7 @@ class PowerAnalysisMixin:
         self._special_update_active = False
         self._refit_seed_lines = []
         self._law_axis = self._law_legend = None
-        self._law_data_lines, self._law_fit_artists = [], {}
+        self._law_data_lines, self._law_fit_artists, self._law_highlights = [], {}, {}
         self._law_legend_key = None
 
     def _analysis_enabled(self):
@@ -140,7 +144,7 @@ class PowerAnalysisMixin:
             refit["canApply"] = self._refit_trial is not None and self._refit_trial.fitted is not None and "refit" not in self._running
         law = deepcopy(self._law_state) if self._law_state is not None else {}
         if law:
-            law["busy"] = "law" in self._running
+            law["busy"] = "law" in self._running or self._law_timer.isActive()
             law["canApply"] = not law["busy"] and all(not row.get("error") for row in law["rows"] if row["selected"])
         return dict(analysisEnabled=enabled, analysisRequested=self._analysis_values["enabled"],
             analysisReady=ready,
@@ -152,6 +156,7 @@ class PowerAnalysisMixin:
             analysisExportReady=not enabled or ready and not (self._running & {"fit", "detect", "refit", "law"}) and not self._analysis_law_error,
             analysisStatus=self._analysis_status, analysisModel=self._analysis_values["model"],
             analysisMetric=self._analysis_values["metric"], analysisShowResults=self._analysis_values["showResults"],
+            analysisAdvanced=self._analysis_values["advanced"],
             analysisSelectedPeak=self._analysis_values["selectedPeak"], peaks=deepcopy(self._peak_rows),
             analysisSelectedChannel=self._analysis_selected_channel or "",
             peakResults=self._analysis_visible_rows() if ready and self._analysis_values["showResults"] else [],
@@ -159,6 +164,7 @@ class PowerAnalysisMixin:
             analysisLawWarning=self._analysis_law_error, refit=refit, law=law)
 
     def _analysis_cancel_fit(self):
+        self._law_timer.stop()
         for kind in ("fit", "detect", "refit", "law"):
             self._cancel(kind)
         self._analysis_request_key = self._analysis_current_key = None
@@ -191,6 +197,7 @@ class PowerAnalysisMixin:
             return
         self._analysis_cancel_fit()
         if base != self._analysis_dataset_base:
+            self._analysis_values["areaMetric"] = "legacy"
             self._peak_rows = []
             self._analysis_draft = False
             self._analysis_selected_rows = {}
@@ -230,9 +237,10 @@ class PowerAnalysisMixin:
         laws, ranges = deepcopy(self._analysis_law_fits), deepcopy(entry.get("ranges", []))
         law_error = self._analysis_law_error
         preferences = {key: self._analysis_values[key] for key in
-            ("metric", "intensityLog", "linewidthLog", "showResults", "issuesOnly", "advanced")}
+            ("metric", "areaMetric", "curveScope", "intensityLog", "linewidthLog", "showResults", "issuesOnly", "advanced")}
         payload = dict(cubes=cubes, background=background, rows=rows, model=model, results=results,
-            laws=laws, ranges=ranges, law_error=law_error, preferences=preferences)
+            laws=laws, ranges=ranges, law_error=law_error, preferences=preferences,
+            law_history=deepcopy(entry.get("lawHistory", [])))
         with self._analysis_save_lock:
             self._analysis_save_pending[path] = payload
         if debounce:
@@ -328,7 +336,7 @@ class PowerAnalysisMixin:
                 if cached is not None and cached.get("fingerprint") == fingerprint:
                     return dict(request=key, base=base, rows=rows, settings=cached["settings"],
                         results=cached["results"], ranges=cached.get("ranges", []),
-                        laws=cached.get("laws", []), law_error=cached.get("lawError", ""), cached=True,
+                        laws=cached.get("laws", []), law_error=cached.get("lawError", ""), law_history=cached.get("lawHistory", []), cached=True,
                         fingerprint=fingerprint, keep_plot=was_ready)
                 if restore and not detect and store_path is not None:
                     from core.power_analysis_store import load_analysis
@@ -385,9 +393,12 @@ class PowerAnalysisMixin:
         elif kind == "law":
             if self._stage == "law" and self._law_state:
                 self._law_state["message"] = error
+                self._law_fits = []
                 for row in self._law_state["rows"]:
                     if row["selected"]:
-                        row["error"] = error
+                        row["error"] = row["result"] = error
+                        for name in ("alpha", "alphaError", "count"):
+                            row.pop(name, None)
             else:
                 self._analysis_law_error = error
                 entry = self._analysis_cache.get(self._analysis_current_key)
@@ -413,11 +424,15 @@ class PowerAnalysisMixin:
                 for name, value in payload.get("preferences", {}).items():
                     if name in {"intensityLog", "linewidthLog", "showResults", "issuesOnly", "advanced"} and isinstance(value, bool):
                         self._analysis_values[name] = value
-                    elif name == "metric" and value in {"Integrated area", "Peak height"}:
+                    elif name == "curveScope" and value in {"current", "all"}:
+                        self._analysis_values[name] = value
+                    elif name == "areaMetric" and value in {"legacy", "full"}:
+                        self._analysis_values[name] = value
+                    elif name == "metric" and value in {"Integrated area", "Full fitted area", "Peak height"}:
                         self._analysis_values[name] = value
             key = self._analysis_key()
             entry = dict(results=payload["results"], settings=payload["settings"], ranges=payload.get("ranges", []),
-                laws=payload.get("laws", []), lawError=payload.get("law_error", ""), fingerprint=payload["fingerprint"])
+                laws=payload.get("laws", []), lawError=payload.get("law_error", ""), lawHistory=payload.get("law_history", []), fingerprint=payload["fingerprint"])
             self._analysis_adopt(key, entry, persist=not (payload.get("restored") or payload.get("cached")))
             self._message(("Saved analysis restored. " if payload.get("restored") else
                 "Cached fits reused. " if payload.get("cached") else "") + self._analysis_status + f" ({elapsed / 1000:.3f} s)")
@@ -486,7 +501,9 @@ class PowerAnalysisMixin:
                     value = bool(value)
                 elif field == "model" and value not in {"Lorentzian", "Gaussian"}:
                     raise ValueError("Choose Lorentzian or Gaussian.")
-                elif field == "metric" and value not in {"Integrated area", "Peak height"}:
+                elif field == "curveScope" and value not in {"current", "all"}:
+                    raise ValueError("Choose current spectrum or all spectra.")
+                elif field == "metric" and value not in {"Integrated area", "Full fitted area", "Peak height"}:
                     raise ValueError("Choose integrated area or peak height.")
                 elif field == "selectedPeak":
                     value = max(0, min(int(value), max(0, len(self._peak_rows) - 1)))
@@ -508,7 +525,7 @@ class PowerAnalysisMixin:
                     self._analysis_update_table()
                 elif field not in {"showResults", "advanced", "pickMode"}:
                     self._schedule_plot()
-                if field in {"metric", "intensityLog", "linewidthLog", "showResults", "issuesOnly", "advanced"}:
+                if field in {"metric", "curveScope", "intensityLog", "linewidthLog", "showResults", "issuesOnly", "advanced"}:
                     self._analysis_save()
             elif key.startswith("peak."):
                 _, index, field = key.split(".")
@@ -526,7 +543,16 @@ class PowerAnalysisMixin:
                 self._refit_state["status"] = str(error)
                 self._refit_trial = None
             elif self._stage == "law" and self._law_state:
+                self._law_timer.stop()
+                self._cancel("law")
+                self._law_fits = []
                 self._law_state["message"] = str(error)
+                for row in self._law_state["rows"]:
+                    if row.get("selected"):
+                        row["result"] = row["error"] = str(error)
+                        for name in ("alpha", "alphaError", "count"):
+                            row.pop(name, None)
+                self._schedule_plot()
             self._message(str(error))
         self._publish()
         return True
@@ -582,6 +608,7 @@ class PowerAnalysisMixin:
             elif action == "refit.apply":
                 self._analysis_run_refit(apply=True)
             elif action in {"refit.cancel", "law.cancel"}:
+                self._law_timer.stop()
                 self._cancel("refit" if action.startswith("refit") else "law")
                 self._refit_trial = None
                 self._disconnect_law_selector()
@@ -590,6 +617,8 @@ class PowerAnalysisMixin:
                 self._schedule_plot()
             elif action == "law.suggest":
                 self._analysis_refresh_law(suggest=True)
+            elif action == "law.keep":
+                self._analysis_keep_law()
             elif action == "law.apply":
                 self._analysis_apply_law()
         except (ValueError, TypeError, KeyError, IndexError) as error:
@@ -666,6 +695,9 @@ class PowerAnalysisMixin:
                     rows.append(dict(channel=channel, index=index, peak=peak, power=_finite(fit.power_uw),
                         area=_finite(component.area), height=_finite(component.height), fwhm=_finite(component.fwhm_mev),
                         fwhmError=_finite(component.fwhm_error_mev), center=_finite(component.center_ev),
+                        centerError=_finite(getattr(component, "center_error_ev", float("nan"))),
+                        areaFull=_finite(getattr(component, "fit_area_full", float("nan"))),
+                        areaFullError=_finite(getattr(component, "fit_area_full_error", float("nan"))),
                         rms=_finite(fit.rms), status=component.status, manual=bool(fit.manual),
                         source=getattr(record, "file_name", ""), sourceRow=getattr(record, "row_index", None),
                         provenance=getattr(record, "source_provenance", ""), sources=list(record_sources(record)) if record else []))
@@ -769,7 +801,7 @@ class PowerAnalysisMixin:
             raise ValueError("Enable peak analysis and wait for spectrum fits before fitting a power law.")
         import numpy as np
         from core.power_law_analysis import peak_series
-        self._law_series = peak_series(self._analysis_results, self._products.get("records", {}))
+        self._law_series = peak_series(self._analysis_results, self._products.get("records", {}), self._analysis_values["areaMetric"])
         saved = self._analysis_cache[self._analysis_current_key].get("ranges", [])
         mapping = {(row["channel"], row["peak"]): row for row in saved}
         powers = np.concatenate([source["power"] for source in self._law_series]) if self._law_series else np.array([])
@@ -783,7 +815,7 @@ class PowerAnalysisMixin:
                 lower=prior["lower"] if prior else lower, upper=prior["upper"] if prior else upper,
                 suggested=bool(prior and prior.get("suggested")), result="", error=""))
         self._law_state = dict(rows=rows, selectedRow=0, shared=not saved or len({(row["lower"], row["upper"]) for row in saved}) <= 1,
-            local=False, message=_EXPLORATORY)
+            local=False, areaMetric=self._analysis_values["areaMetric"], history=deepcopy(self._analysis_cache[self._analysis_current_key].get("lawHistory", [])), message=_EXPLORATORY)
         self._stage = "law"
         self._analysis_refresh_law()
 
@@ -791,6 +823,17 @@ class PowerAnalysisMixin:
         if self._stage != "law" or not self._law_state:
             return
         state = self._law_state
+        if key == "areaMetric":
+            if value not in {"legacy", "full"}:
+                raise ValueError("Choose a valid area metric.")
+            if value == state["areaMetric"]:
+                return
+            state["areaMetric"] = value
+            from core.power_law_analysis import peak_series
+            self._law_series = peak_series(self._analysis_results, self._products.get("records", {}), value)
+            self._special_plot_key = None
+            self._analysis_refresh_law()
+            return
         if key == "local":
             state["local"] = bool(value)
             self._schedule_plot()
@@ -837,16 +880,19 @@ class PowerAnalysisMixin:
         from core.power_law import suggest_power_range, local_slopes
         from core.load_cancellation import load_scope, check_load_cancelled
         key, version = self._analysis_current_key, self._law_version
+        area_metric = self._law_state["areaMetric"] if purpose == "draft" and self._law_state else self._analysis_values["areaMetric"]
         results, records = dict(self._analysis_results), dict(self._products.get("records", {}))
         rows = deepcopy(rows)
         def operation(cancellation):
             with load_scope(cancellation):
-                series = {(source["channel"], source["peak"]): source for source in peak_series(results, records)}
+                series = {(source["channel"], source["peak"]): source for source in peak_series(results, records, area_metric)}
                 fits, local, failures, suggested_count = [], {}, [], 0
                 for row in rows:
                     check_load_cancelled()
                     source = series[(row["channel"], row["peak"])]
                     row["result"], row["error"] = "", ""
+                    for field in ("alpha", "alphaError", "count"):
+                        row.pop(field, None)
                     if not row.get("selected", True):
                         continue
                     if suggest:
@@ -857,7 +903,7 @@ class PowerAnalysisMixin:
                         except ValueError as error:
                             failures.append(row["name"] + ": " + str(error) + " Previous limits retained.")
                     try:
-                        fit = evaluate_ranges(results, records, [row])[0]
+                        fit = evaluate_ranges(results, records, [row], area_metric)[0]
                         fits.append(fit)
                         row["result"] = (f"alpha {fit['alpha']:.5g} ± {fit['alpha_error']:.3g}; n={fit['n']}; "
                             f"omitted (including outside range)={fit['excluded']}" + ("; crosses source boundary" if fit["crosses_sources"] else ""))
@@ -874,10 +920,55 @@ class PowerAnalysisMixin:
         if self._stage != "law" or not self._law_state:
             return
         self._law_version += 1
-        self._start("law", self._analysis_law_job(self._law_state["rows"], purpose="draft", suggest=suggest))
+        self._cancel("law")
+        self._law_fits = []
+        for row in self._law_state["rows"]:
+            row["result"], row["error"] = "", ""
+            for field in ("alpha", "alphaError", "count"):
+                row.pop(field, None)
+        self._law_state["message"] = "Updating interval…"
+        self._law_suggest_pending = suggest
+        self._running.add("law")
+        self._law_timer.start(0 if suggest else 200)
+        self._schedule_plot()
+        self._publish()
+
+    def _analysis_run_law_draft(self):
+        if not self._closed and self._stage == "law" and self._law_state:
+            self._start("law", self._analysis_law_job(self._law_state["rows"], purpose="draft", suggest=self._law_suggest_pending))
+
+    def _analysis_keep_law(self):
+        if self._law_timer.isActive() or "law" in self._running or not self._law_fits:
+            raise ValueError("Wait for a valid interval fit before keeping it.")
+        entry = self._analysis_cache[self._analysis_current_key]
+        from datetime import datetime, timezone
+        from core.power_workflow import record_sources
+        history = entry.setdefault("lawHistory", [])
+        sources = {(item["channel"], item["peak"]): item for item in self._law_series}
+        for fit in self._law_fits:
+            retained = deepcopy(fit)
+            source = sources[(fit["channel"], fit["peak"])]
+            records = self._products.get("records", {}).get(fit["channel"], ())
+            spectrum_fits = self._analysis_results[fit["channel"]]
+            captured = []
+            for index, (power, intensity, valid) in enumerate(zip(source["power"], source["intensity"], source["valid"])):
+                power, intensity = float(power), float(intensity)
+                reason = ("invalid fit" if not valid else "invalid or nonpositive value" if not (isfinite(power) and isfinite(intensity) and power > 0 and intensity > 0)
+                    else "outside interval" if not fit["lower"] <= power <= fit["upper"] else "included")
+                components = spectrum_fits[index].components
+                component = components[fit["peak"] - 1] if fit["peak"] <= len(components) else None
+                captured.append(dict(spectrum_index=index, power=power if isfinite(power) else None,
+                    intensity=intensity if isfinite(intensity) else None, status=component.status if component else "missing peak",
+                    source=list(record_sources(records[index])) if index < len(records) else [], inclusion_reason=reason))
+            retained.update(input_rows=captured, captured_utc=datetime.now(timezone.utc).isoformat(),
+                input_fingerprint=entry.get("fingerprint", ""))
+            history.append(retained)
+        self._law_state["history"] = deepcopy(history)
+        self._analysis_save()
+        self._law_state["message"] = "Kept " + str(len(self._law_fits)) + " interval result(s)."
 
     def _analysis_apply_law(self):
-        if self._stage != "law" or not self._law_state or "law" in self._running:
+        if self._stage != "law" or not self._law_state or "law" in self._running or self._law_timer.isActive():
             return
         if any(row.get("error") for row in self._law_state["rows"] if row["selected"]):
             raise ValueError("Resolve the selected power-law interval errors before applying.")
@@ -885,7 +976,8 @@ class PowerAnalysisMixin:
             for row in self._law_state["rows"] if row["selected"]]
         self._analysis_cache[self._analysis_current_key].update(ranges=ranges, laws=list(self._law_fits), lawError="")
         self._analysis_law_fits, self._analysis_law_error = list(self._law_fits), ""
-        self._analysis_values["metric"] = "Integrated area"
+        self._analysis_values["areaMetric"] = self._law_state["areaMetric"]
+        self._analysis_values["metric"] = "Full fitted area" if self._law_state["areaMetric"] == "full" else "Integrated area"
         self._stage = "plot"
         self._disconnect_law_selector()
         self._message(f"Applied {len(ranges)} independent peak power-law fits. " + _EXPLORATORY)
@@ -905,9 +997,11 @@ class PowerAnalysisMixin:
         if self._analysis_law_error:
             raise ValueError("Review power-law intervals after refitting: " + self._analysis_law_error)
         entry = self._analysis_cache[self._analysis_current_key]
-        return dict(results=dict(self._analysis_results), records=dict(self._products.get("records", {})),
+        channel = self._analysis_selected_channel if self._analysis_selected_channel in self._analysis_results else next(iter(self._analysis_results))
+        row = self._analysis_selected_index(channel)
+        return dict(export_curve_scope=self._analysis_values["curveScope"], export_curve_channel=channel, export_curve_row=row, results=dict(self._analysis_results), records=dict(self._products.get("records", {})),
             settings=self._analysis_settings, power_laws=deepcopy(self._analysis_law_fits),
-            power_law_ranges=deepcopy(entry.get("ranges", [])), background=float(self._products["background"]),
+            power_law_ranges=deepcopy(entry.get("ranges", [])), power_law_history=deepcopy(entry.get("lawHistory", [])), area_metric=self._analysis_values["areaMetric"], background=float(self._products["background"]),
             metric=self._analysis_values["metric"], log_power=bool(self._values["powerLog"]),
             log_intensity=self._analysis_values["intensityLog"], log_linewidth=self._analysis_values["linewidthLog"],
             power_limits=tuple(sorted((self._values["ymin"], self._values["ymax"]))))
@@ -921,13 +1015,13 @@ class PowerAnalysisMixin:
             power_limits=tuple(sorted((self._values["ymin"], self._values["ymax"]))),
             log_intensity=self._analysis_values["intensityLog"], log_linewidth=self._analysis_values["linewidthLog"],
             records=self._products.get("records", {}))
-        if self._analysis_values["metric"] == "Integrated area" and self._analysis_law_fits:
+        if self._analysis_law_fits and ((self._analysis_values["metric"] == "Integrated area" and self._analysis_values["areaMetric"] == "legacy") or (self._analysis_values["metric"] == "Full fitted area" and self._analysis_values["areaMetric"] == "full")):
             draw_power_laws(intensity_axis, self._analysis_law_fits)
         if self._analysis_law_error:
             intensity_axis.text(.02, .98, "Power-law intervals need review after refitting", transform=intensity_axis.transAxes, va="top", fontsize=7)
         if not self._analysis_ready():
-            for axis in self._analysis_trends:
-                axis.text(.5, .5, "Fitting spectra…" if "fit" in self._running else self._analysis_status,
+            for axis, label in zip(self._analysis_trends, ("intensity", "FWHM")):
+                axis.text(.5, .5, "Fitting spectra…" if "fit" in self._running else "Fit spectra to\nview " + label,
                     transform=axis.transAxes, ha="center", va="center", wrap=True)
 
     def _analysis_render_spectrum(self, spectrum_axis, residual_axis):
@@ -984,7 +1078,7 @@ class PowerAnalysisMixin:
             return ("refit", id(state), state["channel"], state["index"], id(fit), *common)
         if self._stage == "law" and self._law_state:
             state = self._law_state
-            return ("law", id(state), id(self._analysis_results), state["local"],
+            return ("law", id(state), id(self._analysis_results), state["local"], state["areaMetric"],
                 tuple((row["channel"], row["peak"], row["selected"]) for row in state["rows"]),
                 tuple(self._law_local) if state["local"] else (), *common)
         return None
@@ -994,7 +1088,7 @@ class PowerAnalysisMixin:
             return self._refit_seed_lines
         if self._stage != "law":
             return []
-        artists = list(self._law_data_lines)
+        artists = list(self._law_data_lines) + list(self._law_highlights.values())
         artists.extend(artist for pair in self._law_fit_artists.values() for artist in pair)
         if self._law_legend is not None:
             artists.append(self._law_legend)
@@ -1041,6 +1135,11 @@ class PowerAnalysisMixin:
         axis = self._law_axis
         limits = axis.get_ylim()
         fits = {(fit["channel"], fit["peak"]): fit for fit in self._law_fits}
+        for source, row in zip(self._law_series, self._law_state["rows"]):
+            highlight = self._law_highlights.get((row["channel"], row["peak"]))
+            if highlight is not None:
+                mask = source["valid"] & np.isfinite(source["power"]) & np.isfinite(source["intensity"]) & (source["power"] > 0) & (source["intensity"] > 0) & (source["power"] >= row["lower"]) & (source["power"] <= row["upper"])
+                highlight.set_data(source["power"][mask], source["intensity"][mask])
         for key, (span, line) in self._law_fit_artists.items():
             fit = fits.get(key)
             span.set_visible(fit is not None)
@@ -1100,7 +1199,7 @@ class PowerAnalysisMixin:
         self._disconnect_law_selector()
         self._special_background = None
         self._refit_seed_lines = []
-        self._law_data_lines, self._law_fit_artists = [], {}
+        self._law_data_lines, self._law_fit_artists, self._law_highlights = [], {}, {}
         self._law_legend = self._law_legend_key = None
         import numpy as np
         figure.clear()
@@ -1126,20 +1225,25 @@ class PowerAnalysisMixin:
             axes[1].axhline(0, color="gray", lw=.7)
             axes[1].set(xlabel="Energy (eV)", ylabel="Residual")
         elif self._stage == "law" and self._law_state:
+            if figure.get_figwidth() < 7.5:
+                # Compact windows need extra physical padding around vertical labels.
+                figure.get_layout_engine().set(w_pad=.18, h_pad=.08)
             from core.plotting import plain_log_ticks
             from matplotlib.widgets import SpanSelector
             axes = figure.subplots(2 if self._law_state["local"] else 1, 1, squeeze=False).ravel()
             axis = axes[0]
             self._law_axis = axis
             axis.set(xscale="log", yscale="log", xlabel="Power (uW)")
-            axis.set_ylabel("Peak area\n(a.u. eV)", fontsize=9)
+            axis.set_ylabel(("Full fitted area" if self._law_state["areaMetric"] == "full" else "Measured-range fit area") + "\n(a.u. eV)", fontsize=9)
             plain_log_ticks(axis.xaxis)
             plain_log_ticks(axis.yaxis)
             for index, (source, row) in enumerate(zip(self._law_series, self._law_state["rows"])):
                 if not row["selected"]:
                     continue
                 mask = source["valid"] & np.isfinite(source["power"]) & np.isfinite(source["intensity"]) & (source["power"] > 0) & (source["intensity"] > 0)
-                self._law_data_lines.extend(axis.plot(source["power"][mask], source["intensity"][mask], "o-", color=f"C{index % 10}", ms=3, label=source["name"], animated=True))
+                self._law_data_lines.extend(axis.plot(source["power"][mask], source["intensity"][mask], "o-", color=f"C{index % 10}", alpha=.25, ms=3, label=source["name"], animated=True))
+                highlight, = axis.plot([], [], "o", color=f"C{index % 10}", ms=4, label="_interval", animated=True)
+                self._law_highlights[(row["channel"], row["peak"])] = highlight
                 for boundary in source["boundaries"]:
                     self._law_data_lines.append(axis.axvline(boundary, color="gray", ls=":", alpha=.25, animated=True))
                 span = axis.axvspan(1., 2., color=f"C{index % 10}", alpha=.07, animated=True, visible=False)
@@ -1219,7 +1323,7 @@ class PowerAnalysisMixin:
                     for peak, component in enumerate(fit.components):
                         if component.status != "ok":
                             continue
-                        value = component.fwhm_mev if event.inaxes is self._analysis_trends[1] else component.height if self._analysis_values["metric"] == "Peak height" else component.area
+                        value = component.fwhm_mev if event.inaxes is self._analysis_trends[1] else component.height if self._analysis_values["metric"] == "Peak height" else getattr(component, "fit_area_full", float("nan")) if self._analysis_values["metric"] == "Full fitted area" else component.area
                         if not isfinite(value) or event.inaxes.get_yscale() == "log" and value <= 0:
                             continue
                         if getattr(event, "x", None) is not None and getattr(event, "y", None) is not None:
@@ -1321,32 +1425,27 @@ class PowerAnalysisMixin:
         def choice(key, label, value, options):
             return dict(key=key, type="choice", label=label, value=value,
                 options=[dict(value=value, label=label) for value, label in options], enabled=editable)
-        fields = [dict(key="analysis.enabled", type="flag", label="Intensity + linewidth vs power", value=values["enabled"], enabled=available),
+        fields = [dict(key="analysis.enabled", type="flag", label="Peak analysis", value=values["enabled"], enabled=available),
             dict(key="analysis-status", type="summary", value=self._analysis_status)]
-        fields.append(dict(key="analysis.fit", type="action", label="Fit all powers" if values["enabled"] else "Analyze peaks",
-            primary=True, enabled=editable))
         if values["enabled"]:
-            fields.extend([choice("analysis.selectedPeak", "Selected peak / click target", values["selectedPeak"], [(index, f"Peak {index + 1}") for index in range(len(self._peak_rows))]),
-                choice("analysis.pickMode", "Spectrum clicks", values["pickMode"], [("move", "Move selected peak"), ("add", "Add peak on click")])])
-            for index, row in enumerate(self._peak_rows):
-                for field, title in (("center", "Center (eV)"), ("width", "FWHM (meV)")):
-                    fields.append(dict(key=f"peak.{index}.{field}", type="number", label=title, value=row[field],
-                        pair=f"peak-{index}", pairLabel=f"Peak {index + 1}", shortLabel=title,
-                        min=1e-6 if field == "width" else -1e4, max=1e4, step=.001 if field == "center" else 1.,
-                        decimals=7 if field == "center" else 5, enabled=editable))
-            fields.extend([action("analysis.detect", "Detect peak guesses"), action("analysis.add", "Add"), action("analysis.remove", "Remove", editable and len(self._peak_rows) > 1),
-                dict(key="analysis.advanced", type="flag", label="Advanced fit and display settings", value=values["advanced"], enabled=available)])
+            fields.append(dict(key="peak-count", type="summary", value=f"{len(self._peak_rows)} peak(s) · use the controls below the plot to fit or inspect results."))
             if values["advanced"]:
-                fields.extend([choice("analysis.model", "Peak model", values["model"], [("Lorentzian", "Lorentzian"), ("Gaussian", "Gaussian")]),
-                choice("analysis.metric", "PL intensity", values["metric"], [("Integrated area", "Integrated area"), ("Peak height", "Peak height")]),
-                choice("analysis.intensityLog", "Intensity Y axis", values["intensityLog"], [(True, "Log"), (False, "Linear")]),
-                choice("analysis.linewidthLog", "Linewidth Y axis", values["linewidthLog"], [(True, "Log"), (False, "Linear")])])
-            fields.extend([
-                action("analysis.manual", "Manual refit selected power…", editable and self._analysis_ready()),
-                action("analysis.law", "Fit power law…", editable and self._analysis_ready()),
-                dict(key="analysis.showResults", type="flag", label="Show peak results table", value=values["showResults"], enabled=available),
-                dict(key="peak-identity-note", type="summary", value="Peak 1 is lowest energy. Click or drag a guess, then Fit all powers. FWHM fields above are initial guesses, not results."),
-                dict(key="peak-fit-range", type="summary", value="Fit range: full measured spectrum per channel. Plot zoom does not change the fit range. All peaks share one fitted linear background per spectrum.")])
+                fields.extend([choice("analysis.selectedPeak", "Selected peak / click target", values["selectedPeak"], [(index, f"Peak {index + 1}") for index in range(len(self._peak_rows))]),
+                    choice("analysis.pickMode", "Spectrum clicks", values["pickMode"], [("move", "Move selected peak"), ("add", "Add peak on click")])])
+                for index, row in enumerate(self._peak_rows):
+                    for field, title in (("center", "Center (eV)"), ("width", "FWHM (meV)")):
+                        fields.append(dict(key=f"peak.{index}.{field}", type="number", label=title, value=row[field],
+                            pair=f"peak-{index}", pairLabel=f"Peak {index + 1}", shortLabel=title,
+                            min=1e-6 if field == "width" else -1e4, max=1e4, step=.001 if field == "center" else 1.,
+                            decimals=7 if field == "center" else 5, enabled=editable))
+                fields.extend([action("analysis.detect", "Detect peak guesses"), action("analysis.add", "Add"), action("analysis.remove", "Remove", editable and len(self._peak_rows) > 1),
+                    choice("analysis.model", "Peak model", values["model"], [("Lorentzian", "Lorentzian"), ("Gaussian", "Gaussian")]),
+                    choice("analysis.metric", "PL intensity", values["metric"], [("Integrated area", "Area · measured range"), ("Full fitted area", "Area · full fitted peak"), ("Peak height", "Peak height")]),
+                    choice("analysis.curveScope", "Export curves", values["curveScope"], [("current", "Current spectrum"), ("all", "All analyzed spectra")]),
+                    choice("analysis.intensityLog", "Intensity Y axis", values["intensityLog"], [(True, "Log"), (False, "Linear")]),
+                    choice("analysis.linewidthLog", "Linewidth Y axis", values["linewidthLog"], [(True, "Log"), (False, "Linear")]),
+                    dict(key="peak-identity-note", type="summary", value="Peak 1 is lowest energy. Center and FWHM are initial guesses."),
+                    dict(key="peak-fit-range", type="summary", value="Fit range: full measured spectrum per channel. All peaks share one fitted linear background per spectrum.")])
         return [dict(key="peak-analysis", title="Peak analysis", fields=fields)]
 
 

@@ -743,6 +743,7 @@ class PowerBridge(PowerAnalysisMixin, PowerPlotMixin, QObject):
         self._closed = True
         self._plot_timer.stop()
         self._publish_timer.stop()
+        self._law_timer.stop()
         for kind in tuple(self._generation):
             self._cancel(kind)
         for task in self._pending.values():

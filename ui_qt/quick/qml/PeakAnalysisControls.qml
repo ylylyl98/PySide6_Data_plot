@@ -14,20 +14,6 @@ Rectangle {
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
-        RowLayout {
-            Layout.fillWidth: true; Layout.margins: 8
-            Repeater {
-                model: [{key: "find", label: "Find peaks"}, {key: "branches", label: "Branches & fit"}]
-                delegate: AppButton {
-                    required property var modelData
-                    Layout.fillWidth: true
-                    colors: panel.colors; text: modelData.label
-                    checked: panel.state.controlsPage === modelData.key
-                    enabled: !panel.state.busy
-                    onClicked: panel.bridge.setParameter("controlsPage", modelData.key)
-                }
-            }
-        }
         Basic.Label {
             Layout.fillWidth: true; Layout.margins: 10
             visible: !panel.state.hasDataset
@@ -78,6 +64,35 @@ Rectangle {
             Layout.fillWidth: true; Layout.fillHeight: true
             bridge: panel.bridge; colors: panel.colors
             groups: panel.state.parameterGroups || []
+        }
+        RowLayout {
+            Layout.fillWidth: true; Layout.margins: 8
+            spacing: 6
+            visible: panel.state.hasDataset && panel.state.controlsPage !== "branches"
+            AppButton {
+                Layout.fillWidth: true
+                objectName: "app_parameter_find-fit"
+                colors: panel.colors; text: "Find & Fit"; primary: true
+                visible: panel.state.kind === "PL"
+                enabled: panel.state.canAnalyze
+                onClicked: panel.bridge.invoke("find-fit")
+            }
+            AppButton {
+                Layout.fillWidth: true
+                objectName: "app_parameter_detect"
+                colors: panel.colors
+                text: panel.state.kind === "PL" ? "Find only" : "Find"
+                primary: panel.state.kind !== "PL"
+                enabled: panel.state.canAnalyze
+                onClicked: panel.bridge.invoke("detect")
+            }
+        }
+        AppButton {
+            Layout.fillWidth: true; Layout.leftMargin: 8; Layout.rightMargin: 8; Layout.bottomMargin: 6
+            colors: panel.colors
+            text: panel.state.controlsPage === "branches" ? "Done editing peaks" : "Edit peaks…"
+            enabled: panel.state.hasDataset && !panel.state.busy
+            onClicked: panel.bridge.setParameter("controlsPage", panel.state.controlsPage === "branches" ? "find" : "branches")
         }
     }
 }

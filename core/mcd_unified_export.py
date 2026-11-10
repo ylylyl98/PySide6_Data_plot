@@ -591,21 +591,23 @@ def _slope_table(snapshot: Mapping[str, Any], *, allowed_branches: set[str] | No
     if not records:
         return [], []
     keys = [
-        "window_id", "center_ev", "width_mev", "metric", "unit", "fit_id", "branch", "region", "method",
+        "window_id", "center_ev", "width_mev", "metric", "unit", "fit_id", "category", "branch", "region", "reference_region", "comparison", "method",
         "slope", "slope_se", "difference", "difference_se", "n", "requested_range_min_t", "requested_range_max_t",
         "actual_range_min_t", "actual_range_max_t", "covariance_supported", "residual_rms", "jump_flag", "curvature_flag", "status",
     ]
     columns = [
-        "window_id", "center_eV", "width_meV", "metric", "unit", "fit_id", "branch", "region", "method",
+        "window_id", "center_eV", "width_meV", "metric", "unit", "fit_id", "category", "branch", "region", "reference_region", "comparison", "method",
         "slope_MCD_per_T", "slope_SE_MCD_per_T", "difference_MCD_per_T", "difference_SE_MCD_per_T", "n",
         "requested_range_min_T", "requested_range_max_T", "actual_range_min_T", "actual_range_max_T", "covariance_supported", "residual_rms", "jump_flag", "curvature_flag", "status",
     ]
     normalized: list[dict[str, Any]] = []
     for record in records:
         value = dict(record)
-        value.setdefault("slope_se", value.get("standard_error"))
+        if value.get("category") != "differences" and value.get("slope_difference") is None:
+            value.setdefault("slope_se", value.get("standard_error"))
         value.setdefault("difference", value.get("slope_difference"))
-        value.setdefault("difference_se", value.get("standard_error"))
+        if value.get("category") == "differences" or value.get("slope_difference") is not None or value.get("difference") is not None:
+            value.setdefault("difference_se", value.get("standard_error"))
         value.setdefault("branch", f"{value.get('branch_a', '')}->{value.get('branch_b', '')}" if value.get("branch_a") is not None else "")
         requested = value.get("requested_range_t")
         actual = value.get("actual_range_t")
@@ -720,7 +722,7 @@ def _compact_slope_table(snapshot: Mapping[str, Any], *, allowed_branches: set[s
                 low, high = value("low", branch), value(region, branch)
                 differences.append(low - high if not isinstance(low, str) and not isinstance(high, str) else (low if isinstance(low, str) else high))
             rows.append([f"Near-zero minus {label} high field", *differences])
-        rows.extend([["Values = near-zero slope minus high-field slope."], ["SE = standard error. Full diagnostics and difference uncertainty are in JSON."], [], []])
+        rows.extend([["Values = near-zero slope minus high-field slope."], ["SE = standard error. Details and difference uncertainty are in Slope details."], [], []])
     return rows[0], rows[1:]
 
 
@@ -1556,9 +1558,11 @@ def export_mcd_analysis(snapshot: Mapping[str, Any], output_root: str | Path, *,
         # numerical product.
         split_columns, split_rows = _splitting_table(captured, allowed_branches=allowed_branches)
         slope_columns, slope_rows = _compact_slope_table(captured, allowed_branches=allowed_branches)
+        detail_columns, detail_rows = _slope_table(captured, allowed_branches=allowed_branches)
         xlsx = staging / f"MCD_unified_{export_id}.xlsx"
         _write_xlsx(xlsx, (
             ("MCD", mcd_columns, mcd_table), ("Slopes", slope_columns, slope_rows),
+            ("Slope details", detail_columns, detail_rows),
             ("Energy", energy_columns, energy_rows), ("Shift", shift_columns, shift_rows),
             ("Splitting", split_columns, split_rows),
         ))

@@ -5,13 +5,16 @@ from core.power_law import fit_power_law
 from core.power_workflow import record_sources
 
 
-def peak_series(results, records=None):
+def peak_series(results, records=None, area_metric="legacy"):
+    if area_metric not in {"legacy", "full"}:
+        raise ValueError("Unknown area metric.")
+    field = "area" if area_metric == "legacy" else "fit_area_full"
     series = []
     for channel, fits in results.items():
         count = max((len(f.components) for f in fits), default=0)
         for index in range(count):
             power = np.array([f.power_uw for f in fits])
-            area = np.array([f.components[index].area if index < len(f.components) else np.nan for f in fits])
+            area = np.array([getattr(f.components[index], field, np.nan) if index < len(f.components) else np.nan for f in fits])
             valid = np.array([index < len(f.components) and f.components[index].status == 'ok' for f in fits])
             origins = [tuple(record_sources(r)) for r in (records or {}).get(channel, ())]
             boundaries = []
@@ -26,8 +29,8 @@ def peak_series(results, records=None):
     return series
 
 
-def evaluate_ranges(results, records, ranges):
-    available = {(s['channel'], s['peak']): s for s in peak_series(results, records)}
+def evaluate_ranges(results, records, ranges, area_metric="legacy"):
+    available = {(s['channel'], s['peak']): s for s in peak_series(results, records, area_metric)}
     output = []
     for setting in ranges:
         source = available.get((setting['channel'], setting['peak']))
@@ -35,7 +38,8 @@ def evaluate_ranges(results, records, ranges):
             continue
         fit = fit_power_law(source['power'], source['intensity'], setting['lower'], setting['upper'], valid=source['valid'])
         fit.update(channel=source['channel'], peak=source['peak'], name=source['name'],
-            suggested=setting.get('suggested', False),
+            suggested=setting.get('suggested', False), intensity_metric='area' if area_metric == 'legacy' else 'fit_area_full',
+            area_method='legacy_measured_axis_component' if area_metric == 'legacy' else 'full_fitted_component',
             crosses_sources=any(fit['lower'] < b < fit['upper'] for b in source['boundaries']))
         output.append(fit)
     return output

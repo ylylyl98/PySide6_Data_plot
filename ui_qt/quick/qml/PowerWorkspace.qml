@@ -36,8 +36,7 @@ Rectangle {
                 AppButton { colors: page.colors; text: "Measurements…"; onClicked: page.bridge.invoke("choose-group") }
                 AppButton { objectName: "power_view_intensity"; colors: page.colors; text: "Intensity"; primary: page.state.mode !== "vp"; onClicked: page.bridge.setParameter("mode", page.state.vpAvailable ? "intensity" : "single") }
                 AppButton { objectName: "power_view_vp"; colors: page.colors; text: "VP"; primary: page.state.mode === "vp"; enabled: page.state.vpAvailable; onClicked: page.bridge.setParameter("mode", "vp") }
-                AppButton { objectName: "power_analyze_peaks"; colors: page.colors; text: "Analyze peaks"; primary: true; visible: !page.state.analysisEnabled; enabled: page.state.analysisAvailable && !page.state.busy; onClicked: page.bridge.invoke("analysis.fit") }
-                AppButton { colors: page.colors; text: "Fit power law…"; enabled: page.state.analysisEnabled && page.state.analysisExportReady; onClicked: page.bridge.invoke("analysis.law") }
+                AppButton { objectName: "power_analyze_peaks"; colors: page.colors; text: "1 Fit spectra"; primary: true; visible: !page.state.analysisEnabled; enabled: page.state.analysisAvailable && !page.state.busy; onClicked: page.bridge.invoke("analysis.fit") }
             }
             Item {
                 id: plotArea
@@ -55,7 +54,7 @@ Rectangle {
                 Text { anchors.centerIn: parent; visible: !page.state.inspectionVisible; text: page.state.busy ? "Loading Power data…" : page.state.workspaceMessage; color: page.state.error ? page.colors.error : page.colors.muted; width: Math.max(100, parent.width - 48); wrapMode: Text.Wrap; horizontalAlignment: Text.AlignHCenter }
             }
             PowerAnalysisControls { Layout.fillWidth: true; bridge: page.bridge; colors: page.colors; visible: page.state.analysisEnabled }
-            Text { Layout.fillWidth: true; Layout.margins: 8; text: page.state.status; color: page.state.error ? page.colors.error : page.colors.muted; font.pixelSize: 11; wrapMode: Text.Wrap }
+            Text { Layout.fillWidth: true; Layout.margins: 8; visible: !page.state.analysisEnabled || !(page.state.analysisStatus && (page.state.status || "").indexOf(page.state.analysisStatus) === 0) && page.state.status !== page.state.analysisLawWarning; text: page.state.status; color: page.state.error ? page.colors.error : page.colors.muted; font.pixelSize: 11; wrapMode: Text.Wrap }
         }
     }
 }

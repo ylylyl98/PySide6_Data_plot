@@ -297,6 +297,58 @@ class McdExtractTests(unittest.TestCase):
                 [],
             )
 
+    def test_legacy_catalog_refreshes_and_preserves_slope_diagnostics(self) -> None:
+        import sqlite3
+        from contextlib import closing
+        from core.mcd_extract import _record_to_catalog, _path_signature
+        with tempfile.TemporaryDirectory() as folder_text:
+            root = Path(folder_text)
+            package = self._write_result(root, "diag", energy=1.65, doping=2.0, efield=0.2)
+            settings = next(package.glob("*_MCD_settings*.json"))
+            payload = json.loads(settings.read_text(encoding="utf-8"))
+            payload["windows"] = [
+                {"window_id": "selected", "center_ev": 1.65, "width_mev": 5.0},
+                {"window_id": "other", "center_ev": 1.70, "width_mev": 5.0},
+            ]
+            payload["slopes"] = {
+                "fits": [
+                    {"window_id": "selected", "branch": "B increasing", "region": "low", "metric": "mean", "slope": 2.0, "slope_se": 0.12, "requested_range_t": [-0.2, 0.2], "status": "ok"},
+                    {"window_id": "other", "branch": "B increasing", "region": "low", "metric": "mean", "slope": 99.0, "status": "ok"},
+                    {"window_id": "selected", "branch": "B decreasing", "region": "high+", "metric": "mean", "status": "insufficient"},
+                ],
+                "differences": [
+                    {"window_id": "selected", "branch_a": "B increasing", "branch_b": "B increasing", "slope_difference": 0.4, "standard_error": 0.03, "status": "ok"},
+                    {"window_id": "other", "branch_a": "B increasing", "slope_difference": 99.0, "status": "ok"},
+                ],
+            }
+            settings.write_text(json.dumps(payload), encoding="utf-8")
+            original = settings.read_bytes()
+            record = discover_processed_mcd(root)[0]
+            stale = _record_to_catalog(record, _path_signature(settings))
+            stale.pop("slope_diagnostics")
+            legacy_json = package.parent / ".mcd_extract_catalog.json"
+            legacy_json.write_text(json.dumps({"schema_version": 8, "entries": {str(settings.resolve()).casefold(): stale}}), encoding="utf-8")
+            with closing(sqlite3.connect(mcd_catalog_database_path(root))) as db:
+                db.execute("UPDATE catalog_meta SET value='8' WHERE key='schema_version'")
+                db.execute("UPDATE processed_mcd SET record_json=?", (json.dumps(stale),))
+                db.commit()
+            refreshed = discover_processed_mcd(root)[0]
+            self.assertEqual(settings.read_bytes(), original)
+            self.assertEqual(len(refreshed.slope_diagnostics), 3)
+            self.assertEqual({row.get("window_id") for row in refreshed.slope_diagnostics}, {"selected"})
+            self.assertEqual(refreshed.slope_diagnostics[0]["slope_se"], 0.12)
+            self.assertEqual(refreshed.slope_diagnostics[1]["status"], "insufficient")
+            with patch.object(Path, "rglob", side_effect=AssertionError("unexpected rescan")):
+                cached = discover_processed_mcd(root)[0]
+            self.assertEqual(cached.slope_diagnostics, refreshed.slope_diagnostics)
+            paths = export_mcd_extract([cached], root / "export")
+            workbook = load_workbook(paths["summary_xlsx"], data_only=True)
+            table = list(workbook["Slope details"].values)
+            header = list(table[0])
+            self.assertEqual(table[1][header.index("slope_SE_MCD_per_T")], 0.12)
+            self.assertTrue(any(row[header.index("difference_SE_MCD_per_T")] == 0.03 for row in table[1:]))
+            self.assertTrue(any(row[header.index("status")] == "insufficient" for row in table[1:]))
+
     def test_newest_version_removes_only_matching_reprocessing(self) -> None:
         with tempfile.TemporaryDirectory() as folder_text:
             root = Path(folder_text)
@@ -392,7 +444,7 @@ class McdExtractTests(unittest.TestCase):
             self.assertTrue(any(str(value).endswith("_B_T") for value in decreasing_headers))
             self.assertTrue(any("E1.65eV" in str(value) for value in increasing_headers))
             summary = load_workbook(paths["summary_xlsx"], data_only=False)
-            self.assertEqual(summary.sheetnames, ["Slopes", "Conditions"])
+            self.assertEqual(summary.sheetnames, ["Slopes", "Slope details", "Conditions"])
             slope_headers = [cell.value for cell in summary["Slopes"][1]]
             self.assertIn("Increasing slope (MCD/T)", slope_headers)
             self.assertIn("Decreasing slope (MCD/T)", slope_headers)
@@ -436,7 +488,7 @@ class McdExtractTests(unittest.TestCase):
                 records, root / "extracts", series_groups=series
             )
             workbook = load_workbook(paths["summary_xlsx"], data_only=True)
-            self.assertEqual(workbook.sheetnames, ["Slopes", "Conditions"])
+            self.assertEqual(workbook.sheetnames, ["Slopes", "Slope details", "Conditions"])
             headers = [cell.value for cell in workbook["Conditions"][1]]
             energy_column = headers.index("Window center (eV)") + 1
             energies = {

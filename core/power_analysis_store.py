@@ -13,8 +13,10 @@ import numpy as np
 from core.power_multi_peaks import MultiPeakSettings, PeakSeed, SpectrumFit, center_bounds
 from core.power_peaks import PeakFit
 
-_VERSION = 2
-_FIELDS = ('power_uw', 'status', 'center_ev', 'fwhm_mev', 'fwhm_error_mev', 'area', 'height', 'rms')
+_VERSION = 3
+_FIELDS = ('power_uw', 'status', 'center_ev', 'fwhm_mev', 'fwhm_error_mev', 'area', 'height', 'rms',
+           'center_error_ev', 'height_error', 'fit_area_full', 'fit_area_full_error', 'area_error', 'uncertainty_status')
+_STRING_FIELDS = {'status', 'uncertainty_status'}
 _ARRAYS = ('x', 'fitted', 'residual', 'baseline')
 
 
@@ -57,7 +59,7 @@ def _peak_settings(rows, model):
         None if row.get("upper") in (None, "") else float(row["upper"])) for row in rows), model)
 
 
-def save_analysis(path, cubes, background, rows, model, results, *, laws=(), law_error='', ranges=(), preferences=None):
+def save_analysis(path, cubes, background, rows, model, results, *, laws=(), law_error='', ranges=(), preferences=None, law_history=()):
     """Atomically save numeric results and metadata in a single NPZ file."""
     fingerprint = analysis_fingerprint(cubes, background)
     settings = _peak_settings(rows, model)
@@ -86,8 +88,12 @@ def save_analysis(path, cubes, background, rows, model, results, *, laws=(), law
         for index, fit in enumerate(fits):
             item = dict(power_uw=float(fit.power_uw), status=str(fit.status), manual=bool(fit.manual),
                         rms=_number(fit.rms), parameters=list(fit.parameters), settings=asdict(fit.settings),
-                        components=[{key: (str(getattr(c, key)) if key == 'status' else _number(getattr(c, key)))
+                        components=[{key: (str(getattr(c, key)) if key in _STRING_FIELDS else _number(getattr(c, key)))
                                      for key in _FIELDS} for c in fit.components])
+            item['covariance'] = None if fit.covariance is None else np.asarray(fit.covariance, dtype=float).tolist()
+            item['spectrum_area_roi'] = _number(fit.spectrum_area_roi)
+            item['spectrum_area_roi_domain'] = fit.spectrum_area_roi_domain
+            item['spectrum_area_roi_method'] = fit.spectrum_area_roi_method
             for name in _ARRAYS:
                 value = getattr(fit, name)
                 item[name] = None if value is None else pack_array(value)
@@ -96,7 +102,7 @@ def save_analysis(path, cubes, background, rows, model, results, *, laws=(), law
     arrays['data'] = np.concatenate(chunks) if chunks else np.empty(0, dtype=float)
     metadata = dict(version=_VERSION, fingerprint=fingerprint, rows=rows, model=model,
                     results=packed, laws=list(laws), law_error=str(law_error), ranges=list(ranges),
-                    preferences=dict(preferences or {}))
+                    preferences=dict(preferences or {}), law_history=list(law_history))
     arrays['metadata'] = np.frombuffer(json.dumps(metadata, allow_nan=False, ensure_ascii=False).encode('utf-8'), dtype=np.uint8)
     # Validate the complete representation before replacing a previously valid cache.
     _unpack(metadata, arrays, cubes, fingerprint)
@@ -151,7 +157,7 @@ def _validate_law_metadata(laws, ranges, cubes, count):
 
 
 def _unpack(meta, arrays, cubes, fingerprint):
-    if meta['version'] not in (1, _VERSION) or meta['fingerprint'] != fingerprint or set(meta['results']) != set(cubes):
+    if meta['version'] not in (1, 2, _VERSION) or meta['fingerprint'] != fingerprint or set(meta['results']) != set(cubes):
         raise ValueError('Stale cache')
     if not isinstance(meta['laws'], list) or not isinstance(meta.get('ranges', []), list) or not isinstance(meta.get('preferences', {}), dict):
         raise ValueError('Invalid metadata')
@@ -166,7 +172,10 @@ def _unpack(meta, arrays, cubes, fingerprint):
     if not isinstance(meta['law_error'], str):
         raise ValueError('Invalid law error')
     _validate_law_metadata(meta['laws'], meta.get('ranges', []), cubes, count)
-    data = np.asarray(arrays['data']) if meta['version'] == 2 else None
+    if not isinstance(meta.get('law_history', []), list):
+        raise ValueError('Invalid law history')
+    _validate_law_metadata(meta.get('law_history', []), [], cubes, count)
+    data = np.asarray(arrays['data']) if meta['version'] >= 2 else None
     if data is not None and (data.ndim != 1 or data.dtype.kind not in 'fiu'):
         raise ValueError('Invalid numeric data')
     results = {}
@@ -189,9 +198,11 @@ def _unpack(meta, arrays, cubes, fingerprint):
                 raise ValueError('Invalid power')
             components = []
             for component in item['components']:
-                fields = {key: (component[key] if key == 'status' else
-                                (np.nan if component[key] is None else float(component[key]))) for key in _FIELDS}
-                if fields['power_uw'] != powers[i] or any(np.isinf(v) for k, v in fields.items() if k != 'status'):
+                fields = {key: (component.get(key, 'unavailable') if key in _STRING_FIELDS else
+                                (np.nan if component.get(key) is None else float(component[key]))) for key in _FIELDS}
+                if any(not isinstance(fields[key], str) for key in _STRING_FIELDS):
+                    raise ValueError('Invalid component status')
+                if fields['power_uw'] != powers[i] or any(np.isinf(v) for k, v in fields.items() if k not in _STRING_FIELDS):
                     raise ValueError('Invalid component')
                 components.append(PeakFit(**fields))
             params = tuple(float(v) for v in item['parameters'])
@@ -223,13 +234,31 @@ def _unpack(meta, arrays, cubes, fingerprint):
                 raise ValueError('Arrays without parameters')
             if item['rms'] is not None and not np.isfinite(float(item['rms'])):
                 raise ValueError('Invalid RMS')
+            covariance = item.get('covariance')
+            if covariance is not None:
+                covariance = np.asarray(covariance, dtype=float)
+                if covariance.shape != (len(params), len(params)) or not np.isfinite(covariance).all():
+                    raise ValueError('Invalid covariance')
+            roi = item.get('spectrum_area_roi')
+            domain = item.get('spectrum_area_roi_domain')
+            method = item.get('spectrum_area_roi_method', '')
+            if roi is not None and not np.isfinite(float(roi)):
+                raise ValueError('Invalid spectrum area')
+            if domain is not None and (not isinstance(domain, (list, tuple)) or len(domain) != 2
+                    or not np.isfinite(domain).all() or domain[0] > domain[1]):
+                raise ValueError('Invalid spectrum area domain')
+            if not isinstance(method, str):
+                raise ValueError('Invalid spectrum area method')
             fits.append(SpectrumFit(float(item['power_uw']), str(item['status']), tuple(components), fit_settings,
                                     bool(item['manual']), np.nan if item['rms'] is None else float(item['rms']),
-                                    params, component_curves=curves, **values))
+                                    params, component_curves=curves, covariance=covariance,
+                                    spectrum_area_roi=np.nan if roi is None else float(roi),
+                                    spectrum_area_roi_domain=None if domain is None else tuple(domain),
+                                    spectrum_area_roi_method=method, **values))
         results[label] = tuple(fits)
     return dict(rows=meta['rows'], model=meta['model'], settings=settings, results=results,
                 laws=meta['laws'], law_error=meta['law_error'], ranges=meta.get('ranges', []),
-                preferences=meta.get('preferences', {}), fingerprint=fingerprint)
+                preferences=meta.get('preferences', {}), law_history=meta.get('law_history', []), fingerprint=fingerprint)
 
 
 def load_analysis(path, cubes, background):

@@ -46,16 +46,45 @@ Basic.ApplicationWindow {
             Layout.margins: 6
             spacing: 4
             Repeater {
-                model: [{key: "open-workspace", label: "Open workspace…"}, {key: "save-copy", label: "Save copy…"},
-                    {key: "export-dialog", label: "Export CSV / JSON / PNG…"}, {key: "apply-overlay", label: "Apply to main app"},
-                    {key: "results", label: "Results"}, {key: "task-details", label: "Task details"}, {key: "restart", label: "Restart"}]
+                model: [{key: "export-dialog", label: "Export XLSX + data…"},
+                    {key: "apply-overlay", label: "Apply to main app"}]
                 delegate: AppButton {
                     required property var modelData
                     colors: window.colors; text: modelData.label
                     objectName: "peak_action_" + modelData.key
-                    enabled: !window.state.busy && (modelData.key === "export-dialog" ? window.state.canExport
-                        : modelData.key === "apply-overlay" ? window.state.canApplyOverlay : true)
+                    enabled: !window.state.busy && (modelData.key === "export-dialog" ? window.state.canExport : window.state.canApplyOverlay)
                     onClicked: window.peakBridge.invoke(modelData.key)
+                }
+            }
+            AppButton {
+                id: moreButton
+                colors: window.colors; text: "More…"
+                enabled: !window.state.busy
+                onClicked: moreMenu.open()
+                Basic.Menu {
+                    id: moreMenu
+                    y: moreButton.height
+                    Repeater {
+                        model: [{key: "open-workspace", label: "Open workspace…"}, {key: "save-copy", label: "Save copy…"},
+                            {key: "results", label: "Results"}, {key: "task-details", label: "Task details"},
+                            {key: "restart", label: "Restart"}]
+                        delegate: Basic.MenuItem {
+                            required property var modelData
+                            text: modelData.label
+                            objectName: "peak_action_" + modelData.key
+                            onTriggered: window.peakBridge.invoke(modelData.key)
+                        }
+                    }
+                    Basic.MenuSeparator { }
+                    Basic.MenuItem { text: "Back"; enabled: window.state.hasDataset; onTriggered: window.peakBridge.invoke("back") }
+                    Basic.MenuItem { text: "Forward"; enabled: window.state.hasDataset; onTriggered: window.peakBridge.invoke("forward") }
+                    Basic.MenuItem { text: "Larger peak markers"; enabled: window.state.hasDataset; onTriggered: window.peakBridge.setParameter("markerSize", (window.state.markerSize || 9) + 1) }
+                    Basic.MenuItem { text: "Smaller peak markers"; enabled: window.state.hasDataset; onTriggered: window.peakBridge.setParameter("markerSize", (window.state.markerSize || 9) - 1) }
+                    Basic.MenuItem {
+                        text: "Analyze full map"
+                        enabled: window.state.hasDataset && !window.state.busy
+                        onTriggered: window.peakBridge.setParameter("analysisScope", "map")
+                    }
                 }
             }
         }
@@ -86,12 +115,6 @@ Basic.ApplicationWindow {
         Basic.SplitView {
             Layout.fillWidth: true; Layout.fillHeight: true
             orientation: Qt.Horizontal
-            PeakAnalysisControls {
-                Basic.SplitView.preferredWidth: 330
-                Basic.SplitView.minimumWidth: 250
-                Basic.SplitView.maximumWidth: 520
-                bridge: window.peakBridge; colors: window.colors
-            }
             ColumnLayout {
                 Basic.SplitView.fillWidth: true
                 spacing: 2
@@ -122,7 +145,7 @@ Basic.ApplicationWindow {
                     Layout.fillWidth: true
                     spacing: 2
                     Repeater {
-                        model: ["home", "back", "forward", "pan", "zoom", "save-figure"]
+                        model: ["home", "pan", "zoom", "save-figure"]
                         delegate: AppButton {
                             required property string modelData
                             colors: window.colors
@@ -138,6 +161,7 @@ Basic.ApplicationWindow {
                         onToggled: window.peakBridge.setParameter("showOverlay", checked)
                     }
                     Basic.SpinBox {
+                        visible: window.width >= 900
                         from: 1; to: 64; value: window.state.markerSize || 9
                         enabled: window.state.hasDataset
                         Accessible.name: "Peak marker size"
@@ -169,10 +193,16 @@ Basic.ApplicationWindow {
                 }
                 PeakAnalysisResults {
                     Layout.fillWidth: true
-                    Layout.preferredHeight: visible ? 245 : 0
+                    Layout.preferredHeight: visible ? Math.min(245, Math.max(100, window.height * 0.22)) : 0
                     visible: window.state.showResults
                     bridge: window.peakBridge; colors: window.colors
                 }
+            }
+            PeakAnalysisControls {
+                Basic.SplitView.preferredWidth: 330
+                Basic.SplitView.minimumWidth: 250
+                Basic.SplitView.maximumWidth: 520
+                bridge: window.peakBridge; colors: window.colors
             }
         }
         RowLayout {

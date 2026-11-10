@@ -250,12 +250,17 @@ class BatchCancelled(InterruptedError):
 
 
 def export_batch(dataset,parameters,background_paths,directory,cancelled=None):
+    import csv
+    import json
+    import os
+    import tempfile
     p=_params(parameters); paths=[]
     if dataset['mode']=='Reflection':
         from .background_roles import validate_background_role
         validate_background_role(p['background_role'],background_paths)
     axes=(p['cut_axis'],) if p['batch_axes']=='selected' else ('first','second')
     if p['batch_axes'] not in ('selected','both'): raise ValueError('Unknown batch axes')
+    planned=[]
     for axis in axes:
         q=dict(p,cut_axis=axis)
         if p['batch_axes']=='both' and p['cut_coordinates']=='explicit':
@@ -263,13 +268,54 @@ def export_batch(dataset,parameters,background_paths,directory,cancelled=None):
             q['cut_type']=p['cut_type'] if axis=='first' else pairs[p['cut_type']]
         q=_params(q)
         for value in slice_values(dataset,q):
-            if cancelled and cancelled(): raise BatchCancelled(paths)
-            q.update(view='slice',cut_value=value)
-            try: result=analyze(dataset,q,background_paths,cancelled)
-            except InterruptedError as exc: raise BatchCancelled(paths) from exc
+            planned.append((dict(q,view='slice',cut_value=value), value))
+    if not planned: raise ValueError('No measured slices are available for batch export.')
+    out=Path(directory); out.mkdir(parents=True,exist_ok=True)
+    base=Path(dataset['source_path']).stem+'_batch_index'
+    index=out/(base+'.csv'); suffix=2
+    while index.exists():
+        index=out/(f'{base}_{suffix}.csv'); suffix+=1
+    rows=[dict(source=str(dataset['source_path']),cut_axis=q['cut_axis'],cut_type=q['cut_type'],
+               cut_value=value,cut_unit='',status='pending',exported_files='[]') for q,value in planned]
+    def write_index():
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile('w', encoding='utf-8-sig', newline='',
+                                             dir=out, prefix='.batch-index-', suffix='.tmp',
+                                             delete=False) as stream:
+                temporary = Path(stream.name)
+                writer=csv.DictWriter(stream,fieldnames=['source','cut_axis','cut_type','cut_value','cut_unit','status','exported_files'])
+                writer.writeheader(); writer.writerows(rows)
+            os.replace(temporary, index)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+    write_index()
+    paths.append(str(index))
+    for i,(q,value) in enumerate(planned):
+        try:
+            if cancelled and cancelled(): raise InterruptedError()
+            result=analyze(dataset,q,background_paths,cancelled)
             result['title']=f"slice_{q['cut_type']}_{value:.9g}"
-            paths.extend(export_result(result,directory,parameters=q))
-    if not paths: raise ValueError('No measured slices are available for batch export.')
+            exported=export_result(result,directory,parameters=q)
+        except InterruptedError as exc:
+            rows[i]['status']='cancelled'; write_index()
+            raise BatchCancelled(paths) from exc
+        except Exception:
+            rows[i]['status']='failed'; write_index()
+            raise
+        paths.extend(exported)
+        if dataset['mode'] == 'Transport':
+            column = q['cut_type'] if q['cut_type'] in dataset['columns'] else q['y_column']
+            rows[i]['cut_unit'] = str(dataset.get('units', {}).get(column, ''))
+        else:
+            import re
+            label = str(result.get('data', {}).get('fixed_axis_label', ''))
+            match = re.search(r'\(([^()]*)\)\s*$', label)
+            rows[i]['cut_unit'] = match.group(1) if match else ''
+        rows[i]['status']='completed'
+        rows[i]['exported_files']=json.dumps([Path(path).name for path in exported],ensure_ascii=False)
+        write_index()
     return paths
 
 

@@ -1,4 +1,4 @@
-"""Explicit, collision-safe CSV/JSON/PNG export of a Peak Analysis snapshot."""
+"""Explicit, collision-safe XLSX/CSV/JSON/PNG export of an analysis snapshot."""
 
 from core.typography import save_figure
 import csv
@@ -14,7 +14,7 @@ from core.peak_plotting import build_figure
 from core.peak_workspace import atomic_json, validate_result
 
 
-def export_dataset(folder, dataset):
+def export_dataset(folder, dataset, *, cancelled=None):
     result = dataset['result']
     if result is None:
         raise ValueError('Find peaks before exporting results.')
@@ -25,14 +25,22 @@ def export_dataset(folder, dataset):
     fields = ['branch', 'branch_id', 'row_index', 'y', 'energy', 'polarity', 'status', 'segment',
               'candidate_id', 'prominence', 'prominence_fraction', 'width_mev',
               'noise_sigma', 'snr', 'neighbor_support', 'neighbor_available', 'neighbor_required',
-              'fit_center', 'fit_status', 'fwhm_mev', 'fwhm_error_mev', 'height', 'area', 'rms']
+              'fit_center', 'center_error_ev', 'fit_status', 'fwhm_mev', 'fwhm_error_mev',
+              'height', 'height_error', 'area', 'area_error', 'fit_area_full', 'fit_area_full_error',
+              'uncertainty_status', 'rms']
     names = {b['id']: b['name'] for b in dataset['branches']}
     with (target/'peaks.csv').open('w', encoding='utf-8-sig', newline='') as stream:
         writer = csv.DictWriter(stream, fields, extrasaction='ignore'); writer.writeheader()
         for p in result['points']:
             writer.writerow({**p, 'branch': names.get(p['branch_id'], p['branch_id'])})
     atomic_json(target/'analysis.json', {k: v for k, v in dataset.items() if k != 'cube'})
+    from core.peak_workbook import export_peak_workbook
+    export_peak_workbook(target, dataset, cancelled=cancelled)
     fig = Figure(figsize=(8, 7)); FigureCanvasAgg(fig)
     build_figure(dataset, dataset['row'], True, bool(result.get('fits')), fig)
     save_figure(fig, target/'peaks.png', dpi=180); fig.clear()
+    if dataset['kind'] == 'PL' and result.get('fits'):
+        from core.peak_plotting import build_fit_trends
+        build_fit_trends(dataset, fig)
+        save_figure(fig, target/'fit_trends.png', dpi=180); fig.clear()
     return str(target)

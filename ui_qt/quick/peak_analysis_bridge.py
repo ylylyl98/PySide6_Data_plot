@@ -50,6 +50,8 @@ class _EntryModel(QAbstractListModel):
         return None
 
     def replace(self, rows):
+        if not rows and not self.rows:
+            return
         self.beginResetModel()
         self.rows = rows
         self.endResetModel()
@@ -165,6 +167,7 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
             scanLabel=dataset["cube"].gate_label if dataset else "Scan coordinate",
             scanValue=float(dataset["cube"].gate[dataset["row"]]) if dataset else 0.,
             controlsPage=self._controls_page, selectedBranch=self._selected_branch, pickSeed=self._pick_seed,
+            analysisScope=dataset.get("analysis_scope", "map") if dataset else "spectrum",
             showOverlay=dataset.get("show_overlay", True) if dataset else True,
             markerSize=dataset.get("marker_size", 9) if dataset else 9,
             showResidual=dataset.get("show_residual", False) if dataset else False,
@@ -225,11 +228,11 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
                     available=target is not None, active=self.dataset["channel"] == channel))
         return choices, products
 
-    def addDatasets(self, datasets):
+    def addDatasets(self, datasets, *, replace_existing=False):
         if self._closed:
             return
         if self._busy:
-            self._queue.append(("datasets", datasets))
+            self._queue.append(("workspace-datasets" if replace_existing else "datasets", datasets))
             return
         from core.peak_workspace import validate_result
         for dataset in datasets:
@@ -238,17 +241,25 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
                 for previous in self.datasets.values():
                     if previous["key"] != dataset["key"] and previous["kind"] == "DRR" and previous["source"] == dataset["source"] and previous["channel"] == dataset["channel"] and previous.get("group_id", "legacy") == dataset.get("group_id", "legacy"):
                         previous["group_id"] = "previous:" + previous["key"]
-            if dataset["key"] in self.datasets:
+            if dataset["key"] in self.datasets and not replace_existing:
                 previous = self.datasets[dataset["key"]]
+                changed_row = previous.get("row", 0) != dataset.get("row", previous.get("row", 0))
                 previous.update(view=dataset.get("view"), reply_server=dataset.get("reply_server", self.reply_server), row=dataset.get("row", previous.get("row", 0)))
+                if changed_row and previous.get("analysis_scope") == "spectrum":
+                    for field in ("candidates", "result"):
+                        previous[field] = None
+                    previous.update(branches=[], branch_catalog=[], manual_seeds=False,
+                        candidate_assignments={}, segment_assignments={}, overlay_position="detected")
                 for field in ("group_id", "source_name", "product_label", "source_processing"):
                     if field in dataset:
                         previous[field] = dataset[field]
             else:
+                if replace_existing and dataset["key"] in self.datasets:
+                    dataset["reply_server"] = self.datasets[dataset["key"]].get("reply_server", self.reply_server)
                 self.datasets[dataset["key"]] = dataset
             self.active_key = dataset["key"]
         self._select_dataset()
-        self._message("Ready. Find all peaks scans the complete heatmap; filters reuse cached measurements.")
+        self._message("Ready. Choose a range and filter preset, then analyze.")
 
     def _select_dataset(self):
         dataset = self.dataset
@@ -269,10 +280,15 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
             self._branches_model.replace([])
             return
         from core.peak_plotting import branch_color
-        self._branches_model.replace([{**branch, "displayColor": branch_color(branch)} for branch in dataset["branches"]])
-        names = {branch["id"]: branch["name"] for branch in dataset["branches"]}
-        points = (dataset.get("result") or {}).get("points", [])
-        self._results_model.replace([{**point, "branch": names.get(point["branch_id"], point["branch_id"])} for point in points])
+        # Hidden QML lists need no per-point dictionaries or model resets.
+        self._branches_model.replace([{**branch, "displayColor": branch_color(branch)} for branch in dataset["branches"]]
+            if self._controls_page == "branches" else [])
+        if self._show_results:
+            names = {branch["id"]: branch["name"] for branch in dataset["branches"]}
+            points = (dataset.get("result") or {}).get("points", [])
+            self._results_model.replace([{**point, "branch": names.get(point["branch_id"], point["branch_id"])} for point in points])
+        else:
+            self._results_model.replace([])
 
     def _start(self, kind, operation, *, dataset_key=None):
         if self._closed or self._busy:
@@ -327,13 +343,13 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
             for dataset in datasets:
                 if kind == "snapshot":
                     dataset["reply_server"] = getattr(self, "_loading_reply", "") or self.reply_server
-            self.addDatasets(sorted(datasets, key=lambda dataset: dataset["key"] == active))
-        elif kind in {"detect", "filter", "track", "fit", "seed"} and key in self.datasets:
+            self.addDatasets(sorted(datasets, key=lambda dataset: dataset["key"] == active), replace_existing=kind in {"workspace", "restore"})
+        elif kind in {"detect", "filter", "track", "fit", "find-fit", "seed"} and key in self.datasets:
             target = self.datasets[key]
             for field in ("candidates", "result", "branches", "branch_catalog", "manual_seeds", "candidate_assignments", "segment_assignments", "overlay_position"):
                 if field in result:
                     target[field] = result[field]
-            if kind == "detect":
+            if kind in {"detect", "find-fit"}:
                 target["show_overlay"] = True
             self._pick_seed = False
             self._last_error = "\n".join((target.get("result") or {}).get("notices", []))
@@ -342,8 +358,15 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
             points = (target.get("result") or {}).get("points", [])
             text = (f"{sum(point['status'] == 'accepted' for point in points)} positions across {len(target['branches'])} branches."
                     if kind not in {"detect", "filter", "seed"} else self._cache_status())
-            if kind == "fit":
+            if kind in {"fit", "find-fit"}:
                 text += f" {sum(point.get('fit_status') == 'ok' for point in points)} valid fits."
+            if not points:
+                text = "No features found. Try Sensitive, widen the range, or adjust Custom filters."
+            elif kind == "filter" and target["kind"] == "PL":
+                text += " Click Find & Fit to update the fit."
+            notices = (target.get("result") or {}).get("notices", [])
+            if notices:
+                text += " " + " ".join(notices)
             self._message(text or "Manual seed ready. Connect selected branches to track it.")
         elif kind == "export":
             self._result_paths = [str(path) for path in sorted(Path(result).iterdir()) if path.is_file()]
@@ -368,8 +391,8 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
         if self._closed or self._closing or self._busy or not self._queue:
             return
         kind, value = self._queue.popleft()
-        if kind == "datasets":
-            self.addDatasets(value)
+        if kind in {"datasets", "workspace-datasets"}:
+            self.addDatasets(value, replace_existing=kind == "workspace-datasets")
         else:
             self.loadSnapshot(*value)
         if not self._busy and self._queue:
@@ -414,8 +437,9 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
         if self.dataset is None or self._busy or self._closing:
             return
         from ui_qt.quick.peak_analysis_workflow import analyze_dataset, capture_request
+        self._filter_timer.stop()
         dataset = capture_request(self.dataset)
-        self._message({"detect": "Finding candidates across the full heatmap…", "filter": "Filtering cached candidates…",
+        self._message({"detect": "Finding features…", "find-fit": "Finding and fitting PL peaks…", "filter": "Filtering cached candidates…",
             "track": "Connecting selected branches…", "fit": "Fitting selected PL branches…"}[action])
         self._start(action, lambda cancel, progress: analyze_dataset(dataset, action, cancelled=cancel, progress=progress), dataset_key=dataset["key"])
 
@@ -428,6 +452,19 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
         if self.dataset and self.dataset.get("candidates") and not self._busy:
             self._filter_timer.start(100)
         self._publish()
+
+    def _clear_scope_results(self):
+        """A new analysis target must not export or fit the previous target's seeds."""
+        dataset = self.dataset
+        self._filter_timer.stop()
+        for key in ("candidates", "result"):
+            dataset[key] = None
+        dataset.update(branches=[], branch_catalog=[], manual_seeds=False,
+            candidate_assignments={}, segment_assignments={}, overlay_position="detected")
+        self._selected_branch = ""
+        self._update_models()
+        self._schedule_plot()
+        self._message("Selection changed. Click Find & Fit." if dataset["kind"] == "PL" else "Selection changed. Click Find.")
 
     def _scope_settings(self, dataset):
         cube, scope = dataset["cube"], dataset.get("scope", 0)
@@ -461,6 +498,7 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
             if key == "controlsPage":
                 if value in {"find", "branches"}:
                     self._controls_page = value
+                    self._update_models()
                 self._publish()
                 return
             if key == "dataset":
@@ -473,21 +511,57 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
                 return
             if dataset is None:
                 return
+            if key == "exportCurveScope":
+                if value not in {"current", "all"}:
+                    raise ValueError("Choose current or all analyzed spectra.")
+                dataset["export_curve_scope"] = value
+                self._update_models()
+                self._publish()
+                return
+            if key == "analysisPlot":
+                if value not in {"spectra", "trends"}:
+                    raise ValueError("Choose spectra or fitted trends.")
+                dataset['plot_view'] = value
+                self._update_models()
+                self._schedule_plot()
+                self._publish()
+                return
+            if key == "analysisScope":
+                if value not in {"spectrum", "map"}:
+                    raise ValueError("Choose Current spectrum or Full map.")
+                if value != dataset.get("analysis_scope", "map"):
+                    dataset["analysis_scope"] = value
+                    self._clear_scope_results()
+                self._publish()
+                return
+            if key == "filterPreset":
+                if value == "Custom":
+                    dataset["custom_filters"] = True
+                elif value in {"Balanced", "Sensitive", "Strict"}:
+                    self.invoke("preset:" + value)
+                self._publish()
+                return
             if key == "product":
                 import numpy as np
                 choices, _ = self._dataset_choices()
                 group = next(choice for choice in choices if self.active_key in choice["keys"])
                 target = next((self.datasets[item] for item in group["keys"] if self.datasets[item]["channel"] == value), None)
                 if target is not None and target is not dataset:
+                    old_row = target["row"]
                     target["row"] = int(np.argmin(abs(target["cube"].gate - dataset["cube"].gate[dataset["row"]])))
                     target["view"] = {**(target.get("view") or {}), **{key: item for key, item in (dataset.get("view") or {}).items() if key in {"xlim", "ylim"}}}
                     self.active_key = target["key"]
+                    if old_row != target["row"] and target.get("analysis_scope") == "spectrum":
+                        self._clear_scope_results()
                     self._select_dataset()
                 return
             if key in {"row", "resultRow"}:
                 if key == "resultRow":
-                    value = self._results_model.rows[int(value)]["row_index"]
+                    value = (dataset.get("result") or {}).get("points", [])[int(value)]["row_index"]
+                previous_row = dataset["row"]
                 dataset["row"] = max(0, min(int(value), len(dataset["cube"].gate) - 1))
+                if dataset.get("analysis_scope") == "spectrum" and previous_row != dataset["row"]:
+                    self._clear_scope_results()
                 self._row_timer.start(0)
             elif key == "selectedBranch":
                 branch = next((branch for branch in dataset["branches"] if branch["id"] == str(value)), None)
@@ -505,6 +579,14 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
                                 branch[field] = str(value).strip() or branch["name"]
                             elif field == "enabled":
                                 branch[field] = bool(value)
+                if field == "enabled":
+                    if dataset.get("result"):
+                        dataset["result"]["fits"] = []
+                        for point in dataset["result"]["points"]:
+                            for fitted_field in ("fit_status", "fit_center", "center_error_ev", "fwhm_mev", "fwhm_error_mev", "height", "height_error", "area", "area_error", "fit_area_full", "fit_area_full_error", "uncertainty_status", "rms"):
+                                point.pop(fitted_field, None)
+                    dataset["overlay_position"] = "detected"
+                    self._queue_filter()
                 self._update_models()
                 self._schedule_plot()
             elif key == "markerSize":
@@ -545,6 +627,8 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
                 if settings.get(key) == value:
                     return
                 settings[key] = value
+                if key in {"min_snr", "prominence", "min_width_mev", "min_distance_mev", "neighbor_support", "neighbor_tolerance_mev", "max_width_mev", "max_per_row"}:
+                    dataset["custom_filters"] = True
                 if key in {"x_min", "x_max", "y_min", "y_max"}:
                     dataset["scope"] = 2
                     dataset["custom_range"] = {field: settings[field] for field in ("x_min", "x_max", "y_min", "y_max")}
@@ -574,7 +658,7 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
         if self._busy:
             return
         dataset = self.dataset
-        if action in {"detect", "filter", "track", "fit"}:
+        if action in {"detect", "filter", "track", "fit", "find-fit"}:
             self._analyze(action)
         elif action.startswith("preset:") and dataset:
             from core.peak_profiles import filter_presets
@@ -582,6 +666,7 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
             presets = filter_presets(dataset["cube"], dataset["kind"], dataset["channel"], dataset.get("product_label", ""))
             if name in presets:
                 dataset["settings"].update(presets[name])
+                dataset["custom_filters"] = False
                 self._queue_filter()
         elif action == "reset-filters" and dataset:
             dataset["scope"] = 0
@@ -595,6 +680,7 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
             self._pick_seed = not self._pick_seed
         elif action in {"results", "close-results"}:
             self._show_results = action == "results"
+            self._update_models()
         elif action in {"task-details", "close-details"}:
             self._show_details = action == "task-details"
         elif action in {"open-workspace", "save-copy", "export-dialog", "save-figure"}:
@@ -616,7 +702,7 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
             return
         from ui_qt.quick.peak_analysis_workflow import capture_request, export_analysis
         dataset, destination = capture_request(self.dataset), _path(folder)
-        self._message("Exporting complete CSV, settings and PNG package…")
+        self._message("Exporting XLSX, CSV, settings and PNG package…")
         self._start("export", lambda cancel, progress: export_analysis(destination, dataset, cancelled=cancel, progress=progress))
 
     @Slot(str)
@@ -686,7 +772,8 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
         pool, result = dataset["candidates"], dataset.get("result") or {}
         config = pool["settings"]
         method = "Local extrema" if config["detection_method"] == "local" else f"SG ({config['smoothing_window']} samples) + extrema"
-        text = f"{len(result.get('points', [])):,} kept / {len(pool['points']):,} candidates · {pool['rows']} spectra\nCached: {method}"
+        rows = len(pool["detected_rows"]) if "detected_rows" in pool else pool["rows"]
+        text = f"{len(result.get('points', [])):,} kept / {len(pool['points']):,} candidates · {rows} spectra\nCached: {method}"
         if not pool.get("quality"):
             text += "\nLegacy cache: choose a preset to add noise evidence."
         if detection_settings(dataset["settings"]) != config:
@@ -747,27 +834,60 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
                 bounds.append(number(axis + "_" + suffix, title, pair=axis + "-range", pairLabel=label, shortLabel=title))
         matching = next((name for name, preset in presets.items() if all(abs(float(values.get(key, 0)) - value) <= 1e-8 for key, value in preset.items())), "Custom")
         step = float((dataset["cube"].energy[-1] - dataset["cube"].energy[0]) * 1000 / (len(dataset["cube"].energy) - 1))
-        return [dict(key="find", title="1. Find full-map candidates", fields=[
-                choice("detection_method", "Detection method", values["detection_method"], [("local", "Local extrema"), ("sg", "Extra SG + extrema" if derivative else "SG + extrema")]),
-                {**number("smoothing_window", "Extra SG window (samples)" if derivative else "SG window (samples)"),
-                    "visible": values["detection_method"] == "sg", "description": f"Odd samples, not meV. Approximate full-grid span: {(values['smoothing_window'] - 1) * step:.4g} meV; finite segments may use shorter windows."},
+        custom = dataset.get("custom_filters", False) or matching == "Custom"
+        spectrum = dataset.get("analysis_scope", "map") == "spectrum"
+        pl = dataset["kind"] == "PL"
+        summary = []
+        for point in (dataset.get("result") or {}).get("points", [])[:6]:
+            center = point.get("fit_center") if point.get("fit_status") == "ok" else point["energy"]
+            width = point.get("fwhm_mev")
+            text = f"{point['polarity'].title()} · {center:.6g} eV"
+            if point.get("fit_status") == "ok" and point.get("center_error_ev") is not None:
+                text += f" ± {point['center_error_ev']:.2g} eV"
+            if point.get("fit_status") == "ok" and width is not None:
+                text += f" · FWHM {width:.4g} meV"
+                if point.get("fwhm_error_mev") is not None:
+                    text += f" ± {point['fwhm_error_mev']:.2g} meV"
+            elif point.get("fit_status"):
+                text += " · " + point["fit_status"]
+            summary.append(text)
+        return [dict(key="find", title="Analyze", fields=[
+                choice("analysisScope", "Analyze", dataset.get("analysis_scope", "map"),
+                    [("spectrum", "Current spectrum"), ("map", "Full map")], visible=not spectrum),
+                dict(key="target-note", type="summary", value="Current spectrum · " + f"{float(dataset['cube'].gate[dataset['row']]):.6g} " + dataset['cube'].gate_unit, visible=spectrum),
+                choice("scope", "Range", dataset.get("scope", 0), [(0, "Full range"), (1, "Follow plot view"), (2, "Custom / captured view")]),
+                *[bound for bound in bounds if not spectrum or bound["key"].startswith("x_")],
+                choice("polarity", "Feature", values["polarity"], [("both", "Both"), ("peaks", "Peaks"), ("dips", "Dips")], visible=not pl),
+                choice("filterPreset", "Filter", "Custom" if custom else matching,
+                    [(name, name) for name in (*presets, "Custom")]),
+                number("min_snr", "Min SNR", visible=custom, description="Prominence / estimated noise; 0 disables this filter."),
+                number("prominence", "Min prominence", visible=custom, description="Fraction of the spectrum range."),
+                number("min_width_mev", "Min width (meV)", visible=custom, description="Width at half prominence, separate from fitted FWHM."),
+                action("preset:Balanced", "Reset to Balanced", visible=custom),
+                dict(key="showResidual", type="flag", label="Show residual", value=dataset.get("show_residual", False), enabled=editable, visible=pl),
+                dict(key="result-summary", type="summary", value="\n".join(summary), visible=bool(summary)),
+                action("results", "View all results", visible=bool(dataset.get("result")))]),
+            dict(key="advanced", title="Advanced", advanced=True, fields=[
+                choice("detection_method", "Smoothing", values["detection_method"], [("local", "Off"), ("sg", "Extra SG" if derivative else "Savitzky–Golay")]),
+                {**number("smoothing_window", "SG window (samples)"), "visible": values["detection_method"] == "sg",
+                    "description": f"Approximate span: {(values['smoothing_window'] - 1) * step:.4g} meV. Smoothing is for detection only."},
                 dict(key="method-note", type="summary", value=method),
                 dict(key="input-processing", type="summary", value=processing, visible=derivative),
-                action("detect", "Find all peaks", primary=True),
-                dict(key="cache-status", type="summary", value=self._cache_status())]),
-            dict(key="filters", title="2. Filter · " + profile_name(dataset["kind"], dataset["channel"], dataset.get("product_label", "")), fields=[
-                *[action("preset:" + name, name, description="; ".join(f"{key}: {value:g}" for key, value in preset.items())) for name, preset in presets.items()],
-                dict(key="preset-status", type="summary", value=matching + " filters"),
-                choice("scope", "Range", dataset.get("scope", 0), [(0, "Full dataset"), (1, "Current heatmap view"), (2, "Custom")]),
-                choice("polarity", "Feature", values["polarity"], [("both", "Peaks and dips"), ("peaks", "Peaks"), ("dips", "Dips")], visible=dataset["kind"] == "DRR"),
-                *bounds, number("min_snr", "Minimum SNR (0 = off)", description="Prominence / robust noise on the cached detection signal; a heuristic, not a confidence probability."),
-                number("prominence", "Minimum prominence fraction"), number("min_width_mev", "Minimum width (meV)", description="Width at half prominence on the detection signal, not fitted FWHM. Presets use sample intervals, not an instrument-resolution claim."),
-                number("neighbor_support", "Support (of 5; 0 = off)"),
+                number("min_distance_mev", "Min spacing (meV)"),
+                number("max_width_mev", "Max width (0 = off)"), number("max_per_row", "Max features per row (0 = off)"),
+                number("neighbor_support", "Neighbor support (of 5)", visible=not spectrum),
+                number("neighbor_tolerance_mev", "Neighbor drift (meV / row)", visible=not spectrum),
+                number("candidate_floor", "Candidate floor", description="Lower this and find again to include weaker features omitted from the cache."),
+                choice("model", "Fit model", values["model"], [("Lorentzian", "Lorentzian"), ("Gaussian", "Gaussian")], visible=pl),
                 dict(key="showRejected", type="flag", label="Show rejected candidates", value=dataset.get("show_rejected", False), enabled=editable),
-                action("reset-filters", "Reset filters")]),
-            dict(key="more-filters", title="More filters", advanced=True, fields=[number("min_distance_mev", "Minimum spacing (meV)"),
-                number("neighbor_tolerance_mev", "Neighbor drift (meV / row)"), number("max_width_mev", "Maximum width (0 = no limit)"), number("max_per_row", "Maximum peaks per row (0 = no cap)")]),
-            dict(key="detection-options", title="Detection options", advanced=True, fields=[number("candidate_floor", "Candidate floor", description="Fraction of each full spectrum range. Zero caches all local extrema, without a peak-count cap.")])]
+                choice("overlayPosition", "Overlay positions", dataset.get("overlay_position", "detected"),
+                    [("detected", "Detected positions"), ("fitted", "Valid fitted centers")], visible=pl),
+                choice("exportCurveScope", "Export curves", dataset.get("export_curve_scope", "current"),
+                    [("current", "Current spectrum"), ("all", "All analyzed spectra")]),
+                choice("analysisPlot", "Analysis plot", dataset.get("plot_view", "spectra"),
+                    [("spectra", "Spectra"), ("trends", "Fit center / FWHM ± SE")], visible=pl),
+                dict(key="cache-status", type="summary", value=self._cache_status()),
+                action("reset-filters", "Clear all filters")])]
 
     @Slot()
     def close(self):

@@ -144,14 +144,22 @@ X 范围、区域数和固定分界一起传递。中心改变后手动 X 几何
 
 ## Peak Analysis 峰分析
 
-绘制 PL、DRR、Compare intensity 或 Power intensity 后，通过绘图工具栏右侧 **Peak Analysis...** 或 Workflow 菜单打开。英文分析窗口运行于独立进程，使用数值快照。PL 支持检测及可选多峰 Lorentzian/Gaussian 拟合；DRR 支持各已提供产品的峰/谷；Compare/Power intensity 使用 PL 适配器。VP 不适用。重复扫描坐标须明确分离或聚合，不会篡改实测功率来隐藏重复；此类数据仍可使用 Power 自身峰分析。
+绘制 PL、DRR、Compare intensity 或 Power intensity 后，通过绘图工具栏右侧 **Analyze…** 或 Workflow 菜单打开。英文分析窗口运行于独立进程，使用数值快照。PL 支持检测及可选多峰 Lorentzian/Gaussian 拟合；DRR 支持各已提供产品的峰/谷；Compare/Power intensity 使用 PL 适配器。VP 不适用。重复扫描坐标须明确分离或聚合，不会篡改实测功率来隐藏重复；此类数据仍可使用 Power 自身峰分析。
 
 快照继承色图、色限、对数/零中心归一化及区域色限。DRR 图上方有 **ΔR/R / 2nd derivative** 标签；文件使用另一行标签，单文件仅显示名称。各产品分别保留分支/结果，共享所选扫描坐标。缺失产品须在主应用显示后再发送。同数值数据重新打开会更新显示设置并保留分析；旧保存快照需重新移交才能获得更新的显示元数据。
 
+### 简易单光谱流程
+
+在 PL 或 DRR 点击 **Analyze…** 打开独立分析窗口。新传入的数据默认分析当前选中的光谱，并固定使用打开时的可见范围。左侧看图，右侧操作；Find & Fit / Find 固定在底部，Custom 与 Advanced 参数可独立滚动，Edit peaks 位于底部次级位置。单光谱模式会给光谱更多绘图空间。PL 的 **Find & Fit** 自动寻峰，再用 Lorentzian 分量与线性背景拟合所选峰；**Find only** 只预览检测结果。DRR 的 **Find** 支持 **Peaks / Dips / Both**。PL 拟合使用传入的线性强度，不使用额外平滑后的检测曲线。
+
+**Filter** 提供 **Balanced / Sensitive / Strict / Custom**。选择 Custom 后，原地展开 Min SNR、Min prominence 和 Min width。调整筛选会更新检测预览；PL 再点 **Find & Fit** 更新拟合。**Reset to Balanced** 恢复默认预设。平滑窗口、间距、最大宽度/数量、拟合模型和候选下限收在 **Advanced**；邻行支持仅用于整图分析。检测宽度为半突出程度宽度，与拟合 FWHM 分开。
+
+通过 **Edit peaks…** 勾选、排除、命名峰或手动添加光谱种子。**More → Analyze full map** 打开批量流程，Analyze 选择器可返回 Current spectrum。切换光谱或分析对象会清除旧结果，等待重新分析；旧工作区保留范围和设置。结果摘要在图旁，**View all results** 打开详细表格。导出需要显式操作；仅点击 **Apply to main app** 才回传主图标记，日常绘图不触发峰分析。
+
 ### 检测一次 再筛选缓存
 
-1. 在 **Find & filter** 选择 **Local extrema**（SciPy `find_peaks`，无平滑）或 **SG + extrema**（二阶 SG 平滑后使用同一检测器）。检测谷时反转输入信号；SG 不会对已处理产品再次求导。不均匀能量按有限连续段重采样，窗口随段长缩短，不足五点的段不平滑。
-2. **Find all peaks** 扫描所有光谱并叠加候选。**Candidate floor** 是每条完整光谱幅度范围的比例。PL/原始 ΔR/R 默认 **SG + extrema**、窗口 **11**；导数产品默认 **Local extrema**。导数额外平滑标为 **Extra SG**，可获得时显示上游窗口/阶数。来源记录取自当前显示产品，而非主窗口尚未应用设置。要比较导数窗口，在 DRR 修改后发送新产品。
+1. 在 **Advanced → Smoothing** 选择 **Off**（SciPy `find_peaks`，无平滑）或 **Savitzky–Golay**（二阶 SG 平滑后使用同一检测器）。检测谷时反转输入信号；SG 不会对已处理产品再次求导。不均匀能量按有限连续段重采样，窗口随段长缩短，不足五点的段不平滑。
+2. **Find / Find only** 扫描所选单条光谱或整图，并叠加候选。**Candidate floor** 是每条完整光谱幅度范围的比例。PL/原始 ΔR/R 默认 **SG + extrema**、窗口 **11**；导数产品默认 **Local extrema**。导数额外平滑标为 **Extra SG**，可获得时显示上游窗口/阶数。来源记录取自当前显示产品，而非主窗口尚未应用设置。要比较导数窗口，在 DRR 修改后发送新产品。
 3. 两种默认均使用 floor **0.01** 和 **Balanced** 筛选。floor `0` 表示有意保留全部局部极值，没有峰数上限。检测在分析后台任务中提供进度/取消。修改检测器、SG 窗口或 floor 才重建候选；低于缓存 floor 的筛选不能找回检测时遗漏的点。
 
 新数据使用按产品区分的 Balanced 阈值：
@@ -164,9 +172,9 @@ X 范围、区域数和固定分界一起传递。中心改变后手动 X 几何
 
 **Sensitive** 将 SNR 降低 2、prominence 减半、支持数降低 1；**Strict** 将 SNR 增加 2、prominence 乘 1.5、支持数增加 1。Sensitive/Balanced/Strict 的宽度阈值分别为能量中位采样间隔的 2/3/4 倍；同极性间距初值均为 2 倍。转换为 meV、舍入到小数点后 4 位并限制在 0.0001–1000 meV。0.2 meV/点时，Balanced 宽度为 0.6 meV、间距为 0.4 meV。这些依采样设定的值是起点，不代表仪器分辨率；提示列出阈值和 SG 窗口的大致跨度。
 
-预设清除最大宽度/数量上限，保留范围、极性和检测器选择。手动编辑显示 **Custom filters**。旧工作区保留设置/缓存，需要明确选择预设才更新。新移交在子进程应用当前默认，即使主应用未重启；已知数据保留原选择。**More → Restart Analysis** 可刷新分析进程。
+预设清除最大宽度/数量上限，保留范围、极性和检测器选择。手动编辑筛选参数后显示 **Custom**。旧工作区保留设置/缓存，需要明确选择预设才更新。新移交在子进程应用当前默认，即使主应用未重启；已知数据保留原选择。**More → Restart** 可刷新分析进程。
 
-页面直接显示 **X/Y bounds**、**Both/Peaks/Dips**、**Min SNR**、**Min prominence**、**Min width** 和 **Support (of 5)**。**Full / View / Custom** 选择筛选范围；编辑界限自动选 Custom 并复用缓存。View 跟随热图，在平移/缩放手势后统一筛选一次；切换范围保留已保存自定义边界。**More filters** 包含间距、邻行漂移、最大宽度和每行数量（`0` 按标签含义表示关闭/无限）。**Reset filters** 恢复缓存候选，**Show rejected candidates** 将排除点画为灰叉。**Detection options** 提供候选采集 floor。页面报告保留/总数和缓存实际检测方法。
+范围控件始终可见；选择 **Custom** 筛选后展开 SNR、突出程度和最小宽度。整图模式还显示扫描坐标范围。**Full range / Follow plot view / Custom / captured view** 分别使用全范围、跟随视图或固定自定义范围。编辑边界会选择 Custom。邻行支持、间距、最大宽度/数量、候选下限和被排除标记位于 **Advanced**；**Clear all filters** 恢复缓存中的候选点。
 
 ### 理解检测指标
 
@@ -180,9 +188,9 @@ X 范围、区域数和固定分界一起传递。中心改变后手动 X 几何
 
 点击热图或移动 **Spectrum** 检查实测光谱。鼠标读数显示 X/Y 和标签；热图还显示输入网格的 **Z (nearest)**，早于颜色裁剪/归一化或额外平滑。悬停可看信号名/单元坐标。离开图后标记为最后读数，数据/视图改变时清除。对数轴按显示单元边界取样，报告实际扫描值。光谱/残差的 Y 是鼠标位置，不吸附曲线；缺失坐标/Z 为 `—`。鼠标移动仅更新文字，不选择光谱或运行分析。
 
-PL 可使用 **Fit selected branches** 拟合，**Show residual** 显示残差。叠加可选择检测位置或有效拟合中心。**Apply overlay** 将位置发送到匹配的主应用热图。数值来源改变使叠加失效，缩放/色限改变不重跑分析。工具栏 **Size** 调标记面积（默认 `9 pt²`），不重检测、筛选或重建热图，并写入工作区、导出和叠加包。
+PL 可使用 **Fit selected branches** 拟合，**Show residual** 显示残差。叠加可选择检测位置或有效拟合中心。**Apply to main app** 将位置发送到匹配的主应用热图。数值来源改变使叠加失效，缩放/色限改变不重跑分析。工具栏 **Size** 调标记面积（默认 `9 pt²`），不重检测、筛选或重建热图，并写入工作区、导出和叠加包。
 
-**Results** 按需打开表格，含 SNR、支持/可用行数、prominence 和实测宽度。**Export...** 创建含 CSV/JSON/PNG 的新目录，CSV 也包含噪声/支持指标。进度/取消在状态栏，不自动打开主应用底部面板。Windows 关闭时保存工作区到 `%LOCALAPPDATA%/DPTK/Peak Analysis`。**More → Restart Analysis** 先保存再重启。源码/打包代码重启要求见[开发指南](development.md)。
+**Results** 按需打开表格，含 SNR、支持/可用行数、prominence 和实测宽度。**Export...** 创建含 CSV/JSON/PNG 的新目录，CSV 也包含噪声/支持指标。进度/取消在状态栏，不自动打开主应用底部面板。Windows 关闭时保存工作区到 `%LOCALAPPDATA%/DPTK/Peak Analysis`。**More → Restart** 先保存再重启。源码/打包代码重启要求见[开发指南](development.md)。
 
 ## Compare 对比
 
