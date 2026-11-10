@@ -47,7 +47,7 @@ def _digest_signature(path):
     return stat.st_mtime_ns, stat.st_size, stat.st_dev, stat.st_ino, change
 
 
-def _cached_load_digest(path):
+def _stable_load_digest(path):
     """Hash each load; metadata stamps alone cannot prove content is unchanged."""
     path = Path(path).resolve()
     before = _digest_signature(path)
@@ -149,7 +149,7 @@ def verify_initial_data_working_file(
         is_canonical_file = False
 
     if is_canonical_file or working.parent != root:
-        digest = _cached_load_digest(working)
+        digest = _stable_load_digest(working)
         return WorkingCopyRecord(
             canonical_source_path=str(working),
             working_copy_path=str(working),
@@ -166,8 +166,8 @@ def verify_initial_data_working_file(
         )
 
     canonical = initial_root / working.name
-    working_hash = _cached_load_digest(working)
-    canonical_hash = _cached_load_digest(canonical)
+    working_hash = _stable_load_digest(working)
+    canonical_hash = _stable_load_digest(canonical)
     is_root_file = working.parent == root
     verified = (
         is_root_file
