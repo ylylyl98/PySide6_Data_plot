@@ -136,7 +136,8 @@ Rectangle {
             AppInspectionDivider {
                 id: spectrumInspection
                 anchors.fill: parent
-                visible: page.state.inspectionVisible && page.state.compactInspection && page.state.panel === "map"
+                visible: page.state.inspectionVisible && (!page.state.compactInspection || page.state.panel === "map")
+                showSpectrumControl: page.state.compactInspection && page.state.panel === "map"
                 bridge: page.bridge
                 state: page.state
                 colors: page.colors

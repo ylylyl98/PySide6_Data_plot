@@ -8,6 +8,8 @@ import QtQuick.Window
 Rectangle {
     id: root
     required property var bridge
+    property bool colorRangesInFooter: false
+    property var colorRangeController: null
     required property var colors
     readonly property var state: bridge.snapshot
     readonly property string product: state.scale || "linear"
@@ -39,7 +41,8 @@ Rectangle {
     // Validate drafts before changing the bank; a rejected edit remains visible.
     function commitEdits() {
         function visit(item) {
-            if (item.objectName && item.objectName.indexOf("drr_number_") === 0) {
+            if (item.objectName && (item.objectName.indexOf("drr_number_") === 0
+                    || item.objectName.indexOf("color_sidebar_number_") === 0)) {
                 if (!item.commit()) return false
             }
             let children = item.children || []
@@ -146,12 +149,12 @@ Rectangle {
             ChoiceEditor { Layout.fillWidth: true; bridge: viewBridge; colors: root.colors; fieldKey: "cmap" }
             RangeEditor {
                 Layout.fillWidth: true
-                visible: root.state.regionCount === 1
+                visible: !root.colorRangesInFooter && root.state.regionCount === 1
                 bridge: viewBridge; colors: root.colors; title: root.product === "linear" ? "Linear color" : "Log color"
                 minimumKey: root.product + ".vmin"; maximumKey: root.product + ".vmax"; autoAction: "auto." + root.product
             }
             Repeater {
-                model: root.state.regionCount === 3 ? ["left", "middle", "right"] : root.state.regionCount === 2 ? ["left", "right"] : []
+                model: root.colorRangesInFooter ? [] : root.state.regionCount === 3 ? ["left", "middle", "right"] : root.state.regionCount === 2 ? ["left", "right"] : []
                 delegate: RangeEditor {
                     required property string modelData
                     Layout.fillWidth: true
@@ -163,6 +166,7 @@ Rectangle {
                 }
             }
             FlagEditor { Layout.fillWidth: true; bridge: viewBridge; colors: root.colors; fieldKey: "clip"; label: "Clip outliers" }
+            ColorRangeSidebar { Layout.fillWidth: true; controller: root.colorRangeController; colors: root.colors }
             Text { Layout.fillWidth: true; text: root.bridge.error; visible: text.length > 0; color: root.colors.error; wrapMode: Text.Wrap }
             Text { Layout.fillWidth: true; text: (root.state.texts.memoryStatus || {}).text || ""; color: root.colors.muted; wrapMode: Text.Wrap }
         }

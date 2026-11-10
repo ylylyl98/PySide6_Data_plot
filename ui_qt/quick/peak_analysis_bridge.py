@@ -5,7 +5,6 @@ Agg figures and Qt list models are owned by the QGuiApplication thread only.
 """
 from __future__ import annotations
 
-from core.typography import save_figure
 
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -89,6 +88,9 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
         self.reply_server = str(reply_server)
         self.datasets = {}
         self.active_key = None
+        # None means a workspace was opened directly, so all entries are current.
+        self._current_source_keys = None
+        self._show_history = False
         self._closed = self._closing = self._close_ready = self._restart_requested = False
         self._busy, self._operation, self._status = False, "", "Open a plotted dataset from the main app, or add a saved workspace."
         self._error = self._last_error = ""
@@ -99,6 +101,7 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
         self._queue = deque()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dptk-peak-analysis")
         self._controls_page = "find"
+        self._next_controls_page = None
         self._pick_seed = self._show_results = self._show_details = False
         self._selected_branch = ""
         self._result_paths = []
@@ -134,6 +137,21 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
     def dataset(self):
         return self.datasets.get(self.active_key)
 
+    def _save_folder(self):
+        if self.dataset is None:
+            return self.session_path.parent
+        from core.peak_output_names import output_folder
+        return output_folder(self.dataset, self.session_path.parent)
+
+    @staticmethod
+    def _write_history(datasets, active, session):
+        from core.peak_workspace import save_workspace
+        root = next((item['history_root'] for item in datasets if item.get('history_root')), None)
+        if root:
+            from core.peak_file_history import save_histories
+            return save_histories(datasets, root, active_key=active)
+        return save_workspace(session, datasets, active)
+
     @Property(QObject, notify=plotBackendChanged)
     def plotBackend(self):
         return self._canvas.backend if self._canvas is not None else None
@@ -159,30 +177,40 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
         dataset = self.dataset
         result = dataset.get("result") if dataset else None
         choices, products = self._dataset_choices()
+        from core.peak_analysis_state import analysis_state
+        workflow = analysis_state(dataset) if dataset else {}
         return dict(title="Peak Analysis", status=self._status, error=self._error, busy=self._busy,
             progress=self._progress, operation=self._operation, hasDataset=dataset is not None,
             datasetCount=len(self.datasets), datasetChoices=choices, activeKey=self.active_key or "", products=products,
+            showHistory=self._show_history, historyCount=(sum(key not in self._current_source_keys for key in self.datasets)
+                if self._current_source_keys is not None else 0),
             datasetName=dataset["name"] if dataset else "", kind=dataset["kind"] if dataset else "", channel=dataset["channel"] if dataset else "",
             row=dataset.get("row", 0) if dataset else 0, rowMaximum=len(dataset["cube"].gate) - 1 if dataset else 0,
             scanLabel=dataset["cube"].gate_label if dataset else "Scan coordinate",
             scanValue=float(dataset["cube"].gate[dataset["row"]]) if dataset else 0.,
             controlsPage=self._controls_page, selectedBranch=self._selected_branch, pickSeed=self._pick_seed,
+            workflow=workflow, showWholeBranches=bool(dataset and dataset.get('show_whole_branches')),
             analysisScope=dataset.get("analysis_scope", "map") if dataset else "spectrum",
             showOverlay=dataset.get("show_overlay", True) if dataset else True,
-            markerSize=dataset.get("marker_size", 9) if dataset else 9,
+            showRejected=dataset.get("show_rejected", False) if dataset else False,
+            markerSize=dataset.get("marker_size", 4) if dataset else 4,
+            mapHeightPercent=dataset.get("map_height_percent", self._default_map_share()) if dataset else 69,
+            filtersPending=bool(dataset and dataset.get("filters_pending")),
+            autoFilters=bool(dataset and dataset.get("auto_filters")),
+            canFilter=bool(dataset and dataset.get("candidates")) and not self._busy,
             showResidual=dataset.get("show_residual", False) if dataset else False,
             overlayPosition=dataset.get("overlay_position", "detected") if dataset else "detected",
             showResults=self._show_results, showDetails=self._show_details, taskDetails=self._last_error or "No task errors.",
             resultCount=len(result.get("points", ())) if result else 0, resultMethod=result.get("method", "") if result else "",
             canAnalyze=dataset is not None and not self._busy,
             canTrack=bool(dataset and dataset["branches"]) and not self._busy,
-            canFit=bool(dataset and dataset["kind"] == "PL" and dataset["branches"]) and not self._busy,
-            canExport=bool(result) and not self._busy and not self._filter_timer.isActive(),
-            canApplyOverlay=bool(result) and not self._busy and not self._filter_timer.isActive(),
+            canFit=bool(workflow.get('can_fit')) and not self._busy,
+            canExport=bool(workflow.get('can_export')) and not self._busy and not self._filter_timer.isActive(),
+            canApplyOverlay=bool(workflow.get('can_export')) and not self._busy and not self._filter_timer.isActive(),
             plotTool=self._plot_tool, parameterGroups=self._parameter_groups(), cacheStatus=self._cache_status(),
             closeReady=self._close_ready, closing=self._closing, restartRequested=self._restart_requested,
             sessionPath=str(self.session_path), sessionFolderUrl=QUrl.fromLocalFile(str(self.session_path.parent)).toString(),
-            resultPaths=list(self._result_paths))
+            resultPaths=list(self._result_paths), saveFolder=str(self._save_folder()))
 
     def _publish(self):
         if not self._closed and not self._publish_timer.isActive():
@@ -206,6 +234,9 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
     def _dataset_choices(self):
         groups = {}
         for dataset in self.datasets.values():
+            historical = self._current_source_keys is not None and dataset["key"] not in self._current_source_keys
+            if historical and not self._show_history:
+                continue
             group = (("DRR", dataset["source"], dataset.get("group_id", "legacy"))
                 if dataset["kind"] == "DRR" and dataset["channel"] in {"raw", "second"} else ("single", dataset["key"]))
             groups.setdefault(group, []).append(dataset["key"])
@@ -215,6 +246,8 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
             label = first.get("source_name", first["name"])
             if first["kind"] == "DRR":
                 label = label.replace(" · raw · ", " · ").replace(" · second · ", " · ")
+            if self._current_source_keys is not None and all(key not in self._current_source_keys for key in keys):
+                label += " (previous)"
             counts[label] = counts.get(label, 0) + 1
             suffix = f" ({counts[label]})" if counts[label] > 1 else ""
             choices.append(dict(key=keys[0], label=label + suffix, active=self.active_key in keys, keys=list(keys)))
@@ -243,14 +276,34 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
                         previous["group_id"] = "previous:" + previous["key"]
             if dataset["key"] in self.datasets and not replace_existing:
                 previous = self.datasets[dataset["key"]]
+                if dataset["kind"] in {"DRR", "PL"} and "auto_filters" not in previous:
+                    previous["auto_filters"] = bool(dataset.get("auto_filters")) and not previous.get("custom_filters", False)
                 changed_row = previous.get("row", 0) != dataset.get("row", previous.get("row", 0))
                 previous.update(view=dataset.get("view"), reply_server=dataset.get("reply_server", self.reply_server), row=dataset.get("row", previous.get("row", 0)))
-                if changed_row and previous.get("analysis_scope") == "spectrum":
+                reset_results = changed_row and previous.get("analysis_scope") == "spectrum"
+                migrate_drr = dataset["kind"] == "DRR" and previous.get("analysis_workflow_version", 0) < 2
+                migrate_pl = (dataset["kind"] == "PL" and previous.get("analysis_workflow_version", 0) < 3
+                              and previous.get("analysis_scope", "spectrum") == "spectrum")
+                if (migrate_drr or migrate_pl) and not previous.get("analysis_scope_explicit"):
+                    new_scope = dataset.get("analysis_scope", "map")
+                    reset_results |= previous.get("analysis_scope", "map") != new_scope
+                    previous["analysis_scope"] = new_scope
+                    previous["scope"] = dataset.get("scope", previous.get("scope", 2))
+                    if "custom_range" in dataset:
+                        previous["custom_range"] = deepcopy(dataset["custom_range"])
+                    for field in ("x_min", "x_max", "y_min", "y_max"):
+                        if field in dataset["settings"]:
+                            reset_results |= previous["settings"].get(field) != dataset["settings"][field]
+                            previous["settings"][field] = dataset["settings"][field]
+                    if dataset.get("analysis_scope_explicit"):
+                        previous["analysis_scope_explicit"] = True
+                    previous["analysis_workflow_version"] = 3
+                if reset_results:
                     for field in ("candidates", "result"):
                         previous[field] = None
                     previous.update(branches=[], branch_catalog=[], manual_seeds=False,
                         candidate_assignments={}, segment_assignments={}, overlay_position="detected")
-                for field in ("group_id", "source_name", "product_label", "source_processing"):
+                for field in ("group_id", "source_name", "product_label", "source_processing", "source_export", "processed_path", "processed_path_inferred", "processed_path_hint", "history_root"):
                     if field in dataset:
                         previous[field] = dataset[field]
             else:
@@ -268,6 +321,8 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
         dataset.setdefault("row", 0)
         dataset["row"] = max(0, min(int(dataset["row"]), len(dataset["cube"].gate) - 1))
         self._pick_seed = False
+        if dataset['kind'] != 'PL' and self._controls_page not in {'find', 'branches'}:
+            self._controls_page = 'find'
         self._selected_branch = self._selected_branch if any(branch["id"] == self._selected_branch for branch in dataset["branches"]) else next((branch["id"] for branch in dataset["branches"]), "")
         self._update_models()
         self._schedule_plot()
@@ -298,6 +353,7 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
         token = self._generation
         self._cancel_event = cancellation = Event()
         self._busy, self._operation, self._progress = True, kind, 0
+        self._refresh_peak_selection()
         started = perf_counter()
         def run():
             def progress(value):
@@ -330,6 +386,19 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
         self._busy, self._operation, self._future = False, "", None
         key, result = payload
         cancelled = self._cancel_event.is_set()
+        if cancelled or error:
+            self._next_controls_page = None
+        if not cancelled and not error and kind == 'initial-snapshot':
+            history, result, history_error, per_file = result
+            if per_file:
+                self.datasets.clear()
+                self.active_key = None
+                self._result_paths = []
+            if history:
+                self.addDatasets(history[0], replace_existing=True)
+            if history_error:
+                self.logMessage.emit(history_error)
+            kind = 'snapshot'
         if cancelled:
             self._message("Cancelled; previous results kept.")
         elif error:
@@ -343,21 +412,56 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
             for dataset in datasets:
                 if kind == "snapshot":
                     dataset["reply_server"] = getattr(self, "_loading_reply", "") or self.reply_server
+                    # Older main-app handoffs may still carry the former
+                    # implicit single-spectrum default even in a new child.
+                    if (dataset["kind"] == "PL" and dataset.get("analysis_workflow_version", 0) < 3
+                            and not dataset.get("analysis_scope_explicit")
+                            and dataset.get("analysis_scope", "spectrum") == "spectrum"):
+                        cube = dataset["cube"]
+                        dataset.update(analysis_scope="map", scope=0, analysis_workflow_version=3,
+                            candidates=None, result=None, branches=[], branch_catalog=[], manual_seeds=False,
+                            candidate_assignments={}, segment_assignments={}, overlay_position="detected")
+                        dataset["settings"].update(x_min=float(cube.energy.min()), x_max=float(cube.energy.max()),
+                                                   y_min=float(cube.gate.min()), y_max=float(cube.gate.max()))
+            if kind == "snapshot":
+                self._current_source_keys = {dataset["key"] for dataset in datasets}
+                self._show_history = False
+            else:
+                self._current_source_keys = None
+                self._show_history = False
             self.addDatasets(sorted(datasets, key=lambda dataset: dataset["key"] == active), replace_existing=kind in {"workspace", "restore"})
-        elif kind in {"detect", "filter", "track", "fit", "find-fit", "seed"} and key in self.datasets:
+        elif kind in {"detect", "filter", "auto-filter", "track", "fit", "find-fit", "seed"} and key in self.datasets:
             target = self.datasets[key]
-            for field in ("candidates", "result", "branches", "branch_catalog", "manual_seeds", "candidate_assignments", "segment_assignments", "overlay_position"):
+            for field in ("candidates", "result", "branches", "branch_catalog", "manual_seeds", "manual_peak_edits", "candidate_assignments", "segment_assignments", "overlay_position", "filters_pending", "detection_dirty"):
                 if field in result:
                     target[field] = result[field]
+            if kind in {"detect", "auto-filter", "find-fit"} and result.get("auto_filters"):
+                target["settings"] = result["settings"]
+                target["auto_filters"] = True
+                target["auto_filter_summary"] = result.get("auto_filter_summary", "")
+                target["custom_filters"] = False
             if kind in {"detect", "find-fit"}:
                 target["show_overlay"] = True
+            if self._next_controls_page and kind in {'detect', 'fit'}:
+                self._controls_page = self._next_controls_page
+                self._next_controls_page = None
+                if kind == 'detect':
+                    target['show_residual'] = False
+            if target['kind'] == 'PL' and kind == 'fit':
+                target['show_residual'] = True
             self._pick_seed = False
+            if kind == 'seed' and target['kind'] == 'PL':
+                target['show_overlay'] = True
+                target.pop('_manual_peak_draft', None)
+                edits = [edit for edit in target.get('manual_peak_edits', []) if edit['row'] == target['row'] and edit['action'] == 'set']
+                if edits:
+                    self._selected_branch = edits[-1]['branch_id']
             self._last_error = "\n".join((target.get("result") or {}).get("notices", []))
             self._update_models()
             self._schedule_plot()
             points = (target.get("result") or {}).get("points", [])
             text = (f"{sum(point['status'] == 'accepted' for point in points)} positions across {len(target['branches'])} branches."
-                    if kind not in {"detect", "filter", "seed"} else self._cache_status())
+                    if kind not in {"detect", "filter", "auto-filter", "seed"} else self._cache_status())
             if kind in {"fit", "find-fit"}:
                 text += f" {sum(point.get('fit_status') == 'ok' for point in points)} valid fits."
             if not points:
@@ -369,14 +473,15 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
                 text += " " + " ".join(notices)
             self._message(text or "Manual seed ready. Connect selected branches to track it.")
         elif kind == "export":
-            self._result_paths = [str(path) for path in sorted(Path(result).iterdir()) if path.is_file()]
-            self._message("Saved Peak Analysis package: " + result)
+            self._result_paths = list(result)
+            self._message(f"Saved {len(result)} analysis files: " + str(Path(result[0]).parent))
         elif kind == "overlay":
             self._message("Overlay sent to the matching main-app dataset.")
         elif kind == "save-copy":
             self._message("Workspace copy saved: " + str(result))
         elif kind == "save-figure":
-            self._message("Figure saved: " + str(result))
+            self._result_paths = list(result)
+            self._message(f"Saved {len(result)} figure(s): " + str(Path(result[0]).parent))
         elif kind == "save-close":
             self._close_ready = True
             self.closeReady.emit()
@@ -400,12 +505,18 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
 
     @Slot()
     def restore(self):
-        if not self.session_path.is_file() or self._closed:
+        if self._closed:
             return
         from core.peak_workspace import load_workspace
         path = self.session_path
+        if not path.is_file() and not (path.parent / 'peak-history-last.json').is_file():
+            return
+        def read(cancel, progress):
+            from core.peak_file_history import load_last_histories
+            previous = load_last_histories(path.parent)
+            return previous if previous is not None else load_workspace(path)
         self._message("Restoring Peak Analysis workspace…")
-        self._start("restore", lambda cancel, progress: load_workspace(path))
+        self._start("restore", read)
 
     def loadSnapshot(self, path, fresh=True, reply_server=""):
         if self._closed:
@@ -418,8 +529,49 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
         self._loading_reply = str(reply_server)
         if reply_server:
             self.reply_server = str(reply_server)
+        if fresh:
+            self._load_current_snapshot(path)
+            return
         self._message("Loading numeric data snapshot…" if fresh else "Loading saved analysis workspace…")
         self._start("snapshot" if fresh else "workspace", lambda cancel, progress: load_workspace(path, fresh_snapshot=fresh))
+
+    def loadInitialSnapshot(self, path, reply_server=''):
+        """Restore saved choices and the handoff in one transaction/first plot."""
+        if self._closed:
+            return
+        if self._busy or self.datasets:
+            self.loadSnapshot(path, True, reply_server)
+            return
+        self._loading_reply = str(reply_server)
+        if reply_server:
+            self.reply_server = str(reply_server)
+        self._load_current_snapshot(_path(path), initial=True)
+
+    def _load_current_snapshot(self, incoming, *, initial=False):
+        from core.peak_workspace import load_workspace
+        from ui_qt.quick.peak_analysis_workflow import capture_request
+        session = self.session_path
+        previous = [capture_request(item) for item in self.datasets.values()]
+        active = self.active_key
+        def load(cancel, progress):
+            fresh = load_workspace(incoming, fresh_snapshot=True)
+            history, history_error = None, ''
+            root = next((item['history_root'] for item in fresh[0] if item.get('history_root')), None)
+            if root:
+                from core.peak_file_history import load_histories, save_histories
+                if previous:
+                    save_histories(previous, root, active_key=active)
+                saved, report = load_histories(fresh[0], root, legacy_path=session)
+                history = saved, None
+                history_error = str(report.get('warning', ''))
+            elif initial and session.is_file():
+                try:
+                    history = load_workspace(session)
+                except ValueError as error:
+                    history_error = str(error)
+            return history, fresh, history_error, bool(root)
+        self._message('Loading current data and saved analysis choices…')
+        self._start('initial-snapshot', load)
 
     @Slot(str, "QVariantList")
     def openFiles(self, kind, urls):
@@ -440,17 +592,31 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
         self._filter_timer.stop()
         dataset = capture_request(self.dataset)
         self._message({"detect": "Finding features…", "find-fit": "Finding and fitting PL peaks…", "filter": "Filtering cached candidates…",
+            "auto-filter": "Generating filters from the candidate data…",
             "track": "Connecting selected branches…", "fit": "Fitting selected PL branches…"}[action])
         self._start(action, lambda cancel, progress: analyze_dataset(dataset, action, cancelled=cancel, progress=progress), dataset_key=dataset["key"])
 
     def _start_seed(self, energy):
         from ui_qt.quick.peak_analysis_workflow import add_seed, capture_request
         dataset = capture_request(self.dataset)
+        if dataset['kind'] == 'PL':
+            from core.pl_manual_peaks import edit_pl_peak
+            draft = dict(self._manual_peak_draft(self.dataset))
+            self._start('seed', lambda cancel, progress: edit_pl_peak(dataset, dataset['row'], energy,
+                width_mev=draft['width_mev'], move_limit_mev=draft['move_limit_mev'], fixed=draft['fixed']), dataset_key=dataset['key'])
+            return
         self._start("seed", lambda cancel, progress: add_seed(dataset, dataset["row"], energy), dataset_key=dataset["key"])
 
     def _queue_filter(self):
-        if self.dataset and self.dataset.get("candidates") and not self._busy:
-            self._filter_timer.start(100)
+        if self.dataset:
+            self.dataset["auto_filters"] = False
+            self.dataset["filters_pending"] = True
+            self._refresh_peak_selection()
+            if self.dataset['kind'] == 'PL':
+                from core.peak_analysis_state import invalidate_fit
+                invalidate_fit(self.dataset)
+                self._schedule_plot()
+            self._message("Filter settings changed. Click Apply filters." if self.dataset.get("candidates") else "Find candidates first, then Apply filters.")
         self._publish()
 
     def _clear_scope_results(self):
@@ -464,7 +630,7 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
         self._selected_branch = ""
         self._update_models()
         self._schedule_plot()
-        self._message("Selection changed. Click Find & Fit." if dataset["kind"] == "PL" else "Selection changed. Click Find.")
+        self._message("Selection changed. Find peaks to start reviewing this range.")
 
     def _scope_settings(self, dataset):
         cube, scope = dataset["cube"], dataset.get("scope", 0)
@@ -495,9 +661,26 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
         if self._busy and key not in {"showOverlay", "markerSize"}:
             return
         try:
+            if key == "showHistory":
+                self._show_history = bool(value)
+                if not self._show_history and self._current_source_keys is not None and self.active_key not in self._current_source_keys:
+                    self.active_key = next((item for item in reversed(self.datasets) if item in self._current_source_keys), None)
+                    self._select_dataset()
+                self._publish()
+                return
             if key == "controlsPage":
-                if value in {"find", "branches"}:
+                if value in {"find", "branches", "fit", "results"}:
                     self._controls_page = value
+                    self._pick_seed = False
+                    self._refresh_peak_selection()
+                    if dataset and dataset['kind'] == 'PL' and value in {'find', 'branches', 'fit'}:
+                        dataset['plot_view'] = 'spectra'
+                        if value in {'find', 'branches'}:
+                            dataset['show_residual'] = False
+                        if self._canvas is not None and 'map_height_percent' not in dataset:
+                            self._resize_plot()
+                            self._canvas.draw_idle()
+                        self._schedule_plot()
                     self._update_models()
                 self._publish()
                 return
@@ -510,6 +693,19 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
                     self._select_dataset()
                 return
             if dataset is None:
+                return
+            if key == "mapHeightPercent":
+                if value == "auto":
+                    dataset.pop("map_height_percent", None)
+                else:
+                    value = float(value)
+                    if not isfinite(value):
+                        raise ValueError("Map height must be finite.")
+                    dataset["map_height_percent"] = max(20, min(80, round(value)))
+                if self._canvas is not None:
+                    self._resize_plot()
+                    self._canvas.draw_idle()
+                self._publish()
                 return
             if key == "exportCurveScope":
                 if value not in {"current", "all"}:
@@ -529,14 +725,24 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
             if key == "analysisScope":
                 if value not in {"spectrum", "map"}:
                     raise ValueError("Choose Current spectrum or Full map.")
+                dataset["analysis_scope_explicit"] = True
                 if value != dataset.get("analysis_scope", "map"):
                     dataset["analysis_scope"] = value
                     self._clear_scope_results()
                 self._publish()
                 return
             if key == "filterPreset":
-                if value == "Custom":
+                if value == "Auto from data":
+                    if dataset.get("candidates"):
+                        self.invoke("auto-filter")
+                    else:
+                        dataset["auto_filters"] = True
+                        self._message("Find candidates will generate and apply filters from the data.")
+                elif value == "All candidates" and dataset["kind"] == "DRR":
+                    self.invoke("reset-filters")
+                elif value == "Custom":
                     dataset["custom_filters"] = True
+                    dataset["auto_filters"] = False
                 elif value in {"Balanced", "Sensitive", "Strict"}:
                     self.invoke("preset:" + value)
                 self._publish()
@@ -563,11 +769,30 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
                 if dataset.get("analysis_scope") == "spectrum" and previous_row != dataset["row"]:
                     self._clear_scope_results()
                 self._row_timer.start(0)
+            elif key.startswith("manual.") and dataset['kind'] == 'PL':
+                field = key.partition('.')[2]
+                draft = self._manual_peak_draft(dataset)
+                if field == 'target':
+                    self._selected_branch = str(value)
+                    dataset.pop('_manual_peak_draft', None)
+                    self._refresh_peak_selection()
+                elif field == 'fixed':
+                    draft[field] = bool(value)
+                elif field in {'energy', 'width_mev', 'move_limit_mev'}:
+                    numeric = float(value)
+                    if not isfinite(numeric) or (field != 'energy' and numeric <= 0):
+                        raise ValueError('Enter a finite position and positive width / movement range.')
+                    draft[field] = numeric
+                self._update_models()
             elif key == "selectedBranch":
                 branch = next((branch for branch in dataset["branches"] if branch["id"] == str(value)), None)
                 if branch is not None:
                     self._selected_branch = str(value)
-                    dataset["row"] = branch["seed_row"]
+                    if dataset['kind'] != 'PL' or not any(p.get('branch_id') == str(value) and p['row_index'] == dataset['row']
+                            for p in (dataset.get('result') or {}).get('points', [])):
+                        dataset["row"] = branch["seed_row"]
+                    dataset.pop('_manual_peak_draft', None)
+                    self._refresh_peak_selection()
                     self._row_timer.start(0)
             elif key.startswith("branch."):
                 _, identity, field = key.split(".", 2)
@@ -586,7 +811,11 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
                             for fitted_field in ("fit_status", "fit_center", "center_error_ev", "fwhm_mev", "fwhm_error_mev", "height", "height_error", "area", "area_error", "fit_area_full", "fit_area_full_error", "uncertainty_status", "rms"):
                                 point.pop(fitted_field, None)
                     dataset["overlay_position"] = "detected"
-                    self._queue_filter()
+                    if dataset['kind'] == 'PL':
+                        from core.peak_analysis_state import invalidate_fit
+                        invalidate_fit(dataset)
+                    else:
+                        self._queue_filter()
                 self._update_models()
                 self._schedule_plot()
             elif key == "markerSize":
@@ -595,6 +824,9 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
                 if self._heat is not None:
                     resize_overlay(self._heat, dataset["marker_size"])
                     self._canvas.draw_idle()
+            elif key == 'showWholeBranches':
+                dataset['show_whole_branches'] = bool(value)
+                self._update_models()
             elif key in {"showOverlay", "showResidual", "showRejected", "pickSeed"}:
                 if key == "pickSeed":
                     self._pick_seed = bool(value)
@@ -609,6 +841,20 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
             elif key == "scope":
                 dataset["scope"] = max(0, min(2, int(value)))
                 self._apply_scope_settings()
+            elif key == 'pl_weak_features' and dataset['kind'] == 'PL':
+                dataset['settings'][key] = bool(value)
+                dataset['filters_pending'] = True
+                dataset['detection_dirty'] = True
+                self._refresh_peak_selection()
+                from core.peak_analysis_state import invalidate_fit
+                invalidate_fit(dataset)
+                if value:
+                    dataset['settings']['candidate_floor'] = 0.
+                self._message('Detection settings changed. Click Find to rebuild candidates before applying filters.')
+            elif key in {'remove_scatter', 'neighbor_adaptive'} and dataset['kind'] == 'DRR':
+                dataset['settings'][key] = bool(value)
+                dataset['custom_filters'] = True
+                self._queue_filter()
             elif key in _NUMBERS or key in {"detection_method", "polarity", "model"}:
                 settings = dataset["settings"]
                 if key in _NUMBERS:
@@ -620,13 +866,19 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
                         value = int(round(value))
                     if key == "smoothing_window" and value % 2 == 0:
                         value += 1
-                elif value not in {"detection_method": {"local", "sg"}, "polarity": {"both", "peaks", "dips"}, "model": {"Lorentzian", "Gaussian"}}[key]:
+                elif value not in {"detection_method": {"local", "sg"}, "polarity": {"both", "peaks", "dips"}, "model": {"Lorentzian", "Gaussian", "Asymmetric Lorentzian"}}[key]:
                     raise ValueError("Unknown Peak Analysis option.")
                 if key == "polarity" and dataset["kind"] == "PL":
                     value = "peaks"
                 if settings.get(key) == value:
                     return
                 settings[key] = value
+                if key == 'model' and dataset['kind'] == 'PL':
+                    from core.peak_analysis_state import invalidate_fit
+                    invalidate_fit(dataset)
+                    self._schedule_plot()
+                    self._message('Peak shape changed. Fit the checked peaks again; detection and filters are unchanged.')
+                    return
                 if key in {"min_snr", "prominence", "min_width_mev", "min_distance_mev", "neighbor_support", "neighbor_tolerance_mev", "max_width_mev", "max_per_row"}:
                     dataset["custom_filters"] = True
                 if key in {"x_min", "x_max", "y_min", "y_max"}:
@@ -635,6 +887,12 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
                 if key not in {"detection_method", "smoothing_window", "candidate_floor"}:
                     self._queue_filter()
                 else:
+                    if dataset['kind'] == 'PL':
+                        from core.peak_analysis_state import invalidate_fit
+                        invalidate_fit(dataset)
+                        dataset.update(detection_dirty=True, filters_pending=True)
+                        self._refresh_peak_selection()
+                        self._schedule_plot()
                     self._message("Detection settings changed. Find all peaks to rebuild; existing cached measurements remain unchanged.")
         except (ValueError, TypeError, KeyError, IndexError, StopIteration) as error:
             self._message(str(error), error=True)
@@ -658,7 +916,10 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
         if self._busy:
             return
         dataset = self.dataset
-        if action in {"detect", "filter", "track", "fit", "find-fit"}:
+        if action in {'workflow-find', 'workflow-fit'} and dataset:
+            self._next_controls_page = 'branches' if action == 'workflow-find' else 'results'
+            action = 'detect' if action == 'workflow-find' else 'fit'
+        if action in {"detect", "filter", "auto-filter", "track", "fit", "find-fit"}:
             self._analyze(action)
         elif action.startswith("preset:") and dataset:
             from core.peak_profiles import filter_presets
@@ -669,23 +930,58 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
                 dataset["custom_filters"] = False
                 self._queue_filter()
         elif action == "reset-filters" and dataset:
-            dataset["scope"] = 0
+            dataset["custom_filters"] = False
             dataset["settings"].update(prominence=0., min_width_mev=0., min_distance_mev=0., min_snr=0.,
-                neighbor_support=0, max_width_mev=0., max_per_row=0, polarity="both" if dataset["kind"] == "DRR" else "peaks")
+                neighbor_support=0, max_width_mev=0., max_per_row=0, remove_scatter=False, neighbor_adaptive=False)
+            if dataset["kind"] == "PL":
+                dataset["scope"] = 0
+                dataset["settings"]["polarity"] = "peaks"
             self._apply_scope_settings()
             self._queue_filter()
+        elif action in {'manual-add', 'manual-move', 'manual-exclude', 'manual-restore'} and dataset and dataset['kind'] == 'PL':
+            from core.pl_manual_peaks import edit_pl_peak, exclude_pl_peak, restore_pl_peak_edits
+            from ui_qt.quick.peak_analysis_workflow import capture_request
+            captured, row = capture_request(dataset), dataset['row']
+            draft, branch = dict(self._manual_peak_draft(dataset)), self._selected_branch
+            def edit(cancel, progress):
+                if action == 'manual-exclude':
+                    return exclude_pl_peak(captured, row, branch)
+                if action == 'manual-restore':
+                    return restore_pl_peak_edits(captured, row)
+                return edit_pl_peak(captured, row, draft['energy'],
+                    branch_id=branch if action == 'manual-move' else None,
+                    width_mev=draft['width_mev'], move_limit_mev=draft['move_limit_mev'], fixed=draft['fixed'])
+            self._start('seed', edit, dataset_key=dataset['key'])
         elif action == "exclude-branch" and self._selected_branch:
             self.setParameter("branch." + self._selected_branch + ".enabled", False)
-        elif action == "pick-seed":
+        elif action in {"pick-seed", "manual-pick"}:
             self._pick_seed = not self._pick_seed
         elif action in {"results", "close-results"}:
             self._show_results = action == "results"
             self._update_models()
         elif action in {"task-details", "close-details"}:
             self._show_details = action == "task-details"
+        elif action in {"save-results", "save-data"}:
+            self._save_results()
+        elif action == 'save-figure-auto' and dataset:
+            from core.peak_output_names import output_stem
+            destination = self._save_folder() / (output_stem(dataset) + '_figure.png')
+            self.saveFigure(str(destination), automatic=True)
+        elif action == 'open-save-folder' and dataset:
+            from PySide6.QtGui import QDesktopServices
+            folder = self._save_folder()
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+                if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder))):
+                    self._message('Could not open save folder: ' + str(folder), error=True)
+            except OSError as error:
+                self._message(str(error), error=True)
         elif action in {"open-workspace", "save-copy", "export-dialog", "save-figure"}:
-            self.dialogRequested.emit(action, QUrl.fromLocalFile(str(self.session_path if action == "save-copy" else self.session_path.parent)).toString())
-        elif action == "apply-overlay" and dataset and dataset.get("result"):
+            if action == "save-figure" and not self._figure_save_ready():
+                return
+            destination = self.session_path if action == 'save-copy' else self._save_folder()
+            self.dialogRequested.emit(action, QUrl.fromLocalFile(str(destination)).toString())
+        elif action == "apply-overlay" and self.snapshot['canApplyOverlay']:
             from ui_qt.quick.peak_analysis_workflow import capture_request, send_overlay
             captured = capture_request(dataset)
             session, reply = self.session_path, dataset.get("reply_server", self.reply_server)
@@ -698,12 +994,28 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
 
     @Slot(str)
     def exportTo(self, folder):
-        if self._closed or self._busy or not self.dataset or not self.dataset.get("result"):
+        if self._closed or not self.snapshot['canExport']:
             return
-        from ui_qt.quick.peak_analysis_workflow import capture_request, export_analysis
+        from ui_qt.quick.peak_analysis_workflow import capture_request, export_analysis, refresh_source_export
         dataset, destination = capture_request(self.dataset), _path(folder)
-        self._message("Exporting XLSX, CSV, settings and PNG package…")
-        self._start("export", lambda cancel, progress: export_analysis(destination, dataset, cancelled=cancel, progress=progress))
+        self._message("Saving Excel results, source plot overlay and analysis JSON…")
+        session = self.session_path
+        self._start("export", lambda cancel, progress: export_analysis(destination,
+            refresh_source_export(dataset, session, cancelled=cancel), cancelled=cancel, progress=progress))
+
+    def _save_results(self):
+        if self._closed or not self.snapshot['canExport']:
+            return
+        from ui_qt.quick.peak_analysis_workflow import capture_request, export_analysis, refresh_source_export
+        dataset, destination = capture_request(self.dataset), self._save_folder()
+        datasets, active, session = [capture_request(item) for item in self.datasets.values()], self.active_key, self.session_path
+        def write(cancel, progress):
+            destination.mkdir(parents=True, exist_ok=True)
+            self._write_history(datasets, active, session)
+            current = refresh_source_export(dataset, session, cancelled=cancel)
+            return export_analysis(destination, current, cancelled=cancel, progress=progress)
+        self._message('Saving Excel results, source plot overlay and analysis JSON…')
+        self._start('export', write)
 
     @Slot(str)
     def saveWorkspace(self, path):
@@ -719,22 +1031,30 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
         self._message("Saving workspace copy…")
         self._start("save-copy", write)
 
+    def _figure_save_ready(self):
+        if self.dataset is None:
+            return False
+        if self.dataset.get("detection_dirty"):
+            self._message("Detection settings changed. Find peaks before saving the figure.", error=True)
+            return False
+        if self.dataset.get("filters_pending") or self._filter_timer.isActive():
+            self._message("Apply filters before saving the figure.", error=True)
+            return False
+        return True
+
     @Slot(str)
-    def saveFigure(self, path):
+    def saveFigure(self, path, *, automatic=False):
         if self._closed or self._busy or self.dataset is None:
+            return
+        if not self._figure_save_ready():
             return
         from ui_qt.quick.peak_analysis_workflow import capture_request
         dataset, destination = capture_request(self.dataset), _path(path)
         def write(cancel, progress):
-            from matplotlib.figure import Figure
-            from matplotlib.backends.backend_agg import FigureCanvasAgg
-            from core.peak_plotting import build_figure
-            figure = Figure(figsize=(9, 7))
-            FigureCanvasAgg(figure)
-            build_figure(dataset, dataset["row"], dataset.get("show_overlay", True), dataset.get("show_residual", False), figure)
-            save_figure(figure, destination, dpi=180)
-            figure.clear()
-            return str(destination)
+            from core.peak_figure_export import export_source_figures
+            from ui_qt.quick.peak_analysis_workflow import refresh_source_export
+            current = refresh_source_export(dataset, self.session_path, cancelled=cancel)
+            return export_source_figures(destination, current, cancelled=cancel)
         self._start("save-figure", write)
 
     @Slot()
@@ -758,11 +1078,10 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
             self._close_ready = True
             self.closeReady.emit()
             return
-        from core.peak_workspace import save_workspace
         from ui_qt.quick.peak_analysis_workflow import capture_request
         datasets, active, path = [capture_request(item) for item in self.datasets.values()], self.active_key, self.session_path
-        self._message("Saving workspace before closing…")
-        self._start("save-close", lambda cancel, progress: save_workspace(path, datasets, active))
+        self._message("Saving analysis history before closing…")
+        self._start("save-close", lambda cancel, progress: self._write_history(datasets, active, path))
 
     def _cache_status(self):
         dataset = self.dataset
@@ -777,12 +1096,52 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
         if not pool.get("quality"):
             text += "\nLegacy cache: choose a preset to add noise evidence."
         if detection_settings(dataset["settings"]) != config:
-            text += "\nDetection changed. Find all peaks to rebuild; filters use the existing cache."
+            text += ("\nPL detection mode changed. Find again before filtering." if dataset['kind'] == 'PL'
+                     and bool(dataset['settings'].get('pl_weak_features')) != bool(config.get('pl_weak_features'))
+                     else "\nDetection changed. Find all peaks to rebuild; filters use the existing cache.")
         if dataset["settings"]["prominence"] < config["candidate_floor"]:
             text += "\nBelow cached floor: lower Candidate floor and find again for weaker features."
+        if dataset.get("filters_pending"):
+            text += "\nFind again to apply the detection change." if dataset.get('detection_dirty') else "\nFilter changes not applied. Click Apply filters."
         return text
 
+    @staticmethod
+    def _filter_preview_summary(dataset):
+        from core.peak_filter_preview import preview_summary
+        text = preview_summary(dataset.get('result'))
+        if dataset.get('filters_pending'):
+            text = 'Preview shows the last applied filters. Click Apply filters to update.\n' + text
+        return text
+
+    @staticmethod
+    def _scatter_summary(dataset):
+        from core.peak_filter_preview import scatter_summary
+        text = scatter_summary(dataset.get('result'))
+        if text and dataset.get('filters_pending'):
+            text = 'Last applied result; draft changes pending. ' + text
+        return text
+
+    def _manual_peak_draft(self, dataset):
+        context = (dataset['row'], self._selected_branch)
+        draft = dataset.get('_manual_peak_draft')
+        if not draft or tuple(draft.get('context', ())) != context:
+            point = next((p for p in (dataset.get('result') or {}).get('points', [])
+                if p['row_index'] == dataset['row'] and p.get('branch_id') == self._selected_branch), {})
+            energy = float(point.get('energy', dataset['cube'].energy[len(dataset['cube'].energy)//2]))
+            draft = dict(context=context, energy=energy, width_mev=float(point.get('width_mev') or 5.),
+                move_limit_mev=max(.001, (point.get('fit_center_max', energy+.003)-energy)*1000),
+                fixed=bool(point.get('fit_center_fixed', False)))
+            dataset['_manual_peak_draft'] = draft
+        return draft
+
     def _parameter_groups(self):
+        legacy = self._legacy_parameter_groups()
+        if self.dataset and self.dataset['kind'] == 'PL':
+            from ui_qt.quick.peak_analysis_pages import pl_parameter_groups
+            return pl_parameter_groups(self, legacy, self._legacy_parameter_groups(page='find'))
+        return legacy
+
+    def _legacy_parameter_groups(self, page=None):
         dataset = self.dataset
         if dataset is None:
             return []
@@ -799,22 +1158,51 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
         def choice(key, label, value, options, **extra):
             return dict(key=key, type="choice", label=label, value=value,
                 options=[dict(value=item, label=title) for item, title in options], enabled=editable, **extra)
-        if self._controls_page == "branches":
+        if (page or self._controls_page) == "branches":
             manual = not dataset.get("candidates") or dataset.get("manual_seeds")
-            return [dict(key="branch-actions", title="Branches", fields=[
-                action("track", "Connect selected branches", enabled=editable and bool(dataset["branches"]), primary=True),
-                action("pick-seed", "Pick seed on spectrum"), action("exclude-branch", "Exclude selected branch"),
+            pl = dataset['kind'] == 'PL'
+            manual_groups = []
+            if pl:
+                draft = self._manual_peak_draft(dataset)
+                points = [p for p in (dataset.get('result') or {}).get('points', [])
+                    if p['row_index'] == dataset['row'] and p.get('branch_id')]
+                names = {b['id']: b['name'] for b in dataset['branches']}
+                selected = any(p['branch_id'] == self._selected_branch for p in points)
+                def manual_number(key, label, minimum, maximum, step, decimals):
+                    return dict(key='manual.'+key, type='number', label=label, value=draft[key],
+                        min=minimum, max=maximum, step=step, decimals=decimals, enabled=editable)
+                manual_groups = [dict(key='manual-peaks', title='Edit current spectrum', fields=[
+                    dict(key='manual-row', type='summary', value=f"{dataset['cube'].gate_label}: {dataset['cube'].gate[dataset['row']]:.6g}. These edits affect this spectrum only."),
+                    choice('manual.target', 'Selected peak', self._selected_branch if selected else '',
+                        [('', 'Select a peak')] + [(p['branch_id'], f"{names.get(p['branch_id'], 'Peak')} · {p['energy']:.6f} eV") for p in points]),
+                    manual_number('energy', 'Initial position (eV)', float(dataset['cube'].energy.min()), float(dataset['cube'].energy.max()), .0001, 6),
+                    action('manual-pick', 'Cancel picking' if self._pick_seed else 'Add by clicking spectrum'),
+                    action('manual-add', 'Add peak at position'),
+                    action('manual-move', 'Update selected peak', enabled=editable and selected),
+                    action('manual-exclude', 'Exclude selected peak here', enabled=editable and selected),
+                    dict(key='manual-note', type='summary', value='Exclusions survive Find and filtering. Refit after editing.')]),
+                    dict(key='manual-constraints', title='Peak constraints / reset', advanced=True, fields=[
+                    manual_number('width_mev', 'Initial width (meV)', .001, 1000., .1, 3),
+                    manual_number('move_limit_mev', 'Allowed movement ± (meV)', .001, 1000., .1, 3),
+                    dict(key='manual.fixed', type='flag', label='Fix center at this position', value=draft['fixed'], enabled=editable),
+                    action('manual-restore', 'Reset edits in this spectrum', enabled=editable and any(e['row'] == dataset['row'] for e in dataset.get('manual_peak_edits', []))),
+                    dict(key='manual-constraint-note', type='summary', value='Position is an initial guess unless fixed. Click Update selected peak to apply these constraints. Check the residual before trusting overlapping peaks.')])]
+            return [*manual_groups, dict(key="branch-actions", title="Whole branches", advanced=pl, fields=[
+                action("track", "Connect selected branches", enabled=editable and bool(dataset["branches"]), primary=True, visible=not pl),
+                action("pick-seed", "Pick seed on spectrum", visible=not pl), action("exclude-branch", "Exclude selected whole branch"),
                 dict(key="branch-guidance", type="summary", value="Check branches to include them; edit names above. Names, IDs and colors survive reversible filter splits. Ambiguous matches remain separate points.")]),
                 dict(key="fit", title="Fit (optional)", fields=[
-                    choice("model", "Model", values["model"], [("Lorentzian", "Lorentzian"), ("Gaussian", "Gaussian")]),
-                    action("fit", "Fit selected PL branches", enabled=editable and dataset["kind"] == "PL" and bool(dataset["branches"])),
+                    choice("model", "Model", values["model"], [("Lorentzian", "Lorentzian"), ("Gaussian", "Gaussian"), ("Asymmetric Lorentzian", "Asymmetric Lorentzian")]),
+                    action("fit", "Fit selected PL branches", enabled=editable and dataset["kind"] == "PL" and bool(dataset["branches"]), visible=not pl),
                     dict(key="showResidual", type="flag", label="Show residual", value=dataset.get("show_residual", False), enabled=editable and dataset["kind"] == "PL"),
                     choice("overlayPosition", "Overlay positions", dataset.get("overlay_position", "detected"),
                         [("detected", "Detected positions"), ("fitted", "Valid fitted centers")], visible=dataset["kind"] == "PL")]),
                 dict(key="branch-settings", title="Branch settings", advanced=True, fields=[number("max_shift_mev", "Maximum step (meV)"),
                     {**number("noise_sigma", "Noise multiplier"), "enabled": editable and manual},
                     {**number("max_gap", "Maximum missing rows"), "enabled": editable and manual},
-                    dict(key="manual-tracking-note", type="summary", value="Noise multiplier and missing-row tolerance apply only to manual seed tracking. Cached candidate association uses Maximum step and breaks at missing rows.")])]
+                    dict(key="manual-tracking-note", type="summary", value=("PL weak-feature association uses Maximum step and Maximum missing rows; predictions do not add measured points. Noise multiplier applies to manual seeds."
+                        if dataset['kind'] == 'PL' and values.get('pl_weak_features') else
+                        "Noise multiplier and missing-row tolerance apply only to manual seed tracking. Cached candidate association uses Maximum step and breaks at missing rows."))])]
         method = "Local extrema: SciPy find_peaks, without smoothing. "
         if values.get("detection_method") == "sg":
             method = "SG order 2 smoothing, then SciPy find_peaks. No extra derivative. "
@@ -834,14 +1222,78 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
                 bounds.append(number(axis + "_" + suffix, title, pair=axis + "-range", pairLabel=label, shortLabel=title))
         matching = next((name for name, preset in presets.items() if all(abs(float(values.get(key, 0)) - value) <= 1e-8 for key, value in preset.items())), "Custom")
         step = float((dataset["cube"].energy[-1] - dataset["cube"].energy[0]) * 1000 / (len(dataset["cube"].energy) - 1))
-        custom = dataset.get("custom_filters", False) or matching == "Custom"
+        custom = not dataset.get('auto_filters', False) and (dataset.get("custom_filters", False) or matching == "Custom")
         spectrum = dataset.get("analysis_scope", "map") == "spectrum"
         pl = dataset["kind"] == "PL"
+        if not pl:
+            loose_keys = ("min_snr", "prominence", "min_width_mev", "min_distance_mev",
+                "neighbor_support", "max_width_mev", "max_per_row", "remove_scatter")
+            if all(values.get(key, 0) == 0 for key in loose_keys):
+                matching = "All candidates"
+            return [dict(key="find-candidates", title="1 Find candidates", fields=[
+                    choice("analysisScope", "Spectra", dataset.get("analysis_scope", "map"),
+                        [("map", "All spectra in dataset"), ("spectrum", "Current spectrum")]),
+                    dict(key="candidate-explanation", type="summary", value="Find detects peaks and dips, then applies automatic or current filters for preview. Filtering keeps all candidates available."),
+                    action("detect", "Find candidates", enabled=editable, primary=True,
+                        description="Detect peaks and dips, then apply automatic or current filters for preview.")]),
+                dict(key="detection-settings", title="Detection settings", advanced=True, fields=[
+                    choice("detection_method", "Smoothing", values["detection_method"],
+                        [("local", "Off"), ("sg", "Extra SG" if derivative else "Savitzky–Golay")]),
+                    number("smoothing_window", "SG window (samples)", visible=values["detection_method"] == "sg"),
+                    number("candidate_floor", "Candidate floor", description="0 keeps weak extrema. Changing detection settings requires Find candidates again.")]),
+                dict(key="filters", title="2 Filter results", fields=[
+                    choice("polarity", "Keep", values["polarity"],
+                        [("both", "Both"), ("peaks", "Peaks only"), ("dips", "Dips only")]),
+                    choice("scope", "Keep range", dataset.get("scope", 0),
+                        [(0, "Full range"), (1, "Follow plot view"), (2, "Custom range")]),
+                    *[{**bound, "visible": dataset.get('scope', 0) == 2 and (not spectrum or bound['key'].startswith('x_'))} for bound in bounds],
+                    choice("filterPreset", "Filters", "Auto from data" if dataset.get("auto_filters") else "Custom" if dataset.get("custom_filters") else matching,
+                        [(name, name) for name in ("Auto from data", "All candidates", *presets, "Custom")]),
+                    action("auto-filter", "Suggest filters", enabled=editable and bool(dataset.get("candidates")),
+                        description="Generate and apply new filters for this range. Replaces manual filter values."),
+                    dict(key="showRejected", type="flag", label="Preview excluded points", value=dataset.get("show_rejected", False), enabled=editable and bool(dataset.get('result')))]),
+                dict(key="filter-settings", title="Adjust filters", advanced=True, fields=[
+                    dict(key='remove_scatter', type='flag', label='Remove isolated clusters',
+                        value=bool(values.get('remove_scatter')), enabled=editable, visible=not spectrum),
+                    number("min_snr", "Min SNR"),
+                    number("prominence", "Min prominence"),
+                    number("min_width_mev", "Min width (meV)"),
+                    number("min_distance_mev", "Min spacing (meV)"),
+                    number("max_width_mev", "Max width (0 = off)"),
+                    number("max_per_row", "Max features per row (0 = off)"),
+                    number("neighbor_support", "Neighbor support (of 5)", visible=not spectrum),
+                    number("neighbor_tolerance_mev", "Base neighbor drift (meV / row)", visible=not spectrum),
+                    dict(key='neighbor_adaptive', type='flag', label='Adapt matching to peak width',
+                        value=bool(values.get('neighbor_adaptive')), enabled=editable, visible=not spectrum,
+                        description='Allows broad peaks up to twice the base drift when both spectra agree on an unambiguous nearest match. Apply filters to update.'),
+                    action("reset-filters", "Clear quality filters")]),
+                dict(key="details", title="Details", advanced=True, fields=[
+                    dict(key='scatter-status', type='summary', value=self._scatter_summary(dataset),
+                        visible=bool(dataset.get('result'))),
+                    dict(key="filter-note", type="summary", value=(
+                        dataset.get("auto_filter_summary") or "Find automatically generates and applies filters from the data."
+                        if dataset.get("auto_filters") else "Manual filters. Edit under Adjust filters, then click Apply filters. Suggest filters replaces manual values.")),
+                    dict(key="exclusion-summary", type="summary", value=self._filter_preview_summary(dataset),
+                        visible=bool(dataset.get('show_rejected') and dataset.get('result'))),
+                    dict(key="cache-details", type="summary", value=self._cache_status()),
+                    dict(key="method-note", type="summary", value=method),
+                    dict(key="input-processing", type="summary", value=processing, visible=derivative),
+                    choice("exportCurveScope", "Export curves", dataset.get("export_curve_scope", "current"),
+                        [("current", "Current spectrum"), ("all", "All analyzed spectra")]),
+                    action("results", "View all results", visible=bool(dataset.get("result")))])]
         summary = []
+        fit = next((item for item in (dataset.get('result') or {}).get('fits', [])
+                    if item['row_index'] == dataset['row']), None)
+        if fit and fit.get('fit_quality'):
+            quality = fit['fit_quality']
+            summary.append('Current fit: ' + str(quality['status']))
+            summary.append(f"Model comparison excluded {quality['excluded_count']} automatic component(s).")
+            summary.append('Map: cyan circles = detected; orange crosses = unconfirmed detections; lines = valid fitted centers.')
         for point in (dataset.get("result") or {}).get("points", [])[:6]:
             center = point.get("fit_center") if point.get("fit_status") == "ok" else point["energy"]
             width = point.get("fwhm_mev")
-            text = f"{point['polarity'].title()} · {center:.6g} eV"
+            label = 'Shoulder candidate' if point.get('candidate_origin') == 'curvature' else point['polarity'].title()
+            text = f"{label} · {center:.6g} eV"
             if point.get("fit_status") == "ok" and point.get("center_error_ev") is not None:
                 text += f" ± {point['center_error_ev']:.2g} eV"
             if point.get("fit_status") == "ok" and width is not None:
@@ -853,13 +1305,17 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
             summary.append(text)
         return [dict(key="find", title="Analyze", fields=[
                 choice("analysisScope", "Analyze", dataset.get("analysis_scope", "map"),
-                    [("spectrum", "Current spectrum"), ("map", "Full map")], visible=not spectrum),
-                dict(key="target-note", type="summary", value="Current spectrum · " + f"{float(dataset['cube'].gate[dataset['row']]):.6g} " + dataset['cube'].gate_unit, visible=spectrum),
+                    [("map", "All spectra in dataset"), ("spectrum", "Current spectrum")]),
+                dict(key="target-note", type="summary", value=(
+                    "Current spectrum · " + f"{float(dataset['cube'].gate[dataset['row']]):.6g} " + dataset['cube'].gate_unit
+                    if spectrum else f"{sum(values['y_min'] <= y <= values['y_max'] for y in dataset['cube'].gate)} / {len(dataset['cube'].gate)} spectra in range · selected dataset only")),
                 choice("scope", "Range", dataset.get("scope", 0), [(0, "Full range"), (1, "Follow plot view"), (2, "Custom / captured view")]),
                 *[bound for bound in bounds if not spectrum or bound["key"].startswith("x_")],
                 choice("polarity", "Feature", values["polarity"], [("both", "Both"), ("peaks", "Peaks"), ("dips", "Dips")], visible=not pl),
-                choice("filterPreset", "Filter", "Custom" if custom else matching,
-                    [(name, name) for name in (*presets, "Custom")]),
+                choice("filterPreset", "Filter", "Auto from data" if dataset.get('auto_filters') else "Custom" if custom else matching,
+                    [(name, name) for name in ("Auto from data", *presets, "Custom")]),
+                action("auto-filter", "Suggest filters", enabled=editable and bool(dataset.get('candidates')),
+                    description="Compare noise and continuity filters using cached candidates; replaces manual thresholds."),
                 number("min_snr", "Min SNR", visible=custom, description="Prominence / estimated noise; 0 disables this filter."),
                 number("prominence", "Min prominence", visible=custom, description="Fraction of the spectrum range."),
                 number("min_width_mev", "Min width (meV)", visible=custom, description="Width at half prominence, separate from fitted FWHM."),
@@ -872,13 +1328,18 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
                 {**number("smoothing_window", "SG window (samples)"), "visible": values["detection_method"] == "sg",
                     "description": f"Approximate span: {(values['smoothing_window'] - 1) * step:.4g} meV. Smoothing is for detection only."},
                 dict(key="method-note", type="summary", value=method),
+                dict(key='pl_weak_features', type='flag', label='Recover weak PL features',
+                    value=bool(values.get('pl_weak_features', False)), enabled=editable,
+                    description='Local noise, separate branch tracking and provisional multiscale shoulders (orange diamonds). Rebuild candidates after changing. Shoulder contrast is not measured prominence.'),
+                dict(key='pl-filter-summary', type='summary', value=dataset.get('auto_filter_summary', ''),
+                    visible=bool(dataset.get('auto_filter_summary'))),
                 dict(key="input-processing", type="summary", value=processing, visible=derivative),
                 number("min_distance_mev", "Min spacing (meV)"),
                 number("max_width_mev", "Max width (0 = off)"), number("max_per_row", "Max features per row (0 = off)"),
                 number("neighbor_support", "Neighbor support (of 5)", visible=not spectrum),
                 number("neighbor_tolerance_mev", "Neighbor drift (meV / row)", visible=not spectrum),
                 number("candidate_floor", "Candidate floor", description="Lower this and find again to include weaker features omitted from the cache."),
-                choice("model", "Fit model", values["model"], [("Lorentzian", "Lorentzian"), ("Gaussian", "Gaussian")], visible=pl),
+                choice("model", "Fit model", values["model"], [("Lorentzian", "Lorentzian"), ("Gaussian", "Gaussian"), ("Asymmetric Lorentzian", "Asymmetric Lorentzian")], visible=pl),
                 dict(key="showRejected", type="flag", label="Show rejected candidates", value=dataset.get("show_rejected", False), enabled=editable),
                 choice("overlayPosition", "Overlay positions", dataset.get("overlay_position", "detected"),
                     [("detected", "Detected positions"), ("fitted", "Valid fitted centers")], visible=pl),
@@ -900,8 +1361,7 @@ class PeakAnalysisBridge(PeakAnalysisPlotMixin, QObject):
             timer.stop()
         self._executor.shutdown(wait=True, cancel_futures=True)
         if self.datasets and not self._close_ready:
-            from core.peak_workspace import save_workspace
-            save_workspace(self.session_path, list(self.datasets.values()), self.active_key)
+            self._write_history(list(self.datasets.values()), self.active_key, self.session_path)
         if self._canvas is not None:
             self._canvas.close()
         self.settings.sync()

@@ -9,6 +9,7 @@ Basic.Control {
     required property var bridge
     required property var colors
     property var groups: []
+    property var colorRangeController: null
     property bool pinDataGroup: true
     property string message: ""
     property var groupSchema: []
@@ -117,6 +118,11 @@ Basic.Control {
                     color: pane.colors.muted
                     wrapMode: Text.WordWrap
                     Accessible.name: text
+                }
+                ColorRangeSidebar {
+                    Layout.fillWidth: true
+                    controller: pane.colorRangeController
+                    colors: pane.colors
                 }
                 Repeater {
                     model: pane.scrollingSchema

@@ -58,7 +58,7 @@ def can_compare(request):
 
 def check_background(request, *, automatic, reload, cancellation):
     """Use the existing joint certificate, or compare/fall back without commit."""
-    from core.drr_bn_store import DrrBnStore, is_bn_calibration_source, joint_validation_passed
+    from core.drr_bn_store import DrrBnStore, is_bn_calibration_source, joint_validation_passed, calibration_usable
     from core.drr_sources import portable_source_name, resolve_source_path
     from core.load_cancellation import load_scope
     from ui_qt.quick.drr_background_workflow import BackgroundDraft, prepare_application
@@ -85,11 +85,11 @@ def check_background(request, *, automatic, reload, cancellation):
             original_files = tuple(item["path"] for item in source["baseline_files"])
             original_which = source["baseline_which"]
             previous = store.load_result(version)
-            current = (version.fresh and version.eligible and version.validation_status == "accepted"
+            current = (version.fresh and version.eligible and version.validation_status in ("accepted", "single_pair")
                 and source.get("y_axis") == context.y_axis
                 and (version.settings.get("derivative_window"), version.settings.get("derivative_polyorder"))
                     == (context.derivative_window, context.derivative_polyorder)
-                and joint_validation_passed(version.report, version.settings))
+                and calibration_usable(version.report, version.settings))
             if current:
                 draft = BackgroundDraft(kind="bn", files=files, which=which, auto_bn_compare=automatic,
                     calibration=dict(payload=previous, original=False))
@@ -97,7 +97,10 @@ def check_background(request, *, automatic, reload, cancellation):
                 captured = replace(request, background_recipe=prepared.recipe, backgrounds=prepared.recipe.files,
                     background_frame=prepared.recipe.which)
                 products = load_drr(captured, prepared_background=prepared) if reload else None
-                return BnOutcome("Saved BN validation matches the current group and SG settings.", previous,
+                message = ("Saved single-measurement BN correction matches this data and SG settings; independent repeats were not used."
+                           if version.validation_status == "single_pair" else
+                           "Saved BN validation matches the current group and SG settings.")
+                return BnOutcome(message, previous,
                     prepared if reload else None, products)
         else:
             from core.drr_measured_bn import is_measured_bn_name

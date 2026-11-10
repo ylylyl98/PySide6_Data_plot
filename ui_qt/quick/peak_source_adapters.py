@@ -6,6 +6,7 @@ product. Display normalization and source coordinates travel independently.
 from __future__ import annotations
 
 import json
+from dataclasses import asdict, replace
 from pathlib import Path
 
 
@@ -32,6 +33,101 @@ def _identity(mode, folder, files):
     return json.dumps([mode, str(folder), files], ensure_ascii=False, sort_keys=True, default=str)
 
 
+def _processed_path(owner, mode, derivative=None, products=None, channel="raw", *, prefer_saved=True):
+    """Predict the preferred export path without reading or writing files.
+
+    Collision handling or DRR fingerprint reuse may choose a different name.
+    """
+    primary = getattr(owner, "_source", None)
+    folder = getattr(owner, "_folder", None)
+    if not primary or not folder:
+        return None
+    path = Path(primary)
+    if path.suffix.casefold() == ".dat" and derivative is None:
+        return str(path)
+    cube = (getattr(owner, "_cube", None) if mode == "pl" else
+            getattr(products, channel, None))
+    saved = getattr(cube, "_peak_processed_path", None)
+    if saved and prefer_saved:
+        return str(saved)
+    if mode == "pl":
+        return str(Path(folder) / "Processed Data" / "PL" / f"{path.stem}_PL_linear.dat")
+    request = products.request
+    if not request.files:
+        return None
+    from core.export import build_drr_export_base
+    from ui_qt.quick.drr_workflow import _export_mode_label
+    base = build_drr_export_base(request.files[0], len(request.files), _export_mode_label(request),
+        derivative if isinstance(derivative, int) else None,
+        products.second_window if channel == "second" else products.raw_window,
+        request.polyorder, "More correct (regrid)")
+    if isinstance(derivative, tuple):
+        base += "_dXdY"
+    return str(Path(folder) / "Processed Data" / "DRR" / f"{base}.dat")
+
+
+def _path_is_inferred(owner, mode, derivative=None, products=None, channel="raw"):
+    path = getattr(owner, "_source", None)
+    if path and Path(path).suffix.casefold() == ".dat" and derivative is None:
+        return False
+    cube = getattr(owner, "_cube", None) if mode == "pl" else getattr(products, channel, None)
+    return not bool(getattr(cube, "_peak_processed_path", None))
+
+
+def bind_exported_paths(owner, result):
+    """Attach successful export paths to the exact products currently displayed."""
+    if owner._workflow == "pl":
+        pairs = ((owner._cube, result.get("dat")),)
+    elif owner._workflow == "drr" and owner._drr_products is not None:
+        products = owner._drr_products
+        pairs = ((products.raw, result.get("raw_dat")), (products.second, result.get("second_dat")))
+    else:
+        return
+    for cube, path in pairs:
+        if cube is not None and path:
+            cube._peak_processed_path = str(path)
+
+
+def capture_source_export(owner, mode, cube, axis, channel="raw"):
+    """Capture normal-export settings without rendering or reading data."""
+    from core.drr_export_title import background_label, display_title, imported_background_label
+    from core.peak_display import capture_display
+    from core.plotting import SplitColorScale
+    actual = capture_display(axis)
+    if not all(key in actual and actual[key] is not None for key in ('cmap', 'vmin', 'vmax')):
+        return None
+    if mode == "pl":
+        if not callable(getattr(owner, "_params", None)):
+            return None
+        scale = "log" if owner._values.get("scale") == "log" else "linear"
+        params = owner._params(scale)
+        png_title = None
+    else:
+        display = getattr(owner, "_drr_display", None)
+        if display is None:
+            return None
+        params = display.heatmap_params(cube, channel)
+        request = owner._drr_products.request
+        processing = {"background_mode": request.background_mode}
+        recipe = getattr(request, "background_recipe", None)
+        if recipe is not None:
+            processing["drr_background_assignments"] = [item.to_dict() for item in recipe.assignments]
+            processing["background_kind"] = getattr(getattr(recipe, "draft", None), "kind", None)
+            if getattr(owner._drr_products, "background_references", ()):
+                processing["selection_method"] = "fitted_sample"
+        background = (imported_background_label(getattr(owner._drr_products.source, "import_metadata", None))
+                      if request.background_mode == "imported" else background_label(processing))
+        png_title = display_title(params.title, background=background)
+    colors = {key: actual[key] for key in ('cmap', 'vmin', 'vmax', 'log_scale', 'center_zero', 'clip_outliers') if key in actual}
+    colors['split_scale'] = SplitColorScale(**actual['split_scale']) if actual.get('split_scale') else None
+    params = replace(params, **colors)
+    width = getattr(owner, "_png_export_width", None)
+    params = replace(params, png_width_scale=width() if callable(width) else params.png_width_scale)
+    if mode == "drr":
+        params = replace(params, xlim=tuple(axis.get_xlim()), ylim=tuple(axis.get_ylim()))
+    return dict(params=asdict(params), drr=mode == "drr", png_title=png_title)
+
+
 def _root_sources(owner, mode):
     if _pending(owner) or getattr(owner, "_cube", None) is None:
         return []
@@ -51,7 +147,11 @@ def _root_sources(owner, mode):
         index = int(values.get("scale") == "log") if len(maps) > 1 else 0
         axis = maps[min(index, len(maps) - 1)][0]
         return [dict(cube=owner._cube, kind="PL", channel="PL", source=source, name="PL · " + name,
-            axes=[entry[0] for entry in maps], view=_view(axis), row=_row(owner._cube, values), mode="PL")]
+            axes=[entry[0] for entry in maps], view=_view(axis), row=_row(owner._cube, values), mode="PL",
+            processed_path=_processed_path(owner, "pl"),
+            processed_path_hint=_processed_path(owner, "pl", prefer_saved=False),
+            processed_path_inferred=_path_is_inferred(owner, "pl"),
+            source_export=capture_source_export(owner, "pl", owner._cube, axis))]
     products = getattr(owner, "_drr_products", None)
     if products is None:
         return []
@@ -66,7 +166,11 @@ def _root_sources(owner, mode):
         label = "Mixed derivative" if mixed else "2nd derivative" if derivative == 2 else "1st derivative" if derivative == 1 else "ΔR/R"
         descriptor = dict(cube=cube, group_cube=products.source, kind="DRR", channel=channel,
             source=source, name=f"DRR · {channel} · {name}", source_name="DRR · " + name,
-            product_label=label, axes=[axis], view=_view(axis), row=_row(cube, values), mode="DRR")
+            product_label=label, axes=[axis], view=_view(axis), row=_row(cube, values), mode="DRR",
+            processed_path=_processed_path(owner, "drr", derivative, products, channel),
+            processed_path_hint=_processed_path(owner, "drr", derivative, products, channel, prefer_saved=False),
+            processed_path_inferred=_path_is_inferred(owner, "drr", derivative, products, channel),
+            source_export=capture_source_export(owner, "drr", cube, axis, channel))
         if derivative is not None:
             descriptor["source_processing"] = dict(method="Savitzky–Golay", derivative="mixed" if mixed else derivative,
                 window_samples=int(products.second_window if channel == "second" else products.raw_window), polyorder=int(request.polyorder))

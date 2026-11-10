@@ -123,7 +123,7 @@ class QualityTests(unittest.TestCase):
         points=[dict(row_index=i,energy=1.65,polarity='peak') for i in (2,3)]
         self.assertEqual(supported_candidates(points,gates,3,1.5),[])
 
-    def test_restore_preserves_legacy_filtering_but_fresh_handoff_uses_quality(self):
+    def test_restore_preserves_legacy_filtering_and_fresh_drr_uses_suggested(self):
         d = self.noisy_map()
         for key in ('min_snr', 'neighbor_support', 'neighbor_tolerance_mev'):
             d['settings'].pop(key, None)
@@ -134,5 +134,6 @@ class QualityTests(unittest.TestCase):
             fresh, _ = load_workspace(path, fresh_snapshot=True)
         self.assertEqual(restored[0]['settings'].get('min_snr'), 0)
         self.assertEqual(restored[0]['settings'].get('neighbor_support'), 0)
-        self.assertGreater(fresh[0]['settings'].get('min_snr', 0), 0)
-        self.assertGreater(fresh[0]['settings'].get('neighbor_support', 0), 0)
+        self.assertEqual(fresh[0]['settings']['min_snr'], 3)
+        self.assertEqual(fresh[0]['settings']['neighbor_support'], 3)
+        self.assertEqual(fresh[0]['settings']['prominence'], 0)

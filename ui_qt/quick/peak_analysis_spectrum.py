@@ -13,8 +13,7 @@ from matplotlib import rcParams
 from matplotlib.colors import to_rgba
 
 from core.peak_plotting import branch_color
-from core.power_multi_peaks import multi_peak_model
-from core.power_peaks import peak_model
+from core.pl_fit_models import evaluate_fit, evaluate_component
 
 
 class RetainedPeakSpectrum:
@@ -32,6 +31,8 @@ class RetainedPeakSpectrum:
             artist.remove()
         self.markers = axis.scatter([], [], s=20, zorder=10)
         self.markers.set_visible(False)
+        self.excluded_markers = None
+        self._excluded_by_row = {}
         self.residual = None
         if residual_axis is not None:
             residual_lines = list(residual_axis.lines)
@@ -47,10 +48,16 @@ class RetainedPeakSpectrum:
         result = dataset.get("result") or {}
         branches = dataset["branches"]
         signature = (id(dataset["cube"]), id(branches), len(branches), id(dataset.get("result")),
-                     len(result.get("points", ())), len(result.get("fits", ())))
+                     len(result.get("points", ())), len(result.get("fits", ())),
+                     id(dataset.get('candidates')), bool(dataset.get('show_rejected')))
         if signature == self._dataset_signature:
             return
         self._dataset_signature = signature
+        self._excluded_by_row = {}
+        if dataset.get('show_rejected'):
+            from core.peak_filter_preview import excluded_candidates
+            for point in excluded_candidates(dataset):
+                self._excluded_by_row.setdefault(point['row_index'], []).append(point['energy'])
         self._branch_by_id = {branch["id"]: branch for branch in branches}
         self._branch_order = {key: index for index, key in enumerate(self._branch_by_id)}
         points, seeds = defaultdict(dict), defaultdict(set)
@@ -111,6 +118,14 @@ class RetainedPeakSpectrum:
         cube = dataset["cube"]
         x, spectrum = cube.energy, cube.Z[row]
         self.measured.set_data(x, spectrum)
+        excluded = self._excluded_by_row.get(row, []) if dataset.get('show_rejected') else []
+        if excluded and self.excluded_markers is None:
+            self.excluded_markers = self.axis.scatter([], [], marker='x', s=18,
+                color='0.5', alpha=.65, linewidths=.7, zorder=8)
+            self.excluded_markers.set_gid('peak-rejected')
+        if self.excluded_markers is not None:
+            self.excluded_markers.set_offsets(np.column_stack((excluded, np.interp(excluded, x, spectrum))))
+            self.excluded_markers.set_visible(bool(excluded))
         handles = [self.measured]
         pool = dataset.get("candidates")
         smoothing = bool(pool and pool["settings"]["detection_method"] == "sg")
@@ -128,7 +143,7 @@ class RetainedPeakSpectrum:
         if fit:
             mask = (x >= fit["x_min"]) & (x <= fit["x_max"])
             xf, parameters = x[mask], fit["parameters"]
-            yf = multi_peak_model(xf, parameters, model=fit["model"], origin=fit["origin"])
+            yf = evaluate_fit(xf, fit)
             if self.total is None:
                 self.total, = self.axis.plot([], [], "--", lw=1.3, label="Total fit")
             self.total.set_color(self._cycle[int(smoothing) % len(self._cycle)])
@@ -140,7 +155,7 @@ class RetainedPeakSpectrum:
                 branch = self._branch_by_id.get(identity)
                 if not branch or not branch.get("enabled", True):
                     continue
-                component = peak_model(xf, 0, 0, *parameters[2 + 3 * index:5 + 3 * index], model=fit["model"], origin=fit["origin"])
+                component = evaluate_component(xf, fit, index)
                 if active_components == len(self.components):
                     line, = self.axis.plot([], [], lw=1)
                     self.components.append(line)
@@ -196,6 +211,12 @@ class RetainedPeakSpectrum:
             annotation.set_visible(False)
         self.axis.title.set_text(f"{cube.gate_label} = {cube.gate[row]:.6g}")
         self._autoscale_y(self.axis)
+        # Keep labels inside a short spectrum panel instead of over its title.
+        low, high = self.axis.get_ylim()
+        for annotation in self.annotations[:len(positions)]:
+            below = annotation.xy[1] > low + .65 * (high - low)
+            annotation.set_position((3, -6 if below else 6))
+            annotation.set_verticalalignment("top" if below else "bottom")
         if self.residual_axis is not None:
             if fit:
                 # Recomputing a blended axhline transform against a previous

@@ -11,6 +11,33 @@ from tests.test_peak_workspace import sample
 
 
 class PeakProfileTests(unittest.TestCase):
+    def test_width_adaptive_defaults_restore_and_automatic_recommendation(self):
+        from core.peak_candidates import detect_heatmap
+        from core.peak_profiles import recommend_drr_filters
+        from ui_qt.quick.peak_analysis_workflow import prepare_sources
+        d = prepare_sources([dict(cube=sample('DRR'), kind='DRR', channel='second',
+                                  source='adaptive.csv', name='Adaptive')])[0]
+        self.assertTrue(d['settings']['neighbor_adaptive'])
+        d['candidates'] = detect_heatmap(d, d['settings'])
+        recommended, _ = recommend_drr_filters(d, d['candidates'])
+        self.assertTrue(recommended['neighbor_adaptive'])
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'adaptive.npz'
+            save_workspace(path, [d], d['key'])
+            restored, _ = load_workspace(path)
+            self.assertTrue(restored[0]['settings']['neighbor_adaptive'])
+            # Legacy cached sessions retain strict matching even on a handoff.
+            d['settings'].pop('neighbor_adaptive')
+            save_workspace(path, [d], d['key'])
+            for fresh in (False, True):
+                restored, _ = load_workspace(path, fresh_snapshot=fresh)
+                self.assertFalse(restored[0]['settings']['neighbor_adaptive'])
+        d['analysis_scope'] = 'spectrum'
+        recommended, _ = recommend_drr_filters(d, d['candidates'])
+        self.assertFalse(recommended['neighbor_adaptive'])
+        pl = create_dataset(sample(), 'PL', 'PL', 'pl.csv', 'PL')
+        self.assertFalse(pl['settings']['neighbor_adaptive'])
+
     def test_new_data_uses_product_specific_balanced_filters(self):
         for kind, channel, snr, prominence, support in (
                 ('PL', 'PL', 5., .05, 3), ('PL', 'KK', 5., .05, 3),
@@ -32,9 +59,9 @@ class PeakProfileTests(unittest.TestCase):
             self.assertAlmostEqual(d['settings']['min_distance_mev'], spacing)
 
     def test_handoff_gets_new_profile_but_saved_manual_settings_survive(self):
-        for channel, product, snr, prominence, support in (
-                ('raw', 'ΔR/R', 5., .08, 3), ('second', '2nd derivative', 7., .1, 4),
-                ('raw', '1st derivative', 7., .1, 4), ('second', 'Mixed derivative', 7., .1, 4)):
+        for channel, product in (
+                ('raw', 'ΔR/R'), ('second', '2nd derivative'),
+                ('raw', '1st derivative'), ('second', 'Mixed derivative')):
             with self.subTest(product=product), tempfile.TemporaryDirectory() as folder:
                 d = create_dataset(sample('DRR'), 'DRR', channel, 'old-app.csv', 'Old app')
                 d['product_label'] = product
@@ -47,8 +74,9 @@ class PeakProfileTests(unittest.TestCase):
                 self.assertEqual(saved[0]['settings'], original)
                 fresh, _ = load_workspace(path, fresh_snapshot=True)
                 self.assertEqual((fresh[0]['settings']['min_snr'], fresh[0]['settings']['prominence'],
-                                  fresh[0]['settings']['neighbor_support']), (snr, prominence, support))
-                self.assertEqual(fresh[0]['settings']['min_width_mev'], 1.2)
+                                  fresh[0]['settings']['neighbor_support']), (3., 0., 3))
+                self.assertAlmostEqual(fresh[0]['settings']['min_width_mev'], .8)
+                self.assertAlmostEqual(fresh[0]['settings']['min_distance_mev'], .8)
                 self.assertEqual(fresh[0]['settings']['smoothing_window'], 17)
                 self.assertEqual(fresh[0]['settings']['candidate_floor'], .023)
 

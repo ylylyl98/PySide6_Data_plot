@@ -401,6 +401,18 @@ def _isolated():
             self.assertEqual(self.state.heatmap_params(self.raw).xlim[0], 1.4)
             self.assertEqual(self.state.heatmap_params(self.raw).xlim[1], 2.8)
 
+        def test_pending_restore_preserves_explicit_same_value_axis_commit(self):
+            saved = self.saved_view()
+            saved["viewport"] = dict(xlim=[1.4, 2.6], ylim=[-.2, .2])
+            self.state.setEditing("axis.xmin", True)
+            self.assertFalse(self.state.restore_candidates(dict(exact=saved),
+                folder=self.temporary.name, files=["a_720nmc.csv"]))
+            self.assertTrue(self.state.setNumber("axis.xmin", "1"))
+            settle()
+            params = self.state.heatmap_params(self.raw)
+            self.assertEqual(params.xlim, (1., 2.8))
+            self.assertEqual(params.ylim, (-.2, .2))
+
         def test_global_templates_write_only_through_explicit_success_hook(self):
             self.state.set_memory_status("History connected", available=True)
             self.state.setFlag("memory.global", True)
@@ -431,6 +443,46 @@ def _isolated():
             params = self.state.heatmap_params(self.raw)
             self.assertEqual(params.xlim, (1.4, 2.6))
             self.assertEqual(params.ylim, (-.8, .5))
+
+        def test_axis_auto_replaces_saved_viewport_and_preserves_fixed_endpoint(self):
+            saved = self.saved_view()
+            saved["viewport"] = dict(xlim=[1.4, 2.6], ylim=[-.2, .2])
+            self.assertTrue(self.state.restore_candidates(dict(exact=saved),
+                folder=self.temporary.name, files=["a_720nmc.csv"]))
+            for axis, expected in (("x", (1.2, 3.)), ("y", (-.5, 1.))):
+                with self.subTest(axis=axis):
+                    self.assertTrue(self.state.invoke("auto." + axis))
+                    params = self.state.heatmap_params(self.raw)
+                    self.assertEqual(getattr(params, axis + "lim"), expected)
+                    self.assertTrue(self.state.snapshot["flags"]["fix.axis." + axis + "min"]["checked"])
+                    if axis == "x":
+                        self.assertEqual(params.ylim, (-.2, .2))
+
+        def test_explicit_same_axis_value_replaces_saved_viewport_but_cancel_does_not(self):
+            saved = self.saved_view()
+            saved["viewport"] = dict(xlim=[1.4, 2.6], ylim=[-.2, .2])
+            self.assertTrue(self.state.restore_candidates(dict(exact=saved),
+                folder=self.temporary.name, files=["a_720nmc.csv"]))
+            changes = []
+            self.state.parameterChanged.connect(lambda key, value: changes.append(key))
+            for key, value, expected in (("axis.xmin", "1.2", (1.2, 2.8)),
+                                         ("axis.ymax", ".5", (-.5, .5))):
+                with self.subTest(key=key):
+                    axis = key[5]
+                    before = getattr(self.state.heatmap_params(self.raw), axis + "lim")
+                    # NumberEditor cancels a draft before resetting validation
+                    # with its unchanged canonical value.
+                    self.state.setEditing(key, True)
+                    self.state.setEditing(key, False)
+                    self.assertTrue(self.state.setNumber(key, value))
+                    self.assertEqual(getattr(self.state.heatmap_params(self.raw), axis + "lim"), before)
+                    count = len(changes)
+                    self.state.setEditing(key, True)
+                    self.assertTrue(self.state.setNumber(key, value))
+                    self.assertEqual(getattr(self.state.heatmap_params(self.raw), axis + "lim"), expected)
+                    self.assertEqual(changes[count:], [key])
+                    if axis == "x":
+                        self.assertEqual(self.state.heatmap_params(self.raw).ylim, (-.2, .2))
 
         def test_valid_pending_derivative_limits_are_computed_when_product_arrives(self):
             self.state.sync_cube(self.raw, None)

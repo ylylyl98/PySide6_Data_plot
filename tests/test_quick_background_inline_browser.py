@@ -109,9 +109,36 @@ def _isolated():
             scan = BackgroundSourceCatalogBridge._scan_catalog
             opened = Path.open
 
+            class HeaderOnly:
+                def __init__(self, stream):
+                    self.stream = stream
+                    self.lines = 0
+
+                def __enter__(self):
+                    self.stream.__enter__()
+                    return self
+
+                def __exit__(self, *args):
+                    return self.stream.__exit__(*args)
+
+                def readline(self, *args, **kwargs):
+                    self.lines += 1
+                    if self.lines > 1:
+                        raise AssertionError("Reference browsing read beyond CSV header")
+                    return self.stream.readline(*args, **kwargs)
+
+                def read(self, *args, **kwargs):
+                    raise AssertionError("Reference browsing read CSV spectrum")
+
+                def readlines(self, *args, **kwargs):
+                    raise AssertionError("Reference browsing read CSV spectra")
+
+                def __iter__(self):
+                    raise AssertionError("Reference browsing iterated CSV spectra")
+
             def metadata_open(path, *args, **kwargs):
                 if path.suffix.casefold() == ".csv":
-                    raise AssertionError("Reference browsing read CSV contents")
+                    return HeaderOnly(opened(path, *args, **kwargs))
                 return opened(path, *args, **kwargs)
 
             with patch("core.drr_sources.discover_drr_sources", side_effect=AssertionError("Full experiment inspected")) as discover, \

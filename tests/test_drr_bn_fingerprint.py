@@ -36,6 +36,7 @@ class PipelineFingerprintTests(unittest.TestCase):
         self.assertEqual(first, _algorithm_identity())
         self.assertEqual(first['protocol'], 'd2_shrinkage_v1')
         expected = {'core.drr_bn_service', 'core.drr_bn_calibration', 'core.drr_bn_joint', 'core.drr_bn_d2_objective',
+                    'core.drr_bn_single', 'core.drr_bn_single_smooth', 'core.drr_bn_single_phase', 'core.drr_bn_single_high_frequency', 'core.drr_bn_single_exports', 'core.drr_bn_multi', 'core.drr_bn_trend', 'core.drr_bn_trend_adaptive', 'core.drr_bn_settings',
                     'core.processing', 'core.processing_run', 'core.loader',
                     'core.drr_segmented_derivative', 'core.drr_sources',
                     'core.drr_bn_store', 'core.drr_bn_fingerprint'}
@@ -83,7 +84,7 @@ class PipelineFingerprintTests(unittest.TestCase):
                        side_effect=load_from(Path(directory) / '_MEI_two')):
                 second = _algorithm_identity()
         self.assertEqual(first, second)
-        self.assertEqual(len(first['module_fingerprints']), 11)
+        self.assertEqual(len(first['module_fingerprints']), 20)
         self.assertTrue(all(item['kind'] == 'loader_code'
                             for item in first['module_fingerprints'].values()))
 

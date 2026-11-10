@@ -16,6 +16,7 @@ from pathlib import Path
 from PySide6.QtCore import QLocale, QObject, Property, QTimer, Signal, Slot
 
 from core.colormaps import CUSTOM_COLORMAPS, RDBU_R_P0P60_ID, STANDARD_COLORMAPS, register_colormaps
+from ui_qt.quick.drr_recommendations import DrrRecommendationsMixin
 
 
 _SIDES = ("left", "middle", "right")
@@ -30,7 +31,7 @@ _MEMORY = {
 }
 
 
-class DrrDisplayState(QObject):
+class DrrDisplayState(DrrRecommendationsMixin, QObject):
     snapshotChanged = Signal()
     editingChanged = Signal()
     errorChanged = Signal()
@@ -78,6 +79,7 @@ class DrrDisplayState(QObject):
         self._debounce.timeout.connect(self._flush_changes)
         self._snapshot = {}
         self._memory = _DisplayMemory(self)
+        self._init_recommendations()
         self.refresh()
 
     @Property("QVariantMap", notify=snapshotChanged)
@@ -129,8 +131,12 @@ class DrrDisplayState(QObject):
             self._choices["yaxis.right"] = 0
         self.refresh()
 
-    def sync_cube(self, cube, second_cube=None, *, axis_coordinates=None):
+    def sync_cube(self, cube, second_cube=None, *, axis_coordinates=None, preserve_view=False):
         """Refresh unlocked ranges, retaining separate raw/derivative scales."""
+        import numpy as np
+        preserve_view = bool(preserve_view and cube is not None and self._raw is not None
+            and np.array_equal(cube.energy, self._raw.energy) and np.array_equal(cube.gate, self._raw.gate))
+        self._recommend_status.clear()
         self._memory.before_sync(cube)
         previous_coordinates = {key: axis.right for key, axis in self._coordinates.items()} if cube is self._raw else {}
         self._raw, self._second = cube, second_cube
@@ -139,17 +145,19 @@ class DrrDisplayState(QObject):
 
             if np.asarray(cube.Z).shape != (len(cube.gate), len(cube.energy)):
                 raise ValueError("DRR dimensions do not match energy and gate axes")
-            for axis, values in (("x", cube.energy), ("y", cube.gate)):
+            for axis, values in (() if preserve_view else (("x", cube.energy), ("y", cube.gate))):
                 lo, hi = self._extent(values)
                 for bound, value in (("min", lo), ("max", hi)):
                     key = f"axis.{axis}{bound}"
                     locked = axis == "x" and self._flags["memory.lock_x"] and self._has_geometry
                     if not locked and not self._flags["fix." + key] and key not in self._memory.protected:
                         self._numbers[key] = self._quantize(key, value)
-            self._initialize_boundaries()
+            if not preserve_view:
+                self._initialize_boundaries()
             self._has_geometry = True
-            self._auto_product("raw", all_regions=True)
-            self._auto_product("second", all_regions=True)
+            if not preserve_view:
+                self._auto_product("raw", all_regions=True)
+                self._auto_product("second", all_regions=True)
         self.set_axis_coordinates(previous_coordinates if axis_coordinates is None else axis_coordinates)
         self.refresh()
 
@@ -305,7 +313,9 @@ class DrrDisplayState(QObject):
             self.editingChanged.emit()
 
     def _changed(self, key, value, *, stepped=False):
-        if (key.removeprefix("fix.") in self._memory.RANGE_NUMBERS or key.startswith("auto.")
+        if not key.startswith("recommend."):
+            self._recommend_status.clear()
+        if (key.removeprefix("fix.") in self._memory.RANGE_NUMBERS or key.startswith(("auto.", "recommend."))
                 or key in {"memory.auto", "yaxis.left", "yaxis.a", "yaxis.b", "yaxis.c"}):
             self._memory.save_manual_ranges()
         self._pending[key] = value
@@ -335,8 +345,14 @@ class DrrDisplayState(QObject):
         except ValueError as error:
             self._set_error(key, str(error))
             return False
+        # A saved zoom can differ from the numeric controls. An explicit
+        # draft commit must apply those controls even when the value is equal;
+        # cancelling a draft clears editing first and remains a no-op.
+        apply_axis_view = (key in self._editing and key.startswith("axis.")
+                           and (key[5] + "lim" in self._memory.viewport
+                                or self._memory.pending is not None))
         self.setEditing(key, False)
-        changed = self._numbers[key] != value
+        changed = self._numbers[key] != value or apply_axis_view
         self._numbers[key] = value
         if changed:
             self._memory.edited("numbers", key)
@@ -391,6 +407,12 @@ class DrrDisplayState(QObject):
 
     @Slot(str, int, result=bool)
     def setChoice(self, key, index):
+        if key == "recommendStrength":
+            if self._closed or not 0 <= index < 4:
+                return False
+            self._recommend_strength = index
+            self.refresh()
+            return True
         options = self._choice_options(key)
         if self._closed or key not in self._choices or not 0 <= index < len(options) or not options[index][1]:
             return False
@@ -460,8 +482,14 @@ class DrrDisplayState(QObject):
     def invoke(self, key):
         if self._closed or self._raw is None:
             return False
+        if key.startswith("recommend."):
+            return self._invoke_recommendation(key)
+        self._recommend_status.clear()
         if key in {"auto.x", "auto.y"}:
             axis = key[-1]
+            # Auto applies the resulting controls, including fixed endpoints,
+            # instead of continuing to render a restored file's old zoom.
+            self._memory.viewport.pop(axis + "lim", None)
             lo, hi = self._extent(self._raw.energy if axis == "x" else self._raw.gate)
             for bound, value in (("min", lo), ("max", hi)):
                 number = f"axis.{axis}{bound}"
@@ -622,6 +650,7 @@ class DrrDisplayState(QObject):
                               fixLegend=dict(text="Fix M = manual · Fix λ = wavelength · Fix F = saved file", visible=True),
                               yaxisEquation=dict(text="y = " + self.y_axis_spec().removeprefix("linear:"), visible=state["advancedYAxis"]),
                               yaxisLabel=dict(text="Measured gate coordinates are recomputed when the left-axis selection changes.", visible=state["advancedYAxis"]))
+        self._recommendation_snapshot(state)
         if state != self._snapshot:
             self._snapshot = state
             self.snapshotChanged.emit()

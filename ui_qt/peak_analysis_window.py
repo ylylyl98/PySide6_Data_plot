@@ -75,7 +75,7 @@ class PeakAnalysisWindow(QMainWindow):
         self.product_tabs.currentChanged.connect(self.select_product)
         toolrow=QHBoxLayout();self.navigation=AnalysisToolbar(self.canvas,self,coordinates=False);toolrow.addWidget(self.navigation,1)
         self.show_overlay=QCheckBox('Show peaks');self.show_overlay.setChecked(True);toolrow.addWidget(self.show_overlay)
-        self.marker_size=QSpinBox();self.marker_size.setRange(1,64);self.marker_size.setValue(9)
+        self.marker_size=QSpinBox();self.marker_size.setRange(1,64);self.marker_size.setValue(4)
         self.marker_size.setKeyboardTracking(False);self.marker_size.setAccessibleName('Heatmap marker size')
         self.marker_size.setToolTip('Heatmap marker area in pt². Display only; detection and filtering are unchanged.')
         toolrow.addWidget(QLabel('Size'));toolrow.addWidget(self.marker_size)
@@ -192,7 +192,7 @@ class PeakAnalysisWindow(QMainWindow):
         self.row_slider.setRange(0,len(d['cube'].gate)-1)
         self.row_slider.setValue(min(max(0,int(d.get('row',0))),len(d['cube'].gate)-1))
         self.show_overlay.setChecked(d.get('show_overlay',True))
-        self.marker_size.setValue(int(d.get('marker_size',9)))
+        self.marker_size.setValue(int(d.get('marker_size',4)))
         self.controls.position.setCurrentIndex(1 if d.get('overlay_position')=='fitted' else 0)
         self.populate_branches();self._syncing=False;self.update_cache_status();self.redraw();self.update_actions()
 
@@ -485,8 +485,8 @@ class PeakAnalysisWindow(QMainWindow):
         if not folder:return
         from core.peak_export import export_dataset
         d=snapshot(self.dataset)
-        self._start('Exporting CSV, settings and PNG...',lambda cancel,progress:export_dataset(folder,d),
-                    lambda path:self.status_label.setText('Saved '+path))
+        self._start('Saving Excel results...',lambda cancel,progress:export_dataset(folder,d),
+                    lambda paths:self.status_label.setText('Saved ' + str(len(paths)) + ' files in ' + folder))
 
     def apply_overlay(self):
         if not self.dataset or not self.dataset['result']:return

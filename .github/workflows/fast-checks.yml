@@ -55,6 +55,7 @@ jobs:
           tests.test_quick_megasweep_picker
           tests.test_quick_megasweep_qml
           tests.test_quick_application_shell
+          tests.test_quick_button_affordance
           tests.test_quick_numeric_format
           tests.test_number_presentation
           tests.test_quick_selection_contrast
@@ -90,8 +91,15 @@ jobs:
           tests.test_quick_measurement_selection
           tests.test_quick_plot_surface
           tests.test_quick_main_responsiveness
+          tests.test_color_range_controller
+          tests.test_quick_color_range_adapters
+          tests.test_quick_color_range_bar
+          tests.test_quick_heatmap_array_reuse
+          tests.test_quick_heatmap_preview
           tests.test_quick_raster_heatmaps
           tests.test_drr_display_state
+          tests.test_display_recommendations
+          tests.test_drr_recommendations
           tests.test_quick_drr_restart_ranges
           tests.test_quick_drr_workflow
           tests.test_quick_drr_export_names
@@ -111,6 +119,9 @@ jobs:
           tests.test_quick_pn_batch_ui
           tests.test_quick_drr_background_selection
           tests.test_quick_drr_bn_automatic
+          tests.test_quick_bn_single
+          tests.test_quick_bn_batch
+          tests.test_quick_bn_multi
           tests.test_quick_compare
           tests.test_quick_compare_startup
           tests.test_quick_heatmap_style
@@ -194,6 +205,32 @@ jobs:
           tests.test_dat_loader
           tests.test_loader
           tests.test_processing_derivative
+          tests.test_peak_auto_selection
+          tests.test_peak_trajectories
+          tests.test_peak_scatter_filter
+          tests.test_peak_filter_preview
+          tests.test_peak_filter_workflow
+          tests.test_peak_quality
+          tests.test_peak_adaptive_support
+          tests.test_pl_peak_candidates
+          tests.test_pl_weak_workflow
+          tests.test_pl_fit_quality
+          tests.test_pl_fit_models
+          tests.test_pl_manual_peaks
+          tests.test_peak_analysis_state
+          tests.test_pl_plot_direct_edit
+          tests.test_peak_plot_navigation
+          tests.test_peak_save_workflow
+          tests.test_peak_file_history
+          tests.test_peak_workspace_storage
+          tests.test_peak_processed_paths
+          tests.test_peak_output_names
+          tests.test_peak_flat_export
+          tests.test_peak_source_figure
+          tests.test_peak_live_export
+          tests.test_peak_simple_workbook
+          tests.test_pl_analysis_contracts
+          tests.test_peak_performance_correctness
           tests.test_drr_export_title
           tests.test_source_catalog_cache
           tests.test_drr_catalog_layers
@@ -207,6 +244,20 @@ jobs:
           tests.test_drr_bn_fingerprint
           tests.test_drr_bn_store
           tests.test_drr_bn_integration
+          tests.test_drr_bn_single
+          tests.test_drr_bn_single_smooth
+          tests.test_drr_bn_single_phase
+          tests.test_drr_bn_single_high_frequency
+          tests.test_drr_bn_hf_integration
+          tests.test_bn_injection_audit
+          tests.test_drr_bn_gap_prediction
+          tests.test_drr_bn_trend
+          tests.test_drr_bn_trend_adaptive
+          tests.test_drr_bn_trend_lifecycle
+          tests.test_drr_bn_fast_generation
+          tests.test_drr_bn_single_lifecycle
+          tests.test_drr_bn_assignments
+          tests.test_drr_bn_multi
           tests.test_shg_fit
           tests.test_shg_workbook
           tests.test_shg_legacy_workbook

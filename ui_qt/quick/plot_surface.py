@@ -13,8 +13,8 @@ import sys
 import threading
 import weakref
 
-from PySide6.QtCore import QEvent, QObject, Property, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QCursor, QGuiApplication, QImage
+from PySide6.QtCore import QEvent, QObject, Property, QRectF, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtGui import QCursor, QGuiApplication, QImage, QPen
 from PySide6.QtQml import QQmlEngine, qmlRegisterType
 from PySide6.QtQuick import QQuickPaintedItem
 
@@ -34,12 +34,14 @@ class _CanvasBackend(QObject):
     drawFailed = Signal(str)
     cursorChanged = Signal(int)
     cursorTextChanged = Signal()
+    rubberbandChanged = Signal(object)
     _drawRequested = Signal()
 
     def __init__(self, canvas):
         super().__init__()
         self._canvas_ref = weakref.ref(canvas)
         self._cursor_text = ""
+        self.rubberband = None
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._draw)
@@ -59,6 +61,12 @@ class _CanvasBackend(QObject):
         if text != self._cursor_text:
             self._cursor_text = text
             self.cursorTextChanged.emit()
+
+    def set_rubberband(self, rectangle):
+        """Normalized top-left coordinates, separate from exported Agg frames."""
+        if rectangle != self.rubberband:
+            self.rubberband = rectangle
+            self.rubberbandChanged.emit(rectangle)
 
     @Slot()
     def _queue_draw(self):
@@ -162,6 +170,7 @@ class PlotSurface(QQuickPaintedItem):
         self._painted_generation = 0
         self._presented_generation = 0
         self._image_lock = threading.Lock()
+        self._rubberband = None
         self._window = None
         self._size_pending = False
         self._size_timer = QTimer(self)
@@ -230,6 +239,8 @@ class PlotSurface(QQuickPaintedItem):
             self._backend.frameReady.disconnect(self._accept_frame)
             self._backend.closed.disconnect(self._backend_closed)
             self._backend.cursorChanged.disconnect(self._set_cursor)
+            self._backend.set_rubberband(None)
+            self._backend.rubberbandChanged.disconnect(self._set_rubberband)
         self._ownership.dispose()
         self._ownership.canvas = canvas
         self._size_pending = False
@@ -239,6 +250,7 @@ class PlotSurface(QQuickPaintedItem):
             self._attachment_epoch += 1
             self._image = canvas.image if canvas is not None else QImage()
             self._image_generation = canvas.frame_generation if canvas is not None else 0
+            self._rubberband = None
         self._painted_generation = self._presented_generation = 0
         self.paintedGenerationChanged.emit()
         self.presentedGenerationChanged.emit()
@@ -247,6 +259,7 @@ class PlotSurface(QQuickPaintedItem):
             self._backend.frameReady.connect(self._accept_frame)
             self._backend.closed.connect(self._backend_closed)
             self._backend.cursorChanged.connect(self._set_cursor)
+            self._backend.rubberbandChanged.connect(self._set_rubberband)
             self._sync_size()
         self.backendChanged.emit()
         self.update()
@@ -255,6 +268,7 @@ class PlotSurface(QQuickPaintedItem):
     def _visibility_changed(self):
         if not self.isVisible() and self._backend is not None:
             self._backend.set_cursor_text("")
+            self._backend.set_rubberband(None)
 
     @Slot()
     def close(self):
@@ -272,13 +286,33 @@ class PlotSurface(QQuickPaintedItem):
             self._image_generation = generation
         self.update()
 
+    @Slot(object)
+    def _set_rubberband(self, rectangle):
+        with self._image_lock:
+            self._rubberband = rectangle
+        self.update()
+
     def paint(self, painter):
         # This can run on the scene graph render thread. All mutable Agg state
         # stays on the GUI thread; retain one immutable image for this paint.
         with self._image_lock:
             image, generation, epoch = QImage(self._image), self._image_generation, self._attachment_epoch
+            rubberband = self._rubberband
         if not image.isNull():
             painter.drawImage(self.boundingRect(), image)
+            if rubberband is not None:
+                x, y, width, height = rubberband
+                rectangle = QRectF(x * self.width(), y * self.height(), width * self.width(), height * self.height())
+                painter.save()
+                painter.setClipRect(self.boundingRect())
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                # Contrasting strokes keep the selection visible on any map
+                # colors in either theme, without repainting the scientific data.
+                painter.setPen(QPen(Qt.GlobalColor.white, 3))
+                painter.drawRect(rectangle)
+                painter.setPen(QPen(Qt.GlobalColor.black, 1, Qt.PenStyle.DashLine))
+                painter.drawRect(rectangle)
+                painter.restore()
             self._paintCompleted.emit(generation, epoch)
 
     @Slot(int, int)

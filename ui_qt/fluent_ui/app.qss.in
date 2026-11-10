@@ -178,8 +178,8 @@ QToolButton:checked:pressed {
 }
 
 QToolButton[autoRaise="true"] {
-    background-color: transparent;
-    border: @{stroke_thin} solid transparent;
+    background-color: @{control_surface};
+    border: @{stroke_thin} solid @{border_primary};
 }
 
 QToolButton[autoRaise="true"]:hover {
@@ -195,6 +195,17 @@ QToolButton[autoRaise="true"]:checked {
 
 QToolButton[autoRaise="true"]:focus {
     border-color: @{focus_border};
+}
+
+QToolButton[autoRaise="true"]:pressed {
+    background-color: @{surface_background_pressed};
+    border-color: @{border_pressed};
+}
+
+QToolButton[autoRaise="true"]:disabled {
+    background-color: @{surface_disabled};
+    border-color: @{border_disabled};
+    color: @{text_disabled};
 }
 
 QToolButton[fluentIconOnly="true"] {
@@ -235,8 +246,8 @@ QToolButton[appRole="toolbarPrimaryAction"]:disabled {
 QPushButton[fluentAppearance="subtle"], QToolButton[fluentAppearance="subtle"],
 QPushButton[fluentAppearance="transparent"], QToolButton[fluentAppearance="transparent"],
 QToolButton[appRole="toolbarSecondaryAction"] {
-    background-color: transparent;
-    border-color: transparent;
+    background-color: @{control_surface};
+    border-color: @{border_primary};
     color: @{text_secondary};
     font-weight: @{weight_regular};
 }
@@ -263,9 +274,9 @@ QToolButton[appRole="toolbarSecondaryAction"]:focus {
 QPushButton[fluentAppearance="subtle"]:disabled, QToolButton[fluentAppearance="subtle"]:disabled,
 QPushButton[fluentAppearance="transparent"]:disabled, QToolButton[fluentAppearance="transparent"]:disabled,
 QToolButton[appRole="toolbarSecondaryAction"]:disabled {
-    background-color: transparent;
+    background-color: @{surface_disabled};
     color: @{text_disabled};
-    border-color: transparent;
+    border-color: @{border_disabled};
 }
 
 QToolButton:checked:disabled,
@@ -316,8 +327,8 @@ QWidget[fluentSize="compact"] QPushButton, QWidget[fluentSize="compact"] QToolBu
 }
 
 QPushButton[appRole="linkButton"] {
-    background-color: transparent;
-    border: none;
+    background-color: @{control_surface};
+    border: @{stroke_thin} solid @{border_primary};
     color: @{brand_foreground};
     font-weight: @{weight_semibold};
 }
@@ -326,15 +337,25 @@ QPushButton[appRole="linkButton"]:hover {
     background-color: @{subtle_hover};
 }
 
+QPushButton[appRole="linkButton"]:pressed {
+    background-color: @{subtle_pressed};
+}
+
+QPushButton[appRole="linkButton"]:disabled {
+    background-color: @{surface_disabled};
+    border-color: @{border_disabled};
+    color: @{text_disabled};
+}
+
 QPushButton[appRole="linkButton"]:focus {
     border: @{stroke_thin} solid @{focus_border};
     border-radius: @{radius_small};
 }
 
 QToolButton[appRole="expanderHead"] {
-    background-color: transparent;
-    border: none;
-    padding: @{space_xs} 0;
+    background-color: @{control_surface};
+    border: @{stroke_thin} solid @{border_primary};
+    padding: @{space_xs} @{space_s};
     min-height: 24px;
     color: @{text_primary};
     font-size: @{font_body_size};
@@ -343,13 +364,23 @@ QToolButton[appRole="expanderHead"] {
 }
 
 QToolButton[appRole="expanderHead"]:hover {
-    background-color: transparent;
+    background-color: @{subtle_hover};
     color: @{brand_foreground};
 }
 
 QToolButton[appRole="expanderHead"]:focus {
     border: @{stroke_thin} solid @{focus_border};
     border-radius: @{radius_small};
+}
+
+QToolButton[appRole="expanderHead"]:pressed {
+    background-color: @{subtle_pressed};
+}
+
+QToolButton[appRole="expanderHead"]:disabled {
+    background-color: @{surface_disabled};
+    border-color: @{border_disabled};
+    color: @{text_disabled};
 }
 
 /* ---- Inputs ---- */

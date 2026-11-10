@@ -9,7 +9,9 @@ Item {
     required property var colors
     required property var state
     property bool dragging: false
-    readonly property real footerHeight: spectrumToggle.implicitHeight + 16
+    property bool showSpectrumControl: true
+    readonly property var colorController: bridge && bridge.colorRangeController !== undefined ? bridge.colorRangeController : null
+    readonly property real footerHeight: colorBar.available ? Math.max(46, colorBar.implicitHeight + 16) : spectrumToggle.implicitHeight + 16
     readonly property real plotHeight: Math.max(0, height - footerHeight)
     readonly property bool spectrumVisible: state.spectrumVisible !== false
     readonly property real dividerY: state.dividerY === undefined ? 0.7 : state.dividerY
@@ -28,7 +30,7 @@ Item {
         y: overlay.plotHeight * overlay.dividerY - height / 2
         width: Math.max(0, overlay.width * (overlay.rightFraction - overlay.leftFraction))
         height: 10
-        visible: overlay.spectrumVisible
+        visible: overlay.spectrumVisible && overlay.showSpectrumControl
         focusPolicy: Qt.StrongFocus
         Accessible.role: Accessible.Separator
         Accessible.name: "Resize heatmap and spectrum"
@@ -78,27 +80,30 @@ Item {
         color: overlay.colors.surface
         Rectangle { width: parent.width; height: 1; color: overlay.colors.divider }
     }
+    ColorRangeBar {
+        id: colorBar
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        anchors.margins: 8
+        controller: overlay.colorController
+        colors: overlay.colors
+        headerRightInset: overlay.showSpectrumControl ? spectrumToggle.width + 8 : 0
+        headerMinimumHeight: overlay.showSpectrumControl ? spectrumToggle.implicitHeight : 0
+    }
     AppButton {
         id: spectrumToggle
         objectName: "app_toggle_spectrum"
         colors: overlay.colors
         anchors.right: parent.right
         anchors.rightMargin: 8
-        anchors.bottom: parent.bottom
-        anchors.bottomMargin: 8
+        anchors.top: parent.top
+        anchors.topMargin: overlay.height - overlay.footerHeight + 8
+        visible: overlay.showSpectrumControl
         width: Math.min(implicitWidth, Math.max(0, overlay.width - 16))
         primary: !overlay.spectrumVisible
         text: overlay.spectrumVisible ? "Hide spectrum" : "Show spectrum"
         description: overlay.spectrumVisible ? "Hide the spectrum and expand the heatmap" : "Show the spectrum below the heatmap"
         onClicked: overlay.bridge.invoke("toggle-spectrum")
-        background: Rectangle {
-            radius: 4
-            color: spectrumToggle.primary ? overlay.colors.accent
-                 : spectrumToggle.down ? overlay.colors.pressed
-                 : spectrumToggle.hovered ? overlay.colors.hover : overlay.colors.control
-            border.width: spectrumToggle.visualFocus ? 2 : 1
-            border.color: spectrumToggle.visualFocus ? overlay.colors.focus
-                        : spectrumToggle.primary ? overlay.colors.accent : overlay.colors.border
-        }
     }
 }

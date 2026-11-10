@@ -31,11 +31,11 @@ Basic.Button {
     }
     background: Rectangle {
         radius: 6
-        color: !control.enabled ? control.subtle ? "transparent" : control.colors.controlDisabled
+        color: !control.enabled ? control.colors.controlDisabled
                             : control.down ? control.colors.pressed
                             : control.hovered ? control.colors.hover
-                                              : control.subtle ? "transparent" : control.colors.control
-        border.width: control.visualFocus ? 2 : control.subtle ? 0 : 1
+                                              : control.colors.control
+        border.width: control.visualFocus ? 2 : 1
         border.color: control.visualFocus ? control.colors.focus
                                          : !control.enabled ? control.colors.borderDisabled
                                          : control.hovered ? control.colors.borderHover : control.colors.border

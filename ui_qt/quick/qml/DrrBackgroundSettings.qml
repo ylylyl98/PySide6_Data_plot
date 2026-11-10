@@ -15,6 +15,10 @@ Rectangle {
     property var invalidFields: ({})
     property bool showReport: false
     property bool showMatchDetails: false
+    property bool showBnAdvanced: false
+    property bool showBnDetails: false
+    property int bnRunningSeconds: 0
+    property double bnStartedAt: 0
     property bool pnExternalFiles: false
     property bool pnManagedViewRequested: false
     property string pnContextKey: ""
@@ -23,7 +27,7 @@ Rectangle {
         && (state.pnExternalReferenceActive !== true || pnManagedViewRequested)
     readonly property bool inlineReferencesVisible: !advancedPage && !pnSimpleVisible && ["bn", "p", "n", "pn", "custom"].indexOf(state.kind) >= 0
     readonly property bool hasReport: !!state.texts?.report?.length
-    readonly property bool previewPaneVisible: advancedPage || (showReport && hasReport)
+    readonly property bool previewPaneVisible: (advancedPage && (state.page !== "bn" || state.hasPreview)) || (showReport && hasReport)
     readonly property var sourceTypes: [
         {key: "self", title: "Self", choice: 4},
         {key: "bn", title: "BN", choice: 0},
@@ -40,7 +44,7 @@ Rectangle {
         {key: "pn", title: "P+N advanced generation"},
         {key: "fit", title: "Fit sample background"},
         {key: "composite", title: "Build composite"},
-        {key: "bn", title: "Compare BN references"},
+        {key: "bn", title: "BN calibration options"},
         {key: "raw", title: "Preview original data"}
     ]
     readonly property var availableTools: toolPages.filter(tool => tool.key === "raw"
@@ -49,6 +53,20 @@ Rectangle {
         || tool.key === "bn" && state.kind === "bn"
         || tool.key === "composite" && ["bn", "p", "n", "pn", "custom"].indexOf(state.kind) >= 0)
     readonly property bool invalid: Object.keys(invalidFields).length > 0
+    Timer {
+        id: bnRunningTimer
+        objectName: "bn_running_timer"
+        interval: 1000
+        repeat: true
+        running: root.state.page === "bn" && root.state.busy === true
+        onRunningChanged: {
+            if (running) {
+                root.bnStartedAt = Date.now()
+                root.bnRunningSeconds = 0
+            }
+        }
+        onTriggered: root.bnRunningSeconds = Math.floor((Date.now() - root.bnStartedAt) / 1000)
+    }
     implicitWidth: 1060
     implicitHeight: 720
     color: colors.surface
@@ -161,7 +179,7 @@ Rectangle {
         required property string field
         required property string label
         property bool inlineLabel: false
-        property var descriptor: root.state.choices ? root.state.choices[field] : ({items: [], current: -1})
+        property var descriptor: root.state.choices?.[field] ?? ({items: [], current: -1})
         Layout.fillWidth: true
         columns: inlineLabel ? 2 : 1
         rowSpacing: 3
@@ -428,7 +446,12 @@ Rectangle {
             columns: root.width >= 680 ? 2 : 1
             columnSpacing: 12
             Flag { field: "fixed"; text: "Keep background across groups"; implicitHeight: 32; padding: 2; hint: "Reuse the chosen common references when changing measurement groups."; visible: root.inlineReferencesVisible; enabled: !root.state.busy && root.state.canFix }
-            Flag { field: "auto_bn_compare"; text: "Automatic BN comparison"; implicitHeight: 32; padding: 2; hint: root.state.autoCompareSupported ? (root.state.flags.fixed ? "Compare for review while keeping the chosen background. Apply a candidate explicitly in BN comparison." : "Apply a candidate only after the current group's joint DR/R + D2E checks pass.") : "Unavailable in this session. Use Advanced tools to review BN references."; visible: root.state.kind === "bn"; enabled: !root.state.busy && root.state.autoCompareSupported }
+            Action { command: "calibrate-bn"; text: "Calibrate & use · Auto trend"; description: "Calibrate BN, apply the correction and return to the main plot. If calibration fails, keep the current background."; visible: root.inlineReferencesVisible && root.state.kind === "bn"; enabled: !root.state.busy && !root.state.matching && root.state.canCalibrate && !root.invalid }
+        }
+        ColumnLayout {
+            Layout.fillWidth: true
+            visible: root.inlineReferencesVisible && root.state.kind === "bn" && root.state.bnHasComparison
+            Note { objectName: "bn_generated_background"; visible: root.state.bnHasComparison; text: root.state.canUseCalibrated ? "Ready: " + root.state.bnGeneratedLabel + " · not applied" : "No eligible correction · current background unchanged" }
         }
         Basic.ScrollView {
             id: settingsOptions
@@ -553,7 +576,7 @@ Rectangle {
         }
         RowLayout {
             Layout.fillWidth: true
-            Heading { Layout.fillWidth: false; text: root.advancedPage ? (root.toolPages.find(page => page.key === root.state.page)?.title || "Background tools") : root.sourceTitle }
+            Heading { Layout.fillWidth: false; text: root.state.page === "bn" ? "BN calibration" : root.advancedPage ? (root.toolPages.find(page => page.key === root.state.page)?.title || "Background tools") : root.sourceTitle }
             Note { Layout.fillWidth: false; text: root.state.measurementSummary || "" }
             Item { Layout.fillWidth: true }
             Action { command: "page:settings"; text: "Back to background"; visible: root.advancedPage }
@@ -755,27 +778,104 @@ Rectangle {
                     ColumnLayout {
                         Layout.fillWidth: true
                         visible: root.state.page === "bn"
-                        Heading { text: "Measured BN group comparison" }
-                        Note { text: "Uses the selected common BN reference and current SG settings. Leave trusted calibration ranges empty for preview only; intervals require independent physical evidence." }
-                        Repeater {
-                            model: [{key: "train_region", title: "Fit energy"}, {key: "validation_region", title: "Check energy"}, {key: "core_region", title: "Correction energy"}]
-                            delegate: ColumnLayout {
-                                required property var modelData
-                                Layout.fillWidth: true
-                                Editor { field: "bn." + modelData.key + ".low"; label: modelData.title + " low (eV)"; numeric: true }
-                                Editor { field: "bn." + modelData.key + ".high"; label: modelData.title + " high (eV)"; numeric: true }
+                        Flag { field: "bn.per_measurement"; text: "Calibrate each measurement before averaging"; visible: !root.state.bnSingleMeasurement }
+                        Choice { field: "bnCalibrationMethod"; label: "Calibration method"; visible: root.state.bnIndividualCalibration }
+                        Note { objectName: "bn_trend_explanation"; visible: root.state.bnIndividualCalibration && root.state.flags?.["bn.single_trend_enabled"]; text: "Automatically adapts background intervals and correction strength to each CSV. One gain is shared across all gates. Changes absolute DR/R; inspect original vs calibrated." }
+                        Note { objectName: "bn_texture_explanation"; visible: root.state.bnIndividualCalibration && !root.state.flags?.["bn.single_trend_enabled"]; text: "Adjusts measured BN texture. Compare original and calibrated results." }
+                        Note { visible: !root.state.bnIndividualCalibration; text: "Compares the selected common BN reference for the measurement group." }
+                        Flow {
+                            Layout.fillWidth: true
+                            spacing: 5
+                            Action { command: "generate-bn"; text: "Generate calibrated background"; primary: true; enabled: !root.state.busy && root.state.canCalibrate && !root.invalid }
+                            Action { command: "compare-bn"; text: "Compare plots"; description: "Show a comparison without applying a background."; enabled: !root.state.busy && root.state.canCalibrate && !root.invalid }
+                        }
+                        Flow {
+                            Layout.fillWidth: true
+                            spacing: 5
+                            visible: root.state.bnHasComparison
+                            Action { objectName: "drr_bn_advanced_apply_candidate"; command: "apply-bn-candidate"; text: "Use " + root.state.bnGeneratedLabel; primary: true; enabled: !root.state.busy && root.state.canUseCalibrated && !root.invalid }
+                            Action { objectName: "drr_bn_advanced_apply_original"; command: "apply-bn-original"; text: "Use original BN"; enabled: !root.state.busy && !root.invalid }
+                        }
+                        Note {
+                            objectName: "bn_outputs"
+                            visible: root.state.bnHasOutputs
+                            text: root.state.bnElapsedSummary + " · " + root.state.bnOutputStatus + (root.state.bnOutputCount ? "\n" + root.state.bnOutputCount + (root.state.bnOutputCount === 1 ? " file" : " files") + " generated · hover for paths" : "\nNo calibrated candidate was generated; the original background is retained.")
+                            HoverHandler { id: bnOutputHover }
+                            Basic.ToolTip.visible: bnOutputHover.hovered && root.state.bnOutputCount > 0
+                            Basic.ToolTip.text: root.state.bnOutputSummary || ""
+                            Basic.ToolTip.delay: 400
+                            Accessible.description: root.state.bnOutputSummary || ""
+                        }
+                        Action { command: "open-bn-output-folder"; text: "Open results folder"; visible: !!root.state.bnOutputDirectory }
+                        AppButton {
+                            objectName: "drr_bn_details_toggle"
+                            colors: root.colors
+                            compact: true
+                            text: root.showBnDetails ? "Hide method details" : "Method details…"
+                            onClicked: root.showBnDetails = !root.showBnDetails
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            visible: root.showBnDetails
+                            Note { text: root.state.bnIndividualCalibration ? "These are within-scan checks, not independent repeat validation. For multiple measurements, DR/R is averaged with equal file weights before D2." : "Trusted calibration intervals require independent physical evidence." }
+                            Note { objectName: "bn_multi_reference_explanation"; visible: root.state.bnIndividualCalibration; text: "One measured BN file is enough. Multiple selected BN references are averaged and may provide texture templates; they are not independent sample repeats." }
+                            Note { visible: root.state.bnIndividualCalibration && root.state.flags?.["bn.single_trend_enabled"]; text: "Automatic selection compares candidate windows within the outer 35% at each end and chooses relatively stable regions; these regions may still contain sample features. A shared linear or quadratic log-gain and its strength are chosen for all gates. Manual intervals replace automatic windows. Gate, window-sensitivity and D2-change guards may reduce or reject the correction; they do not prove physical validity or independent validation." }
+                            Note { visible: root.state.bnIndividualCalibration && !root.state.flags?.["bn.single_trend_enabled"] && root.state.flags?.["bn.single_full_range"]; text: "The full measured energy range is checked. No energy interval is excluded by the local fit or protection settings." }
+                            Note { objectName: "bn_weak_feature_warning"; visible: root.state.bnIndividualCalibration; text: "Real sample peaks and weak features can overlap BN texture and may be changed by this correction. Compare original and corrected results before interpreting them." }
+                            Note { objectName: "bn_model_summary"; visible: !!root.state.bnModelSummary; text: root.state.bnModelSummary }
+                            Note { visible: !!root.state.bnConditionWarning; text: root.state.bnConditionWarning }
+                            Repeater {
+                                model: root.state.bnCandidates || []
+                                delegate: Note { required property var modelData; text: modelData.name + " · " + modelData.status + "\n" + modelData.detail }
+                            }
+                            Repeater {
+                                model: root.state.bnBatchItems || []
+                                delegate: Note { required property var modelData; text: modelData.measurement + " · " + modelData.status + "\n" + modelData.detail }
                             }
                         }
-                        Editor { field: "bn.taper_width"; label: "Transition width (eV)"; numeric: true }
-                        Editor { field: "bn.train_regions"; label: "Optional fit intervals (eV)" }
-                        Editor { field: "bn.protected_regions"; label: "Protected intervals (eV)" }
-                        Editor { field: "bn.uncertain_regions"; label: "Uncertain intervals (eV)" }
-                        Editor { field: "bn.trusted_regions"; label: "Trusted calibration intervals (eV)" }
-                        Action { command: "compare-bn"; text: "Compare BN / save report"; primary: true }
-                        Flow { Layout.fillWidth: true; spacing: 5; Action { command: "use-bn-original"; text: "Keep original in settings" } Action { command: "use-bn-candidate"; text: "Use validated candidate"; enabled: !root.state.busy && root.state.canUseCalibrated } }
+                        AppButton {
+                            objectName: "drr_bn_advanced_toggle"
+                            colors: root.colors
+                            compact: true
+                            text: root.showBnAdvanced ? "Hide advanced settings" : "Advanced settings…"
+                            onClicked: root.showBnAdvanced = !root.showBnAdvanced
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            visible: root.showBnAdvanced
+                            Flag { field: "auto_bn_compare"; text: "Automatic BN comparison"; hint: root.state.autoCompareSupported ? "Automatically apply only candidates passing joint validation; single-scan candidates require explicit selection." : "Unavailable in this session."; enabled: !root.state.busy && root.state.autoCompareSupported }
+                            Editor { field: "bn.single_trend_regions"; label: "Background intervals (eV); empty selects automatically"; visible: root.state.bnIndividualCalibration && root.state.flags?.["bn.single_trend_enabled"] }
+                            Choice { field: "bnTrendOrder"; label: "Trend model"; visible: root.state.bnIndividualCalibration && root.state.flags?.["bn.single_trend_enabled"] }
+                            Editor { field: "bn.single_trend_max_sensitivity"; label: "Maximum background-window sensitivity (fraction)"; numeric: true; visible: root.state.bnIndividualCalibration && root.state.flags?.["bn.single_trend_enabled"] }
+                            Flag { field: "bn.single_full_range"; text: "Calibrate the full measured energy range"; visible: root.state.bnIndividualCalibration && !root.state.flags?.["bn.single_trend_enabled"] }
+                            Repeater {
+                                model: root.state.bnIndividualCalibration ? [] : [{key: "train_region", title: "Fit energy"}, {key: "validation_region", title: "Check energy"}, {key: "core_region", title: "Correction energy"}]
+                                delegate: ColumnLayout {
+                                    required property var modelData
+                                    Layout.fillWidth: true
+                                    Editor { field: "bn." + modelData.key + ".low"; label: modelData.title + " low (eV)"; numeric: true }
+                                    Editor { field: "bn." + modelData.key + ".high"; label: modelData.title + " high (eV)"; numeric: true }
+                                }
+                            }
+                            Editor { field: "bn.taper_width"; label: "Transition width (eV)"; numeric: true; visible: !root.state.bnIndividualCalibration || !root.state.flags?.["bn.single_trend_enabled"] }
+                            Editor { field: "bn.single_regions"; label: "Single measurement fit intervals (eV)"; visible: root.state.bnIndividualCalibration && !root.state.flags?.["bn.single_trend_enabled"] && !root.state.flags?.["bn.single_full_range"] }
+                            Editor { field: "bn.train_regions"; label: "Optional fit intervals (eV)"; visible: !root.state.bnIndividualCalibration }
+                            Editor { field: "bn.protected_regions"; label: "Protected intervals (eV)"; visible: !root.state.bnIndividualCalibration || (!root.state.flags?.["bn.single_trend_enabled"] && !root.state.flags?.["bn.single_full_range"]) }
+                            Editor { field: "bn.uncertain_regions"; label: "Uncertain intervals (eV)"; visible: !root.state.bnIndividualCalibration }
+                            Editor { field: "bn.trusted_regions"; label: "Trusted calibration intervals (eV)"; visible: !root.state.bnIndividualCalibration }
+                        }
+                        Note {
+                            objectName: "bn_short_summary"
+                            visible: !!root.state.bnModelSummary || (root.state.bnCandidates || []).length > 0
+                            text: root.state.canUseCalibrated ? (root.state.bnIndividualCalibration ? "Candidate ready · within-scan checks" : "Candidate ready · joint checks") : "No eligible candidate. Original BN remains available."
+                        }
                         Repeater {
-                            model: root.state.bnCandidates || []
-                            delegate: Note { required property var modelData; text: modelData.name + " · " + modelData.status + "\n" + modelData.detail }
+                            model: root.state.bnBatchItems || []
+                            delegate: Note { required property var modelData; text: modelData.measurement + " · " + modelData.status; maximumLineCount: 1; elide: Text.ElideRight }
+                        }
+                        Repeater {
+                            model: root.state.canUseCalibrated ? [] : (root.state.bnCandidates || []).filter(row => row.name !== "original" && !!row.detail).slice(0, 1)
+                            delegate: Note { required property var modelData; text: modelData.name + " · " + modelData.detail; maximumLineCount: 2; elide: Text.ElideRight }
                         }
                     }
                     ColumnLayout {
@@ -827,7 +927,7 @@ Rectangle {
                             objectName: "drr_background_empty_preview"
                             anchors.centerIn: parent
                             width: Math.max(100, parent.width - 40)
-                            text: "Run this tool's preview to inspect the background. Use Back to background to choose and apply a reference."
+                            text: root.state.page === "bn" ? "Generate a calibrated background, or compare plots without applying changes." : "Run this tool's preview to inspect the background. Use Back to background to choose and apply a reference."
                             color: root.colors.muted
                             wrapMode: Text.Wrap
                             horizontalAlignment: Text.AlignHCenter
@@ -848,13 +948,13 @@ Rectangle {
         }
         Flag { field: "acknowledged"; text: "I reviewed the matching warnings"; visible: !root.pnSimpleVisible && (root.state.warnings || []).length > 0 }
         Basic.ProgressBar { Layout.fillWidth: true; indeterminate: true; visible: root.state.busy || root.state.matching }
-        Note { visible: !root.inlineReferencesVisible || root.state.busy || !!root.state.error; text: root.state.error || root.state.status || ""; color: root.state.error ? root.colors.error : root.colors.muted; maximumLineCount: 4; elide: Text.ElideRight }
+        Note { objectName: "bn_running_status"; visible: !root.inlineReferencesVisible || root.state.busy || !!root.state.error; text: root.state.error || (root.state.page === "bn" && root.state.busy ? (root.state.status || "Running") + " · " + root.bnRunningSeconds + " s" : root.state.status || ""); color: root.state.error ? root.colors.error : root.colors.muted; maximumLineCount: 4; elide: Text.ElideRight }
         RowLayout {
             Layout.fillWidth: true
-            Note { text: root.invalid ? "Correct the highlighted numeric draft before continuing." : root.pnSimpleVisible ? "Generated versions are saved in history. Apply to current group updates the main result." : "Previews and saved drafts leave the applied background unchanged." }
+            Note { objectName: "bn_current_background"; text: root.invalid ? "Correct the highlighted numeric draft before continuing." : root.inlineReferencesVisible && root.state.kind === "bn" ? "Current: " + (root.state.bnCurrentBackground || "Unchanged") : root.pnSimpleVisible ? "Generated versions are saved in history. Apply to current group updates the main result." : "Previews and saved drafts leave the applied background unchanged." }
             Action { command: "cancel-task"; text: "Stop task"; visible: root.state.busy || root.state.matching; enabled: true }
             Action { command: "cancel"; text: "Close"; description: "Close without applying this background draft"; enabled: true }
-            Action { command: root.pnSimpleVisible ? "pn-apply" : "apply"; text: root.pnSimpleVisible ? "Apply to current group" : root.state.method === "matched" ? "Apply matched backgrounds" : "Apply background"; primary: true; enabled: (root.pnSimpleVisible ? root.state.pnCanApply === true : root.state.applyEnabled) && !root.invalid; objectName: "drr_background_apply" }
+            Action { visible: root.state.page !== "bn" && !(root.state.kind === "bn" && root.state.bnHasComparison); command: root.pnSimpleVisible ? "pn-apply" : "apply"; text: root.pnSimpleVisible ? "Apply to current group" : root.state.method === "matched" ? "Apply matched backgrounds" : "Apply background"; primary: true; enabled: (root.pnSimpleVisible ? root.state.pnCanApply === true : root.state.applyEnabled) && !root.invalid; objectName: "drr_background_apply" }
         }
     }
     Loader { id: fileSelectionLoader; anchors.fill: parent }

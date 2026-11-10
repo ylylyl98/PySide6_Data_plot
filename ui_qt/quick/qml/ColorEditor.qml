@@ -6,6 +6,7 @@ ColumnLayout {
     required property var bridge
     required property var colors
     required property string product
+    property bool showRanges: true
     spacing: 12
 
     objectName: "drr_color_editor_" + product
@@ -27,43 +28,47 @@ ColumnLayout {
     }
     RangeEditor {
         Layout.fillWidth: true
-        visible: control.bridge.snapshot.regionCount === 1
+        visible: control.showRanges && control.bridge.snapshot.regionCount === 1
         bridge: control.bridge
         colors: control.colors
         title: "Color"
         minimumKey: control.product + ".vmin"
         maximumKey: control.product + ".vmax"
         autoAction: "auto." + control.product
+        recommendationTarget: control.product
         showFix: control.product === "raw"
     }
     RangeEditor {
         Layout.fillWidth: true
-        visible: control.bridge.snapshot.regionCount > 1
+        visible: control.showRanges && control.bridge.snapshot.regionCount > 1
         bridge: control.bridge
         colors: control.colors
         title: "Left region"
         minimumKey: control.product + ".left_vmin"
         maximumKey: control.product + ".left_vmax"
         autoAction: "auto." + control.product + ".left"
+        recommendationTarget: control.product + ".left"
     }
     RangeEditor {
         Layout.fillWidth: true
-        visible: control.bridge.snapshot.regionCount === 3
+        visible: control.showRanges && control.bridge.snapshot.regionCount === 3
         bridge: control.bridge
         colors: control.colors
         title: "Middle region"
         minimumKey: control.product + ".middle_vmin"
         maximumKey: control.product + ".middle_vmax"
         autoAction: "auto." + control.product + ".middle"
+        recommendationTarget: control.product + ".middle"
     }
     RangeEditor {
         Layout.fillWidth: true
-        visible: control.bridge.snapshot.regionCount > 1
+        visible: control.showRanges && control.bridge.snapshot.regionCount > 1
         bridge: control.bridge
         colors: control.colors
         title: "Right region"
         minimumKey: control.product + ".right_vmin"
         maximumKey: control.product + ".right_vmax"
         autoAction: "auto." + control.product + ".right"
+        recommendationTarget: control.product + ".right"
     }
 }

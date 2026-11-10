@@ -18,6 +18,14 @@ class CountingPoints(list):
 
 
 class SpectrumPlotTests(unittest.TestCase):
+    def test_export_figure_preserves_map_spectrum_height_choice(self):
+        from core.peak_plotting import build_figure
+        dataset = create_dataset(sample(), 'PL', 'PL', 'a.csv', 'Map')
+        dataset['map_height_percent'] = 40
+        heat, spectrum, residual, _ = build_figure(dataset, show_residual=True)
+        self.assertAlmostEqual(heat.get_position().height /
+            (spectrum.get_position().height + residual.get_position().height), 40 / 60)
+
     def test_overlay_groups_points_once_and_keeps_gaps_order_and_disabled_branches(self):
         from core.peak_plotting import overlay_series
         dataset = dict(branches=[dict(id=str(i), enabled=i != 2) for i in range(80)])
@@ -38,12 +46,12 @@ class SpectrumPlotTests(unittest.TestCase):
         d['candidates']=detect_heatmap(d,d['settings'])
         d['result']=filter_heatmap(d,d['settings']);d['branches']=d['result']['branches']
         axis=Figure().add_subplot();artists=draw_overlay(axis,d)
-        self.assertEqual(float(artists[0].get_sizes()[0]),9)
-        d['marker_size']=4
-        packet=overlay_payload(d)
-        self.assertEqual(packet['marker_size'],4)
-        artists=draw_overlay(Figure().add_subplot(),packet)
         self.assertEqual(float(artists[0].get_sizes()[0]),4)
+        d['marker_size']=2
+        packet=overlay_payload(d)
+        self.assertEqual(packet['marker_size'],2)
+        artists=draw_overlay(Figure().add_subplot(),packet)
+        self.assertEqual(float(artists[0].get_sizes()[0]),2)
 
     def test_many_branches_do_not_rescan_map_for_each_spectrum_marker(self):
         d = create_dataset(sample(), 'PL', 'PL', 'a.csv', 'Map')

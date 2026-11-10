@@ -23,6 +23,100 @@ BN_KIND = 'group_bn_calibration'
 _VERIFIED_VERSION = object()
 
 
+def calibration_usable(report, settings=None):
+    """Accept an explicitly scoped single-pair fit or the repeat certificate.
+
+    Single-pair checks are within-scan evidence, never independent validation.
+    Keep ``joint_validation_passed`` strict for repeat-based callers.
+    """
+    if isinstance(report, dict) and report.get('optimization_policy') in {'shared_bn_trend_v1', 'shared_bn_trend_v2'}:
+        from core.drr_bn_trend import trend_validation_passed
+        return trend_validation_passed(report, settings)
+    if isinstance(report, dict) and report.get('optimization_policy') == 'multi_bn_single_v1':
+        from core.drr_bn_multi import multi_pair_validation_passed
+        return multi_pair_validation_passed(report, settings)
+    if isinstance(report, dict) and report.get('optimization_policy') == 'single_pair_v1':
+        from core.drr_bn_single import single_pair_validation_passed
+        return single_pair_validation_passed(report, settings)
+    return joint_validation_passed(report, settings)
+
+
+def _version_usable(version):
+    return (version.fresh and version.eligible
+            and version.validation_status in ('accepted', 'single_pair')
+            and calibration_usable(version.report, version.settings))
+
+
+def _validate_single_scope(identity, report, settings):
+    if report.get('optimization_policy') in {'single_pair_v1', 'multi_bn_single_v1', 'shared_bn_trend_v1', 'shared_bn_trend_v2'}:
+        if len(identity.get('measurements', ())) != 1 or settings.get('single_measurement') is not True:
+            raise ValueError('Single-pair BN correction must retain exactly one measurement and its single-measurement settings.')
+    if report.get('optimization_policy') == 'multi_bn_single_v1' and report.get('model'):
+        if report['model'].get('template_count') != len(identity.get('baseline_files', ())):
+            raise ValueError('Multi-BN templates must match the recorded measured background files.')
+
+
+def _validate_trend_payload(payload):
+    """Bind a shared trend report to the actual exported one-dimensional BN."""
+    report = payload.get('report', {})
+    if report.get('optimization_policy') not in {'shared_bn_trend_v1', 'shared_bn_trend_v2'}:
+        return
+    energy = np.asarray(payload['energy'], float)
+    original = np.asarray(payload['original_background'], float)
+    candidates = payload['candidate_backgrounds']
+    selected = payload['selected_candidate']
+    if (energy.ndim != 1 or original.shape != energy.shape
+            or not np.isfinite(original).all() or np.any(original <= 0)
+            or selected != report.get('selected_candidate') or selected not in candidates
+            or not np.array_equal(candidates.get('original'), original)
+            or not np.array_equal(payload['candidate_background'], candidates[selected])):
+        raise ValueError('Shared trend candidate does not match its reported selection and original BN.')
+    for name, values in candidates.items():
+        values = np.asarray(values, float)
+        if values.shape != energy.shape or not np.isfinite(values).all() or np.any(values <= 0):
+            raise ValueError('Shared trend backgrounds must be positive finite one-dimensional spectra.')
+        if name == 'original':
+            continue
+        if name not in {'trend_linear', 'trend_quadratic'}:
+            raise ValueError('Unknown shared trend candidate.')
+        try:
+            parameters = report['candidates'][name]['parameters']
+            coefficients = np.asarray(parameters['coefficients'], float)
+            center = float(parameters['energy_center_ev'])
+            if (coefficients.shape != (2 if name == 'trend_linear' else 3,)
+                    or not np.isfinite(coefficients).all() or not np.isfinite(center)):
+                raise ValueError('Invalid shared trend polynomial.')
+            if report.get('optimization_policy') == 'shared_bn_trend_v2':
+                model = report['models'][name]
+                strength = float(parameters['strength'])
+                model_strength = float(model['strength'])
+                base_coefficients = np.asarray(model['base_coefficients'], float)
+                final_coefficients = np.asarray(model['coefficients'], float)
+                coordinate = report['coordinate']
+                scale = float(coordinate['scale_ev'])
+                if (isinstance(parameters['strength'], (bool, np.bool_))
+                        or isinstance(model['strength'], (bool, np.bool_))
+                        or not np.isfinite(strength) or not .125 <= strength <= 1.
+                        or not np.isclose(strength * 64, round(strength * 64), rtol=0, atol=1e-12)
+                        or model_strength != strength or not np.isfinite(scale) or scale <= 0
+                        or not np.isclose(center, float(coordinate['center_ev']), rtol=0, atol=1e-12)
+                        or base_coefficients.shape != coefficients.shape
+                        or final_coefficients.shape != coefficients.shape
+                        or not np.isfinite(base_coefficients).all()
+                        or not np.isfinite(final_coefficients).all()
+                        or not np.allclose(final_coefficients, strength * base_coefficients, rtol=1e-10, atol=1e-12)
+                        or not np.allclose(coefficients,
+                            [value / scale**i for i, value in enumerate(final_coefficients)],
+                            rtol=1e-10, atol=1e-12)):
+                    raise ValueError('Shared trend strength or polynomial evidence is inconsistent.')
+            with np.errstate(over='raise', invalid='raise'):
+                expected = original * np.exp(np.polynomial.polynomial.polyval(energy-center, coefficients))
+            if not np.allclose(values, expected, rtol=1e-11, atol=1e-12):
+                raise ValueError('Shared trend candidate differs from its fitted gain curve.')
+        except (KeyError, TypeError, FloatingPointError) as exc:
+            raise ValueError('Shared trend candidate is missing its gain-curve evidence.') from exc
+
+
 def canonical_json(value):
     return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
 
@@ -506,6 +600,7 @@ class DrrBnStore:
             if file_digest(path) != record['report_sha256']:
                 raise ValueError('BN report was modified.')
             doc = json.loads(path.read_text(encoding='utf-8'))
+            _validate_single_scope(doc['source_identity'], doc['report'], doc['settings'])
             if doc['eligible']:
                 validate_distinct_measurement_contents(doc['source_identity']['measurements'])
             csv_path = self._path(doc['csv_path'])
@@ -516,7 +611,7 @@ class DrrBnStore:
             fresh, reasons = self._input_status(doc['source_identity'])
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise ValueError(f'Invalid saved BN calibration {record["version_id"]}: {exc}') from exc
-        eligible = bool(doc['eligible'] and joint_validation_passed(doc['report'], doc['settings']))
+        eligible = bool(doc['eligible'] and calibration_usable(doc['report'], doc['settings']))
         status = doc['status']
         if doc['eligible'] and not eligible:
             status = 'needs_joint_validation'
@@ -580,6 +675,7 @@ class DrrBnStore:
         payload.update({key: doc[key] for key in ('report', 'eligible', 'selected_candidate', 'summary', 'candidates',
                                                 'settings', 'source_identity', 'status', 'reasons')})
         payload.update(eligible=version.eligible, status=version.status)
+        _validate_trend_payload(payload)
         if doc['eligible'] and not version.eligible:
             payload['reasons'] = list(dict.fromkeys([*payload['reasons'], *version.reasons]))
             payload['summary'] = 'Current D2E-priority joint DR/R and D2E validation required. ' + version.summary
@@ -589,10 +685,12 @@ class DrrBnStore:
 
     def save_result(self, payload):
         identity = payload['source_identity']
+        _validate_single_scope(identity, payload['report'], payload['settings'])
+        _validate_trend_payload(payload)
         if payload['eligible']:
             validate_distinct_measurement_contents(identity['measurements'])
-            if not joint_validation_passed(payload['report'], payload['settings']):
-                raise ValueError('Eligible BN publication requires joint DR/R and D2E validation evidence.')
+            if not calibration_usable(payload['report'], payload['settings']):
+                raise ValueError('Eligible BN publication requires joint DR/R and D2E validation evidence or explicit single-pair fit checks.')
         if Path(identity['root']).resolve() != self.root:
             raise ValueError('BN comparison belongs to another experiment.')
         fresh, reasons = self._input_status(identity)
@@ -671,8 +769,8 @@ class DrrBnStore:
         if not isinstance(version, BnCalibrationVersion) or version._verified is not _VERIFIED_VERSION:
             raise ValueError('Activation requires a version returned by store verification.')
         with self._locked():
-            if not version.fresh or not version.eligible or version.validation_status != 'accepted':
-                raise ValueError('Only a fresh, independently validated BN result can be activated.')
+            if not _version_usable(version):
+                raise ValueError('Only a fresh BN result validated under its declared calibration mode can be activated.')
             expected = [v['path'] for v in version.source_identity['measurements']]
             measurements = expected if measurements is None else measurements
             if _names_key(self.root, measurements) != _names_key(self.root, expected):
@@ -686,6 +784,71 @@ class DrrBnStore:
             payload['selections'][_names_key(self.root, expected)] = dict(mode='calibrated', version_id=version.version_id)
             self._atomic_json(self.manifest_path, payload)
             return version
+
+    def activate_many(self, versions, *, original_choices=(), verify_sources=True):
+        """Atomically activate verified, usable singleton calibrations.
+
+        Every record is checked against the current manifest before any
+        selection is written. Source bytes are checked again when loaded.
+        """
+        versions = tuple(versions)
+        original_choices = tuple(original_choices)
+        if not versions and not original_choices:
+            raise ValueError('Select at least one BN calibration or original background.')
+        if any(not isinstance(v, BnCalibrationVersion) or v._verified is not _VERIFIED_VERSION for v in versions):
+            raise ValueError('Batch activation requires verified BN versions.')
+        with self._locked():
+            payload = self._read()
+            records = {record['version_id']: record for record in payload['versions']}
+            updates = {}
+            refreshed = []
+            for version in versions:
+                if not _version_usable(version):
+                    raise ValueError('Every batch BN version must be fresh and eligible.')
+                expected = [v['path'] for v in version.source_identity['measurements']]
+                if len(expected) != 1:
+                    raise ValueError('Batch activation supports one measurement per version.')
+                key = _names_key(self.root, expected)
+                if key in updates:
+                    raise ValueError('Batch contains multiple versions for the same measurement.')
+                record = records.get(version.version_id)
+                if (record is None or record.get('report_sha256') != version.report_sha256
+                        or record.get('group_key') != key):
+                    raise ValueError('BN history changed after verification; verify the batch again.')
+                current = self._version(record) if verify_sources else version
+                if not _version_usable(current):
+                    raise ValueError('Every batch BN version must be fresh and eligible.')
+                refreshed.append(current)
+                updates[key] = dict(mode='calibrated', version_id=version.version_id)
+            for measurements, baseline_files, which in original_choices:
+                measurements = tuple(measurements); baseline_files = tuple(baseline_files)
+                if (len(measurements) != 1 or not baseline_files or which not in ('first', 'last', 'all')
+                        or any(not isinstance(v, str) or not v.strip() for v in (*measurements,*baseline_files))):
+                    raise ValueError('Each original BN choice requires one measurement, background files and a valid frame method.')
+                key = _names_key(self.root, measurements)
+                if key in updates:
+                    raise ValueError('Batch contains multiple choices for the same measurement.')
+                if any(is_bn_calibration_source(self.root, v) for v in baseline_files):
+                    raise ValueError('An original BN choice cannot use a calibrated background.')
+                validate_bn_background_usage(self.root, (), baseline_files)
+                paths = [resolve_source_path(self.root, v) for v in baseline_files]
+                if not resolve_source_path(self.root, measurements[0]).is_file():
+                    raise ValueError('An original BN measurement is unavailable.')
+                if any(not path.is_file() for path in paths):
+                    raise ValueError('An original BN background is unavailable.')
+                updates[key] = dict(mode='original', restore_original=True,
+                    baseline_paths=[portable_source_name(self.root, path) for path in paths], baseline_which=which)
+            payload['selections'].update(updates)
+            self._atomic_json(self.manifest_path, payload)
+        return tuple(refreshed)
+
+    def activate_many_verified(self, versions, *, original_choices=()):
+        """Commit worker-verified versions; caller guards source signatures.
+
+        Manifest records are rechecked under lock. Loaders revalidate source
+        contents; no file snapshots are rehashed here on the GUI thread.
+        """
+        return self.activate_many(versions, original_choices=original_choices, verify_sources=False)
 
     def deactivate(self, measurements, baseline_files=None, which=None, *, restore_original=False):
         if not measurements:
@@ -751,7 +914,7 @@ class DrrBnStore:
         if _names_key(self.root, measurements) != _names_key(
                 self.root, [v['path'] for v in version.source_identity['measurements']]):
             raise ValueError('Saved BN association does not match its exact measurement group.')
-        if not version.fresh or not version.eligible or version.validation_status != 'accepted':
+        if not _version_usable(version):
             raise ValueError('The previously applied BN calibration is stale or not eligible; use the original BN or compare again.')
         return version
 
@@ -760,7 +923,7 @@ class DrrBnStore:
         expected = [v['path'] for v in version.source_identity['measurements']]
         if _names_key(self.root, measurements) != _names_key(self.root, expected):
             raise ValueError('BN calibration is restricted to its exact measurement group; Keep background cannot reuse it for another group.')
-        if not version.fresh or not version.eligible or version.validation_status != 'accepted':
+        if not _version_usable(version):
             raise ValueError('BN calibration is stale or exploratory; the original BN remains the usable reference.')
         if y_axis is not None and version.source_identity.get('y_axis') != str(y_axis):
             raise ValueError('BN calibration uses a different gate axis; restore its original axis or compare this group again.')
@@ -796,3 +959,40 @@ def validate_bn_background_usage(folder, measurements, backgrounds, *, y_axis=No
     for name in backgrounds:
         if name not in managed:
             check_composite(name)
+
+
+def validate_bn_assignment_usage(folder, measurements, assignments, *, y_axis=None):
+    """Validate managed references against exactly the files assigned to them.
+
+    A scoped background may never be averaged, spliced, or hidden in a
+    composite. Full group scope remains mandatory for group calibrations.
+    """
+    selected = tuple(str(v) for v in measurements)
+    assignments = tuple(assignments)
+    by_name = {v.measurement_file: v for v in assignments}
+    normalized = [str(resolve_source_path(folder, v)).casefold() for v in selected]
+    if (not selected or len(set(selected)) != len(selected) or len(set(normalized)) != len(normalized)
+            or len(assignments) != len(selected) or len(by_name) != len(selected)
+            or set(by_name) != set(selected)):
+        raise ValueError('DRR assignments must contain exactly one entry per measurement file.')
+    groups = {}
+    ordinary = []
+    for measurement in selected:
+        item = by_name[measurement]
+        sources = tuple(item.baseline_source_files)
+        managed = [v for v in sources if is_bn_calibration_source(folder, v)]
+        if managed:
+            if item.baseline_mode != 'External' or item.regions or len(sources) != 1 or len(item.baseline_files) != 1:
+                raise ValueError('A group-calibrated BN cannot be averaged or spliced with other backgrounds.')
+            source = managed[0]
+            key = str(resolve_source_path(folder, source)).casefold()
+            if key not in groups:
+                groups[key] = (source, [])
+            groups[key][1].append(measurement)
+        else:
+            ordinary.extend(sources)
+    # This also recursively checks ordinary composite documents for managed BN.
+    validate_bn_background_usage(folder, (), tuple(ordinary), y_axis=y_axis)
+    store = DrrBnStore(folder)
+    for source, owners in groups.values():
+        store.validate_usage(tuple(owners), source, y_axis=y_axis)

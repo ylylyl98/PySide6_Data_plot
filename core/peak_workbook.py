@@ -3,8 +3,7 @@ from pathlib import Path
 import numpy as np
 
 from core.analysis_workbook import AnalysisTable, analysis_filename, write_analysis_workbook
-from core.power_peaks import peak_model
-from core.power_multi_peaks import multi_peak_model
+from core.pl_fit_models import evaluate_fit, evaluate_component
 
 
 FIT_COLUMNS = [('center_eV', 'fit_center'), ('center_err_eV', 'center_error_ev'),
@@ -78,7 +77,10 @@ def peak_tables(dataset):
     detail_fields = ['row_index', 'y', 'branch_id', 'polarity', 'energy', 'status', 'segment',
         'snr', 'prominence', 'width_mev', 'fit_center', 'center_error_ev', 'fwhm_mev', 'fwhm_error_mev',
         'height', 'height_error', 'fit_area_full', 'fit_area_full_error', 'area', 'area_error',
-        'fit_status', 'uncertainty_status', 'rms']
+        'fit_status', 'uncertainty_status', 'rms', 'fit_quality_status', 'candidate_origin', 'provisional',
+        'detection_contrast', 'curvature_width_mev', 'curvature_score', 'scale_support',
+        'fit_local_residual_sigma', 'fit_height_to_local_noise',
+        'manual', 'fit_center_fixed', 'fit_center_min', 'fit_center_max']
     tables.append(AnalysisTable('Details', ['Feature', *detail_fields],
         ([aliases.get(p['branch_id'], p['branch_id']), *[p.get(k) for k in detail_fields]] for p in points)))
 
@@ -96,7 +98,7 @@ def peak_tables(dataset):
             baseline = total = None
             if fit:
                 p = fit['parameters']; baseline = p[0] + p[1] * (x - fit['origin'])
-                total = multi_peak_model(x, p, model=fit['model'], origin=fit['origin'])
+                total = evaluate_fit(x, fit)
             for j, e in enumerate(x):
                 yield [row, float(cube.gate[row]), float(e), float(y[j]),
                     baseline[j] if fit else None, total[j] if fit else None,
@@ -111,7 +113,7 @@ def peak_tables(dataset):
                     continue
                 x = cube.energy[(cube.energy >= fit['x_min']) & (cube.energy <= fit['x_max'])]
                 for i, identity in enumerate(fit['branch_ids']):
-                    y = peak_model(x, 0., 0., *fit['parameters'][2+3*i:5+3*i], model=fit['model'], origin=fit['origin'])
+                    y = evaluate_component(x, fit, i)
                     for e, v in zip(x, y):
                         yield [row, aliases.get(identity, identity), identity, float(e), float(v)]
         tables.append(AnalysisTable('Components', ['Source_row_index', 'Feature', 'branch_id', 'Energy_eV', 'Fitted_signal_above_baseline'], components()))
@@ -123,6 +125,8 @@ def peak_tables(dataset):
         ['Curve scope', scope], ['Curve source rows (zero-based)', curve_rows],
         ['Missing values', 'Blank numeric cells mean unavailable, not zero. Detection and fit status are separate.'],
         ['Uncertainties', 'Approximate 1-sigma least-squares fit standard errors; excludes calibration/systematic uncertainty.'],
+        ['Fixed centers', 'A user-fixed center is a constraint, not a measured value with zero uncertainty. See fit_center_fixed and uncertainty_status in Details.'],
+        ['Asymmetric Lorentzian', 'Only the strongest seeded component has separate left/right widths. Reported width is total FWHM; asymmetry is bounded to [-0.8, 0.8].'],
         ['Spectrum_area_roi', 'Once per spectrum: measured signal minus fitted common linear baseline, integrated over finite sampled fit ROI.'],
         ['fit_area_full', 'Analytic whole-domain area of an individual fitted component; excludes baseline; extrapolates model tails.'],
         ['fit_area_roi / legacy area', 'Fitted component numerically integrated on the sampled fit domain; legacy values are unchanged.'],
@@ -134,11 +138,92 @@ def peak_tables(dataset):
     metadata.extend(['Setting: ' + k, v] for k, v in settings.items())
     metadata.extend(['Branch: ' + aliases[b['id']], {'id': b['id'], 'name': b.get('name'), 'polarity': b['polarity']}] for b in branches)
     metadata.extend(['Notice', text] for text in result.get('notices', []))
+    metadata.extend(['Manual edit', edit] for edit in dataset.get('manual_peak_edits', []))
+    metadata.extend([f"Fit row {row}", {key: fit.get(key) for key in
+        ('model', 'asymmetric_branch_id', 'parameters', 'n_vary', 'fixed_center_branch_ids', 'status', 'fit_quality')}]
+        for row, fit in fits.items())
     tables.append(AnalysisTable('Settings', ['Setting', 'Value'], metadata))
     return tables
 
 
-def export_peak_workbook(folder, dataset, *, cancelled=None):
+def compact_peak_tables(dataset):
+    """Build numeric, scan-aligned tables for plotting filtered features."""
+    result, cube = dataset['result'], dataset['cube']
+    points = result.get('points', [])
+    branches = list(result.get('branches', dataset.get('branches', [])))
+    known = {b['id'] for b in branches}
+    for branch in dataset.get('branches', []):
+        if branch['id'] not in known and any(p['branch_id'] == branch['id'] for p in points):
+            branches.append(branch)
+            known.add(branch['id'])
+    catalog = list(dataset.get('branch_catalog', result.get('branch_catalog', [])))
+    catalog_ids = {b['id'] for b in catalog}
+    catalog.extend(b for b in branches if b['id'] not in catalog_ids)
+    aliases, counts = {}, {'peak': 0, 'dip': 0}
+    for branch in catalog:
+        polarity = branch['polarity']
+        counts[polarity] += 1
+        aliases[branch['id']] = ('P' if polarity == 'peak' else 'D') + str(counts[polarity])
+    enabled = {branch['id']: branch.get('enabled', True) for branch in dataset.get('branches', [])}
+    accepted_ids = {point['branch_id'] for point in points if point.get('status') == 'accepted'}
+    branches = [branch for branch in branches if enabled.get(branch['id'], branch.get('enabled', True))
+                and branch['id'] in accepted_ids]
+    lookup = {}
+    error_available = {name: set() for name in ('center_error_ev', 'fwhm_error_mev', 'height_error', 'fit_area_full_error')}
+    for point in points:
+        lookup.setdefault((point['row_index'], point['branch_id']), []).append(point)
+        if point.get('status') == 'accepted' and point.get('fit_status') == 'ok':
+            for field, identities in error_available.items():
+                if point.get(field) is not None:
+                    identities.add(point['branch_id'])
+    settings = result['settings']
+    rows = [i for i, y in enumerate(cube.gate) if settings['y_min'] <= y <= settings['y_max']]
+    scan = cube.gate_label or 'Scan'
+    unit = getattr(cube, 'gate_unit', '') or ''
+    if unit and f'({unit})'.casefold() not in scan.casefold() and f'[{unit}]'.casefold() not in scan.casefold():
+        scan += ' (' + unit + ')'
+
+    def table(name, selected, field, unit_label, error=None):
+        headers = [scan]
+        error_columns = {}
+        for branch in selected:
+            alias = aliases[branch['id']]
+            name_value = str(branch.get('name') or '')
+            import re
+            label = alias if not name_value or re.fullmatch(r'[PD]\d+', name_value) else alias + ' - ' + name_value
+            headers.append(f'{label} ({unit_label})')
+            has_error = bool(error and branch['id'] in error_available[error])
+            error_columns[branch['id']] = has_error
+            if has_error:
+                headers.append(f'{label} SE ({unit_label})')
+        def values():
+            for row in rows:
+                output = [float(cube.gate[row])]
+                for branch in selected:
+                    matches = lookup.get((row, branch['id']), [])
+                    point = matches[0] if len(matches) == 1 else {}
+                    accepted = point.get('status') == 'accepted'
+                    good = accepted and (field == 'energy' or point.get('fit_status') == 'ok')
+                    output.append(point.get(field) if good else None)
+                    if error_columns[branch['id']]:
+                        output.append(point.get(error) if good else None)
+                yield output
+        return AnalysisTable(name, headers, values())
+
+    if dataset['kind'] == 'DRR':
+        return [table('Peaks', [b for b in branches if b['polarity'] == 'peak'], 'energy', 'eV'),
+                table('Dips', [b for b in branches if b['polarity'] == 'dip'], 'energy', 'eV')]
+    tables = [table('Detected_peaks', branches, 'energy', 'eV')]
+    if result.get('fits') or any(p.get('fit_status') not in (None, '', 'not fitted') for p in points):
+        tables.extend([table('Fitted_peaks', branches, 'fit_center', 'eV', 'center_error_ev'),
+                       table('FWHM', branches, 'fwhm_mev', 'meV', 'fwhm_error_mev'),
+                       table('Height', branches, 'height', cube.cbar_label or 'signal', 'height_error'),
+                       table('Area', branches, 'fit_area_full', 'eV*signal', 'fit_area_full_error')])
+    return tables
+
+
+def export_peak_workbook(folder, dataset, *, cancelled=None, filename=None, compact=True):
     suffix = '_PLfit' if dataset['kind'] == 'PL' else '_DRRpeaks'
-    name = analysis_filename(dataset.get('source') or dataset['name'], suffix, folder)
-    return write_analysis_workbook(Path(folder) / name, peak_tables(dataset), cancelled=cancelled)
+    name = filename or analysis_filename(dataset.get('source') or dataset['name'], suffix, folder)
+    tables = compact_peak_tables(dataset) if compact else peak_tables(dataset)
+    return write_analysis_workbook(Path(folder) / name, tables, cancelled=cancelled)

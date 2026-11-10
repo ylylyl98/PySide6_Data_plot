@@ -143,7 +143,15 @@ class CompareBridge(QObject):
         self._plot_timer = QTimer(self)
         self._plot_timer.setSingleShot(True)
         self._plot_timer.timeout.connect(self._render)
+        from ui_qt.quick.color_range_controller import ColorRangeController
+        from ui_qt.quick.color_range_adapters import CompareColorAdapter
+        self._color_range_controller = ColorRangeController(CompareColorAdapter(self), self)
+        self.snapshotChanged.connect(self._color_range_controller.refresh)
         self._completed.connect(self._finish)
+
+    @Property(QObject, constant=True)
+    def colorRangeController(self):
+        return self._color_range_controller
 
     @Property(QObject, notify=plotBackendChanged)
     def plotBackend(self):
@@ -1175,7 +1183,6 @@ class CompareBridge(QObject):
                 choice("preset", "Channels", [("kk", "KK + KKp"), ("kpk", "KpK + KpKp"), ("all", "All four"), ("custom", "Custom")], enabled=not vp),
                 *[flag("show." + key, key, self._visible[key], enabled=value["preset"] == "custom" and not vp) for key in CHANNELS],
                 choice("cmap", "Color map", cmap_options, enabled=not vp),
-                *color_fields, action("auto-color", "Auto color"),
                 flag("log", "Log intensity scale", enabled=not vp), flag("clip", "Clip intensity outliers", enabled=not vp)]),
             dict(key="axes", title="Axes and spectrum", fields=[*pair("xmin", "xmax", "X axis"), *pair("ymin", "ymax", "Y axis"),
                 action("auto-x", "Auto X"), action("auto-y", "Auto Y"), number("gate", "Cursor gate"),
@@ -1200,12 +1207,10 @@ class CompareBridge(QObject):
                 dict(key="yLabel", type="summary", label="Axis label", value=axis_label, visible=value["yAxis"] == "advanced")]),
             dict(key="fixed", title="Keep bounds on Auto", advanced=True, fields=[
                 *[flag("fix." + key, "Fix " + label, self._fixed[key]) for key, label in (("xmin", "X minimum"), ("xmax", "X maximum"), ("ymin", "Y minimum"), ("ymax", "Y maximum"))],
-                flag("fix.colorMin", "Fix color minimum", self._fixed[color_keys[0]]), flag("fix.colorMax", "Fix color maximum", self._fixed[color_keys[1]])]),
+                ]),
             dict(key="regions", title="Regional intensity colors", advanced=True, fields=[flag("split", "Use independent left / right colors", enabled=not vp),
                 number("splitX", "X boundary"), flag("fix.splitX", "Fix X boundary", self._fixed["splitX"]),
-                *pair("leftMin", "leftMax", "Left colors"), action("auto-left", "Auto left"),
-                *pair("rightMin", "rightMax", "Right colors"), action("auto-right", "Auto right"), flag("showBoundary", "Show boundary"),
-                *[flag("fix." + key, "Fix " + key, self._fixed[key]) for key in ("leftMin", "leftMax", "rightMin", "rightMax")]]),
+                flag("showBoundary", "Show boundary")]),
             dict(key="export-options", title="Export options", advanced=True, fields=[
                 flag("exportClippedData", "Clip exported intensity data to color limits (legacy)")]),
             dict(key="previews", title="Export titles and filenames", advanced=True, fields=previews)]
@@ -1215,6 +1220,7 @@ class CompareBridge(QObject):
         if self._closed:
             return
         self._closed = True
+        self._color_range_controller.close()
         self._sequence += 1
         self._catalog_sequence += 1
         self._plot_timer.stop()

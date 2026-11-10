@@ -106,6 +106,31 @@ Rectangle {
                 enabled: !!root.state.canConfigureBackground
                 onClicked: root.bridge.invoke("background-settings")
             }
+            Text {
+                Layout.fillWidth: true
+                visible: root.state.bnReferenceChoice?.visible === true
+                text: "Current BN"
+                color: root.colors.muted
+                font.pointSize: 9
+            }
+            AppComboBox {
+                id: bnReferenceChoice
+                objectName: "drr_bn_reference_choice"
+                Layout.fillWidth: true
+                Layout.minimumWidth: 0
+                colors: root.colors
+                visible: root.state.bnReferenceChoice?.visible === true
+                enabled: root.state.bnReferenceChoice?.enabled === true && !root.state.busy
+                model: (root.state.bnReferenceChoice?.items || []).map(item => ({ text: String(item) }))
+                textRole: "text"
+                currentIndex: root.state.bnReferenceChoice?.current ?? -1
+                Accessible.name: "Current BN background"
+                Accessible.description: "Switch between the original and generated BN backgrounds."
+                onActivated: index => {
+                    root.bridge.setParameter("bnReference", index)
+                    currentIndex = Qt.binding(function() { return root.state.bnReferenceChoice?.current ?? -1 })
+                }
+            }
             AppButton {
                 objectName: "drr_cancel_bn"
                 Layout.fillWidth: true
@@ -137,6 +162,8 @@ Rectangle {
             Display {
                 bridge: root.bridge.drrDisplayBridge
                 colors: root.colors
+                colorRangesInFooter: true
+                colorRangeController: root.bridge.colorRangeController
             }
             AppParameterPane {
                 objectName: "drr_native_processing"

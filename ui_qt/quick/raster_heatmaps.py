@@ -40,8 +40,23 @@ def _draw_cells(mesh, fallback, renderer):
         return fallback(renderer)
     from matplotlib.image import PcolorImage
     coordinates = mesh.get_coordinates()
-    image = PcolorImage(mesh.axes, coordinates[0, :, 0], coordinates[:, 0, 1],
-                        mesh.get_array(), norm=mesh.norm, cmap=mesh.get_cmap(),
+    x, y = coordinates[0, :, 0], coordinates[:, 0, 1]
+    values = mesh.get_array()
+    if getattr(mesh.figure.canvas, "color_range_preview", False):
+        # This temporary nearest-cell preview trades resolution for latency.
+        # Keep the mesh and its full-resolution scientific data untouched.
+        import numpy as np
+        from math import ceil
+        rows, cols = values.shape
+        width, height = mesh.axes.bbox.width, mesh.axes.bbox.height
+        col_step = max(1, ceil(cols / max(1., width * .5)))
+        row_step = max(1, ceil(rows / max(1., height * .5)))
+        col_index = np.arange(0, cols, col_step)
+        row_index = np.arange(0, rows, row_step)
+        x = x[np.append(col_index, cols)]
+        y = y[np.append(row_index, rows)]
+        values = values[np.ix_(row_index, col_index)]
+    image = PcolorImage(mesh.axes, x, y, values, norm=mesh.norm, cmap=mesh.get_cmap(),
                         alpha=mesh.get_alpha())
     image.set_figure(mesh.figure)
     image.set_clip_on(mesh.get_clip_on())

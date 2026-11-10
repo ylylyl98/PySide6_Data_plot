@@ -41,6 +41,21 @@ class WorkspaceTests(unittest.TestCase):
                 d=api.create_dataset(sample(kind),kind,channel,'a.csv','Sample')
                 self.assertEqual(d['settings']['detection_method'],method)
 
+    def test_scatter_choice_round_trip_and_legacy_default_do_not_refilter(self):
+        api = self.api()
+        with tempfile.TemporaryDirectory() as folder:
+            dataset = api.create_dataset(sample('DRR'), 'DRR', 'second', 'source.csv', 'DRR')
+            path = Path(folder) / 'scatter.npz'
+            dataset['settings']['remove_scatter'] = True
+            api.save_workspace(path, [dataset], dataset['key'])
+            restored = api.load_workspace(path)[0][0]
+            self.assertTrue(restored['settings']['remove_scatter'])
+            dataset['settings'].pop('remove_scatter')
+            api.save_workspace(path, [dataset], dataset['key'])
+            restored = api.load_workspace(path)[0][0]
+            self.assertFalse(restored['settings']['remove_scatter'])
+            self.assertIsNone(restored['result'])
+
     def test_fresh_handoff_recommends_method_but_workspace_restores_user_choice(self):
         api=self.api()
         for channel,label in [('second','2nd derivative'),('second','Mixed derivative'),('raw','1st derivative')]:
@@ -157,18 +172,26 @@ class WorkspaceTests(unittest.TestCase):
         from core.peak_export import export_dataset
         from core.pl_peak_analysis import detect,track,fit
         d=self.api().create_dataset(sample(),'PL','PL','a.csv','PL sample')
+        d['view'] = dict(display=dict(cmap='viridis', vmin=0., vmax=1.5))
         d['branches']=detect(d,4,d['settings']);d['branches'][0]['name']='Exciton'
         d['result']=fit(d,track(d,d['branches'],d['settings']),d['settings'])
         with tempfile.TemporaryDirectory() as folder:
-            target=Path(export_dataset(folder,d))
-            with (target/'peaks.csv').open(encoding='utf-8-sig',newline='') as stream:
+            outputs=export_dataset(folder,d,include_figures=True,include_sidecars=True)
+            target=Path(folder)
+            self.assertEqual(len(outputs), 5)
+            with (target/'a_peak_details.csv').open(encoding='utf-8-sig',newline='') as stream:
                 rows=list(csv.DictReader(stream))
             self.assertEqual(len(rows),18)
             self.assertEqual(rows[0]['branch'],'Exciton')
             self.assertTrue(rows[0]['energy']);self.assertTrue(rows[0]['fit_center'])
-            self.assertEqual(json.loads((target/'analysis.json').read_text(encoding='utf-8'))['key'],d['key'])
-            with Image.open(target/'peaks.png') as picture:
-                self.assertEqual(picture.size,(1440,1260))
+            self.assertEqual(json.loads((target/'a_analysis_settings.json').read_text(encoding='utf-8'))['key'],d['key'])
+            with Image.open(target/'a_peak_overlay.png') as picture:
+                from core.export import _build_streamlit_style_heatmap_fig
+                from core.peak_source_figure import _fallback_params
+                from matplotlib import pyplot as plt
+                normal = _build_streamlit_style_heatmap_fig(d['cube'], _fallback_params(d), drr=False)
+                self.assertEqual(picture.size, tuple(map(int, normal.get_size_inches() * normal.dpi)))
+                plt.close(normal)
 
 
 if __name__ == '__main__':

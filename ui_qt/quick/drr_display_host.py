@@ -20,6 +20,7 @@ def display_colors() -> dict[str, str]:
         "surface": "sidebar_surface", "text": "heading_text",
         "muted": "section_text", "border": "border_primary",
         "accent": "brand_background", "control": "control_surface",
+        "accentHover": "brand_background_hover", "accentPressed": "brand_background_pressed",
         "hover": "surface_background_hover", "pressed": "surface_background_pressed",
         "error": "danger_foreground", "disabled": "text_disabled",
         "selectedText": "text_on_brand",

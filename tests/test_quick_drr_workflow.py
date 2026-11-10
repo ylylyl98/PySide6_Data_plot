@@ -802,6 +802,58 @@ class QuickDrrWorkflowTests(unittest.TestCase):
         self.assertEqual(file_only.drrDisplayBridge.snapshot["flags"]["fix.raw.vmin"]["text"], "Fix F")
         self.assertEqual(file_only.drrDisplayBridge.snapshot["numbers"]["raw.vmin"]["value"], -.4)
 
+    def test_reloaded_dat_axis_controls_replace_saved_zoom_in_rendered_frame(self):
+        source = self.dat()
+        bridge = self.load_native(source)
+        state = bridge.drrDisplayBridge
+        for key, value in (("axis.xmin", "1.8"), ("axis.xmax", "2"),
+                           ("axis.ymin", "-1"), ("axis.ymax", "1")):
+            self.assertTrue(state.setNumber(key, value), state.error)
+        for key in ("fix.axis.ymin", "fix.axis.ymax"):
+            self.assertTrue(state.setFlag(key, True))
+        self.wait_plot(bridge)
+        bridge._maps[0][0].set_xlim(1.85, 1.95)
+        bridge._maps[0][0].set_ylim(-.7, .7)
+        bridge.invoke("export")
+        self.wait(lambda: not bridge.snapshot["busy"] and not bridge._pending)
+        self.assertIn("Export completed", bridge.snapshot["status"])
+        bridge.close()
+        # Exercise file-restored Fix flags without this machine's manual
+        # preferences taking precedence over the saved view.
+        bridge.settings.remove("drr/display_memory/manual_ranges")
+        bridge.settings.sync()
+        restored = self.load_native(source)
+        state = restored.drrDisplayBridge
+        self.assertEqual(state.snapshot["flags"]["fix.axis.ymin"]["text"], "Fix F")
+        np.testing.assert_allclose(restored._maps[0][0].get_ylim(), (-.7, .7))
+
+        def assert_frame_changed(operation, xlim, ylim):
+            before = restored._canvas.image
+            generation = restored._canvas.frame_generation
+            self.assertTrue(operation(), state.error)
+            self.wait_plot(restored)
+            self.assertGreater(restored._canvas.frame_generation, generation)
+            self.assertNotEqual(restored._canvas.image, before)
+            np.testing.assert_allclose(restored._maps[0][0].get_xlim(), xlim)
+            np.testing.assert_allclose(restored._maps[0][0].get_ylim(), ylim)
+
+        # Both Y endpoints remain fixed; Auto must display their actual values.
+        assert_frame_changed(lambda: state.invoke("auto.y"), (1.85, 1.95), (-1., 1.))
+        self.assertTrue(state.snapshot["flags"]["fix.axis.ymin"]["checked"])
+        self.assertTrue(state.snapshot["flags"]["fix.axis.ymax"]["checked"])
+        # Retyping the displayed X maximum is still an explicit request to
+        # replace the file's zoom, even though the control number is unchanged.
+        state.setEditing("axis.xmax", True)
+        assert_frame_changed(lambda: state.setNumber("axis.xmax", "2"), (1.8, 2.), (-1., 1.))
+        for key, value, xlim, ylim in (
+            ("axis.xmin", "1.82", (1.82, 2.), (-1., 1.)),
+            ("axis.xmax", "1.98", (1.82, 1.98), (-1., 1.)),
+            ("axis.ymin", "-.5", (1.82, 1.98), (-.5, 1.)),
+            ("axis.ymax", ".5", (1.82, 1.98), (-.5, .5)),
+        ):
+            with self.subTest(key=key):
+                assert_frame_changed(lambda: state.setNumber(key, value), xlim, ylim)
+
     def test_failed_paired_native_export_does_not_publish_pending_display_history(self):
         from core.drr_display_settings import INDEX_NAME, find_candidates
         from core import export as export_core

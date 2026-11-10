@@ -12,7 +12,7 @@ from core import processing_run as P
 from core.drr_baseline_candidates import parse_drr_acquisition_conditions
 from core.drr_bn_calibration import BnCalibrationSettings, evaluate_bn_group
 from core.drr_bn_store import (DrrBnStore, canonical_json, file_digest, is_bn_calibration_source,
-                               source_records, validate_distinct_measurement_contents, joint_validation_passed)
+                               source_records, validate_distinct_measurement_contents, calibration_usable)
 from core.drr_composite_background import is_composite_background
 from core.drr_sources import inspect_csv_spectral_grid, resolve_source_path
 from core.load_cancellation import LoadCancelled, check_load_cancelled
@@ -41,6 +41,7 @@ def _emit(target, value):
 def _algorithm_identity():
     from core.drr_bn_fingerprint import module_fingerprint, python_runtime_identity
     names = ('core.drr_bn_service', 'core.drr_bn_calibration', 'core.drr_bn_joint', 'core.drr_bn_d2_objective',
+             'core.drr_bn_single', 'core.drr_bn_single_smooth', 'core.drr_bn_single_phase', 'core.drr_bn_single_high_frequency', 'core.drr_bn_single_exports', 'core.drr_bn_multi', 'core.drr_bn_trend', 'core.drr_bn_trend_adaptive', 'core.drr_bn_settings',
              'core.processing', 'core.processing_run', 'core.loader',
              'core.drr_segmented_derivative', 'core.drr_sources',
              'core.drr_bn_store', 'core.drr_bn_fingerprint')
@@ -112,20 +113,25 @@ def _ordering(root, records, cancellation):
                          limitation='Missing complete capture logs: file modification order is a proxy, not verified acquisition chronology.')
 
 
-def _compatibility(measurements, baseline_files):
+def _compatibility(measurements, baseline_files, *, single_measurement=False):
     bn_pattern = re.compile(r'(?<![a-z0-9])bn(?:back(?:ground)?)(?=$|[^a-z])', re.I)
     if any(not bn_pattern.search(Path(name).stem) for name in baseline_files):
         raise ValueError('BN comparison requires measured BNback/BNbackground reference files; P/N or other generated backgrounds are not BN inputs.')
     parsed = {name: asdict(parse_drr_acquisition_conditions(name)) for name in (*measurements, *baseline_files)}
     unknown = set()
+    differences = {}
     for field in next(iter(parsed.values())):
         known = {v[field] for v in parsed.values() if v[field] is not None}
         if len(known) > 1:
-            raise ValueError(f'Measurement and BN acquisition condition differs: {field}.')
+            if not single_measurement:
+                raise ValueError(f'Measurement and BN acquisition condition differs: {field}.')
+            differences[field] = {name: values[field] for name, values in parsed.items()}
         if any(v[field] is None for v in parsed.values()):
             unknown.add(field)
-    return dict(parsed=parsed, unknown_fields=sorted(unknown),
-                interpretation='Known conflicts rejected; unknown filename conditions are not asserted to match.')
+    return dict(parsed=parsed, unknown_fields=sorted(unknown), differences=differences,
+                interpretation=('Explicit single-measurement pairing: filename differences are reported, not asserted to match; the native grid is checked separately.'
+                                if single_measurement else
+                                'Known conflicts rejected; unknown filename conditions are not asserted to match.'))
 
 
 def compare_bn_group(folder, measurements, baseline_files, which='all', settings=None, *,
@@ -152,13 +158,17 @@ def compare_bn_group(folder, measurements, baseline_files, which='all', settings
         raise ValueError('Compare raw measurement spectra with measured BN files; generated or composite references cannot be recalibrated.')
     if {resolve_source_path(root, n) for n in measurements} & {resolve_source_path(root, n) for n in baseline_files}:
         raise ValueError('A measurement cannot be its own BN reference.')
-    compatibility = _compatibility(measurements, baseline_files)
     if settings is None:
         config = BnCalibrationSettings()
     elif isinstance(settings, BnCalibrationSettings):
         config = settings
     else:
         config = BnCalibrationSettings(**dict(settings))
+    if config.single_measurement and len(measurements) != 1:
+        raise ValueError('Single-measurement BN correction requires exactly one measurement file.')
+    if config.single_trend_enabled and not config.single_measurement:
+        raise ValueError('Shared BN trend normalization requires single-measurement calibration mode.')
+    compatibility = _compatibility(measurements, baseline_files, single_measurement=config.single_measurement)
     settings_dict = json.loads(canonical_json(asdict(config)))
     m_records = source_records(root, measurements)
     validate_distinct_measurement_contents(m_records)
@@ -228,8 +238,27 @@ def compare_bn_group(folder, measurements, baseline_files, which='all', settings
     background = np.mean(selected_vectors, axis=0)
     halves = np.stack([np.mean(first_halves, axis=0), np.mean(last_halves, axis=0)]) if half_available else None
     _emit(progress, 40)
-    result = evaluate_bn_group(e, np.stack(data), background, gates=g, settings=config,
-                               repeat_order=np.arange(len(data)), background_repeats=halves, cancellation=cancellation)
+    if config.single_measurement:
+        if config.single_trend_enabled:
+            from core.drr_bn_trend import evaluate_bn_trend
+            result = evaluate_bn_trend(e, np.stack(data), background, gates=g, settings=config,
+                                      background_repeats=halves, cancellation=cancellation)
+        elif config.single_full_range and len(selected_vectors) >= 2:
+            from core.drr_bn_multi import evaluate_bn_multi
+            result = evaluate_bn_multi(e, np.stack(data), background, gates=g, settings=config,
+                                       templates=np.stack(selected_vectors), cancellation=cancellation)
+            if 'no_distinct_bn_texture' in result.reasons:
+                from core.drr_bn_single import evaluate_bn_single
+                result = evaluate_bn_single(e, np.stack(data), background, gates=g, settings=config,
+                                            background_repeats=halves, cancellation=cancellation)
+                result.report['multi_reference_fallback'] = 'Selected BN files contain no distinct texture; fit their mean as one reference.'
+        else:
+            from core.drr_bn_single import evaluate_bn_single
+            result = evaluate_bn_single(e, np.stack(data), background, gates=g, settings=config,
+                                        background_repeats=halves, cancellation=cancellation)
+    else:
+        result = evaluate_bn_group(e, np.stack(data), background, gates=g, settings=config,
+                                   repeat_order=np.arange(len(data)), background_repeats=halves, cancellation=cancellation)
     _check(cancellation)
     # The selected candidate is stored for review even when the applied method
     # has conservatively fallen back to the original reference.
@@ -240,8 +269,8 @@ def compare_bn_group(folder, measurements, baseline_files, which='all', settings
                                        independent_halves_available=half_available,
                                        limitation=('Disjoint frame halves test within-reference sensitivity; they are not independent acquisition sessions.'
                                                    if half_available else 'First/last selection or odd/fewer-than-two frame count: equal-weight BN halves unavailable.'))
-    if result.eligible and not joint_validation_passed(report, settings_dict):
-        raise ValueError('BN engine returned acceptance without complete joint DR/R and D2E evidence.')
+    if result.eligible and not calibration_usable(report, settings_dict):
+        raise ValueError('BN engine returned acceptance without complete joint DR/R and D2E evidence or single-pair calibration checks.')
     candidates = []
     for name in result.candidate_backgrounds:
         candidate_report = report.get('candidates', {}).get(name, {})
@@ -266,6 +295,8 @@ def compare_bn_group(folder, measurements, baseline_files, which='all', settings
                                eligible=bool(result.eligible and name == result.selected_method),
                                reason=candidate_reason))
     summary = (f'{result.status}: {result.selected_method}. ' + '; '.join(result.reasons)).rstrip('. ')
+    if compatibility['differences']:
+        summary += '. Acquisition labels differ: ' + ', '.join(compatibility['differences'])
     payload = dict(report=report, energy=e.copy(), gates=g.copy(), original_background=background.copy(),
                    candidate_background=result.candidate_backgrounds[result.selected_method].copy(),
                    candidate_backgrounds={k: v.copy() for k, v in result.candidate_backgrounds.items()},

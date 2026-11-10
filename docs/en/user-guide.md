@@ -50,6 +50,34 @@ Color-limit arrows use approximately 0.5% of that minimum/maximum span, rounded 
 
 Mouse-wheel scrolling moves panels and lists without changing dropdowns, numbers, sliders, dials or active tabs. Click or use the keyboard to edit.
 
+### Color range sliders
+
+PL and DRR keep **C limits** in a fixed bar below the plot. One, two or three
+regions share the row, with independent minimum/maximum handles, synchronized
+readouts and **Auto**. Exact **Min / Max** inputs and **Fix** are in the left
+sidebar. Dragging updates those numbers immediately, independently of the image
+refresh rate. Type a value and press **Enter** or leave the field to apply it;
+unfinished text is retained during refresh, and **Escape** cancels a draft.
+Explicit numeric edits remain allowed for fixed endpoints. Narrow windows scroll
+the slider row horizontally. The sidebar retains colormaps, region boundaries,
+axes and other display options. DRR **Overall / Weak features** remain beside
+the sliders; **Weak strength** is in the sidebar. In paired views, the product
+selector chooses the colors being edited.
+Compare uses its intensity regions or VP range; MCD uses one map range and its
+existing shared color lock. Pure spectrum/curve panels have no color slider.
+
+The nonlinear track retains the full editable data range when limits are
+narrowed: drag outward for a wider view without a mode switch. Numeric entry can
+extend the track. Positions are not proportional to values; read the numbers and
+endpoint ticks. Fixed endpoints stay put during dragging. With zero centering
+and both endpoints unlocked, dragging adjusts a symmetric range; exact numeric
+edits retain their existing semantics. Previews are rate-limited from a 50 ms
+target and adapt to rendering cost; release applies the latest range. Large
+rectilinear maps use a temporary lower-resolution screen preview while dragging;
+release and export use the full data. Color
+edits do not recalculate Spectrum data or change its selected scan. Show/Hide
+spectrum and the draggable heatmap/spectrum divider remain separate controls.
+
 ## Finding and loading measurements
 
 Choose the experiment folder and then the sources for the desired workflow. PL and DRR have separate selections and a source/history catalog; recent folders and local file drops are supported. Dialogs start from the requesting workflow's folder and do not reuse stale filenames from a previous open/save request.
@@ -91,6 +119,31 @@ DRR supports native CSV self/external references, precomputed DAT/XLSX maps, ene
 - **Processing** contains derivative/SG controls and single-spectrum fits. Y-window controls appear only for the mixed derivative.
 
 Use the toolbar's **Gate / Previous / Next** to inspect adjacent measured scan coordinates. **Analysis…** can add the current committed source to DRR Analysis or open its workspace. A derivative view sends the original committed source, avoiding differentiation of an already differentiated input.
+
+### Recommended display ranges
+
+The native DRR bottom **C limits** bar offers **Overall** and **Weak features** beside
+each region's color limits, in addition to the existing **Auto**. Overall uses
+robust percentiles; Weak features estimates variation within quieter energy
+windows, separately from differences between their background levels. It also
+keeps a central portion of the visible data within the color scale, so a quiet
+patch cannot saturate most of a map with a changing background. Select
+**Weak strength** (Gentle, Standard, Strong or Maximum), then click
+**Weak features** in the region to apply it. The result reports the applied
+limits and saturation percentage. Before numeric rounding and fixed endpoints,
+Gentle/Standard/Strong/Maximum limit saturation to approximately 20/40/60/75%,
+respectively. Weak limits stay within the Overall range, and stronger contrast
+never widens them. These are display heuristics, not noise measurements or proof
+that an enhanced structure is a real signal. Both actions retain Fix endpoints and the
+selected colormap, including **RdBu_r p=0.60**. Linear weak contrast turns
+**Center Zero** off; Log uses positive-data percentiles instead. These actions
+change display values only, without smoothing, differentiating or discarding data.
+
+**Trim empty X edges** proposes a range from the full measured maps, retaining
+scan rows, color limits and region boundaries. It respects fixed X endpoints;
+ambiguous edges are retained. Use **Auto** beside X to restore the full extent
+(release Fix first for a fixed endpoint). Trimming does not change analysis or
+exported numerical data, and a proposed edge is not proof of absent weak signals.
 
 ### Choosing a background
 
@@ -148,21 +201,25 @@ Plot PL, DRR, Compare intensity or Power intensity, then use **Analyze…** at t
 
 Snapshots inherit colormaps, limits, log/zero-centered normalization and regional scales. DRR has **ΔR/R / 2nd derivative** tabs above the plot; files have a separate tab strip (a single file shows its name). Products retain independent branches/results and share the selected scan coordinate. To enable a missing product, display and send it from the main app. Reopening the same numeric data refreshes display settings while preserving analysis; older saved snapshots need a new handoff for updated display metadata.
 
-### Simple spectrum workflow
+### DRR: find candidates, then filter
 
-Use **Analyze…** in PL or DRR to open the independent analysis window. New handoffs start with the currently selected spectrum and a captured copy of the visible range. The graph is on the left and controls on the right. Find & Fit / Find stay at the bottom while Custom and Advanced controls scroll; Edit peaks is a secondary footer action. PL **Find & Fit** detects peaks and fits the selected peaks with Lorentzian components and a linear background; **Find only** previews detection without fitting. DRR **Find** supports **Peaks / Dips / Both**. PL fits use the supplied linear intensity samples, without the extra detection smoothing. The current-spectrum view gives the spectrum more space than the map.
+A new DRR handoff defaults to **All spectra in dataset** and the full energy and scan ranges. In **1 Find candidates**, click **Find candidates** to scan the full energy range of every spectrum and cache both polarities. In **2 Filter results → Keep**, choose **Peaks only**, **Dips only**, or **Both**, then click **Apply filters**; switching types reuses the cache without redetection. Choose **Current spectrum** under Spectra when you want to inspect just one row. Changing scope requires finding candidates again.
 
-**Filter** offers **Balanced / Sensitive / Strict / Custom**. Choosing Custom reveals Min SNR, Min prominence and Min width in place. Editing these filters updates the detection preview; PL requires **Find & Fit** again to refresh the fit. **Reset to Balanced** restores the preset. **Advanced** holds smoothing, spacing, maximum width/count, model and detection-floor settings. Neighbor support applies only to full-map analysis. Detection width means width at half prominence, separate from fitted FWHM.
+New DRR data start in **Auto from data** mode with candidate floor `0`. Find builds a broad candidate cache, then generates and applies initial filters from measured candidate metrics. The analysis panel shows candidate and retained counts. The recommendation is a heuristic starting point, not a physical classification; inspect and adjust it for your measurement. Detection runs in the background with progress and cancellation. **Detection settings** offers Off (SciPy `find_peaks`) or Savitzky–Golay smoothing, its window, and the candidate floor. Raw ΔR/R defaults to SG with an 11-sample window; derivative products default to local extrema, with optional smoothing labeled **Extra SG**. SG does not differentiate the supplied product. Changing the detector, SG window or floor requires **Find candidates** again; filters cannot recover features excluded by the floor or smoothing.
 
-Use **Edit peaks…** to include/exclude or name peaks and add a spectrum seed. **More → Analyze full map** enables the batch workflow; the Analyze selector returns to Current spectrum. Changing the spectrum or analysis scope clears the old results and waits for a new analysis. Existing workspaces retain their scope and settings. Results appear beside the plot, with **View all results** for the detailed table. Export is explicit; **Apply to main app** sends an overlay only when requested. Daily plotting does not run peak analysis.
+In **2 Filter results**, set the **Keep** type, **Keep range**, preset and quality thresholds, then click **Apply filters**. Draft range and threshold changes do not alter the result until applied. Filtering reuses the candidate cache: widen a range, change polarity or clear a threshold and apply again to restore matching cached candidates without redetection. **Full range**, **Follow plot view**, and **Custom range** choose the filter bounds; Adjust filters include spacing, maximum width/count and neighbor support. A preset such as Balanced, Sensitive or Strict deliberately excludes some candidates; **All candidates** and **Clear quality filters** remove quality cutoffs. Detection width is the width at half prominence, separate from fitted FWHM.
 
-### Detect once, filter the cache
+For map data with enough neighboring-spectrum evidence, the automatic recommendation compares seven filter proposals against the same continuity reference. Its heuristic score weights retention of weaker reference candidates at 45%, retention of all reference candidates at 25%, and removal of candidates lacking reference continuity at 30%; available terms are renormalized when evidence is missing. The bounded reference follows sustained, smooth same-polarity trajectories, allows one missing row at a time, and breaks at large scan gaps. It is used for scoring, not physical identification or ground truth: noise can appear continuous and real features can be isolated or move rapidly. When neighboring evidence is insufficient, including a single-spectrum analysis, the statistical starting filters are used instead.
 
-1. In **Advanced → Smoothing**, choose **Off** (SciPy `find_peaks`, no smoothing) or **Savitzky–Golay** (order-2 SG smoothing followed by that detector). Dips invert the supplied signal. SG does not differentiate an already processed product. Uneven energy coordinates are regridded per finite segment; windows shorten to fit and segments under five samples remain unsmoothed.
-2. **Find / Find only** scans the selected spectrum or full map and overlays candidates. **Candidate floor** is a fraction of each full spectrum's range. PL/raw ΔR/R default to **SG + extrema**, window **11**; derivative products default to **Local extrema**. Derivative smoothing is labeled **Extra SG**, and recorded upstream window/order are shown when available. Provenance comes from the displayed product, not pending main-window settings. Change derivative generation in DRR, then send the updated product to compare SG windows.
-3. Both defaults use floor **0.01** and **Balanced** filters. Floor `0` deliberately retains all local extrema; there is no peak-count cap. Detection runs with progress/cancellation in the analysis worker. Changing detector, SG window or floor rebuilds the candidate pool; filters below the cached floor cannot recover omitted candidates.
+After detection, **Suggest filters** recomputes and applies a recommendation from the cached candidates. Manually editing filter parameters or choosing a preset disables automatic overwriting; click **Apply filters** to use manual changes, or generate a new recommendation when desired.
 
-New datasets use these product-specific Balanced thresholds:
+After choosing the numerical filters, automatic DRR analysis enables **Remove isolated clusters** when sustained trajectories cover at least seven spectra and 5% of the candidates passing quality and neighboring-support filters. Cleanup preserves those trajectories, SNR ≥ 8 or unavailable SNR, and locally repeated same-type features: at least three distinct spectra within a seven-row window, with a width-based energy tolerance bounded to one–three energy samples. Large scan gaps break neighborhoods. These protections favor weak-feature retention and may also retain correlated noise. Single-spectrum analysis and insufficient evidence skip cleanup. **Details** reports the actual outcome. To restore removed points, disable **Adjust filters → Remove isolated clusters** and click **Apply filters**; **All candidates** also disables it. Saved manual choices are preserved; PL fitting is unchanged.
+
+Enable **Preview excluded points** to show faded × markers on the map and selected spectrum. Only exclusions within the last applied X/Y range and feature type are shown. The panel counts the first failing condition (SNR, prominence, width, neighboring support, isolated cluster, spacing, or per-spectrum limit); hover near a marker to read its reason in the cursor bar and hover over that bar for details. Draft edits do not alter the preview until **Apply filters**. Hiding the preview does not change results. Older saved results need filters reapplied to generate explanations.
+
+The sidebar separates **1 Find candidates** from **2 Filter results**. Detection always caches both peaks and dips; **Keep** controls only the retained result. Find also applies suggested or current filters to produce a starting preview. X/Y editors appear only for **Custom range**; single-spectrum analysis uses the selected scan row. Expand **Adjust filters** for numeric quality thresholds, **Detection settings** for smoothing and candidate floor, or **Details** for recommendation and exclusion explanations. **Find candidates** sits in the detection section; **Apply filters** remains fixed at the bottom.
+
+The optional **Balanced** filter preset uses these starting thresholds. Prominence is normalized by the range of the full spectrum, not the selected X range.
 
 | Product | Minimum SNR | Prominence fraction | Support out of 5 |
 | --- | ---: | ---: | ---: |
@@ -170,17 +227,39 @@ New datasets use these product-specific Balanced thresholds:
 | DRR ΔR/R | 5 | 0.08 | 3 |
 | DRR 2nd derivative / other labeled derivatives | 7 | 0.10 | 4 |
 
-**Sensitive** lowers SNR by 2, halves prominence and lowers support by 1. **Strict** raises SNR by 2, multiplies prominence by 1.5 and raises support by 1. Width thresholds use 2/3/4 median energy-sample intervals for Sensitive/Balanced/Strict; same-polarity spacing starts at 2 intervals. They convert to meV, round to 4 decimal places and stay in 0.0001–1000 meV. At 0.2 meV/sample, Balanced width is 0.6 meV and spacing 0.4 meV. These sampling-based values are starting points, not instrument resolution. Tooltips list thresholds and the SG window's approximate span.
+**Sensitive** lowers SNR by 2, halves prominence and lowers support by 1; **Strict** raises SNR by 2, multiplies prominence by 1.5 and raises support by 1. Their width thresholds use 2, 3 and 4 median energy-sample intervals for Sensitive, Balanced and Strict respectively; same-polarity spacing starts at 2 intervals. These sampling-based values are starting points, not instrument resolution.
 
-Presets clear maximum width/count caps and retain range, polarity and detector choices. Manual filter edits select **Custom**. Existing workspaces keep settings/caches; choose a preset explicitly to update them. New handoffs apply current defaults in the child process, even if the main app is running; known datasets retain their choices. **More → Restart** refreshes the analysis process.
+### PL and shared controls
 
-The range controls stay visible; **Custom** filters expose SNR, prominence and minimum width. Full-map mode also exposes scan bounds. **Full range / Follow plot view / Custom / captured view** selects the range; editing bounds selects Custom. Follow plot view refilters after a pan/zoom gesture, while captured/custom ranges remain fixed. **Advanced** contains neighbor support, spacing, neighbor drift, maximum width/count, candidate floor, rejected markers and cached-method details. **Clear all filters** restores cached candidates; it does not recover points omitted by the detection floor.
+PL uses **1 Find peaks → 2 Check peaks → 3 Fit → 4 Results**. Choose all spectra or the current spectrum and an analysis range, then **Find peaks** to detect candidates and apply the default filters. Check them on the plot; changes under **Adjust filters** require **Apply filters**. Choose a shape and **Fit checked peaks**, then inspect residuals and save results. Fitting uses the reviewed candidates without finding peaks or choosing filters again. Return to any step to revise the analysis.
+
+New handoffs default to the full map and full energy/scan ranges. Fits use supplied linear intensities without detection smoothing. Detection changes require finding again; pending filters block fitting, export and sending overlays. Shape or peak-selection changes invalidate fits while preserving candidates and filter values. Saved workspaces retain their choices.
+
+New PL handoffs enable **Recover weak PL features** and **Auto from data**. Candidates have no relative-prominence floor; local raw-minus-SG noise and neighboring spectra provide editable screening. **Suggest filters** compares seven settings while protecting prominent, supported extrema, so a stricter drift setting cannot win by deleting the main branch. Manual presets and edits stop automatic replacement. Changing weak-feature mode requires **Find** again; existing saved analyses retain their original mode.
+
+Weak-feature mode also proposes shoulders from three distinct curvature scales derived from the dominant peak width (a 5–9 meV central scale, evaluated at 0.8/1/1.2 times that scale). Orange hollow diamonds are **provisional shoulder landmarks**, not independently resolved peaks. Their measured prominence is zero; curvature contrast and seed width are separate heuristics, not peak height or fitted FWHM. A positive minimum-prominence filter excludes these shoulders. In map mode they require at least four-of-five neighboring-row support when support filtering is enabled. Raw data and its displayed intensities are unchanged. Close branches use mutual-nearest prediction with up to the configured missing-row gap; no missing measured points are invented, and large scan-coordinate gaps break tracking.
+
+PL fitting limits automatic center drift, tries a second initialization for weak companions, and compares at most three one-component deletions using global and local BIC evidence on the same samples. Manual seeds are not pruned. This bounded comparison is not an exhaustive peak-count search or physical identification. Automatic analysis fits at most eight prioritized seeds per spectrum, retaining excess candidates as explicitly unfitted; more than eight manual/prominent seeds require user selection. Boundary hits, shoulder shifts and structured residuals remain review states. In fitted overlays, cyan circles retain detected positions, orange crosses show unconfirmed detections, and branch lines show valid fitted centers. **Show residual** and the current-fit summary expose model limitations; CSV/JSON and XLSX **Details** retain origin, quality and provisional-candidate fields.
+
+In **2 Check peaks**, choose a spectrum on the map, then click a peak marker on the spectrum to select it. An orange vertical line identifies the selected peak. Drag horizontally to move it, double-click empty space to add a peak, or press **Delete** with the plot focused to exclude the selected peak. **Esc** cancels dragging or picking. Editing is disabled during pan/zoom, computation or pending result changes. **Edit current spectrum** also allows exact numeric positions followed by **Update selected peak**.
+
+The review sidebar keeps only peak selection, Add, Remove and Next open. Under **Exact position / constraints**, set an exact position, width, allowed movement or **Fix center at this position**, then apply with **Update selected peak**. Edits affect this spectrum only and survive Find, filtering and workspace reload; **Reset edits in this spectrum** restores its automatic results. **Whole-map branch selection → Show all branches** reveals checkboxes for entire branches. Edits invalidate fits; continue to **3 Fit** to refit. Model comparison does not prune manually assigned peaks. A fixed center's zero standard error describes a constraint, not measurement precision. The review step gives the spectrum more height by default; manual Map size settings take precedence.
+
+**4 Results** distinguishes detected positions, valid fitted centers and other/unconfirmed positions. **Save results** saves plotting tables in XLSX, a source-export heatmap overlay and complete analysis JSON together; CSV is no longer generated by default. **Save editable session** preserves the workspace for continued editing. **Show positions in main app** explicitly sends the overlay to the main application.
+
+The optional **Asymmetric Lorentzian** adds unequal left/right widths only to the strongest seeded component. Other components remain symmetric, and the default Lorentzian is unchanged. Asymmetry is bounded to ±0.8; exported width is total FWHM. A smaller residual does not establish that weak components are reliably resolved: inspect boundaries, uncertainty and residual structure. JSON retains manual constraints, models, quality metrics and edit history; the default workbook contains numeric tables for plotting.
+
+The plot is on the left and the controls on the right. **Map size** changes the map's share of plot height from 20% to 80%; **Auto** restores the scope-dependent layout. The choice is remembered per dataset. Results appear beside the plot, with **View all results** for the detailed table. Export is explicit; **Apply to main app** sends an overlay only when requested.
+
+With **Zoom** active, drag a visible black-and-white rectangle over the desired plot area and release to zoom. Press **Esc** during the gesture to cancel it.
+
+A fresh handoff initially shows the incoming datasets. Earlier workspace datasets and results are retained: choose **More → Show previous datasets** to display and select them. Closing the option returns to the current handoff. Reopening the same numerical dataset preserves its explicitly chosen analysis scope; legacy implicit DRR defaults are updated for the new workflow.
 
 ### Interpreting detection metrics
 
-Candidate width is full width at half prominence, not fitted FWHM. SNR is prominence divided by robust noise on the cached detection signal, per finite segment. Noise is MAD / 0.67448975 of residuals after an order-2 SG baseline of up to 51 samples; this baseline only estimates noise and never shifts/refits extrema. Segments under seven samples lack a noise estimate and are rejected when SNR filtering is enabled. SNR is a heuristic ratio, not confidence probability.
+For ordinary extrema, candidate width is full width at half prominence, not fitted FWHM. DRR and legacy PL SNR is prominence divided by robust noise on the cached detection signal, per finite segment. Noise is MAD / 0.67448975 of residuals after an order-2 SG baseline of up to 51 samples; this baseline only estimates noise and never shifts/refits extrema. New PL weak-feature mode instead uses a local raw-minus-SG residual MAD window of up to 101 samples, with shoulder contrast separately identified. Segments under seven samples lack a noise estimate and are rejected when SNR filtering is enabled. SNR is a heuristic ratio, not confidence probability.
 
-Same-polarity support is counted after shape/SNR filtering and before range cropping/branch association in sorted scan coordinates. Default tolerance is `1.5 meV` per neighboring row, doubled for the second neighbor. Required support scales at map edges; scan gaps above 1.5 median steps break neighborhoods. Single spectra do not require absent neighbors; counts do not recursively promote points. Strong support can shorten branch endpoints: lower support to inspect them instead of increasing smoothing. Applying a preset to an old cache computes missing noise metrics once, then reuses them. Exports/workspaces retain the original candidate pool and metrics.
+Same-polarity support is counted after shape/SNR filtering and before range cropping/branch association in sorted scan coordinates. Fixed presets use a base tolerance of `1.5 meV` per neighboring row; automatic filters estimate it from the data. The second neighbor has twice the reach. New DRR map analysis and **Suggest filters** enable **Adjust filters → Adapt matching to peak width**: when a base match fails, broad candidates may match within one quarter of the smaller width, capped at twice the base tolerance per row. Extra matches must be mutual nearest neighbors, with the second-nearest alternative farther by more than one quarter of the base reach. This allows limited peak-position jitter without declaring a branch connection. Narrow peaks, unavailable widths and zero base tolerance do not gain extra reach. Turn the option off and click **Apply filters** to restore fixed-tolerance matching without redetection. Saved choices are retained; older saved analyses, fixed presets, PL and single-spectrum analysis retain the previous behavior. **All candidates** disables the option. Required support scales at map edges; scan gaps above 1.5 median steps break neighborhoods. Counts do not recursively promote points. Strong support can shorten branch endpoints: lower support to inspect them instead of increasing smoothing. Applying a preset to an old cache computes missing noise metrics once, then reuses them. Exports/workspaces retain the original candidate pool and metrics.
 
 ### Branches, spectra, fits and overlays
 
@@ -188,9 +267,21 @@ In **Edit peaks…**, edit a name to rename, check inclusion or use **Exclude br
 
 Click the map or move **Spectrum** to inspect a measured spectrum. The mouse readout shows X/Y and labels; heatmaps also show **Z (nearest)** from the input grid before color clipping/normalization or extra smoothing. Hover for signal label/cell coordinates. Leaving the axes marks the last reading; data/view changes clear it. Log axes report physical scan values using displayed cell boundaries. Spectrum/residual Y is the actual mouse coordinate, not curve-snapped; missing coordinates/Z show `—`. Mouse motion only changes text and does not select a spectrum or run analysis.
 
-For PL, **Fit selected branches** optionally fits peaks; **Show residual** exposes residuals. Choose detected positions or valid fitted centers for the overlay. **Apply to main app** sends positions to matching main-app heatmaps. Numeric source changes invalidate overlays; zoom/color changes do not rerun analysis. Toolbar **Size** sets marker area (default `9 pt²`) without detection/filtering or heatmap rebuilding, and is retained in workspace saves, exports and overlay packets.
+For PL, **3 Fit → Fit checked peaks** fits the reviewed selection; **Show residual** displays residuals when fits exist. Choose detected positions or valid fitted centers for the overlay. **Apply to main app** sends positions to matching main-app heatmaps. Numeric source changes invalidate overlays; zoom/color changes do not rerun analysis. Toolbar **Size** sets marker area (default `4 pt²`) without detection/filtering or heatmap rebuilding, and is retained in workspace saves, exports and overlay packets.
 
-**Results** opens the table on demand with SNR, supporting/available rows, prominence and measured width. **Export...** creates a new folder containing CSV/JSON/PNG; CSV also includes noise/support metrics. Progress/cancellation remains in the status bar without automatically opening the main app's bottom docks. On Windows the workspace saves on close under `%LOCALAPPDATA%/DPTK/Peak Analysis`. **More → Restart** saves before restarting. Source-code/bundled-code restart requirements are in [Development](development.md).
+**Save results** saves `_peak_results.xlsx`, `_peak_overlay.png` and `_analysis_settings.json` together. The adjacent **Save figure** button saves the overlay alone. PNG uses the main application's normal heatmap export renderer, preserving its layout, colors, title, colorbars and dimensions, with retained peak/dip markers overlaid. It is not the Analyze window's map-and-spectrum layout. Source export settings are captured when opening analysis and refreshed from the live main plot when saving, with numeric source identity checked. Offline exports retain the captured settings. Old histories without verifiable color limits require reopening from the main plot; automatic color guesses are not used.
+
+For DRR, choose **Peaks only**, **Dips only** or **Both** under **2 Filter results → Keep**, then click **Apply filters** before saving. The saved markers use the applied result, as does XLSX; there is no separate image-only feature filter. Rejected-candidate previews are excluded from saved PNGs. Adjust **Size** above the map to change marker area (default 4 pt²).
+
+When the main plot selects a wide PNG (for example 2.0×), **Save results** includes both the original 1.0× `_peak_overlay.png` and `_peak_overlay_2.0x.png`; **Save figure** also saves both sizes. They share the same data, colors and peak/dip markers. Only canvas width increases; height, font sizes and DPI remain unchanged. An analysis of d2E exports the d2E map and detections, not the original DRR signal. Repeated saves and save-as preserve existing files with matching sequence numbers.
+
+The default XLSX contains numeric plotting sheets: **Peaks** and **Dips** for DRR; **Detected_peaks** for PL, plus **Fitted_peaks**, **FWHM**, **Height**, and **Area** after fitting. Each sheet begins with the scan coordinate and units, followed by stable branch columns and adjacent available standard errors (SE). Unreliable or missing values remain blank rather than zero. Area is the fitted component's full analytic area. Thresholds, candidate points, quality flags, failure reasons and edit history remain in JSON/session history. Details, Curves, Components and Settings sheets are not included by default.
+
+Outputs live directly beside the processed file, preserving its complete experimental filename with readable ASCII normalization. Existing outputs are preserved using matching sequential `_02`, `_03` suffixes for XLSX, PNG and JSON; names are not shortened or given random/hash IDs. Raw inputs not yet exported use `Processed Data/PL` or `Processed Data/DRR`. **More** contains save-as and open-folder actions.
+
+Analysis history is saved beside each processed file as `<full filename>_analysis_history.npz` when switching files or closing. Reopening loads only that file's history. Old combined workspaces and nested histories remain untouched while matching records are migrated in the background. `%LOCALAPPDATA%/DPTK/Peak Analysis` holds settings, handoffs and history path bindings/migration indexes/cache instead of an ever-growing combined workspace. **More → Restart** saves before restarting. Source-code/bundled-code restart requirements are in [Development](development.md).
+
+Use the **mouse wheel** to zoom around the pointer, **middle-button drag** to pan, and **Home** (button or key) to restore the full range. **Zoom** rectangle selection remains available for precise inspection. Left-click continues to select spectra and edit peak positions.
 
 ## Compare
 
