@@ -16,6 +16,7 @@ from pathlib import Path
 import struct
 import subprocess
 import sys
+import tempfile
 
 INSTALLED_APP_ID = "com.ylylyl98.dptk_desktop.data_plot"
 SOURCE_NAME = "DPTK Source"
@@ -35,7 +36,9 @@ class CodeLease:
                         ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD),
                         ("hEvent", wintypes.HANDLE)]
 
-        directory = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "DPTK/source-locks"
+        # Coordination is temporary runtime state, not application settings.
+        # Check/demo entrypoints must not create files in production profiles.
+        directory = Path(tempfile.gettempdir()) / "DPTK-source-locks"
         directory.mkdir(parents=True, exist_ok=True)
         self.file = (directory / (source_app_id(root) + ".lock")).open("a+b")
         self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)

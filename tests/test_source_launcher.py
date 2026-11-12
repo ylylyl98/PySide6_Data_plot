@@ -281,7 +281,8 @@ class WindowsSourceTests(unittest.TestCase):
                 while time.monotonic() < deadline:
                     if receipt.exists():
                         value = json.loads(receipt.read_text(encoding="utf-8"))
-                        self.assertEqual(value, {"cwd": str(root), "version": expected})
+                        self.assertTrue(Path(value["cwd"]).samefile(root))
+                        self.assertEqual(value["version"], expected)
                         receipt.unlink()
                         return
                     time.sleep(.1)
@@ -327,7 +328,9 @@ class WindowsSourceTests(unittest.TestCase):
         from windows_source import create_shortcut, relaunch_properties
 
         with TemporaryDirectory(prefix="DPTK source 中文 ") as directory:
-            root = Path(directory)
+            # CI can supply TEMP through an 8.3 alias such as RUNNER~1. Shell
+            # links store the canonical path, even when creation used that alias.
+            root = Path(directory).resolve()
             for relative in (".venv/Scripts/pythonw.exe", "assets/icons/app_icon.ico", "launch_data_plot.pyw"):
                 target = root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
