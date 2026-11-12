@@ -3,6 +3,8 @@ import argparse
 import hashlib
 from pathlib import Path
 import sys
+from windows_source import protect_source_code
+protect_source_code()
 
 if __name__ == "__main__" and "--legacy-widgets" not in sys.argv:
     from run_peak_analysis_quick import main as native_main

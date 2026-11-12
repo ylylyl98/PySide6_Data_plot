@@ -4,46 +4,21 @@ param(
     [switch]$Desktop
 )
 
+# Compatibility entry; Data_Plot_App.bat is the normal first-run path.
 $ErrorActionPreference = "Stop"
-
 $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
-$launcherPath = Join-Path $projectRoot "Data_Plot_App.bat"
-$iconPath = Join-Path $projectRoot "assets\icons\app_icon.ico"
-
-if (-not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) {
-    throw "Launcher not found: $launcherPath"
+$python = Join-Path $projectRoot ".venv\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+    throw "Run Data_Plot_App.bat first to prepare the source environment."
 }
-if (-not (Test-Path -LiteralPath $iconPath -PathType Leaf)) {
-    throw "Application icon not found: $iconPath"
-}
-
-if ($Desktop) {
-    $desktopPath = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
-    $ShortcutPath = Join-Path $desktopPath "DPTK Desktop.lnk"
-} elseif ([string]::IsNullOrWhiteSpace($ShortcutPath)) {
-    $ShortcutPath = Join-Path $projectRoot "DPTK Desktop.lnk"
-} else {
-    $ShortcutPath = [System.IO.Path]::GetFullPath($ShortcutPath)
-}
-
-$shortcutDirectory = Split-Path -Parent $ShortcutPath
-if (-not (Test-Path -LiteralPath $shortcutDirectory -PathType Container)) {
-    throw "Shortcut directory not found: $shortcutDirectory"
-}
-
-$shell = New-Object -ComObject WScript.Shell
+Push-Location -LiteralPath $projectRoot
 try {
-    $shortcut = $shell.CreateShortcut($ShortcutPath)
-    $shortcut.TargetPath = $launcherPath
-    $shortcut.WorkingDirectory = $projectRoot
-    $shortcut.IconLocation = "$iconPath,0"
-    $shortcut.Description = "Launch DPTK Desktop"
-    $shortcut.Save()
-} finally {
-    if ($null -ne $shortcut) {
-        [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut)
+    if ($ShortcutPath) {
+        & $python -c 'import sys; from pathlib import Path; from windows_source import create_shortcut; print(create_shortcut(Path(sys.argv[1])))' $ShortcutPath
+    } else {
+        & $python -c 'from windows_source import create_shortcut; print(create_shortcut())'
     }
-    [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+    if ($LASTEXITCODE -ne 0) { throw "Could not create the DPTK Source shortcut." }
+} finally {
+    Pop-Location
 }
-
-Write-Output "Created DPTK shortcut: $ShortcutPath"

@@ -22,6 +22,7 @@ Desktop.ini
 .vscode/
 .idea/
 DPTK Desktop.lnk
+DPTK Source.lnk
 
 # Local AI/tool state
 .agents/

@@ -4,6 +4,8 @@ import argparse
 import hashlib
 import json
 import sys
+from windows_source import protect_source_code
+protect_source_code()
 if __name__ == "__main__" and "--legacy-widgets" not in sys.argv:
     from run_drr_analysis_quick import main as native_main
     raise SystemExit(native_main(sys.argv[1:]))

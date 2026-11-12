@@ -202,6 +202,15 @@ for its flags, isolated checks and explicit test settings.
 Published binaries and CI validate Windows; these instructions do not promise
 prebuilt packages or equivalent testing on other operating systems.
 
+On Windows, double-click **`Data_Plot_App.bat`** to prepare the environment,
+create the **DPTK Source** desktop shortcut, and launch. Future desktop and
+taskbar launches safely check the configured remote's `main` before starting.
+Pin the running **DPTK Source** icon; remove any old source pin first. Local
+changes, a different branch, divergent history or an unavailable remote skip
+the update with an English explanation and allow launching the local version.
+An already-running source window is activated without updating. See
+[source shortcuts](docs/en/development.md#source-shortcuts-and-macos-recipes).
+
 ## Development and support
 
 Start with the [development guide](docs/en/development.md) and repository
