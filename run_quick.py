@@ -15,6 +15,12 @@ from time import perf_counter
 
 
 def main(argv=None, *, production=False):
+    from windows_source import protect_source_code
+    protect_source_code()
+    if production:
+        from windows_source import acquire_source_instance
+        if not acquire_source_instance():
+            return 0
     started = perf_counter()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--demo", action="store_true")
@@ -83,6 +89,9 @@ def main(argv=None, *, production=False):
         temporary.cleanup()
         return 2
     window = engine.rootObjects()[0]
+    if production:
+        from windows_source import attach_source_window
+        attach_source_window(window)
     screen = app.primaryScreen()
     available = screen.availableGeometry() if persistent and screen is not None else None
     window.setWidth(min(args.width, available.width()) if available is not None else args.width)

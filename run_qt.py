@@ -4,6 +4,19 @@ if __name__ == '__main__':
     # Dispatch frozen process workers before importing Qt or creating an app.
     from multiprocessing import freeze_support
     freeze_support()
+    from windows_source import protect_source_code
+    protect_source_code()
+    import sys
+    # Take the lifetime guard before importing application code. Child analysis
+    # processes have their own IPC and are dispatched separately below.
+    if not any(flag in sys.argv for flag in (
+        "--mcd-organizer-quick", "--mcd-organizer", "--peak-analysis-quick", "--peak-analysis",
+        "--drr-analysis-quick", "--drr-analysis", "--check-quick-display",
+        "--check-megasweep-runtime", "--check-powerpoint-integration",
+    )):
+        from windows_source import acquire_source_instance
+        if not acquire_source_instance():
+            raise SystemExit(0)
 
 import sys
 import os
@@ -17,7 +30,9 @@ from PySide6.QtGui import QIcon
 
 from app_version import __version__
 
-APP_USER_MODEL_ID = "com.ylylyl98.dptk_desktop.data_plot"
+from windows_source import app_user_model_id
+
+APP_USER_MODEL_ID = app_user_model_id()
 APP_ICON_PATH = Path("assets") / "icons" / "app_icon.ico"
 _diagnostic_stream = None
 
@@ -113,6 +128,9 @@ def main() -> int:
         from run_quick import main as quick_main
         return quick_main(sys.argv[1:], production=True)
 
+    from windows_source import acquire_source_instance
+    if not acquire_source_instance():
+        return 0
     set_windows_app_user_model_id()
 
     parser = argparse.ArgumentParser(add_help=False)
@@ -143,6 +161,8 @@ def main() -> int:
     if not app_icon.isNull():
         window.setWindowIcon(app_icon)
     window.show()
+    from windows_source import attach_source_window
+    attach_source_window(window)
     return app.exec()
 
 

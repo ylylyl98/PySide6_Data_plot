@@ -29,13 +29,55 @@ py -3.13 -m venv .venv
 .venv\Scripts\python.exe run_qt.py
 ```
 
-Use `.venv\Scripts\python.exe` explicitly when another Python may be on PATH. `Data_Plot_App.bat` launches without pulling Git updates by default. Set `DPTK_AUTO_UPDATE=1` before launching to request its fetch/fast-forward update path. It skips updating if changes, untracked files, missing upstream or fetch errors prevent it, and continues launching. This launcher behavior does not replace the repository synchronization rules below.
+Use `.venv\Scripts\python.exe` explicitly when another Python may be on PATH.
+Direct `run_qt.py` launches do not fetch updates. On Windows, `Data_Plot_App.bat`
+and `launch_data_plot.pyw` check for source updates by default; the former
+`DPTK_AUTO_UPDATE` opt-in is no longer used. This does not replace the repository
+synchronization rules below.
 
 ## Source shortcuts and macOS recipes
 
-On Windows, running `Data_Plot_App.bat` creates an icon-aware `DPTK Desktop.lnk`
-beside the launcher if it is missing. Use it for normal source launches and
-taskbar pinning. To create the shortcut on the Desktop instead:
+On Windows, double-click **`Data_Plot_App.bat`**. This single user-facing batch
+entry prepares `.venv` when needed, creates **DPTK Source.lnk** on the real
+Desktop (including redirected Desktop folders), and starts the native app.
+Python 3.13 and Git must be installed; dependency installation needs network
+access on first setup. `build_windows.bat` remains a separate developer build tool.
+
+Launch **DPTK Source**, then right-click its running taskbar icon and choose
+**Pin to taskbar**. Remove old source pins first; Windows keeps a copy of their
+old targets. The shortcut and window share an explicit source AppUserModelID,
+icon, and relaunch command targeting this checkout's `.venv` and
+`launch_data_plot.pyw`. Installed builds keep their original identity. Different
+checkout paths also receive different source identities. Moving the checkout
+requires recreating the shortcut and pin. Do not move only the shortcut's target
+or delete `.venv`; the source folder and environment must remain available.
+The implementation follows Microsoft's [AppUserModelID guidance](https://learn.microsoft.com/en-us/windows/win32/shell/appids)
+and [window relaunch properties](https://learn.microsoft.com/en-us/windows/win32/properties/props-system-appusermodel-relaunchcommand).
+
+Each fresh launch checks `main` against **the remote configured by
+`branch.main.remote`**, requiring `branch.main.merge=refs/heads/main`. It fetches
+that remote's `main` with noninteractive credentials and a timeout, and only
+fast-forwards a clean checkout. Staged, unstaged and untracked changes, a
+different/detached branch, missing tracking configuration, an in-progress Git
+operation, local commits/divergence, ignored-file collisions or Git/network
+failure skip updating. An English dialog says **Source was NOT updated** and
+explains why; click **OK** to start the local version. No stash, reset, clean,
+branch switching or forced local history changes are performed. It does not
+automatically install newer versions of already-present dependencies; use
+`pip install -r requirements.txt` when a release changes required versions.
+
+A per-checkout Windows mutex is held from before the update check through the
+main process lifetime, including normal direct `run_qt.py` launches. Another
+launch only requests window activation, including restoring a minimized window.
+Analysis subprocesses also hold shared code locks, so an analysis window left
+open after the main window exits prevents updating. A conservative process
+inspection additionally protects older running versions that predate the locks;
+if inspection fails, updating is skipped. The shortcut does not fetch while
+that application is running. English startup
+errors are recorded in `%LOCALAPPDATA%\DPTK\logs\source-launcher.log`.
+Set `DPTK_DEBUG_CONSOLE=1` when using the batch entry to keep console output.
+
+The existing PowerShell helper can also recreate a shortcut after setup:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\create_windows_shortcut.ps1 -Desktop

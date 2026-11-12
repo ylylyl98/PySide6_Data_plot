@@ -15,6 +15,8 @@ def server_name(session):
 
 
 def main(argv=None):
+    from windows_source import protect_source_code
+    protect_source_code()
     from PySide6.QtCore import QCoreApplication, QEvent, QLockFile, QSettings, QTimer, QUrl
     from PySide6.QtGui import QGuiApplication
     from PySide6.QtNetwork import QLocalServer, QLocalSocket

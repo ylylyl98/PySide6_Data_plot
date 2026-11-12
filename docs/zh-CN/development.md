@@ -29,11 +29,21 @@ py -3.13 -m venv .venv
 .venv\Scripts\python.exe run_qt.py
 ```
 
-PATH 可能指向其他 Python 时，显式使用 `.venv\Scripts\python.exe`。`Data_Plot_App.bat` 默认不拉取 Git 更新；启动前设置 `DPTK_AUTO_UPDATE=1` 才会尝试 fetch 和快进更新。如果有本地修改、未跟踪文件、缺少 upstream 或获取失败，启动器跳过更新并继续启动。启动器行为不能替代下文的仓库同步规则。
+PATH 可能指向其他 Python 时，显式使用 `.venv\Scripts\python.exe`。直接运行 `run_qt.py` 不获取更新；Windows 的 `Data_Plot_App.bat` 和 `launch_data_plot.pyw` 默认检查更新，不再需要 `DPTK_AUTO_UPDATE`。启动器行为不能替代下文的仓库同步规则。
 
 ## 源码快捷方式与 macOS 配方
 
-在 Windows 上运行 `Data_Plot_App.bat` 时，如果启动器旁不存在 `DPTK Desktop.lnk`，会创建带应用图标的快捷方式；可用于日常源码启动及固定到任务栏。如需放到桌面：
+Windows 双击 **`Data_Plot_App.bat`** 即可准备 `.venv`、在实际桌面目录（含重定向桌面）创建 **DPTK Source.lnk** 并启动应用。首次需已安装 Python 3.13 和 Git，缺少依赖时需要联网安装。用户只需此一个启动批处理；`build_windows.bat` 仍用于开发打包。
+
+启动 **DPTK Source** 后，右键运行中的任务栏图标选择固定。先取消旧源码图标的固定，因为 Windows 保存的旧副本不会随桌面快捷方式改变。快捷方式和窗口使用匹配的源码身份、应用图标和指向当前目录 `.venv` / `launch_data_plot.pyw` 的重启命令，安装版保持原有身份；不同源码目录也分别标识。移动目录后需重建快捷方式并重新固定，不能仅移动启动文件或删除 `.venv`。
+
+每次新启动要求当前分支为 `main`，且 `branch.main.remote` 指定有效远端、`branch.main.merge` 为 `refs/heads/main`。仅从该远端获取最新 `main`，并仅对干净工作区执行快进更新。有已暂存/未暂存/未跟踪修改、分支不符或 detached HEAD、缺失跟踪配置、正在进行的 Git 操作、本地领先或历史分叉、被忽略文件的覆盖冲突、网络或 Git 失败时，英文提示 **Source was NOT updated** 并解释原因，点击 **OK** 启动本地版本。不会自动 stash、reset、clean、切换分支或强改本地历史；抓取禁止交互认证并设超时。现有依赖不会自动升级版本，需求版本改变时请执行 `pip install -r requirements.txt`。
+
+更新开始前即持有按源码目录隔离的 Windows 互斥锁，持续到主应用进程退出；直接执行 `run_qt.py` 的正常启动也参与保护。重复启动只激活现有窗口（最小化时恢复），不会更新代码。启动错误日志位于 `%LOCALAPPDATA%\DPTK\logs\source-launcher.log`；可设置 `DPTK_DEBUG_CONSOLE=1` 后运行批处理以查看控制台输出。
+
+独立分析子进程也持有共享代码锁，主窗口退出后仍打开的分析窗口同样阻止更新。另有保守的进程检查保护尚未采用新锁的旧版本；无法可靠检查时跳过更新，不关闭已有进程。
+
+环境准备好后，也可使用兼容的 PowerShell 辅助脚本重建快捷方式：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\create_windows_shortcut.ps1 -Desktop

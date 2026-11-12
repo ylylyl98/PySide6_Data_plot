@@ -22,9 +22,9 @@ class WindowsPowerPointPackagingTests(unittest.TestCase):
 
     def test_source_launcher_repairs_missing_powerpoint_bridge(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        launcher = (root / "Data_Plot_App.bat").read_text(encoding="utf-8")
+        launcher = (root / "scripts" / "source_launcher.py").read_text(encoding="utf-8")
         self.assertIn('import PySide6, pythoncom, win32com.client', launcher)
-        self.assertIn('pip install -r requirements.txt', launcher)
+        self.assertIn('"-m", "pip", "install", "-r"', launcher)
 
 
 if __name__ == "__main__":

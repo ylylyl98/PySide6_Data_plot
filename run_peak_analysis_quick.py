@@ -17,6 +17,8 @@ def legacy_owner_running(session_path):
 
 
 def main(argv=None):
+    from windows_source import protect_source_code
+    protect_source_code()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot", type=Path)
     parser.add_argument("--session", type=Path)

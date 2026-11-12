@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+from windows_source import protect_source_code
+protect_source_code()
 
 if __name__ == "__main__" and "--legacy-widgets" not in sys.argv:
     from run_mcd_organizer_quick import main as native_main

@@ -6,6 +6,8 @@ import sys
 
 
 def main(argv=None):
+    from windows_source import protect_source_code
+    protect_source_code()
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("folder",type=Path,nargs="?")
     parser.add_argument("--settings",type=Path)
