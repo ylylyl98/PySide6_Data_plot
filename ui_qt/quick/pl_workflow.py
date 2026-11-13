@@ -22,16 +22,19 @@ class PlRequest:
 
 
 def load_pl_source(request):
-    from core.data_io import load_pl_cube
     from core.loader import load_dat, resolve_dat_y_axis
-    from core.processing import apply_sg_derivative_energy
     path = Path(request.path)
     signatures=input_signatures(path)
-    cube = load_dat(path) if path.suffix.casefold() == ".dat" else load_pl_cube(str(path.parent),path.name,y_axis=request.y_axis)
+    if path.suffix.casefold() == ".dat":
+        cube = load_dat(path)
+    else:
+        from core.data_io import load_pl_cube
+        cube = load_pl_cube(str(path.parent),path.name,y_axis=request.y_axis)
     if path.suffix.casefold() == ".dat" and request.dat_choice != "original":
         label,unit,semantic = resolve_dat_y_axis(request.dat_choice,custom_label=request.dat_label,custom_unit=request.dat_unit)
         cube = replace(cube,gate_label=label,gate_unit=unit,y_axis_semantic=semantic)
     if request.processing != "none":
+        from core.processing import apply_sg_derivative_energy
         cube,_ = apply_sg_derivative_energy(cube,derivative={"smooth":0,"first":1,"second":2}[request.processing],
             window_length=request.window,polyorder=request.polynomial)
     for array in (cube.energy,cube.gate,cube.Z): array.setflags(write=False)

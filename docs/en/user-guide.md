@@ -387,6 +387,80 @@ Offline file generation uses the bundled `python-pptx` library and does not requ
 
 Launcher/PowerPoint setup and platform requirements are in [Development](development.md) and [Troubleshooting](troubleshooting.md).
 
+### Edit a dragged PNG from PowerPoint (Windows prototype)
+
+Keep the native app running and select the experiment folder containing the PNGs.
+Drag an exported PL/DRR PNG from File Explorer into desktop PowerPoint as usual.
+Double-click the picture in normal editing view to open its saved numerical map
+and display settings in the app. The first lookup checks PNG image content under
+that experiment's `Processed Data` folder, decoding only matching candidates.
+If no identical PNG content is found, it falls back to decoded pixel comparison. If PowerPoint
+compressed the picture, or several exports look identical, choose the original
+PNG in the association dialog. PNG, DAT and metadata must remain together.
+Pixel comparison after recompression can take longer in a large experiment;
+progress and errors appear in the app's status bar and **Log** in English.
+If Windows leaves PowerPoint in front, select the app's taskbar button; the
+requested figure is already loaded. The integration does not force foreground focus.
+
+Adjust display ranges, colors or regions, then use **Save PNG + DAT**. This creates
+a new `_PPT_XX` version beside the original and updates pictures associated during
+this app session. Save verifies the new PNG against its newly written metadata,
+without scanning unrelated export sidecars or decoding the entire experiment again.
+The DAT is copied without recalculating backgrounds or derivatives.
+Load a measurement normally to change numerical processing. PowerPoint is not
+saved automatically: use its usual **Ctrl+S** after reviewing the update.
+
+Opening and updating support ordinary embedded PNG pictures and filled picture
+placeholders without grouping, animations or action links. Updates use PowerPoint's
+native **Change Picture** command, preserving the existing picture and empty slots.
+Updates prefer a direct clipboard transfer to avoid the file dialog. Supported
+clipboard content is restored; newer content copied during the update is retained.
+Complex clipboard formats, including Office objects, use the file route without
+replacing the clipboard. In that case the English Windows **Insert Picture**
+dialog briefly appears and is completed automatically. Wait for the update to
+finish before interacting with PowerPoint.
+Position, size, crop, rotation and stacking order are restored and checked, along
+with the embedded image pixels. Unrecognized dialogs fail with an English error.
+The app attempts to restore the original image if post-update validation fails.
+English warnings identify pictures that overlap an updated image. Secondary
+and logarithmic Y axes are not supported in this editing path. App exit disconnects
+the integration; ordinary picture viewing remains available in PowerPoint.
+
+After an image has been identified, a local path hint accelerates later opens,
+including after an app restart. The hint is revalidated against the current PNG,
+metadata and PowerPoint image pixels. The app reports opening immediately and
+loads the DAT in the background. The first uncached or recompressed image may
+still need a broader lookup.
+The app prepares PNG headers and metadata in the background after selecting an
+experiment folder. A double-click interrupts this preparation to prioritize the
+requested picture. Matching screens PNG chunk lengths before reading image
+payloads, then verifies pixels. The English log reports export search time,
+including worker queue time but excluding the earlier PowerPoint image read.
+
+For a saved presentation, opening a figure can establish a verified baseline for
+the update precheck. If neither PowerPoint nor the disk file has changed, the
+app can read the already-verified embedded picture without writing another full
+temporary presentation. On the first open as well as subsequent checks, the app
+can use an embedded PNG from the saved file or an earlier verified read as a
+candidate, then export just the current target picture and require byte-for-byte
+equality. This validation also works across new PowerPoint automation proxies;
+a file path or a cache entry alone never establishes a match. Unsupported exports or differing bytes fall
+back to a fresh presentation copy. Layout and crop checks remain in place.
+Opening an exported DAT and drawing its spectrum defer raw-data processing and
+SciPy signal imports until smoothing or differentiation is actually requested.
+While editing a PowerPoint figure, automatic raw-source catalog inspection pauses
+so it does not compete with drawing and export. **Select**, **Saved results**,
+and explicit catalog refresh/rebuild still inspect sources when requested.
+The English log reports both the PowerPoint update time and the total time from
+clicking Save PNG + DAT to a successful picture update, including export and queues.
+
+PowerPoint temporary copies and recovery files can use a per-computer folder:
+set `DPTK_PPT_TEMP_DIR`, or set `temp_directory` in
+`%LOCALAPPDATA%/DPTK/PowerPoint/settings.json` to an existing writable directory.
+The environment variable takes precedence. Without a setting, the system temporary
+folder is used. An unavailable configured folder produces an English error instead
+of silently using another drive. Per-operation temporary folders are removed after use.
+
 ## Tools, logs and saving
 
 **Tools** contains the run log and independent DRR Analysis/MCD Organizer entries. The older standalone DRR workspace remains at **Tools → Data Organization → Open DRR Analysis** for candidate inspection, history/comparison and peak-to-peak analysis; use the plot toolbar for the current map's Peak Analysis.

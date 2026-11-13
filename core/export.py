@@ -13,7 +13,7 @@ import re
 import textwrap
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Iterable
+from typing import TYPE_CHECKING, Dict, Iterable
 from uuid import uuid4
 from time import perf_counter
 from concurrent.futures import ThreadPoolExecutor
@@ -33,10 +33,35 @@ from core.plotting import COMPARE_PANEL_ORDER, HeatmapParams, plot_heatmap, reso
 from core.png_render_timing import TimedPngCanvas, collect_png_timings, time_png_stage
 from core.png_geometry import widened_figsize
 from core.processing import background_correct_cube, parse_compare_gate_condition, power_group_title, valley_polarization_cube
-from core.processing_run import save_as_dat
-from core.shg import ShgProcessResult, ShgSettings, ShgSweepData
-from core.shg_fit import ShgAngularFitResult, ShgTwistFitResult
 from app_version import __version__
+
+if TYPE_CHECKING:
+    from core.shg import ShgProcessResult, ShgSettings, ShgSweepData
+    from core.shg_fit import ShgAngularFitResult, ShgTwistFitResult
+
+
+def __getattr__(name):
+    """Keep legacy SHG type aliases available without loading SHG for PNGs."""
+    if name in {'ShgProcessResult', 'ShgSettings', 'ShgSweepData'}:
+        from core import shg
+        return getattr(shg, name)
+    if name in {'ShgAngularFitResult', 'ShgTwistFitResult'}:
+        from core import shg_fit
+        return getattr(shg_fit, name)
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
+
+
+def save_as_dat(gate, energy, Z, *, user_folder='./YZ315', subfolder='Processed Data',
+                csv_filename=None, basename_override=None, name_suffix='',
+                energy_label='Photon energy', energy_unit='eV', gate_precision=6,
+                data_precision=10):
+    """Defer the numerical processing backend until a DAT export is requested."""
+    from core.processing_run import save_as_dat as write_dat
+    return write_dat(gate, energy, Z, user_folder=user_folder, subfolder=subfolder,
+                    csv_filename=csv_filename, basename_override=basename_override,
+                    name_suffix=name_suffix, energy_label=energy_label,
+                    energy_unit=energy_unit, gate_precision=gate_precision,
+                    data_precision=data_precision)
 
 
 # Match the Streamlit-style export geometry used by the desktop app.

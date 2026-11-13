@@ -1,0 +1,238 @@
+"""PowerPoint figure handoff for the native PL/DRR shell."""
+from copy import deepcopy
+from dataclasses import replace
+from pathlib import Path
+from time import perf_counter
+
+
+def restore_pl_figure(display, record, params):
+    """Explicit figure opening outranks local locks without changing those preferences."""
+    from core.pl_display_settings import validate_snapshot
+    snapshot = validate_snapshot(record.snapshot) or display.capture_state()
+    # These are figure values, not new persistent user locks. Keep Auto available
+    # and let an explicit Fix gesture adopt a value as a local preference.
+    snapshot["axis_fixed"] = {key: False for key in snapshot["axis_fixed"]}
+    snapshot["geometry"]["fixed"] = {key: False for key in snapshot["geometry"]["fixed"]}
+    for colors in snapshot["banks"].values():
+        colors["fixed"] = {key: False for key in colors["fixed"]}
+    scale = "log" if params.log_scale else "linear"
+    snapshot["values"].update(xmin=params.xlim[0], xmax=params.xlim[1],
+                              ymin=params.ylim[0], ymax=params.ylim[1], cmap=params.cmap,
+                              scale=scale, sideBySide=False, clip=params.clip_outliers)
+    bank = snapshot["banks"][scale]
+    bank.update(vmin=params.vmin, vmax=params.vmax)
+    split = params.split_scale
+    geometry = snapshot["geometry"]
+    geometry["count"] = (3 if split.split_x2 is not None else 2) if split else 1
+    if split:
+        geometry.update(x0=split.split_x, showBoundary=split.show_boundary)
+        if split.split_x2 is not None:
+            geometry["x1"] = split.split_x2
+        for side in ("left", "right", "middle"):
+            low, high = getattr(split, side + "_vmin"), getattr(split, side + "_vmax")
+            if low is not None and high is not None:
+                bank[side + "Min"], bank[side + "Max"] = low, high
+    if not display.restore_state(snapshot, overlay_manual=False):
+        raise ValueError("The saved PL figure display is incomplete or invalid.")
+
+
+def restore_drr_figure(display, params):
+    """An already computed derivative is shown in the imported-map channel."""
+    display._figure_mode = True
+    display._memory.reset_borrowed()
+    display._memory.viewport = {}
+    display._pending.clear()
+    for key in display._flags:
+        if key.startswith("fix."):
+            display._flags[key] = False
+    display._fix_sources.clear()
+    display._choices.update(colorProduct=0, regionCount=0, **{"yaxis.right": 0})
+    display._numbers.update(dict(zip(("axis.xmin", "axis.xmax", "axis.ymin", "axis.ymax"),
+                                     (*params.xlim, *params.ylim))))
+    display._numbers.update({"raw.vmin": params.vmin, "raw.vmax": params.vmax})
+    display._flags.update(log=params.log_scale, zero=params.center_zero, clip=params.clip_outliers)
+    if params.cmap not in {name for name, _ in display._cmaps}:
+        display._cmaps = (*display._cmaps, (params.cmap, params.cmap))
+    display._choices["raw.cmap"] = next(index for index, (name, _) in enumerate(display._cmaps) if name == params.cmap)
+    split = params.split_scale
+    if split:
+        display._choices["regionCount"] = 2 if split.split_x2 is not None else 1
+        display._numbers["boundary.x0"] = split.split_x
+        if split.split_x2 is not None:
+            display._numbers["boundary.x1"] = split.split_x2
+        display._flags["boundary.show"] = split.show_boundary
+        for side in ("left", "right", "middle"):
+            for bound in ("vmin", "vmax"):
+                value = getattr(split, side + "_" + bound)
+                if value is not None:
+                    display._numbers["raw." + side + "_" + bound] = value
+    display.set_memory_status("PowerPoint figure · saved DAT · display edits only", available=False)
+    display.refresh()
+
+
+class PowerPointApplicationMixin:
+    def _ppt_init(self):
+        self._ppt_applying = False
+        self._ppt_service = None
+        self._ppt_root = ""
+        self._ppt_record = None
+        self._ppt_params = None
+        self._ppt_save_record = None
+        self._ppt_update_timings = {}
+
+    def _ppt_start(self):
+        import sys
+        if sys.platform != "win32" or self._ppt_service is not None:
+            return
+        from ui_qt.quick.powerpoint_service import PowerPointService
+        self._ppt_service = PowerPointService(parent=self)
+        self._ppt_service.figureRequested.connect(self._ppt_open)
+        self._ppt_service.openingStarted.connect(self._ppt_opening)
+        self._ppt_service.statusMessage.connect(self._message)
+        self._ppt_service.figureUpdated.connect(self._ppt_updated)
+        self._ppt_service.requestBinding.connect(self._ppt_binding_needed)
+        self._ppt_sync_root()
+        self._ppt_service.start()
+
+    def _ppt_sync_root(self):
+        if self._ppt_service is not None:
+            root = self._folder
+            for parent in (Path(root), *Path(root).parents) if root else ():
+                if parent.name.casefold() == "processed data":
+                    root = str(parent.parent)
+                    break
+            if root != self._ppt_root:
+                self._ppt_root = root
+                self._ppt_service.set_root(root)
+
+    def _ppt_binding_needed(self, context):
+        if self._busy:
+            self._message("PowerPoint could not identify this PNG. Finish the current operation, then double-click it again.")
+            return
+        self._message("Choose the original exported PNG to associate this PowerPoint picture.")
+        self.pptBindingRequested.emit()
+        self.pptActivateRequested.emit()
+
+    def _ppt_opening(self):
+        if not self._closed and not self._busy:
+            self.pptActivateRequested.emit()
+
+    def _ppt_open(self, record):
+        if self._closed:
+            return
+        if self._busy or self._background_open:
+            self._message("Finish the current operation, then double-click the PowerPoint picture again.")
+            return
+        from core.pptx_figure_edit import experiment_root, load_figure
+        try:
+            experiment_root(record.png_path)
+        except (ValueError, TypeError, KeyError) as exc:
+            self._message(str(exc))
+            return
+        # Validate display metadata and load imports/DAT in the worker. Keep the
+        # current figure intact until the requested figure is ready to display.
+        self._submit("ppt-load", lambda: load_figure(record))
+        self.pptActivateRequested.emit()
+
+    def _ppt_finish(self, kind, result):
+        if kind != "ppt-load":
+            return self._ppt_finish_apply(kind, result)
+        self._ppt_applying = True
+        try:
+            self._sync_source_catalog()
+            return self._ppt_finish_apply(kind, result)
+        finally:
+            self._ppt_applying = False
+            self._sync_source_catalog()
+
+    def _ppt_finish_apply(self, kind, result):
+        if kind == "ppt-load":
+            record, cube, params = result
+            from core.pptx_figure_edit import experiment_root
+            self.selectWorkflow(record.workflow)
+            self._ppt_record = None
+            self._folder = str(experiment_root(record.png_path))
+            self._source, self._sources = record.dat_path, (str(record.dat_path),)
+            self._values["sideBySide"] = False
+            if record.workflow == "drr":
+                from ui_qt.quick.drr_workflow import DrrProducts, DrrRequest
+                request = DrrRequest(files=self._sources, background_mode="imported", experiment_folder=self._folder)
+                self._drr_products = DrrProducts(request, cube, cube, None, 0, 0,
+                    "PowerPoint edits use the saved numerical map; load the measurement to reprocess.")
+                self._drr_background_recipe = None
+                self._drr_backgrounds = ()
+                self._drr_background_required = False
+                self._drr_processing["drrView"] = "raw"
+            self.set_cube(cube)
+            if record.workflow == "pl":
+                restore_pl_figure(self._pl_display, record, params)
+                self._pl_sync_scales()
+                self._pl_remember()
+            else:
+                restore_drr_figure(self._drr_display, params)
+            self._ppt_record, self._ppt_params = record, params
+            self._pl_values.update(pngLayout="wide" if params.png_width_scale > 1 else "original",
+                                   pngWidth=params.png_width_scale)
+            self._export_valid = True
+            self._schedule_plot()
+            self._message(f"PowerPoint: {record.png_path.name} · edit display, then Save PNG + DAT. Numerical processing is preserved.")
+        elif kind == "ppt-export":
+            original, new_record, started = result
+            self._result = f"Saved {new_record.png_path}\n{new_record.dat_path}"
+            self._message("PNG + DAT saved. Updating the associated PowerPoint picture…")
+            if self._ppt_service is not None:
+                self._ppt_save_record = new_record
+                self._ppt_update_timings[new_record.record_id] = (original.record_id, started)
+                # Bound stale entries when PowerPoint reports an uncorrelated failure.
+                while len(self._ppt_update_timings) > 32:
+                    self._ppt_update_timings.pop(next(iter(self._ppt_update_timings)))
+                try:
+                    self._ppt_service.update_figure(original.record_id, new_record.png_path, new_record)
+                except Exception:
+                    self._ppt_update_timings.pop(new_record.record_id, None)
+                    self._ppt_save_record = None
+                    raise
+            else:
+                self._message("PNG + DAT saved; PowerPoint is not connected.")
+
+    def _ppt_updated(self, old_id, record):
+        if self._ppt_record is not None and self._ppt_record.record_id == old_id:
+            self._ppt_record = record
+        timing = self._ppt_update_timings.get(record.record_id) if record is not None else None
+        if timing is not None and timing[0] == old_id:
+            if self._ppt_save_record is not None and self._ppt_save_record.record_id == record.record_id:
+                self._ppt_save_record = None
+            self._ppt_update_timings.pop(record.record_id, None)
+            self._message(f"PowerPoint save and update completed in {perf_counter() - timing[1]:.3f} s.")
+
+    def _ppt_export(self):
+        started = perf_counter()
+        from core.pptx_figure_edit import save_figure_edit
+        record, cube = self._ppt_record, self._cube
+        if record.workflow == "pl":
+            params = self._params(self._pl_display.values["scale"])
+            snapshot = self._pl_display.capture_state()
+        else:
+            params = self._drr_display.heatmap_params(cube)
+            snapshot = self._drr_display.capture_state(self._sources)
+        # Preserve axis labels and the original caption; use the edited scale/width.
+        params = replace(params, title=self._ppt_params.title, xlabel=self._ppt_params.xlabel,
+                         ylabel=self._ppt_params.ylabel, cbar_label=self._ppt_params.cbar_label,
+                         png_width_scale=self._png_export_width())
+        role = ("log" if params.log_scale else "linear") if record.workflow == "pl" else record.role.removesuffix("_wide")
+        edited_record = replace(record, role=role + ("_wide" if params.png_width_scale > 1 else ""))
+        self._submit("ppt-export", lambda: (record, save_figure_edit(edited_record, cube, params, snapshot), started))
+
+    def _ppt_guard_parameter(self, key):
+        if self._ppt_record is None:
+            return False
+        blocked = key in {"backgroundMode", "backgroundFrame", "rawDerivative", "secondDerivative", "sgWindow", "sgPolyorder", "sgYWindow"}
+        blocked = blocked or key in {"pl.yAxis", "pl.a", "pl.b", "pl.c", "pl.datChoice", "pl.datLabel", "pl.datUnit", "pl.processing", "pl.window", "pl.polynomial", "bnReference"}
+        if blocked:
+            self._message("PowerPoint editing preserves the exported DAT. Load a measurement normally to change numerical processing.")
+        return blocked
+
+    def _ppt_close(self):
+        self._ppt_update_timings.clear()
+        if self._ppt_service is not None:
+            self._ppt_service.close()

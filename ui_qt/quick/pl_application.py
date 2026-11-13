@@ -61,6 +61,10 @@ class PlApplicationMixin:
         self._source_catalog.operationCompleted.connect(self._pl_catalog_finished)
         self._catalog_prepare_scope=None
         self._catalog_child_busy=False
+        self._catalog_dialog_seen=False
+        self._catalog_explicit_scope=None
+        self._catalog_explicit_generation=None
+        self._source_catalog.snapshotChanged.connect(self._pl_catalog_dialog_changed)
         try:
             width=float(self.settings.value("export/png_width_scale",2.))
             if not isfinite(width) or not 1<=width<=3:width=2.
@@ -95,16 +99,48 @@ class PlApplicationMixin:
         if self._closed:return
         # A canceled request can still be closing CSV/cache handles. Keep the
         # catalog paused until its completion signal removes that request.
-        self._source_catalog.setForegroundBusy(bool(self._busy or self._pending or self._catalog_child_busy))
-        if self._workflow in {"pl","drr"} and self._folder:
+        ppt_active = bool(getattr(self, "_ppt_applying", False) or getattr(self, "_ppt_record", None) is not None)
+        explicit_scope = self._catalog_explicit_scope
+        explicit_generation = self._catalog_explicit_generation
+        if explicit_scope is not None and (not ppt_active or explicit_scope != (self._workflow, self._folder)
+                or explicit_generation is not None and explicit_generation != self._source_catalog._generation):
+            self._catalog_explicit_scope = self._catalog_explicit_generation = None
+        pause_ppt = ppt_active and not self._source_catalog._dialog_open and self._catalog_explicit_scope is None
+        self._source_catalog.setForegroundBusy(bool(self._busy or self._pending or self._catalog_child_busy or pause_ppt))
+        if not pause_ppt and self._catalog_explicit_scope is None and self._workflow in {"pl","drr"} and self._folder:
             scope=(self._workflow,self._folder)
             if scope!=self._catalog_prepare_scope:
                 self._catalog_prepare_scope=scope
                 self._source_catalog.prepare(*scope)
 
+    def _pl_refresh_catalog_explicit(self, force=False):
+        self._catalog_explicit_scope = (self._workflow, self._folder)
+        self._catalog_explicit_generation = None
+        self._sync_source_catalog()
+        try:
+            self._source_catalog.refreshCurrent(self._workflow, self._folder, list(self._sources), force=force)
+            if self._source_catalog._busy:
+                self._catalog_explicit_generation = self._source_catalog._generation
+            else:
+                self._catalog_explicit_scope = self._catalog_explicit_generation = None
+                self._sync_source_catalog()
+        except Exception:
+            self._catalog_explicit_scope = self._catalog_explicit_generation = None
+            self._sync_source_catalog()
+            raise
+
+    def _pl_catalog_dialog_changed(self):
+        opened = self._source_catalog._dialog_open
+        if opened != self._catalog_dialog_seen:
+            self._catalog_dialog_seen = opened
+            self._sync_source_catalog()
+
     def _pl_open_catalog(self,saved=False):
         if self._workflow not in {"pl","drr"}:return False
+        # An explicitly requested picker must be allowed to inspect sources.
+        self._source_catalog.setForegroundBusy(bool(self._busy or self._pending or self._catalog_child_busy))
         self._source_catalog.open(self._workflow,self._folder,list(self._sources),saved)
+        self._pl_catalog_dialog_changed()
         self.sourceCatalogRequested.emit()
         return True
 
@@ -468,6 +504,9 @@ class PlApplicationMixin:
         else:self._source_catalog.refreshCurrent("pl",context["folder"],list(self._sources),False)
 
     def _pl_catalog_finished(self,kind,elapsed):
+        if kind == "catalog" and self._catalog_explicit_scope is not None:
+            self._catalog_explicit_scope = self._catalog_explicit_generation = None
+            self._sync_source_catalog()
         if self._pl_auto_next_pending:
             completed=self._pl_auto_next_pending;self._pl_auto_next_pending=None
             path=self._source_catalog.next_unprocessed(completed)

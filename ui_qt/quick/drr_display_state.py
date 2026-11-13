@@ -43,6 +43,7 @@ class DrrDisplayState(DrrRecommendationsMixin, QObject):
         super().__init__(parent)
         self.settings = settings
         self._raw = self._second = None
+        self._figure_mode = False
         self._has_geometry = False
         self._second_auto_scale = True
         self._coordinates = {}
@@ -133,6 +134,7 @@ class DrrDisplayState(DrrRecommendationsMixin, QObject):
 
     def sync_cube(self, cube, second_cube=None, *, axis_coordinates=None, preserve_view=False):
         """Refresh unlocked ranges, retaining separate raw/derivative scales."""
+        self._figure_mode = False
         import numpy as np
         preserve_view = bool(preserve_view and cube is not None and self._raw is not None
             and np.array_equal(cube.energy, self._raw.energy) and np.array_equal(cube.gate, self._raw.gate))
@@ -245,6 +247,8 @@ class DrrDisplayState(DrrRecommendationsMixin, QObject):
         return changed
 
     def _enabled_number(self, key):
+        if self._figure_mode and key.startswith("yaxis."):
+            return False
         return not self._closed and (key.startswith("yaxis.") or (self._raw is not None
                 and (not key.startswith("second.") or self._second is not None)))
 
@@ -407,6 +411,8 @@ class DrrDisplayState(DrrRecommendationsMixin, QObject):
 
     @Slot(str, int, result=bool)
     def setChoice(self, key, index):
+        if self._figure_mode and key.startswith("yaxis."):
+            return False
         if key == "recommendStrength":
             if self._closed or not 0 <= index < 4:
                 return False
@@ -637,7 +643,7 @@ class DrrDisplayState(DrrRecommendationsMixin, QObject):
         for key, index in self._choices.items():
             state["choices"][key] = dict(key=key, index=index,
                 options=[dict(text=text, enabled=enabled, tooltip="" if enabled else "No consistent one-to-one measured coordinate mapping.") for text, enabled in self._choice_options(key)],
-                enabled=not self._closed and (key == "yaxis.left" or self._raw is not None),
+                enabled=not self._closed and (key == "yaxis.left" or self._raw is not None) and not (self._figure_mode and key.startswith("yaxis.")),
                 visible=self._visible(key), tooltip="", accessibleName=key)
         for key in ("auto.x", "auto.y", "auto.raw", "auto.second",
                     *(f"auto.{product}.{side}" for product in ("raw", "second") for side in _SIDES),

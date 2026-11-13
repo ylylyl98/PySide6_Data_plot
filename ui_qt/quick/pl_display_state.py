@@ -388,10 +388,11 @@ class PlDisplayState(QObject):
         self.banks = valid["banks"]
         return True
 
-    def restore_state(self, snapshot):
+    def restore_state(self, snapshot, *, overlay_manual=True):
         if not self._restore_payload(snapshot):
             return False
-        self._overlay_manual()
+        if overlay_manual:
+            self._overlay_manual()
         for scale in _SCALES:
             self.banks[scale]["roi"] = list(self._roi_signature())
         self.refresh()

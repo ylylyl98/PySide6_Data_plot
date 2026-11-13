@@ -23,6 +23,7 @@ from ui_qt.quick.maintenance_application import MaintenanceApplicationMixin
 from ui_qt.quick.pl_application import PlApplicationMixin
 from ui_qt.quick.shell_services import ShellServicesMixin
 from ui_qt.quick.appearance import QuickAppearance
+from ui_qt.quick.powerpoint_application import PowerPointApplicationMixin
 
 
 _PLOT_FIELDS = ("_canvas", "_navigation", "_plot_tool", "_blitters", "_maps",
@@ -34,7 +35,7 @@ def _local_path(value) -> Path:
     return Path(url.toLocalFile() if url.isLocalFile() else str(value)).expanduser()
 
 
-class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplicationMixin, MaintenanceApplicationMixin, QObject):
+class QuickApplicationBridge(PowerPointApplicationMixin, ShellServicesMixin, PlApplicationMixin, PeakApplicationMixin, MaintenanceApplicationMixin, QObject):
     snapshotChanged = Signal()
     colorsChanged = Signal()
     plotBackendChanged = Signal()
@@ -51,10 +52,13 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
     backgroundSaveDialogRequested = Signal(str, str)
     updateBridgeChanged = Signal()
     sourceCatalogRequested = Signal()
+    pptActivateRequested = Signal()
+    pptBindingRequested = Signal()
 
     def __init__(self, *, settings: QSettings, parent=None):
         super().__init__(parent)
         self.settings = settings
+        self._ppt_init()
         self._peak_init()
         self._maintenance_init()
         self._workflow = "pl"
@@ -273,6 +277,12 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
     @Slot()
     def startServices(self):
         self._ensure_update_bridge().scheduleAutomaticCheck()
+        self._ppt_start()
+
+    @Slot(QUrl)
+    def bindPowerPointPng(self, value):
+        if self._ppt_service is not None:
+            self._ppt_service.bind_png(str(_local_path(value).resolve()))
 
     @Property(int, notify=drrBackgroundBridgeChanged)
     def backgroundDialogToken(self):
@@ -772,6 +782,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
                 child.invoke("refresh-catalog")
 
     def _publish(self):
+        self._ppt_sync_root()
         self._sync_source_catalog()
         self._sync_peak_sources()
         self._sync_maintenance_context()
@@ -788,6 +799,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
     def selectWorkflow(self, key):
         if key == self._workflow or key not in {item.key for item in FEATURES}:
             return
+        self._ppt_record = None
         if self._workflow == "megasweep":
             self._workflow_bridges["megasweep"].invalidateBackgroundSelection()
         if self._workflow == "drr":
@@ -949,6 +961,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
 
     @Slot(str)
     def setSourcePath(self, value):
+        self._ppt_record = None
         path = _local_path(value)
         if path.is_file():
             self.openFile(QUrl.fromLocalFile(str(path)))
@@ -1226,6 +1239,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             self._canvas.draw_idle()
 
     def _clear_files(self, *, keep_background=None):
+        self._ppt_record = None
         # Clearing the measurement selection is also a way to change groups.
         # Only an explicit background reset (or a non-CSV load) releases Keep.
         if self._workflow == "drr":
@@ -1263,13 +1277,16 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
                       if keep_background else "Measurement selection cleared.")
 
     def _submit(self, kind, operation):
+        if kind not in {"ppt-load", "ppt-export"}:
+            self._ppt_record = None
         if kind.startswith("load"):
             self._remember_folder(self._folder)
         self._cancel_bn_check()
         self._sequence += 1
         sequence = self._sequence
         self._busy = True
-        self._message("Loading measurement…" if kind.startswith("load") else "Exporting…")
+        self._message("Loading PowerPoint figure…" if kind == "ppt-load" else
+                      "Loading measurement…" if kind.startswith("load") else "Exporting…")
         started = perf_counter()
         future = self._executor.submit(operation)
         self._pending[sequence] = future
@@ -1327,6 +1344,15 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         if error:
             self._maintenance_export_contexts.pop(sequence, None)
             self._message(error)
+            return
+        if kind in {"ppt-load", "ppt-export"}:
+            try:
+                self._ppt_finish(kind, result)
+            except (ValueError, TypeError, KeyError, OSError) as exc:
+                self._export_valid = False
+                self._ppt_record = None
+                self._message(f"PowerPoint figure could not be opened or saved: {exc}")
+            self.operationCompleted.emit(kind, elapsed * 1000)
             return
         if kind == "load":
             self._source, cube = result
@@ -1490,6 +1516,8 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
     def setParameter(self, key, value):
         if self._closed:
             return
+        if self._ppt_guard_parameter(key):
+            return
         if hasattr(value, "toVariant"):
             value = value.toVariant()
         if key == "bnReference" and self._workflow == "drr":
@@ -1612,7 +1640,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
     def invoke(self, action):
         if action in {"refresh", "rebuild-catalog"} and self._workflow in {"pl", "drr"}:
             if self._folder:
-                self._source_catalog.refreshCurrent(self._workflow, self._folder, list(self._sources), force=action == "rebuild-catalog")
+                self._pl_refresh_catalog_explicit(force=action == "rebuild-catalog")
             else:
                 self._message("Choose an experiment folder before refreshing its catalog.")
             return
@@ -1730,7 +1758,9 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
             index = min(len(self._cube.gate) - 1, max(0, index + (1 if action == "next-gate" else -1)))
             self.setParameter("gate", float(self._cube.gate[index]))
         elif action == "export" and self._source is not None and self._cube is not None:
-            if self._workflow == "drr":
+            if self._ppt_record is not None:
+                self._ppt_export()
+            elif self._workflow == "drr":
                 from ui_qt.quick.drr_workflow import export_drr
                 products = self._drr_products
                 if products is None:
@@ -2009,6 +2039,7 @@ class QuickApplicationBridge(ShellServicesMixin, PlApplicationMixin, PeakApplica
         if self._closed:
             return
         self._closed = True
+        self._ppt_close()
         self._color_range_controller.close()
         self._appearance.close()
         self._pl_close()
