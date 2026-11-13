@@ -10,12 +10,27 @@ from typing import Any, Optional, Sequence, Tuple
 
 import numpy as np
 
-from core import processing_run as P
 from core.drr_axis_coordinates import CoordinateAccumulator
 from core.streaming_average import StreamingNanMean
 from core.load_cancellation import check_load_cancelled
 if False:  # pragma: no cover - type-only imports are deferred to avoid a cycle.
     from core.drr_sources import DrrMeasurementAssignment
+
+
+def _processing_backend():
+    # Honour callers that explicitly replace loader.P, as the former module
+    # global did, while leaving ordinary DAT imports free of this dependency.
+    if "P" in globals():
+        return globals()["P"]
+    from core import processing_run
+    return processing_run
+
+
+def __getattr__(name):
+    """Retain loader.P compatibility without importing processing for DAT."""
+    if name == "P":
+        return _processing_backend()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 XLSX_Y_LABEL_DOPING = "Doping (V)"
@@ -208,6 +223,7 @@ def _csv_signature(user_folder: str, file_name: str) -> Tuple[int, int]:
 def _peek_y_axis_options_cached(
     user_folder: str, file_name: str, csv_sig: Tuple[int, int]
 ) -> Tuple[tuple[str, ...], str]:
+    P = _processing_backend()
     del csv_sig
 
     # Preferred: use implementation that owns _load_canonical
@@ -233,6 +249,7 @@ def peek_y_axis_options(user_folder: str, file_name: str) -> Tuple[list[str], st
 def _load_pl_cached(
     user_folder: str, file_name: str, log_scale: bool, y_axis: str, csv_sig: Tuple[int, int]
 ) -> dict:
+    P = _processing_backend()
     del csv_sig
 
     return P.process_pl(
@@ -253,6 +270,7 @@ def load_pl(user_folder: str, file_name: str, *, log_scale: bool = False, y_axis
         return load_xlsx_map(user_folder, file_name, y_label=resolve_xlsx_y_label(y_axis))
 
     csv_sig = _csv_signature(user_folder, file_name)
+    P = _processing_backend()
     effective_y_axis = P.resolve_shared_y_axis_request([file_name], y_axis)
     res = _load_pl_cached(user_folder, file_name, bool(log_scale), effective_y_axis, csv_sig)
 
@@ -496,6 +514,7 @@ def build_external_baseline(user_folder: str, files: Sequence[str], *, which: st
       - "last"  : use last frame in each file
       - "all"   : average ALL frames within each file, then average across files
     """
+    P = _processing_backend()
     if not files:
         raise ValueError("build_external_baseline: 'files' is empty.")
 
@@ -556,6 +575,7 @@ def load_drr_avg(
     dE_origin_like: bool = False,
     dE_pad_flat_edges: bool = True,
 ) -> DataCube:
+    P = _processing_backend()
     effective_y_axis = P.resolve_shared_y_axis_request(files, y_axis)
     res = P.process_ref_avg(
         user_folder=user_folder,
@@ -674,6 +694,7 @@ def _native_external_baseline_uncached(
     # Preserve the established recipe order: each source contributes one
     # frame vector, sources are aligned to the first baseline grid and then
     # averaged.  Only the resulting baseline is aligned to the measurement.
+    P = _processing_backend()
     for baseline_file in assignment.baseline_files:
         check_load_cancelled()
         data = P._load_canonical(user_folder, baseline_file, y_axis=y_axis)
@@ -789,6 +810,7 @@ def load_drr_resolved_avg(
     assignments are corrected on their native grids and aligned only after
     correction, with NaN outside coverage.
     """
+    P = _processing_backend()
     selected = tuple(str(item) for item in files)
     from core.drr_bn_store import validate_bn_assignment_usage
     validate_bn_assignment_usage(user_folder, selected, assignments, y_axis=y_axis)

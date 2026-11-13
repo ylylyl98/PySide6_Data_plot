@@ -6,13 +6,18 @@ from pathlib import Path, PurePosixPath
 from typing import Dict, List, Sequence
 
 import numpy as np
-from scipy.signal import savgol_filter
 
 from core.loader import DataCube
 from core.load_cancellation import check_load_cancelled
 from core.measurement_names import (
     REP_SUB_SUFFIX_RE, REP_ONLY_SUFFIX_RE, RUN_SUFFIX_RE, split_group_and_sort_key,
 )
+
+
+def savgol_filter(*args, **kwargs):
+    """Load SciPy only when smoothing or differentiation is requested."""
+    from scipy.signal import savgol_filter as scipy_savgol_filter
+    return scipy_savgol_filter(*args, **kwargs)
 
 
 POWER_TOKEN_RE = re.compile(r"(?P<power>[+-]?\d+(?:[pP\.]\d+)?)\s*uW", re.IGNORECASE)

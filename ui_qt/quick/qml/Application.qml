@@ -147,6 +147,16 @@ Controls.ApplicationWindow {
         function onWorkspaceUrlChanged() { Qt.callLater(window.reloadPages) }
         function onWorkflowBridgeChanged() { Qt.callLater(window.reloadPages) }
         function onFileDialogRequested(purpose, multiple) { window.chooseFiles(purpose, multiple) }
+        function onPptActivateRequested() {
+            if (window.visibility === Window.Minimized) window.showNormal()
+            window.show()
+            window.raise()
+            window.requestActivate()
+        }
+        function onPptBindingRequested() {
+            DialogState.prepareFile(pptPngDialog, window.state.sourceFolderUrl, "")
+            pptPngDialog.open()
+        }
         function onSourceCatalogRequested() {
             if (!catalogLoader.item)
                 catalogLoader.setSource(Qt.resolvedUrl("SourceCatalog.qml"), {bridge: window.appBridge.sourceCatalogBridge, colors: window.colors})
@@ -163,6 +173,18 @@ Controls.ApplicationWindow {
         }
         function onBackgroundFileDialogRequested(role, multiple) { backgroundWindow.choose(role, multiple, "") }
         function onBackgroundSaveDialogRequested(role, suggested) { backgroundWindow.choose(role, false, suggested) }
+    }
+
+    AppFileDialog {
+        id: pptPngDialog
+        objectName: "app_ppt_png_dialog"
+        colors: window.colors
+        parentWindow: window
+        title: qsTr("Choose the original exported PNG for this PowerPoint picture")
+        options: FileDialog.DontUseNativeDialog
+        fileMode: FileDialog.OpenFile
+        nameFilters: ["Exported PNG (*.png)"]
+        onAccepted: window.appBridge.bindPowerPointPng(selectedFile)
     }
 
     Loader { id: updateLoader; anchors.fill: parent }
