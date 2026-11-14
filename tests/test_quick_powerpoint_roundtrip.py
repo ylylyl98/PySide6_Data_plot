@@ -181,16 +181,93 @@ def isolated():
             self.assertEqual(updated.plot["xlim"], [1.5, 3.5])
             self.assertEqual(updated.dat_path.read_bytes(), source_bytes)
 
-        def test_open_does_not_adopt_global_manual_locks(self):
+        def test_open_applies_manual_locks_and_keeps_unfixed_saved_ranges(self):
             record = self.seed()
             display = self.bridge._pl_display
             display._manual = {"axis.xmin": 1.5}
             self.bridge._ppt_open(record)
             wait(lambda: not self.bridge._busy)
-            self.assertEqual(display.values["xmin"], 1.)
+            self.assertIsNotNone(self.bridge._ppt_record, self.bridge._status)
+            self.assertEqual(display.values["xmin"], 1.5)
+            self.assertTrue(display.axis_fixed["xmin"])
+            self.assertEqual(display.values["xmax"], 4.)
+            self.assertFalse(display.axis_fixed["xmax"])
+            self.assertEqual(record.plot["xlim"], [1., 4.])
             self.bridge.setParameter("cmap", "inferno")
             stored = json.loads(str(self.bridge.settings.value("pl/display/manual_locks")))
             self.assertEqual(stored["numbers"]["axis.xmin"], 1.5)
+            self.assertNotIn("axis.xmax", stored["numbers"])
+            self.bridge.invoke("export")
+            wait(lambda: not self.bridge._busy)
+            self.assertEqual(len(self.service.updates), 1, self.bridge._status)
+            updated = self.service.updates[0][2]
+            self.assertEqual(updated.plot["xlim"], [1.5, 4.])
+            self.assertEqual(updated.dat_path.read_bytes(), record.dat_path.read_bytes())
+
+        def test_pl_fixed_colors_and_boundaries_survive_reopening(self):
+            record = self.seed(split=True)
+            self.bridge._ppt_open(record)
+            wait(lambda: not self.bridge._busy)
+            display = self.bridge._pl_display
+            display._manual = {"linear.vmax": 9., "boundary.x0": 2.5}
+            display.geometry["count"] = 2
+            self.bridge._ppt_open(record)
+            wait(lambda: not self.bridge._busy)
+            self.assertIsNotNone(self.bridge._ppt_record, self.bridge._status)
+            self.assertEqual(display.banks["linear"]["vmax"], 9.)
+            self.assertTrue(display.banks["linear"]["fixed"]["vmax"])
+            self.assertEqual(display.banks["linear"]["vmin"], 1.)
+            self.assertFalse(display.banks["linear"]["fixed"]["vmin"])
+            self.assertEqual(display.geometry["count"], 2)
+            self.assertEqual(display.geometry["x0"], 2.5)
+            self.assertTrue(display.geometry["fixed"]["x0"])
+
+        def test_pl_all_fixed_fields_and_saved_display_options(self):
+            for scale in ("linear", "log"):
+                with self.subTest(scale=scale):
+                    record = self.seed(split=True)
+                    plot = dict(record.plot, log_scale=scale == "log", cmap="inferno",
+                                clip_outliers=True, png_width_scale=2.)
+                    plot["split_scale"] = asdict(SplitColorScale(1.5, 1., 5., 2., 7.,
+                        show_boundary=False, split_x2=2.5, middle_vmin=1., middle_vmax=6.))
+                    record = replace(record, plot=plot)
+                    display = self.bridge._pl_display
+                    display._manual = {}
+                    self.bridge._ppt_open(record)
+                    wait(lambda: not self.bridge._busy)
+                    self.assertIsNotNone(self.bridge._ppt_record, self.bridge._status)
+                    display._manual_context = dict(display.axis_context)
+                    display._manual_signature = dict(display.axis_signature)
+                    display._manual = {"axis.xmin": 1.1, "axis.xmax": 4.,
+                        "axis.ymin": -.75, "axis.ymax": .75,
+                        "boundary.x0": 2.5, "boundary.x1": 3.5}
+                    for prefix in ("", "left_", "middle_", "right_"):
+                        display._manual[scale + "." + prefix + "vmin"] = .5
+                        display._manual[scale + "." + prefix + "vmax"] = 8.
+                    # Non-Fix options come from the PNG even with locked boundaries.
+                    display.geometry.update(count=2, showBoundary=True)
+                    display.values.update(cmap="plasma", clip=False)
+                    self.bridge._ppt_open(record)
+                    wait(lambda: not self.bridge._busy)
+                    self.assertIsNotNone(self.bridge._ppt_record, self.bridge._status)
+                    self.assertEqual(display.values["cmap"], "inferno")
+                    self.assertEqual(display.values["scale"], scale)
+                    self.assertTrue(display.values["clip"])
+                    self.assertEqual(display.geometry["count"], 3)
+                    self.assertFalse(display.geometry["showBoundary"])
+                    self.assertEqual(self.bridge._png_export_width(), 2.)
+                    for key, value in display._manual.items():
+                        self.assertEqual(display._number(key), value, key)
+                        self.assertTrue(display._fixed(key), key)
+                    self.bridge.invoke("export")
+                    wait(lambda: not self.bridge._busy)
+                    updated = self.service.updates[-1][2]
+                    self.assertEqual(updated.plot["cmap"], "inferno")
+                    self.assertEqual(updated.plot["log_scale"], scale == "log")
+                    self.assertEqual(updated.plot["png_width_scale"], 2.)
+                    self.assertEqual(updated.plot["ylim"], [-.75, .75])
+                    self.assertEqual(updated.plot["split_scale"]["split_x2"], 3.5)
+                    self.assertEqual(updated.dat_path.read_bytes(), record.dat_path.read_bytes())
 
     result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Cases))
     return 0 if result.wasSuccessful() else 1
