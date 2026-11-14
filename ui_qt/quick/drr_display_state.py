@@ -694,6 +694,7 @@ class _DisplayMemory:
         self.viewport = {}
         self.pending = None
         self.pending_edits = {}
+        self.preserve_manual_geometry_once = False
         self._borrowed_second_auto = None
         self.context = self._read_setting(self.CONTEXT_KEY, None)
         if not isinstance(self.context, dict):
@@ -912,6 +913,21 @@ class _DisplayMemory:
             template = None
         manual = self._manual()
         edits, self.pending_edits = self.pending_edits, {}
+        if self.preserve_manual_geometry_once:
+            # Returning from isolated PowerPoint editing must not turn the
+            # restored measurement Fix values into cross-center history.
+            # Explicit edits during this load retain precedence.
+            for key in self.GEOMETRY:
+                flag = ("flags", "fix." + key)
+                number = ("numbers", key)
+                if manual.get(flag) and number in manual:
+                    edits.setdefault(number, manual[number])
+                    edits.setdefault(flag, True)
+            if any(manual.get(("flags", "fix.boundary." + key)) for key in ("x0", "x1")):
+                for item in (("choices", "regionCount"), ("flags", "boundary.show")):
+                    if item in manual:
+                        edits.setdefault(item, manual[item])
+            self.preserve_manual_geometry_once = False
         self.pending = None
         self.reset_borrowed()
         context = dict(folder=Path(folder).resolve().as_posix().casefold(), source=source_key(folder, files), center=center)
