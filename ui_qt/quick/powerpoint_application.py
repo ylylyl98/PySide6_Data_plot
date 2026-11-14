@@ -137,12 +137,46 @@ def restore_drr_figure(display, params, *, product="raw"):
 class PowerPointApplicationMixin:
     def _ppt_init(self):
         self._ppt_applying = False
+        self._ppt_display_session = None
+        self._ppt_measurement_state = None
         self._ppt_service = None
         self._ppt_root = ""
         self._ppt_record = None
         self._ppt_params = None
         self._ppt_save_record = None
         self._ppt_update_timings = {}
+
+    def _ppt_enter_display(self):
+        if self._ppt_display_session is not None:
+            return
+        from ui_qt.quick.powerpoint_display_session import DisplaySession
+        # Keep the normal measurement workflow intact while the saved DAT is
+        # displayed. Copies are shallow for numerical products/cubes.
+        references = ("_cube", "_source", "_sources", "_folder", "_export_valid",
+                      "_drr_products", "_drr_background_recipe", "_drr_backgrounds",
+                      "_drr_background_required", "_pl_active_source")
+        mappings = ("_values", "_scales", "_pl_values", "_drr_processing")
+        self._ppt_measurement_state = {
+            **{key: getattr(self, key) for key in references},
+            **{key: deepcopy(getattr(self, key)) for key in mappings},
+        }
+        display = self._pl_display if self._workflow == "pl" else self._drr_display
+        self._ppt_display_session = DisplaySession(display)
+
+    def _ppt_leave_display(self, *, preserve_next_drr=True):
+        session = self._ppt_display_session
+        if session is None:
+            return
+        self._ppt_display_session = None
+        state, self._ppt_measurement_state = self._ppt_measurement_state, None
+        self._ppt_record = self._ppt_params = None
+        for key, value in state.items():
+            setattr(self, key, value)
+        session.restore(preserve_next_drr=preserve_next_drr)
+        if self._workflow == "pl":
+            self._pl_sync_scales()
+        if not self._closed:
+            self._schedule_plot()
 
     def _ppt_start(self):
         import sys
@@ -214,6 +248,7 @@ class PowerPointApplicationMixin:
             record, cube, params = result
             from core.pptx_figure_edit import experiment_root
             self.selectWorkflow(record.workflow)
+            self._ppt_enter_display()
             self._ppt_record = None
             self._folder = str(experiment_root(record.png_path))
             self._source, self._sources = record.dat_path, (str(record.dat_path),)
@@ -305,6 +340,7 @@ class PowerPointApplicationMixin:
         return blocked
 
     def _ppt_close(self):
+        self._ppt_leave_display(preserve_next_drr=False)
         self._ppt_update_timings.clear()
         if self._ppt_service is not None:
             self._ppt_service.close()

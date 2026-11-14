@@ -26,7 +26,7 @@ def isolated():
     from unittest.mock import patch
     import numpy as np
     from PIL import Image
-    from PySide6.QtCore import QSettings
+    from PySide6.QtCore import QSettings, QUrl
     from PySide6.QtGui import QGuiApplication
     from core.plotting import HeatmapParams, SplitColorScale
     from core.pptx_figure_index import FigureIndex
@@ -75,6 +75,97 @@ def isolated():
                 figures={png.name: dict(data_file=dat.name, plot=asdict(params), role=role, display_title="Saved rendered title")}
             )))
             return FigureIndex(self.root).scan()[0]
+
+        def measurement(self, name):
+            path = self.root / name
+            waves = np.linspace(630., 690., 41)
+            gates = np.linspace(-2., 2., 9)
+            intensity = 130 + 15*gates[:, None] + 4*np.linspace(-1., 1., 41)[None, :]**2
+            np.savetxt(path, np.column_stack((np.zeros(9), gates, np.zeros(9), intensity)),
+                       delimiter=",", header="Vbg,Vtg,Vbias," + ",".join(map(str, waves)), comments="")
+            return path
+
+        def load_measurement(self, workflow, path):
+            self.bridge.selectWorkflow(workflow)
+            self.bridge.selectFiles([QUrl.fromLocalFile(str(path))])
+            wait(lambda: not self.bridge._busy)
+            if workflow == "drr" and self.bridge._drr_background_required:
+                from tests.quick_drr_helpers import apply_self_background
+                apply_self_background(self.bridge, wait)
+            self.assertIsNotNone(self.bridge._cube, self.bridge._status)
+            self.assertTrue(self.bridge._export_valid, self.bridge._status)
+
+        def test_measurement_fixes_survive_ppt_edits_then_new_csv(self):
+            for workflow in ("pl", "drr"):
+                with self.subTest(workflow=workflow):
+                    self.load_measurement(workflow, self.measurement(workflow + "_660nmc_TG_first.csv"))
+                    display = self.bridge._pl_display if workflow == "pl" else self.bridge._drr_display
+                    color = "linear" if workflow == "pl" else "raw"
+                    fixed = {"axis.xmin": 1.85, "axis.xmax": 1.93, "axis.ymin": -1.,
+                             "axis.ymax": 1., color + ".vmin": .01 if workflow == "pl" else -.5,
+                             color + ".vmax": .5}
+                    if workflow == "drr":
+                        fixed.update({"second.left_vmin": -.02, "second.left_vmax": .02})
+                    for key, value in fixed.items():
+                        self.assertTrue(display.setNumber(key, str(value)), key)
+                        self.assertTrue(display.setFlag("fix." + key, True), key)
+                    display._flush_changes()
+                    prefkey = "pl/display/manual_locks" if workflow == "pl" else display._memory.RANGES_KEY
+                    before = self.bridge.settings.value(prefkey)
+                    record = self.seed(workflow)
+                    self.bridge._ppt_open(record)
+                    wait(lambda: not self.bridge._busy)
+                    self.assertIsNotNone(self.bridge._ppt_record, self.bridge._status)
+                    self.assertTrue(display.setNumber("axis.xmin", "1.86"))
+                    self.assertTrue(display.setFlag("fix.axis.xmax", False))
+                    display._flush_changes()
+                    self.assertEqual(self.bridge.settings.value(prefkey), before)
+                    self.bridge.invoke("export")
+                    wait(lambda: not self.bridge._busy)
+                    self.assertTrue(self.service.updates, self.bridge._status)
+                    edited = self.service.updates[-1][2]
+                    self.assertAlmostEqual(edited.plot["xlim"][0], 1.86)
+                    self.assertEqual(edited.dat_path.read_bytes(), record.dat_path.read_bytes())
+                    self.assertEqual(self.bridge.settings.value(prefkey), before)
+                    # Reopening another PPT figure must not replace the original baseline.
+                    self.bridge._ppt_open(record)
+                    wait(lambda: not self.bridge._busy)
+                    self.load_measurement(workflow, self.measurement(workflow + "_680nmc_TG_next.csv"))
+                    self.assertIsNone(self.bridge._ppt_record)
+                    self.assertIs(display.settings, self.bridge.settings)
+                    for key, value in fixed.items():
+                        actual = display._number(key) if workflow == "pl" else display._numbers[key]
+                        flag = display._fixed(key) if workflow == "pl" else display._flags["fix." + key]
+                        self.assertAlmostEqual(actual, value, msg=key)
+                        self.assertTrue(flag, key)
+                    self.assertEqual(self.bridge.settings.value(prefkey), before)
+
+        def test_failed_ppt_restore_and_workflow_exit_keep_measurement_baseline(self):
+            self.load_measurement("pl", self.measurement("original_660nmc_TG.csv"))
+            display = self.bridge._pl_display
+            display.setNumber("axis.xmin", "1.85")
+            display.setFlag("fix.axis.xmin", True)
+            display._flush_changes()
+            original_cube = self.bridge._cube
+            original_prefs = self.bridge.settings.value("pl/display/manual_locks")
+            record = self.seed()
+            with patch("ui_qt.quick.powerpoint_application.restore_pl_figure", side_effect=ValueError("test invalid display")):
+                self.bridge._ppt_open(record)
+                wait(lambda: not self.bridge._busy)
+            self.assertIsNone(self.bridge._ppt_display_session)
+            self.assertIs(self.bridge._cube, original_cube)
+            self.assertTrue(self.bridge._export_valid)
+            self.assertIs(display.settings, self.bridge.settings)
+            self.assertEqual(display.values["xmin"], 1.85)
+            self.bridge._ppt_open(record)
+            wait(lambda: not self.bridge._busy)
+            display.setNumber("axis.xmin", "1.86")
+            display._flush_changes()
+            self.bridge.selectWorkflow("drr")
+            self.assertIsNone(self.bridge._ppt_display_session)
+            self.assertEqual(display.values["xmin"], 1.85)
+            self.assertTrue(display.axis_fixed["xmin"])
+            self.assertEqual(self.bridge.settings.value("pl/display/manual_locks"), original_prefs)
 
         def test_pl_doubleclick_handoff_save_and_reopen(self):
             record = self.seed(split=True)
@@ -185,6 +276,7 @@ def isolated():
             record = self.seed()
             display = self.bridge._pl_display
             display._manual = {"axis.xmin": 1.5}
+            display._save_manual()
             self.bridge._ppt_open(record)
             wait(lambda: not self.bridge._busy)
             self.assertIsNotNone(self.bridge._ppt_record, self.bridge._status)

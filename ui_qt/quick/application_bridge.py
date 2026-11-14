@@ -799,6 +799,7 @@ class QuickApplicationBridge(PowerPointApplicationMixin, ShellServicesMixin, PlA
     def selectWorkflow(self, key):
         if key == self._workflow or key not in {item.key for item in FEATURES}:
             return
+        self._ppt_leave_display()
         self._ppt_record = None
         if self._workflow == "megasweep":
             self._workflow_bridges["megasweep"].invalidateBackgroundSelection()
@@ -961,6 +962,7 @@ class QuickApplicationBridge(PowerPointApplicationMixin, ShellServicesMixin, PlA
 
     @Slot(str)
     def setSourcePath(self, value):
+        self._ppt_leave_display()
         self._ppt_record = None
         path = _local_path(value)
         if path.is_file():
@@ -981,6 +983,7 @@ class QuickApplicationBridge(PowerPointApplicationMixin, ShellServicesMixin, PlA
 
     @Slot(QUrl)
     def openFile(self, value):
+        self._ppt_leave_display()
         child = self._workflow_bridges.get(self._workflow)
         if child is not None:
             child.openFiles("sources", [value])
@@ -1032,6 +1035,7 @@ class QuickApplicationBridge(PowerPointApplicationMixin, ShellServicesMixin, PlA
         paths = tuple(str(_local_path(value).resolve()) for value in values)
         if not paths:
             return
+        self._ppt_leave_display()
         if self._workflow == "pl":
             if len(paths) != 1:
                 self._message("Select one PL measurement at a time.")
@@ -1239,6 +1243,7 @@ class QuickApplicationBridge(PowerPointApplicationMixin, ShellServicesMixin, PlA
             self._canvas.draw_idle()
 
     def _clear_files(self, *, keep_background=None):
+        self._ppt_leave_display()
         self._ppt_record = None
         # Clearing the measurement selection is also a way to change groups.
         # Only an explicit background reset (or a non-CSV load) releases Keep.
@@ -1278,6 +1283,7 @@ class QuickApplicationBridge(PowerPointApplicationMixin, ShellServicesMixin, PlA
 
     def _submit(self, kind, operation):
         if kind not in {"ppt-load", "ppt-export"}:
+            self._ppt_leave_display()
             self._ppt_record = None
         if kind.startswith("load"):
             self._remember_folder(self._folder)
@@ -1349,7 +1355,10 @@ class QuickApplicationBridge(PowerPointApplicationMixin, ShellServicesMixin, PlA
             try:
                 self._ppt_finish(kind, result)
             except (ValueError, TypeError, KeyError, OSError) as exc:
-                self._export_valid = False
+                if kind == "ppt-load" and self._ppt_display_session is not None:
+                    self._ppt_leave_display()
+                else:
+                    self._export_valid = False
                 self._ppt_record = None
                 self._message(f"PowerPoint figure could not be opened or saved: {exc}")
             self.operationCompleted.emit(kind, elapsed * 1000)
@@ -1432,6 +1441,7 @@ class QuickApplicationBridge(PowerPointApplicationMixin, ShellServicesMixin, PlA
 
     @Slot()
     def loadDemo(self):
+        self._ppt_leave_display()
         self._sequence += 1
         if self._load_cancellation is not None:
             self._load_cancellation.cancel()
