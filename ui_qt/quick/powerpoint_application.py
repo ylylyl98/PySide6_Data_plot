@@ -6,7 +6,7 @@ from time import perf_counter
 
 
 def restore_pl_figure(display, record, params):
-    """Explicit figure opening outranks local locks without changing those preferences."""
+    """Restore saved figure values, then apply the user's explicit manual locks."""
     from core.pl_display_settings import validate_snapshot
     snapshot = validate_snapshot(record.snapshot) or display.capture_state()
     # These are figure values, not new persistent user locks. Keep Auto available
@@ -32,41 +32,105 @@ def restore_pl_figure(display, record, params):
             low, high = getattr(split, side + "_vmin"), getattr(split, side + "_vmax")
             if low is not None and high is not None:
                 bank[side + "Min"], bank[side + "Max"] = low, high
-    if not display.restore_state(snapshot, overlay_manual=False):
+    if not display.restore_state(snapshot, overlay_manual=True):
         raise ValueError("The saved PL figure display is incomplete or invalid.")
 
 
-def restore_drr_figure(display, params):
+def restore_drr_figure(display, params, *, product="raw"):
     """An already computed derivative is shown in the imported-map channel."""
-    display._figure_mode = True
-    display._memory.reset_borrowed()
-    display._memory.viewport = {}
-    display._pending.clear()
-    for key in display._flags:
-        if key.startswith("fix."):
-            display._flags[key] = False
-    display._fix_sources.clear()
-    display._choices.update(colorProduct=0, regionCount=0, **{"yaxis.right": 0})
-    display._numbers.update(dict(zip(("axis.xmin", "axis.xmax", "axis.ymin", "axis.ymax"),
-                                     (*params.xlim, *params.ylim))))
-    display._numbers.update({"raw.vmin": params.vmin, "raw.vmax": params.vmax})
-    display._flags.update(log=params.log_scale, zero=params.center_zero, clip=params.clip_outliers)
-    if params.cmap not in {name for name, _ in display._cmaps}:
-        display._cmaps = (*display._cmaps, (params.cmap, params.cmap))
-    display._choices["raw.cmap"] = next(index for index, (name, _) in enumerate(display._cmaps) if name == params.cmap)
+    manual = display._memory._manual()
+    previous_y = getattr(display, "_ppt_previous_y_identity", None)
+    cube = display._raw
+    current_y = ((str(cube.gate_label).strip().casefold(),
+                  str(getattr(cube, "gate_unit", "")).strip().casefold(),
+                  str(getattr(cube, "y_axis_semantic", "")).strip().casefold())
+                 if cube is not None else None)
+    y_compatible = previous_y is not None and previous_y == current_y
+    y_skipped = not y_compatible and any(("numbers", "axis.y" + end) in manual for end in ("min", "max"))
+    old_numbers = dict(display._numbers)
+    numbers = dict(old_numbers)
+    flags = {key: False for key in display._flags if key.startswith("fix.")}
+    sources = {}
+    numbers.update(dict(zip(("axis.xmin", "axis.xmax", "axis.ymin", "axis.ymax"),
+                            (*params.xlim, *params.ylim))))
+    numbers.update({"raw.vmin": params.vmin, "raw.vmax": params.vmax})
+    count = 0
+    show_boundary = True
     split = params.split_scale
     if split:
-        display._choices["regionCount"] = 2 if split.split_x2 is not None else 1
-        display._numbers["boundary.x0"] = split.split_x
+        count = 2 if split.split_x2 is not None else 1
+        numbers["boundary.x0"] = split.split_x
         if split.split_x2 is not None:
-            display._numbers["boundary.x1"] = split.split_x2
-        display._flags["boundary.show"] = split.show_boundary
+            numbers["boundary.x1"] = split.split_x2
+        show_boundary = split.show_boundary
         for side in ("left", "right", "middle"):
             for bound in ("vmin", "vmax"):
                 value = getattr(split, side + "_" + bound)
                 if value is not None:
-                    display._numbers["raw." + side + "_" + bound] = value
-    display.set_memory_status("PowerPoint figure · saved DAT · display edits only", available=False)
+                    numbers["raw." + side + "_" + bound] = value
+    # Explicit manual Fix values override the PNG; borrowed history does not.
+    color_product = "raw" if getattr(display, "_ppt_previous_figure_mode", False) else product
+    for (category, key), value in manual.items():
+        if category != "numbers" or key.startswith("axis.y") and not y_compatible:
+            continue
+        # The derivative's whole-map range can be manually adjusted without
+        # Fix controls; it is not an explicit lock on a different PNG.
+        if key in {"second.vmin", "second.vmax"}:
+            continue
+        target = key
+        if key.startswith(("raw.", "second.")):
+            if not key.startswith(color_product + "."):
+                continue
+            target = "raw." + key.split(".", 1)[1]
+        if target not in numbers:
+            continue
+        numbers[target] = value
+        flag = "fix." + target
+        if manual.get(("flags", "fix." + key), False) and flag in flags:
+            flags[flag] = True
+            sources[flag] = "M"
+    prefixes = ["axis.x", "axis.y", "raw.v"]
+    if count:
+        prefixes += ["raw.left_v", "raw.right_v"]
+    if count == 2:
+        prefixes.append("raw.middle_v")
+    for prefix in prefixes:
+        lo, hi = prefix + "min", prefix + "max"
+        if numbers[lo] >= numbers[hi]:
+            fixed_lo, fixed_hi = flags.get("fix." + lo, False), flags.get("fix." + hi, False)
+            if fixed_lo == fixed_hi:
+                raise ValueError("Fixed PowerPoint display limits conflict with the saved figure; adjust or release Fix values.")
+            peer = hi if fixed_lo else lo
+            numbers[peer] = old_numbers[peer]
+            if numbers[lo] >= numbers[hi]:
+                delta = max(abs(numbers[lo if fixed_lo else hi]) * 1e-6, 10 ** -display._decimals(peer))
+                numbers[peer] = numbers[lo] + delta if fixed_lo else numbers[hi] - delta
+        if params.log_scale and prefix.startswith("raw.") and numbers[lo] <= 0:
+            raise ValueError("Fixed color limits must be positive for this logarithmic figure.")
+    if count and cube is not None:
+        from core.plotting import SplitColorScale, split_region_slices
+        region = SplitColorScale(numbers["boundary.x0"], numbers["raw.left_vmin"], numbers["raw.left_vmax"],
+            numbers["raw.right_vmin"], numbers["raw.right_vmax"], show_boundary,
+            numbers["boundary.x1"] if count == 2 else None,
+            numbers["raw.middle_vmin"] if count == 2 else None,
+            numbers["raw.middle_vmax"] if count == 2 else None)
+        split_region_slices(cube.energy, region, (numbers["axis.xmin"], numbers["axis.xmax"]))
+    display._memory.reset_borrowed()
+    display._memory.viewport = {}
+    display._pending.clear()
+    display._figure_mode = True
+    display._numbers.update(numbers)
+    display._flags.update(flags)
+    display._fix_sources = sources
+    display._flags.update(log=params.log_scale, zero=params.center_zero, clip=params.clip_outliers, **{"boundary.show": show_boundary})
+    display._choices.update(colorProduct=0, regionCount=count, **{"yaxis.right": 0})
+    if params.cmap not in {name for name, _ in display._cmaps}:
+        display._cmaps = (*display._cmaps, (params.cmap, params.cmap))
+    display._choices["raw.cmap"] = next(index for index, (name, _) in enumerate(display._cmaps) if name == params.cmap)
+    message = "PowerPoint figure · saved DAT · display edits only"
+    if y_skipped:
+        message += " · Y Fix not applied: coordinate identity differs or is unknown"
+    display.set_memory_status(message, available=False)
     display.refresh()
 
 
@@ -156,6 +220,14 @@ class PowerPointApplicationMixin:
             self._values["sideBySide"] = False
             if record.workflow == "drr":
                 from ui_qt.quick.drr_workflow import DrrProducts, DrrRequest
+                display = self._drr_display
+                previous = display._raw
+                display._ppt_previous_y_identity = (
+                    (str(previous.gate_label).strip().casefold(),
+                     str(getattr(previous, "gate_unit", "")).strip().casefold(),
+                     str(getattr(previous, "y_axis_semantic", "")).strip().casefold())
+                    if previous is not None else None)
+                display._ppt_previous_figure_mode = display._figure_mode
                 request = DrrRequest(files=self._sources, background_mode="imported", experiment_folder=self._folder)
                 self._drr_products = DrrProducts(request, cube, cube, None, 0, 0,
                     "PowerPoint edits use the saved numerical map; load the measurement to reprocess.")
@@ -169,7 +241,7 @@ class PowerPointApplicationMixin:
                 self._pl_sync_scales()
                 self._pl_remember()
             else:
-                restore_drr_figure(self._drr_display, params)
+                restore_drr_figure(self._drr_display, params, product=record.role.removesuffix("_wide"))
             self._ppt_record, self._ppt_params = record, params
             self._pl_values.update(pngLayout="wide" if params.png_width_scale > 1 else "original",
                                    pngWidth=params.png_width_scale)

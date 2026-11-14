@@ -44,6 +44,7 @@ jobs:
           tests.test_pptx_figure_index
           tests.test_pptx_lazy_loading
           tests.test_quick_powerpoint_roundtrip
+          tests.test_powerpoint_fixed_display
           tests.test_powerpoint_catalog_priority
           tests.test_powerpoint_clipboard
           tests.test_powerpoint_emf
