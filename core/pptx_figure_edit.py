@@ -15,7 +15,7 @@ def figure_params(record):
     from core.plotting import HeatmapParams, SplitColorScale
     payload = deepcopy(record.plot)
     if payload.get("right_axis") or payload.get("y_axis_log"):
-        raise ValueError("PowerPoint editing currently supports maps without a secondary or logarithmic Y axis.")
+        raise ValueError("Slide figure editing currently supports maps without a secondary or logarithmic Y axis.")
     allowed = {field.name for field in fields(HeatmapParams)}
     payload = {key: value for key, value in payload.items() if key in allowed}
     for key in ("xlim", "ylim"):
@@ -80,7 +80,7 @@ def save_figure_edit(record, cube, params, snapshot):
     from core.pptx_figure_index import FigureIndex
     signatures = getattr(cube, "_quick_pl_signatures", ())
     if not signatures:
-        raise ValueError("Reload the PowerPoint figure before saving.")
+        raise ValueError("Reload the slide figure before saving.")
     verify_signatures(signatures)
     # Keep the original numerical input even after a prior PPT save generated a new version.
     source_dat = Path(signatures[0][0])
@@ -139,7 +139,7 @@ def save_figure_edit(record, cube, params, snapshot):
             records = index.find_png(png, metadata_path=metadata)
             new_record = next((item for item in records if item.png_path == png.resolve()), None)
             if new_record is None:
-                raise ValueError("The saved figure could not be indexed; PowerPoint was not changed.")
+                raise ValueError("The saved figure could not be indexed for the slide update.")
             metadata_signatures[str(metadata.resolve())] = sha256(metadata.read_bytes()).hexdigest()
         except Exception:
             for path in reversed(created):

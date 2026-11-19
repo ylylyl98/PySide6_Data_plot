@@ -17,14 +17,12 @@ from time import perf_counter
 def main(argv=None, *, production=False):
     from windows_source import protect_source_code
     protect_source_code()
-    if production:
-        from windows_source import acquire_source_instance
-        if not acquire_source_instance():
-            return 0
     started = perf_counter()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--demo", action="store_true")
     parser.add_argument("--check", action="store_true", help="Render and close with isolated settings")
+    parser.add_argument("--deckcraft-companion", action="store_true",
+                        help="Listen for DeckCraft figure edits in a minimized, isolated window")
     parser.add_argument("--capture", type=Path)
     parser.add_argument("--settings-file", type=Path)
     parser.add_argument("--open", type=Path, dest="sources", action="append", help="Measurement path; repeat for multiple channels")
@@ -35,6 +33,18 @@ def main(argv=None, *, production=False):
     parser.add_argument("--width", type=int, default=1320)
     parser.add_argument("--height", type=int, default=900)
     args = parser.parse_args(argv)
+    if args.deckcraft_companion and (args.check or args.demo):
+        parser.error("--deckcraft-companion cannot be combined with --check or --demo")
+    if production and not args.deckcraft_companion:
+        from windows_source import acquire_source_instance
+        if not acquire_source_instance():
+            return 0
+    deckcraft_role = None
+    if not args.check and not args.demo:
+        from ui_qt.quick.deckcraft_instance import acquire_deckcraft_role
+        deckcraft_role = acquire_deckcraft_role(companion=args.deckcraft_companion, production=production)
+        if args.deckcraft_companion and deckcraft_role is None:
+            return 0
     from PySide6.QtCore import QCoreApplication, QEvent, QObject, QSettings, QTimer, QUrl, qInstallMessageHandler
     from PySide6.QtGui import QGuiApplication
     from PySide6.QtQml import QQmlApplicationEngine
@@ -57,7 +67,7 @@ def main(argv=None, *, production=False):
         if not icon.isNull():
             app.setWindowIcon(icon)
     temporary = tempfile.TemporaryDirectory(prefix="dptk-native-quick-")
-    persistent = bool(production and not args.check and not args.demo)
+    persistent = bool(production and not (args.check or args.demo or args.deckcraft_companion))
     if args.settings_file is not None:
         settings = QSettings(str(args.settings_file), QSettings.IniFormat)
     elif persistent:
@@ -67,7 +77,7 @@ def main(argv=None, *, production=False):
     if args.theme is not None:
         settings.setValue("quick/appearance", args.theme)
     old_cache = os.environ.get("MPLCONFIGDIR")
-    isolated_cache = args.check or args.demo or not production
+    isolated_cache = not persistent
     if isolated_cache:
         os.environ["MPLCONFIGDIR"] = str(Path(temporary.name) / "matplotlib")
     errors = []
@@ -78,18 +88,20 @@ def main(argv=None, *, production=False):
         if sys.stderr is not None:
             print(text, file=sys.stderr)
     old_handler = qInstallMessageHandler(qt_message)
-    bridge = QuickApplicationBridge(settings=settings)
+    bridge = QuickApplicationBridge(settings=settings, deckcraft_role=deckcraft_role)
     engine = QQmlApplicationEngine()
     register_plot_surface()
-    engine.setInitialProperties({"appBridge": bridge})
+    engine.setInitialProperties({"appBridge": bridge, "startMinimized": args.deckcraft_companion})
     engine.load(QUrl.fromLocalFile(str(Path(__file__).resolve().parent / "ui_qt/quick/qml/Application.qml")))
     if not engine.rootObjects():
         bridge.close()
+        if deckcraft_role is not None:
+            deckcraft_role.close()
         qInstallMessageHandler(old_handler)
         temporary.cleanup()
         return 2
     window = engine.rootObjects()[0]
-    if production:
+    if production and not args.deckcraft_companion:
         from windows_source import attach_source_window
         attach_source_window(window)
     screen = app.primaryScreen()
@@ -105,13 +117,16 @@ def main(argv=None, *, production=False):
         if "first_shell_frame_ms" not in timings:
             timings["first_shell_frame_ms"] = (perf_counter() - started) * 1000
             shell_imports.extend(name for name in ("matplotlib", "numpy", "scipy", "pandas") if name in sys.modules)
-            QTimer.singleShot(0, start_content)
+            if not args.deckcraft_companion:
+                QTimer.singleShot(0, start_content)
         frames.append(perf_counter())
     window.frameSwapped.connect(swapped)
     def start_content():
         if persistent and not args.sources:
             bridge.restoreSourceFolder()
-        if not args.check and not args.demo:
+        if args.deckcraft_companion:
+            bridge._deckcraft_start(companion=True)
+        elif not args.check and not args.demo:
             bridge.startServices()
         bridge.selectWorkflow(args.workflow)
         if args.workflow == "megasweep":
@@ -120,6 +135,8 @@ def main(argv=None, *, production=False):
             bridge.selectFiles([QUrl.fromLocalFile(str(path.resolve())) for path in args.sources])
         elif args.demo:
             bridge.loadDemo()
+    if args.deckcraft_companion:
+        QTimer.singleShot(0, start_content)
     def plot_presented(generation):
         if generation > 0 and "first_plot_frame_ms" not in timings:
             timings["first_plot_frame_ms"] = (perf_counter() - started) * 1000
@@ -208,6 +225,8 @@ def main(argv=None, *, production=False):
     finally:
         timer.stop()
         bridge.close()
+        if deckcraft_role is not None:
+            deckcraft_role.close()
         window.close()
         engine.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)

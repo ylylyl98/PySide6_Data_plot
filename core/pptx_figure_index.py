@@ -136,7 +136,7 @@ class FigureIndex:
             self._cache[key] = _fingerprint(path.read_bytes())
         return self._cache[key]
 
-    def _add(self, png, dat, workflow, role, plot, snapshot, metadata_path=None):
+    def _add(self, png, dat, workflow, role, plot, snapshot, metadata_path=None, *, target_pixels=None):
         png, dat = Path(png), Path(dat)
         if workflow not in ('pl', 'drr') or not role or not png.is_file() or not dat.is_file():
             return None
@@ -148,6 +148,8 @@ class FigureIndex:
         try:
             digest = self._hash(png)
         except (OSError, ValueError):
+            return None
+        if target_pixels is not None and digest != target_pixels:
             return None
         rid = sha256((str(png.resolve()) + '\0' + digest).encode('utf-8')).hexdigest()
         record = FigureRecord(png.resolve(), dat.resolve(), workflow, role, dict(plot or {}), dict(snapshot or {}), rid, Path(metadata_path).resolve() if metadata_path is not None else None)
@@ -180,7 +182,7 @@ class FigureIndex:
                 self._size_cache[key] = image.size
         return self._size_cache[key]
 
-    def _candidates(self, png_path=None, *, metadata_path=None):
+    def _candidates(self, png_path=None, *, metadata_path=None, matching_files=None):
         directory = self.root / 'Processed Data'
         if not directory.is_dir():
             return
@@ -195,6 +197,9 @@ class FigureIndex:
             if target is None or metadata.parent != target.parent or not metadata.name.endswith('.metadata.json'):
                 return
             metadata_files = (metadata,)
+        elif matching_files is not None:
+            metadata_files = (sidecar for folder in matching_files
+                              for sidecar in folder.glob('*.metadata.json'))
         else:
             # Unknown/legacy PNGs still need the full sibling-sidecar search.
             metadata_files = (target.parent.glob('*.metadata.json') if target is not None
@@ -232,6 +237,8 @@ class FigureIndex:
                                 figures[name] = {'data_file': next(iter(data_names)), 'plot': bank[base_role]}
                 for name, figure in figures.items():
                     if target is not None and name != target.name:
+                        continue
+                    if matching_files is not None and os.path.normcase(name) not in matching_files[metadata.parent]:
                         continue
                     if not isinstance(name, str) or Path(name).name != name or not name.lower().endswith('.png') or not isinstance(figure, dict):
                         continue
@@ -288,6 +295,42 @@ class FigureIndex:
                 self._length_cache[key] = _png_chunk_lengths(stream, stat.st_size)
         return self._length_cache[key]
 
+    def _matches_encoding(self, entry, allowed, lengths, structural):
+        try:
+            # Every exact encoding contains at least the target's compressed IDAT bytes.
+            if not entry.is_file() or (lengths and entry.stat().st_size < lengths[1]):
+                return False
+            path = Path(entry.path)
+            if not path.resolve().is_relative_to(allowed):
+                return False
+            if lengths:
+                candidate_lengths = self._chunk_lengths(path)
+                if candidate_lengths is not None and candidate_lengths != lengths:
+                    return False
+            return self._structural_hash(path) == structural
+        except (OSError, ValueError):
+            return False
+
+    def _encoded_files(self, lengths, structural):
+        """Only read sidecars in directories with a possible encoded match."""
+        directory = self.root / 'Processed Data'
+        allowed = directory.resolve()
+        matches = {}
+        parents = dict.fromkeys(sidecar.parent for sidecar in directory.rglob('*.metadata.json'))
+        for parent in parents:
+            try:
+                if not parent.resolve().is_relative_to(allowed):
+                    continue
+                with os.scandir(parent) as entries:
+                    names = {os.path.normcase(entry.name) for entry in entries
+                             if entry.name.lower().endswith('.png')
+                             and self._matches_encoding(entry, allowed, lengths, structural)}
+                    if names:
+                        matches[parent] = names
+            except OSError:
+                continue
+        return matches
+
     def lookup_image(self, image_bytes, record_id=None, *, target_pixels=None):
         """Find matching exports, preferring identical PNG content encoding.
 
@@ -305,43 +348,30 @@ class FigureIndex:
                             and self._hash(record.png_path) == target]
                 if verified:
                     return verified
-        with Image.open(BytesIO(image_bytes)) as target_image:
-            target_size = target_image.size
-        candidates = []
-        for candidate in self._candidates():
-            try:
-                if self._dimensions(candidate[0]) == target_size:
-                    candidates.append(candidate)
-            except (OSError, ValueError):
-                continue
         structural = _png_content_fingerprint(image_bytes)
         lengths = _png_chunk_lengths(BytesIO(image_bytes), len(image_bytes))
         target_pixels = target_pixels if target_pixels is not None else _fingerprint(image_bytes)
-        matched = []
         if structural:
-            for candidate in candidates:
-                try:
-                    candidate_lengths = self._chunk_lengths(candidate[0]) if lengths is not None else None
-                    if candidate_lengths is not None and lengths is not None and candidate_lengths != lengths:
-                        continue
-                    if self._structural_hash(candidate[0]) == structural and self._hash(candidate[0]) == target_pixels:
-                        matched.append(candidate)
-                except (OSError, ValueError):
-                    continue
-        if not matched:
-            for candidate in candidates:
-                try:
-                    if self._hash(candidate[0]) == target_pixels:
-                        matched.append(candidate)
-                except (OSError, ValueError):
-                    continue
-        return self._add_unique(matched)
+            matching_files = self._encoded_files(lengths, structural)
+            verified = self._add_unique(self._candidates(matching_files=matching_files), target_pixels=target_pixels)
+            if verified:
+                return verified
+        with Image.open(BytesIO(image_bytes)) as target_image:
+            target_size = target_image.size
+        matched = []
+        for candidate in self._candidates():
+            try:
+                if self._dimensions(candidate[0]) == target_size and self._hash(candidate[0]) == target_pixels:
+                    matched.append(candidate)
+            except (OSError, ValueError):
+                continue
+        return self._add_unique(matched, target_pixels=target_pixels)
 
-    def _add_unique(self, candidates):
+    def _add_unique(self, candidates, *, target_pixels=None):
         # Match scan(): the last valid sidecar wins for a repeated record ID.
         records = {}
         for candidate in candidates:
-            record = self._add(*candidate)
+            record = self._add(*candidate, target_pixels=target_pixels)
             if record is not None:
                 records[record.record_id] = record
         return list(records.values())

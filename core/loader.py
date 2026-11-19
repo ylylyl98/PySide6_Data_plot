@@ -119,6 +119,28 @@ def resolve_dat_y_axis(choice: str, *, custom_label: str = "", custom_unit: str 
     return "Y", "", "y"
 
 
+def _parse_dat_rows(lines: list[str], columns: int, name: str) -> np.ndarray:
+    if not lines:
+        raise ValueError(f"DAT file {name!r} contains no data rows.")
+    try:
+        table = np.loadtxt(lines, dtype=float, delimiter="\t", comments=None, ndmin=2)
+        if table.shape[1] == columns:
+            return table
+    except ValueError:
+        pass
+    # Keep row-specific errors and legacy spellings accepted by Python's float.
+    rows = []
+    for row_number, line in enumerate(lines, start=2):
+        fields = line.split("\t")
+        if len(fields) != columns:
+            raise ValueError(f"DAT file {name!r} row {row_number} has {len(fields)} columns; expected {columns}.")
+        try:
+            rows.append([float(value.strip()) for value in fields])
+        except ValueError as exc:
+            raise ValueError(f"DAT file {name!r} has non-numeric data on row {row_number}.") from exc
+    return np.asarray(rows, dtype=float)
+
+
 def load_dat(path: str | Path) -> DataCube:
     """Load an Origin-friendly exported DAT matrix into the normal DataCube model."""
     dat_path = Path(path)
@@ -138,20 +160,7 @@ def load_dat(path: str | Path) -> DataCube:
         gate = np.asarray([float(value.strip()) for value in header[1:]], dtype=float)
     except ValueError as exc:
         raise ValueError(f"DAT file {dat_path.name!r} has non-numeric Y/gate headers.") from exc
-    rows: list[list[float]] = []
-    for row_number, line in enumerate(content[1:], start=2):
-        fields = line.split("\t")
-        if len(fields) != len(header):
-            raise ValueError(
-                f"DAT file {dat_path.name!r} row {row_number} has {len(fields)} columns; expected {len(header)}."
-            )
-        try:
-            rows.append([float(value.strip()) for value in fields])
-        except ValueError as exc:
-            raise ValueError(f"DAT file {dat_path.name!r} has non-numeric data on row {row_number}.") from exc
-    if not rows:
-        raise ValueError(f"DAT file {dat_path.name!r} contains no data rows.")
-    table = np.asarray(rows, dtype=float)
+    table = _parse_dat_rows(content[1:], len(header), dat_path.name)
     energy = table[:, 0]
     z = table[:, 1:].T.copy()
     metadata = _load_dat_sidecar(dat_path)

@@ -387,6 +387,38 @@ Offline file generation uses the bundled `python-pptx` library and does not requ
 
 Launcher/PowerPoint setup and platform requirements are in [Development](development.md) and [Troubleshooting](troubleshooting.md).
 
+### Edit an exported PNG with DeckCraft (Windows)
+
+With the Explorer integration configured for your Windows account, double-click
+the `.pptx` in Explorer as usual. DeckCraft opens the presentation and DPTK is
+available when you double-click a plot. For a presentation saved inside an
+experiment, DPTK looks for its `Processed Data` folder automatically.
+
+Install DeckCraft separately. If DPTK cannot find it, set the Windows user
+environment variable `DECKCRAFT_EXE` to the full path to `deckcraft.exe` and
+restart DPTK. If DPTK reports that the presentation is already open outside its
+DeckCraft session, save and close that window before reopening from DPTK.
+
+To open a deck from DPTK, select the experiment folder containing your exports, then choose
+**File → Open in DeckCraft…** and select an existing `.pptx`. If you already
+selected a presentation in **Slides**, use **Open in DeckCraft** in the toolbar.
+Keep DPTK running while you edit the presentation.
+
+1. In DeckCraft's regular editing view, double-click an ordinary embedded PL or
+   DRR plot to open its saved numerical map and display settings in DPTK.
+   If DPTK asks you to locate the original export, choose the PNG that still has
+   its DAT and metadata alongside it. If Windows keeps DeckCraft in front,
+   select DPTK in the taskbar.
+2. Adjust the display and use **Save PNG + DAT** in DPTK to update the picture
+   you opened from DeckCraft. The status bar and **Log** show the result.
+3. Review the updated picture in DeckCraft, then press **Ctrl+S** there to save
+   the presentation.
+
+Each save creates a new PNG, DAT and metadata version alongside the original.
+If the target picture has changed or its window has closed, the new files remain
+available. In DeckCraft 0.18.1, **Undo** restores an ordinary picture in one
+step. A cropped picture takes two steps because its crop is reapplied.
+
 ### Edit a dragged PNG from PowerPoint (Windows prototype)
 
 Keep the native app running and select the experiment folder containing the PNGs.

@@ -199,6 +199,40 @@ def isolated():
             self.bridge.selectWorkflow("drr")
             self.assertIsNone(self.bridge._ppt_record)
 
+        def test_deckcraft_save_tracks_picture_across_saves_and_preserves_failed_export(self):
+            from unittest.mock import Mock
+            record = self.seed()
+            original = record.dat_path.read_bytes()
+            service = self.bridge._deckcraft_service = Mock()
+            first, second = object(), object()
+            service.replace_picture.side_effect = [(second, "Updated in DeckCraft."),
+                                                    ValueError("The picture was deleted.")]
+            self.bridge._ppt_open(record, first)
+            wait(lambda: not self.bridge._busy)
+            self.assertIs(self.bridge._deckcraft_target, first)
+            self.bridge.setParameter("cmap", "inferno")
+            self.bridge.invoke("export")
+            wait(lambda: not self.bridge._busy)
+            edited = self.bridge._ppt_record
+            self.assertEqual(edited.dat_path.read_bytes(), original)
+            self.assertEqual(edited.plot["cmap"], "inferno")
+            service.replace_picture.assert_called_once_with(first, edited.png_path)
+            self.assertIs(self.bridge._deckcraft_target, second)
+            # A delayed Office update for the same PNG must not change the DeckCraft edit.
+            self.bridge._ppt_updated(edited.record_id, record)
+            self.assertIs(self.bridge._ppt_record, edited)
+            self.bridge.invoke("export")
+            wait(lambda: not self.bridge._busy)
+            target, saved_png = service.replace_picture.call_args.args
+            self.assertIs(target, second)
+            self.assertTrue(saved_png.is_file())
+            self.assertEqual(saved_png.with_suffix(".dat").read_bytes(), original)
+            self.assertIn("picture was deleted", self.bridge._status)
+            self.assertEqual(self.service.updates, [])
+            self.bridge._ppt_open(record)
+            wait(lambda: not self.bridge._busy)
+            self.assertIsNone(self.bridge._deckcraft_target)
+
         def test_derivative_dat_is_not_differentiated_again(self):
             record = self.seed("drr")
             self.bridge._ppt_open(record)
@@ -219,6 +253,70 @@ def isolated():
             updated = self.service.updates[0][2]
             self.assertEqual(updated.plot["vmax"], 8.)
             self.assertEqual(updated.dat_path.read_bytes(), record.dat_path.read_bytes())
+
+        def test_deckcraft_split_drr_opens_with_conflicting_measurement_x_fix(self):
+            from unittest.mock import Mock
+            from core.loader import DataCube
+            from ui_qt.quick.drr_workflow import DrrProducts, DrrRequest
+
+            export = self.seed("drr")
+            energies = np.linspace(1.55, 1.95, 9)
+            gates = np.array([-1., 0., 1.])
+            data = np.arange(27, dtype=float).reshape(3, 9) + 1.
+            rows = ["X\t-1\t0\t1", *(
+                "\t".join(f"{value:.6f}" for value in (energy, *column))
+                for energy, column in zip(energies, data.T)
+            )]
+            export.dat_path.write_text("\n".join(rows) + "\n")
+            payload = json.loads(export.metadata_path.read_text())
+            plot = payload["figures"][export.png_path.name]["plot"]
+            plot.update(xlim=[1.55, 1.95], split_scale=asdict(SplitColorScale(
+                1.683333, 1., 8., 2., 9., split_x2=1.75, middle_vmin=1., middle_vmax=10.)))
+            export.metadata_path.write_text(json.dumps(payload))
+            record = FigureIndex(self.root).find_png(export.png_path)[0]
+            prior = DataCube(energies, gates, -data, "Gate", "Previous", "DRR")
+            self.bridge.selectWorkflow("drr")
+            self.bridge._drr_products = DrrProducts(DrrRequest(()), prior, prior, prior, 0, 0)
+            self.bridge.set_cube(prior)
+            state = self.bridge._drr_display
+            self.assertTrue(state.setNumber("axis.xmin", "1.77"))
+            self.assertTrue(state.setFlag("fix.axis.xmin", True))
+            self.assertTrue(state.setNumber("second.right_vmax", "11"))
+            self.assertTrue(state.setFlag("fix.second.right_vmax", True))
+            settings_before = self.bridge.settings.value(state._memory.RANGES_KEY)
+            self.bridge._deckcraft_service = Mock()
+            self.bridge._deckcraft_service.is_current.return_value = True
+
+            target = object()
+            self.bridge._deckcraft_open((0, str(self.root)), target, record)
+            wait(lambda: not self.bridge._busy)
+            self.assertIs(self.bridge._deckcraft_target, target, self.bridge._status)
+            wait(lambda: self.bridge._canvas is not None and self.bridge._canvas.frame_generation > 0
+                 and not self.bridge._plot_timer.isActive()
+                 and not self.bridge._canvas.backend._timer.isActive())
+            self.assertEqual(self.bridge._canvas.last_error, "")
+            self.assertIsNotNone(self.bridge._drr_products.raw)
+            np.testing.assert_array_equal(self.bridge._cube.Z, data)
+            params = state.heatmap_params(self.bridge._cube)
+            self.assertEqual(params.xlim, (1.55, 1.95))
+            self.assertEqual((params.split_scale.split_x, params.split_scale.split_x2), (1.683333, 1.75))
+            self.assertEqual(params.split_scale.right_vmax, 11.)
+            self.assertIn("X locks conflicted", self.bridge._status)
+            self.assertFalse(state._flags["fix.axis.xmin"])
+            self.assertEqual(self.bridge.settings.value(state._memory.RANGES_KEY), settings_before)
+            self.bridge._ppt_leave_display()
+            self.assertIs(self.bridge._cube, prior)
+            self.assertEqual(state._numbers["axis.xmin"], 1.77)
+            self.assertTrue(state._flags["fix.axis.xmin"])
+
+            plot["split_scale"]["split_x"] = 1.5
+            export.metadata_path.write_text(json.dumps(payload))
+            malformed = FigureIndex(self.root).find_png(export.png_path)[0]
+            self.bridge._deckcraft_open((0, str(self.root)), target, malformed)
+            wait(lambda: not self.bridge._busy)
+            self.assertIn(f"{export.png_path.name}: Invalid saved X split geometry", self.bridge._status)
+            self.assertIs(self.bridge._cube, prior)
+            self.assertTrue(state._flags["fix.axis.xmin"])
 
         def test_failed_export_and_changed_data_leave_originals(self):
             record = self.seed()

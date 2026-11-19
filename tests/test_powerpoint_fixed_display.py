@@ -95,13 +95,24 @@ def isolated():
             self.assertEqual(state.heatmap_params(self.cube).split_scale.left_vmin,-.5)
             self.assertTrue(state._flags['fix.raw.left_vmin'])
 
-        def test_invalid_boundary_fails_without_partial_state_changes(self):
+        def test_incompatible_fixed_boundary_uses_valid_saved_geometry(self):
             state=self.display
             state.setChoice('regionCount',1)
             state.setNumber('boundary.x0','2');state.setFlag('fix.boundary.x0',True)
-            prior=dict(state._numbers); flags=dict(state._flags)
             params=replace(self.params,xlim=(2.5,4.),split_scale=SplitColorScale(3.,-1.,5.,-1.,5.))
-            with self.assertRaises(ValueError):restore_drr_figure(state,params)
+            self.assertTrue(restore_drr_figure(state,params))
+            result=state.heatmap_params(self.cube)
+            self.assertEqual(result.xlim,(2.5,4.))
+            self.assertEqual(result.split_scale.split_x,3.)
+            self.assertFalse(state._flags['fix.boundary.x0'])
+
+        def test_invalid_saved_boundary_fails_without_partial_state_changes(self):
+            state=self.display
+            state.setChoice('regionCount',1)
+            state.setNumber('boundary.x0','3');state.setFlag('fix.boundary.x0',True)
+            prior=dict(state._numbers); flags=dict(state._flags)
+            params=replace(self.params,xlim=(2.5,4.),split_scale=SplitColorScale(2.,-1.,5.,-1.,5.))
+            with self.assertRaisesRegex(ValueError,'Invalid saved X split geometry'):restore_drr_figure(state,params)
             self.assertEqual(state._numbers,prior);self.assertEqual(state._flags,flags)
 
         def test_unused_region_values_not_validated(self):

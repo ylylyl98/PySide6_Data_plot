@@ -39,6 +39,20 @@ class DatLoaderTests(unittest.TestCase):
             self.assertTrue(np.isnan(cube.Z[0, 0]))
             self.assertTrue(np.isinf(cube.Z[0, 1]))
 
+    def test_legacy_numeric_spellings_and_tabular_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "legacy.dat"
+            path.write_text("X\t0\n1\t 1_000 \n\n  # Legacy export\n2\t\uff11\uff12\n", encoding="utf-8-sig")
+            cube = load_dat(path)
+            np.testing.assert_array_equal(cube.energy, [1.0, 2.0])
+            np.testing.assert_array_equal(cube.Z, [[1000.0, 12.0]])
+            path.write_text("X\t0\n1\t5 # invalid inline suffix\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "non-numeric data on row 2"):
+                load_dat(path)
+            path.write_text("X\t0\n1\t5\t6\n2\t7\t8\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "row 2 has 3 columns; expected 2"):
+                load_dat(path)
+
     def test_missing_sidecar_uses_neutral_y_label(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "neutral.dat"
