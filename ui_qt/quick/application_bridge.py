@@ -54,10 +54,12 @@ class QuickApplicationBridge(PowerPointApplicationMixin, ShellServicesMixin, PlA
     sourceCatalogRequested = Signal()
     pptActivateRequested = Signal()
     pptBindingRequested = Signal()
+    deckCraftBindingRequested = Signal()
 
-    def __init__(self, *, settings: QSettings, parent=None):
+    def __init__(self, *, settings: QSettings, deckcraft_role=None, parent=None):
         super().__init__(parent)
         self.settings = settings
+        self._deckcraft_role = deckcraft_role
         self._ppt_init()
         self._peak_init()
         self._maintenance_init()
@@ -278,6 +280,24 @@ class QuickApplicationBridge(PowerPointApplicationMixin, ShellServicesMixin, PlA
     def startServices(self):
         self._ensure_update_bridge().scheduleAutomaticCheck()
         self._ppt_start()
+        self._deckcraft_start()
+
+    @Slot(QUrl)
+    def openInDeckCraft(self, value):
+        self._deckcraft_start()
+        if self._deckcraft_service is not None:
+            self._deckcraft_service.launch(_local_path(value).resolve())
+
+    @Slot(QUrl)
+    def bindDeckCraftPng(self, value):
+        pending = self._deckcraft_binding
+        self._deckcraft_binding = None
+        if pending is not None and self._deckcraft_service is not None:
+            self._deckcraft_service.bind_png(*pending, _local_path(value).resolve())
+
+    @Slot()
+    def cancelDeckCraftBinding(self):
+        self._deckcraft_binding = None
 
     @Slot(QUrl)
     def bindPowerPointPng(self, value):
@@ -1291,7 +1311,7 @@ class QuickApplicationBridge(PowerPointApplicationMixin, ShellServicesMixin, PlA
         self._sequence += 1
         sequence = self._sequence
         self._busy = True
-        self._message("Loading PowerPoint figure…" if kind == "ppt-load" else
+        self._message("Loading saved figure…" if kind == "ppt-load" else
                       "Loading measurement…" if kind.startswith("load") else "Exporting…")
         started = perf_counter()
         future = self._executor.submit(operation)
@@ -1360,7 +1380,7 @@ class QuickApplicationBridge(PowerPointApplicationMixin, ShellServicesMixin, PlA
                 else:
                     self._export_valid = False
                 self._ppt_record = None
-                self._message(f"PowerPoint figure could not be opened or saved: {exc}")
+                self._message(f"Slide figure could not be opened or saved: {exc}")
             self.operationCompleted.emit(kind, elapsed * 1000)
             return
         if kind == "load":

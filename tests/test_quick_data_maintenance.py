@@ -224,8 +224,12 @@ def _run_isolated():
         receipt = run_export_with_maintenance(export, folder=root, sources=[source], workflow="PL")
         bridge.acceptExport(receipt)
         wait(lambda: not bridge.snapshot["busy"])
+        context_messages = []
+        bridge.statusMessage.connect(context_messages.append)
         bridge.setContext((str(root), "PL", 2))
         assert not bridge.snapshot["canMove"]
+        assert bridge.snapshot["status"].startswith("Save first")
+        assert context_messages == []
         bridge.acceptExport(receipt)
         wait(lambda: not bridge.snapshot["busy"])
         bridge.invoke("move")

@@ -204,6 +204,26 @@ class FigureIndexTests(unittest.TestCase):
                            index.register_exports({'png_linear': image}, 'pl', {})):
                 self.assertEqual(result, expected)
 
+    def test_encoded_match_without_valid_sidecar_still_finds_recompressed_export(self):
+        with TemporaryDirectory() as tmp:
+            folder = Path(tmp) / 'Processed Data' / 'PL'
+            folder.mkdir(parents=True)
+            target = png()
+            (folder / 'unregistered.png').write_bytes(target)
+            image = folder / 'sample_linear.png'
+            with Image.open(BytesIO(target)) as original:
+                original.save(image, compress_level=0)
+            (folder / 'sample.dat').write_text('data')
+            sidecar = folder / 'sample.metadata.json'
+            payload = {'operation': 'PL', 'outputs': ['sample.dat'],
+                       'figures': {image.name: {'data_file': 'sample.dat', 'plot': {}}}}
+            sidecar.write_text(json.dumps(payload))
+            index = FigureIndex(tmp)
+            self.assertEqual([r.png_path for r in index.lookup_image(target)], [image.resolve()])
+            payload['display_save_pending'] = True
+            sidecar.write_text(json.dumps(payload))
+            self.assertEqual(index.lookup_image(target), [])
+
     def test_size_prefilter_and_tag_revalidate(self):
         from unittest.mock import patch
         import core.pptx_figure_index as module

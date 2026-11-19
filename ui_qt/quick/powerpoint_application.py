@@ -57,6 +57,7 @@ def restore_drr_figure(display, params, *, product="raw"):
     count = 0
     show_boundary = True
     split = params.split_scale
+    saved_x_geometry = {}
     if split:
         count = 2 if split.split_x2 is not None else 1
         numbers["boundary.x0"] = split.split_x
@@ -68,6 +69,16 @@ def restore_drr_figure(display, params, *, product="raw"):
                 value = getattr(split, side + "_" + bound)
                 if value is not None:
                     numbers["raw." + side + "_" + bound] = value
+        if cube is not None:
+            from core.plotting import split_region_slices
+            try:
+                split_region_slices(cube.energy, split, params.xlim)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"Invalid saved X split geometry. {error}") from error
+            keys = ("axis.xmin", "axis.xmax", "boundary.x0")
+            if count == 2:
+                keys += ("boundary.x1",)
+            saved_x_geometry = {key: numbers[key] for key in keys}
     # Explicit manual Fix values override the PNG; borrowed history does not.
     color_product = "raw" if getattr(display, "_ppt_previous_figure_mode", False) else product
     for (category, key), value in manual.items():
@@ -89,6 +100,22 @@ def restore_drr_figure(display, params, *, product="raw"):
         if manual.get(("flags", "fix." + key), False) and flag in flags:
             flags[flag] = True
             sources[flag] = "M"
+    x_skipped = False
+    if saved_x_geometry and any(numbers[key] != value for key, value in saved_x_geometry.items()):
+        try:
+            xlim = (numbers["axis.xmin"], numbers["axis.xmax"])
+            if xlim[0] >= xlim[1]:
+                raise ValueError("The fixed X limits are out of order.")
+            candidate = replace(split, split_x=numbers["boundary.x0"],
+                                split_x2=numbers["boundary.x1"] if count == 2 else None)
+            split_region_slices(cube.energy, candidate, xlim)
+        except ValueError:
+            numbers.update(saved_x_geometry)
+            for key in saved_x_geometry:
+                flag = "fix." + key
+                flags[flag] = False
+                sources.pop(flag, None)
+            x_skipped = True
     prefixes = ["axis.x", "axis.y", "raw.v"]
     if count:
         prefixes += ["raw.left_v", "raw.right_v"]
@@ -99,7 +126,7 @@ def restore_drr_figure(display, params, *, product="raw"):
         if numbers[lo] >= numbers[hi]:
             fixed_lo, fixed_hi = flags.get("fix." + lo, False), flags.get("fix." + hi, False)
             if fixed_lo == fixed_hi:
-                raise ValueError("Fixed PowerPoint display limits conflict with the saved figure; adjust or release Fix values.")
+                raise ValueError("Fixed display limits conflict with the saved figure. Adjust or release Fix values.")
             peer = hi if fixed_lo else lo
             numbers[peer] = old_numbers[peer]
             if numbers[lo] >= numbers[hi]:
@@ -107,14 +134,6 @@ def restore_drr_figure(display, params, *, product="raw"):
                 numbers[peer] = numbers[lo] + delta if fixed_lo else numbers[hi] - delta
         if params.log_scale and prefix.startswith("raw.") and numbers[lo] <= 0:
             raise ValueError("Fixed color limits must be positive for this logarithmic figure.")
-    if count and cube is not None:
-        from core.plotting import SplitColorScale, split_region_slices
-        region = SplitColorScale(numbers["boundary.x0"], numbers["raw.left_vmin"], numbers["raw.left_vmax"],
-            numbers["raw.right_vmin"], numbers["raw.right_vmax"], show_boundary,
-            numbers["boundary.x1"] if count == 2 else None,
-            numbers["raw.middle_vmin"] if count == 2 else None,
-            numbers["raw.middle_vmax"] if count == 2 else None)
-        split_region_slices(cube.energy, region, (numbers["axis.xmin"], numbers["axis.xmax"]))
     display._memory.reset_borrowed()
     display._memory.viewport = {}
     display._pending.clear()
@@ -127,11 +146,14 @@ def restore_drr_figure(display, params, *, product="raw"):
     if params.cmap not in {name for name, _ in display._cmaps}:
         display._cmaps = (*display._cmaps, (params.cmap, params.cmap))
     display._choices["raw.cmap"] = next(index for index, (name, _) in enumerate(display._cmaps) if name == params.cmap)
-    message = "PowerPoint figure · saved DAT · display edits only"
+    message = "Slide figure · saved DAT · display edits only"
+    if x_skipped:
+        message += " · Used saved X range and splits because X locks conflicted"
     if y_skipped:
         message += " · Y Fix not applied: coordinate identity differs or is unknown"
     display.set_memory_status(message, available=False)
     display.refresh()
+    return x_skipped
 
 
 class PowerPointApplicationMixin:
@@ -145,6 +167,9 @@ class PowerPointApplicationMixin:
         self._ppt_params = None
         self._ppt_save_record = None
         self._ppt_update_timings = {}
+        self._deckcraft_service = None
+        self._deckcraft_target = None
+        self._deckcraft_binding = None
 
     def _ppt_enter_display(self):
         if self._ppt_display_session is not None:
@@ -170,6 +195,7 @@ class PowerPointApplicationMixin:
         self._ppt_display_session = None
         state, self._ppt_measurement_state = self._ppt_measurement_state, None
         self._ppt_record = self._ppt_params = None
+        self._deckcraft_target = None
         for key, value in state.items():
             setattr(self, key, value)
         session.restore(preserve_next_drr=preserve_next_drr)
@@ -193,7 +219,7 @@ class PowerPointApplicationMixin:
         self._ppt_service.start()
 
     def _ppt_sync_root(self):
-        if self._ppt_service is not None:
+        if self._ppt_service is not None or self._deckcraft_service is not None:
             root = self._folder
             for parent in (Path(root), *Path(root).parents) if root else ():
                 if parent.name.casefold() == "processed data":
@@ -201,7 +227,55 @@ class PowerPointApplicationMixin:
                     break
             if root != self._ppt_root:
                 self._ppt_root = root
-                self._ppt_service.set_root(root)
+                if self._ppt_service is not None:
+                    self._ppt_service.set_root(root)
+                if self._deckcraft_service is not None:
+                    self._deckcraft_service.set_root(root)
+
+    def _deckcraft_start(self, *, companion=False):
+        import sys
+        if sys.platform != "win32" or self._deckcraft_service is not None:
+            return
+        if companion and (self._deckcraft_role is None or not self._deckcraft_role.companion):
+            return
+        from ui_qt.quick.deckcraft_service import DeckCraftService
+        try:
+            service = self._deckcraft_service = DeckCraftService(self, role=self._deckcraft_role)
+        except (ImportError, OSError) as exc:
+            self._message(f"DeckCraft integration is unavailable: {exc}")
+            return
+        service.statusMessage.connect(self._message)
+        service.figureRequested.connect(self._deckcraft_open)
+        service.bindingRequested.connect(self._deckcraft_binding_needed)
+        service.set_root(self._ppt_root)
+        self._ppt_sync_root()
+        service.start()
+
+    def _deckcraft_open(self, scope, target, record):
+        if self._deckcraft_service.is_current(scope):
+            self._ppt_open(record, target)
+
+    def _activate_figure_editor(self, deckcraft_target):
+        if deckcraft_target is None:
+            self.pptActivateRequested.emit()
+            return
+        from PySide6.QtGui import QGuiApplication
+        for window in QGuiApplication.topLevelWindows():
+            if window.objectName() == "quick_application_window":
+                if not self._deckcraft_service.windows.activate_plot_window(deckcraft_target.window, int(window.winId())):
+                    window.alert(2500)
+                break
+
+    def _deckcraft_binding_needed(self, scope, target):
+        if self._closed or not self._deckcraft_service.is_current(scope):
+            return
+        if self._busy or self._background_open or self._deckcraft_binding is not None:
+            self._message("Finish the current operation, then double-click the DeckCraft picture again.")
+            return
+        self._deckcraft_binding = (scope, target)
+        self._message("Choose the original exported PNG for this DeckCraft picture.")
+        self._activate_figure_editor(target)
+        self.deckCraftBindingRequested.emit()
 
     def _ppt_binding_needed(self, context):
         if self._busy:
@@ -215,11 +289,11 @@ class PowerPointApplicationMixin:
         if not self._closed and not self._busy:
             self.pptActivateRequested.emit()
 
-    def _ppt_open(self, record):
+    def _ppt_open(self, record, deckcraft_target=None):
         if self._closed:
             return
         if self._busy or self._background_open:
-            self._message("Finish the current operation, then double-click the PowerPoint picture again.")
+            self._message("Finish the current operation, then double-click the picture again.")
             return
         from core.pptx_figure_edit import experiment_root, load_figure
         try:
@@ -229,8 +303,14 @@ class PowerPointApplicationMixin:
             return
         # Validate display metadata and load imports/DAT in the worker. Keep the
         # current figure intact until the requested figure is ready to display.
-        self._submit("ppt-load", lambda: load_figure(record))
-        self.pptActivateRequested.emit()
+        def load_matched_figure():
+            try:
+                return (*load_figure(record), deckcraft_target)
+            except (KeyError, OSError, TypeError, ValueError) as error:
+                raise ValueError(f"{record.png_path.name}: {error}") from error
+
+        self._submit("ppt-load", load_matched_figure)
+        self._activate_figure_editor(deckcraft_target)
 
     def _ppt_finish(self, kind, result):
         if kind != "ppt-load":
@@ -245,7 +325,7 @@ class PowerPointApplicationMixin:
 
     def _ppt_finish_apply(self, kind, result):
         if kind == "ppt-load":
-            record, cube, params = result
+            record, cube, params, deckcraft_target = result
             from core.pptx_figure_edit import experiment_root
             self.selectWorkflow(record.workflow)
             self._ppt_enter_display()
@@ -265,27 +345,43 @@ class PowerPointApplicationMixin:
                 display._ppt_previous_figure_mode = display._figure_mode
                 request = DrrRequest(files=self._sources, background_mode="imported", experiment_folder=self._folder)
                 self._drr_products = DrrProducts(request, cube, cube, None, 0, 0,
-                    "PowerPoint edits use the saved numerical map; load the measurement to reprocess.")
+                    "Slide edits use the saved numerical map; load the measurement to reprocess.")
                 self._drr_background_recipe = None
                 self._drr_backgrounds = ()
                 self._drr_background_required = False
                 self._drr_processing["drrView"] = "raw"
             self.set_cube(cube)
+            x_skipped = False
             if record.workflow == "pl":
                 restore_pl_figure(self._pl_display, record, params)
                 self._pl_sync_scales()
                 self._pl_remember()
             else:
-                restore_drr_figure(self._drr_display, params, product=record.role.removesuffix("_wide"))
+                try:
+                    x_skipped = restore_drr_figure(self._drr_display, params, product=record.role.removesuffix("_wide"))
+                except ValueError as error:
+                    raise ValueError(f"{record.png_path.name}: {error}") from error
             self._ppt_record, self._ppt_params = record, params
+            self._deckcraft_target = deckcraft_target
             self._pl_values.update(pngLayout="wide" if params.png_width_scale > 1 else "original",
                                    pngWidth=params.png_width_scale)
             self._export_valid = True
             self._schedule_plot()
-            self._message(f"PowerPoint: {record.png_path.name} · edit display, then Save PNG + DAT. Numerical processing is preserved.")
+            host = "DeckCraft" if deckcraft_target is not None else "PowerPoint"
+            message = f"{host}: {record.png_path.name} · edit display, then Save PNG + DAT. Numerical processing is preserved."
+            if x_skipped:
+                message += " Used saved X range and splits because X locks conflicted."
+            self._message(message)
         elif kind == "ppt-export":
-            original, new_record, started = result
+            original, new_record, started, *deckcraft = result
             self._result = f"Saved {new_record.png_path}\n{new_record.dat_path}"
+            if deckcraft:
+                target, message = deckcraft
+                if target is not None:
+                    self._ppt_record = new_record
+                    self._deckcraft_target = target
+                self._message(f"Saved {new_record.png_path.name}. {message}")
+                return
             self._message("PNG + DAT saved. Updating the associated PowerPoint picture…")
             if self._ppt_service is not None:
                 self._ppt_save_record = new_record
@@ -303,7 +399,7 @@ class PowerPointApplicationMixin:
                 self._message("PNG + DAT saved; PowerPoint is not connected.")
 
     def _ppt_updated(self, old_id, record):
-        if self._ppt_record is not None and self._ppt_record.record_id == old_id:
+        if self._deckcraft_target is None and self._ppt_record is not None and self._ppt_record.record_id == old_id:
             self._ppt_record = record
         timing = self._ppt_update_timings.get(record.record_id) if record is not None else None
         if timing is not None and timing[0] == old_id:
@@ -328,7 +424,20 @@ class PowerPointApplicationMixin:
                          png_width_scale=self._png_export_width())
         role = ("log" if params.log_scale else "linear") if record.workflow == "pl" else record.role.removesuffix("_wide")
         edited_record = replace(record, role=role + ("_wide" if params.png_width_scale > 1 else ""))
-        self._submit("ppt-export", lambda: (record, save_figure_edit(edited_record, cube, params, snapshot), started))
+        target = self._deckcraft_target
+        service = self._deckcraft_service
+
+        def export():
+            updated = save_figure_edit(edited_record, cube, params, snapshot)
+            if target is None:
+                return record, updated, started
+            try:
+                next_target, message = service.replace_picture(target, updated.png_path)
+            except Exception as exc:
+                next_target, message = None, f"DeckCraft update could not be confirmed: {exc}"
+            return record, updated, started, next_target, message
+
+        self._submit("ppt-export", export)
 
     def _ppt_guard_parameter(self, key):
         if self._ppt_record is None:
@@ -336,11 +445,13 @@ class PowerPointApplicationMixin:
         blocked = key in {"backgroundMode", "backgroundFrame", "rawDerivative", "secondDerivative", "sgWindow", "sgPolyorder", "sgYWindow"}
         blocked = blocked or key in {"pl.yAxis", "pl.a", "pl.b", "pl.c", "pl.datChoice", "pl.datLabel", "pl.datUnit", "pl.processing", "pl.window", "pl.polynomial", "bnReference"}
         if blocked:
-            self._message("PowerPoint editing preserves the exported DAT. Load a measurement normally to change numerical processing.")
+            self._message("Slide figure editing preserves the exported DAT. Load a measurement normally to change numerical processing.")
         return blocked
 
     def _ppt_close(self):
         self._ppt_leave_display(preserve_next_drr=False)
         self._ppt_update_timings.clear()
+        if self._deckcraft_service is not None:
+            self._deckcraft_service.close()
         if self._ppt_service is not None:
             self._ppt_service.close()

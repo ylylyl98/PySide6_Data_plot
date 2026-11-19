@@ -5,6 +5,9 @@ from concurrent.futures import ThreadPoolExecutor
 from PySide6.QtCore import QObject, Property, QTimer, Signal, Slot
 
 
+_SAVE_FIRST = "Save first to enable moving exported source files."
+
+
 class DataMaintenanceBridge(QObject):
     snapshotChanged = Signal()
     statusMessage = Signal(str)
@@ -17,7 +20,7 @@ class DataMaintenanceBridge(QObject):
         self._closed = self._busy = self._cleanup = False
         self._receipt, self._context = None, None
         self._generation = 0
-        self._status, self._error = "Save first to enable moving exported source files.", ""
+        self._status, self._error = _SAVE_FIRST, ""
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dptk-data-maintenance")
         self._publish_timer = QTimer(self)
         self._publish_timer.setSingleShot(True)
@@ -53,14 +56,18 @@ class DataMaintenanceBridge(QObject):
         """Invalidate when folder/source/processing generation changes."""
         if not self._closed and context != self._context:
             self._context = context
-            self.invalidate()
+            # Keep the maintenance panel current without replacing an unrelated
+            # operation's progress or error in the main status bar and log.
+            self._receipt = None
+            self._status, self._error = _SAVE_FIRST, ""
+            self._publish()
 
     @Slot()
     def invalidate(self):
         if self._closed:
             return
         self._receipt = None
-        self._message("Save first to enable moving exported source files.")
+        self._message(_SAVE_FIRST)
 
     def _start(self, kind, operation):
         self._generation += 1

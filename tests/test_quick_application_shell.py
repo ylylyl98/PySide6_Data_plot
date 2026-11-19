@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
+os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Basic")
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -16,7 +17,7 @@ from copy import deepcopy
 from time import monotonic
 import unittest
 
-from PySide6.QtCore import QObject, QPoint, Property, QUrl, Qt, Signal, Slot
+from PySide6.QtCore import QMetaObject, QObject, QPoint, Property, QUrl, Qt, Signal, Slot
 from PySide6.QtGui import QFont, QFontDatabase
 from PySide6.QtQml import QQmlApplicationEngine, QQmlComponent, qmlRegisterType
 from PySide6.QtQuick import QQuickItem, QQuickWindow
@@ -49,6 +50,7 @@ class _Bridge(QObject):
     parameterUrlChanged = Signal()
     workspaceUrlChanged = Signal()
     workflowBridgeChanged = Signal()
+    deckCraftBindingRequested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -140,6 +142,22 @@ class _Bridge(QObject):
     @Slot(QUrl)
     def openFile(self, value):
         self.calls.append(("file", value.toString()))
+
+    @Slot(str, result=QUrl)
+    def localFileUrl(self, value):
+        return QUrl.fromLocalFile(value)
+
+    @Slot(QUrl)
+    def openInDeckCraft(self, value):
+        self.calls.append(("deckcraft-open", value.toLocalFile()))
+
+    @Slot(QUrl)
+    def bindDeckCraftPng(self, value):
+        self.calls.append(("deckcraft-bind", value.toLocalFile()))
+
+    @Slot()
+    def cancelDeckCraftBinding(self):
+        self.calls.append(("deckcraft-cancel",))
 
     @Slot(bool)
     def setControlsVisible(self, value):
@@ -601,6 +619,82 @@ Rectangle {
         self.assertTrue(menu.property("visible"))
         QTest.keyClick(self.window, Qt.Key_Escape)
         self.assertFalse(menu.property("visible"))
+        self.assertEqual(self.warnings, [])
+
+    def choose_deckcraft_file(self, filename):
+        def find_row(item):
+            if item.isVisible() and item.property("fileName") == filename:
+                return item
+            for child in item.childItems():
+                row = find_row(child)
+                if row is not None:
+                    return row
+            return None
+
+        deadline = monotonic() + 3
+        row = None
+        while row is None and monotonic() < deadline:
+            QTest.qWait(10)
+            row = next((item for window in self.app.allWindows()
+                        if isinstance(window, QQuickWindow) and window.isExposed()
+                        if (item := find_row(window.contentItem())) is not None), None)
+        self.assertIsNotNone(row, filename)
+        point = row.mapToScene(row.boundingRect().center()).toPoint()
+        QTest.mouseDClick(row.window(), Qt.LeftButton, Qt.NoModifier, point)
+        QTest.qWait(20)
+
+    @unittest.skipUnless(os.name == "nt", "DeckCraft launches on Windows")
+    def test_deckcraft_opens_a_picked_or_selected_presentation(self):
+        root = Path(self.temporary.name)
+        source = root / "Presentation 演示.pptx"
+        source.touch()
+        folder = QUrl.fromLocalFile(str(root))
+        self.bridge.update(sourceFolderUrl=folder)
+        dialog = self.window.findChild(QObject, "app_deckcraft_presentation_dialog")
+        menu = self.window.findChild(QObject, "app_open_deckcraft_menu_item")
+        menu.triggered.emit()
+        QTest.qWait(20)
+        self.assertTrue(dialog.property("visible"))
+        self.assertEqual(dialog.property("nameFilters"), ["PowerPoint presentation (*.pptx)"])
+        self.assertEqual(dialog.property("currentFolder"), folder)
+        self.choose_deckcraft_file(source.name)
+        self.assertEqual(self.bridge.calls[-1], ("deckcraft-open", source.as_posix()))
+
+        page = root / "TestSlides.qml"
+        page.write_text(
+            "import QtQuick\nItem { required property var bridge; required property var colors;"
+            " readonly property var state: bridge.snapshot }\n",
+            encoding="utf-8",
+        )
+        self.bridge._workspace_url = QUrl.fromLocalFile(str(page))
+        self.bridge.update(workflow="slides", source=str(source))
+        self.bridge.workspaceUrlChanged.emit()
+        QTest.qWait(20)
+        self.bridge.calls.clear()
+        self.click("app_slides_open_deckcraft")
+        self.assertFalse(dialog.property("visible"))
+        self.assertEqual(self.bridge.calls, [("deckcraft-open", source.as_posix())])
+        self.assertEqual(self.warnings, [])
+
+    def test_deckcraft_png_binding_accepts_or_cancels_independently(self):
+        image = Path(self.temporary.name) / "Plot.png"
+        image.touch()
+        self.bridge.update(sourceFolderUrl=QUrl.fromLocalFile(self.temporary.name))
+        dialog = self.window.findChild(QObject, "app_deckcraft_png_dialog")
+        power_point_dialog = self.window.findChild(QObject, "app_ppt_png_dialog")
+        self.bridge.deckCraftBindingRequested.emit()
+        QTest.qWait(20)
+        self.assertTrue(dialog.property("visible"))
+        self.assertFalse(power_point_dialog.property("visible"))
+        self.assertEqual(dialog.property("nameFilters"), ["Exported PNG (*.png)"])
+        self.choose_deckcraft_file(image.name)
+        self.bridge.deckCraftBindingRequested.emit()
+        QTest.qWait(20)
+        self.assertTrue(QMetaObject.invokeMethod(dialog, "reject"))
+        self.assertEqual(self.bridge.calls[-2:], [
+            ("deckcraft-bind", image.as_posix()),
+            ("deckcraft-cancel",),
+        ])
         self.assertEqual(self.warnings, [])
 
 

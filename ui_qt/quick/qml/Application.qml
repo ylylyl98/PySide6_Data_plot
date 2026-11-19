@@ -12,6 +12,7 @@ Controls.ApplicationWindow {
     id: window
     objectName: "quick_application_window"
     required property var appBridge
+    property bool startMinimized: false
     readonly property var state: appBridge.snapshot
     readonly property var colors: appBridge.colors
     readonly property string currentWorkflow: state.workflow || "pl"
@@ -21,6 +22,8 @@ Controls.ApplicationWindow {
     readonly property bool logVisible: state.logVisible === true
     readonly property bool compact: width < 1040
     readonly property bool plotWorkflow: currentWorkflow !== "slides" && currentWorkflow !== "tools"
+    readonly property bool deckCraftAvailable: Qt.platform.os === "windows"
+    readonly property var slidesState: currentWorkflow === "slides" && workspaceLoader.item ? workspaceLoader.item.state : null
     property string fileDialogPurpose: "select-files"
     property string fileDialogWorkflow: "pl"
     property string folderDialogPurpose: "source-folder"
@@ -41,7 +44,7 @@ Controls.ApplicationWindow {
     height: 940
     minimumWidth: 640
     minimumHeight: 520
-    visible: true
+    visibility: startMinimized ? Window.Minimized : Window.Windowed
     title: state.title || "DPTK Desktop"
     color: colors.inset
     font.pointSize: 9
@@ -101,6 +104,16 @@ Controls.ApplicationWindow {
         DialogState.prepareFolder(folderDialog, requestState.sourceFolderUrl)
         folderDialog.open()
     }
+    function chooseDeckCraftPresentation() {
+        let folder = slidesState && slidesState.sourceFolderUrl ? slidesState.sourceFolderUrl : state.sourceFolderUrl
+        DialogState.prepareFile(deckCraftPresentationDialog, folder, "")
+        deckCraftPresentationDialog.open()
+    }
+    function openSlidesInDeckCraft() {
+        let source = slidesState ? slidesState.source : ""
+        if (source) appBridge.openInDeckCraft(appBridge.localFileUrl(source))
+        else chooseDeckCraftPresentation()
+    }
     function workflowLabel() {
         for (let workflow of workflows) if (workflow.key === currentWorkflow) return workflow.label
         return currentWorkflow
@@ -157,6 +170,10 @@ Controls.ApplicationWindow {
             DialogState.prepareFile(pptPngDialog, window.state.sourceFolderUrl, "")
             pptPngDialog.open()
         }
+        function onDeckCraftBindingRequested() {
+            DialogState.prepareFile(deckCraftPngDialog, window.state.sourceFolderUrl, "")
+            deckCraftPngDialog.open()
+        }
         function onSourceCatalogRequested() {
             if (!catalogLoader.item)
                 catalogLoader.setSource(Qt.resolvedUrl("SourceCatalog.qml"), {bridge: window.appBridge.sourceCatalogBridge, colors: window.colors})
@@ -185,6 +202,29 @@ Controls.ApplicationWindow {
         fileMode: FileDialog.OpenFile
         nameFilters: ["Exported PNG (*.png)"]
         onAccepted: window.appBridge.bindPowerPointPng(selectedFile)
+    }
+    AppFileDialog {
+        id: deckCraftPresentationDialog
+        objectName: "app_deckcraft_presentation_dialog"
+        colors: window.colors
+        parentWindow: window
+        title: qsTr("Open a presentation in DeckCraft")
+        options: FileDialog.DontUseNativeDialog
+        fileMode: FileDialog.OpenFile
+        nameFilters: [qsTr("PowerPoint presentation (*.pptx)")]
+        onAccepted: window.appBridge.openInDeckCraft(selectedFile)
+    }
+    AppFileDialog {
+        id: deckCraftPngDialog
+        objectName: "app_deckcraft_png_dialog"
+        colors: window.colors
+        parentWindow: window
+        title: qsTr("Choose the original exported PNG for this DeckCraft picture")
+        options: FileDialog.DontUseNativeDialog
+        fileMode: FileDialog.OpenFile
+        nameFilters: [qsTr("Exported PNG (*.png)")]
+        onAccepted: window.appBridge.bindDeckCraftPng(selectedFile)
+        onRejected: window.appBridge.cancelDeckCraftBinding()
     }
 
     Loader { id: updateLoader; anchors.fill: parent }
@@ -284,6 +324,12 @@ Controls.ApplicationWindow {
             title: qsTr("&File")
             Controls.MenuItem { action: openFileAction }
             Controls.MenuItem { action: openFolderAction }
+            Controls.MenuItem {
+                objectName: "app_open_deckcraft_menu_item"
+                text: qsTr("Open in DeckCraft…")
+                visible: window.deckCraftAvailable
+                onTriggered: window.chooseDeckCraftPresentation()
+            }
             Controls.Menu {
                 title: qsTr("Recent folders")
                 enabled: (window.state.recentFolders || []).length > 0
@@ -490,6 +536,14 @@ Controls.ApplicationWindow {
                     AppButton { objectName: "app_plot_pan"; visible: window.plotWorkflow; colors: window.colors; text: "Pan"; compact: true; description: "Pan the plot"; checkable: true; checked: window.state.plotTool === "pan"; onClicked: panAction.trigger() }
                     AppButton { objectName: "app_plot_zoom"; visible: window.plotWorkflow; colors: window.colors; text: "Zoom"; compact: true; description: "Zoom into a plot region"; checkable: true; checked: window.state.plotTool === "zoom"; onClicked: zoomAction.trigger() }
                     AppButton { objectName: "app_peak_analysis"; colors: window.colors; text: qsTr("Analyze…"); compact: true; visible: !window.compact && ["pl", "drr", "cmp", "power"].indexOf(window.currentWorkflow) >= 0; enabled: peakAnalysisAction.enabled; description: "Open current plotted data in the independent Peak Analysis window"; onClicked: peakAnalysisAction.trigger() }
+                    AppButton {
+                        objectName: "app_slides_open_deckcraft"
+                        colors: window.colors
+                        text: window.slidesState && window.slidesState.source ? qsTr("Open in DeckCraft") : qsTr("Open in DeckCraft…")
+                        visible: window.deckCraftAvailable && window.currentWorkflow === "slides"
+                        description: qsTr("Open the selected presentation in DeckCraft, or choose a presentation")
+                        onClicked: window.openSlidesInDeckCraft()
+                    }
                     AppButton { objectName: "drr_plot_raw"; colors: window.colors; text: "ΔR/R"; compact: true; visible: window.currentWorkflow === "drr" && !window.compact; checkable: true; checked: window.state.drrView === "raw"; onClicked: window.appBridge.setParameter("drrView", "raw") }
                     AppButton { objectName: "drr_plot_second"; colors: window.colors; text: "Derivative"; compact: true; visible: window.currentWorkflow === "drr" && !window.compact; enabled: window.state.derivativeAvailable === true; checkable: true; checked: window.state.drrView === "second"; onClicked: window.appBridge.setParameter("drrView", "second") }
                     AppButton { objectName: "drr_plot_pair"; colors: window.colors; text: "Side by side"; compact: true; visible: window.currentWorkflow === "drr" && !window.compact; enabled: window.state.derivativeAvailable === true; checkable: true; checked: window.state.drrView === "pair"; onClicked: window.appBridge.setParameter("drrView", "pair") }

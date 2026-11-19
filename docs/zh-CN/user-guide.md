@@ -375,6 +375,30 @@ MCD Peak Shift 直接复用已接受处理产品，不重新加载，支持原�
 
 启动器/PowerPoint 设置和平台要求见[开发指南](development.md)及[故障排查](troubleshooting.md)。
 
+### 从 DeckCraft 编辑导出的 PNG（Windows）
+
+如果当前 Windows 账户已配置资源管理器联动，直接双击 `.pptx` 即可。DeckCraft 会打开文稿，
+双击图时即可进入 DPTK。文稿放在实验目录或其子目录时，DPTK 会自动寻找该实验的 `Processed Data`。
+
+DeckCraft 需要单独安装。如果 DPTK 找不到程序，请将 Windows 用户环境变量 `DECKCRAFT_EXE`
+设为 `deckcraft.exe` 的完整路径，然后重启 DPTK。如果 DPTK 提示演示文稿已在其他 DeckCraft
+窗口中打开，请先保存并关闭该窗口，再从 DPTK 打开。
+
+也可以从 DPTK 打开文稿。选中导出文件所属的实验目录，然后选择 **File → Open in DeckCraft…** 并打开现有的
+`.pptx`。如果已在 **Slides** 中选中演示文稿，可以直接点击工具栏上的 **Open in DeckCraft**。
+编辑演示文稿期间请保持 DPTK 运行。
+
+1. 在 DeckCraft 的普通编辑视图中，双击普通嵌入式 PL 或 DRR 图片，在 DPTK 中打开已保存的数值图
+   和显示设置。如果 DPTK 提示选择原始导出文件，请选择与 DAT 和元数据保存在一起的原始 PNG。
+   如果 Windows 仍将 DeckCraft 保持在前台，请点击任务栏上的 DPTK。
+2. 调整显示后，在 DPTK 中点击 **Save PNG + DAT**，更新刚才从 DeckCraft 打开的图片。
+   可在 DPTK 状态栏和 **Log** 中查看结果。
+3. 回到 DeckCraft 检查更新后的图片，然后按 **Ctrl+S** 保存演示文稿。
+
+每次保存都会在原图旁生成一版新的 PNG、DAT 和元数据。如果原图已被替换或窗口已关闭，
+仍可使用这次导出的文件。在 DeckCraft 0.18.1 中，普通图片按一次 **Ctrl+Z** 即可撤销换图；
+已裁剪的图片会重新应用裁剪，需要撤销两次。
+
 ### 从 PowerPoint 编辑拖入的 PNG（Windows 原型）
 
 保持原生 App 运行，并选中 PNG 所属的实验文件夹。照常从文件夹把导出的 PL/DRR PNG
