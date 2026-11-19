@@ -167,7 +167,7 @@ class DeckCraftWindowsTests(unittest.TestCase):
             ) as spawn:
                 self.assertEqual(self.desktop.launch(path), DeckCraftWindow(11, 52, 22222))
                 spawn.assert_called_once_with(
-                    [str(executable), "--control", "22222", str(path.resolve())], cwd=directory,
+                    [str(executable.resolve()), "--control", "22222", str(path.resolve())], cwd=directory.resolve(),
                 )
 
     def test_launch_reports_early_exit_and_missing_control_connection(self):
