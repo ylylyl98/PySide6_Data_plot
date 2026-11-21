@@ -281,7 +281,7 @@ Controls.ApplicationWindow {
     Controls.ApplicationWindow {
         id: backgroundWindow
         objectName: "drr_background_window"
-        title: "DRR background settings"
+        title: backgroundLoader.item && backgroundLoader.item.state && backgroundLoader.item.state.rawOnly === true ? "DRR original data" : "DRR background settings"
         width: 1060
         height: 760
         minimumWidth: 700
@@ -547,6 +547,7 @@ Controls.ApplicationWindow {
                     AppButton { objectName: "drr_plot_raw"; colors: window.colors; text: "ΔR/R"; compact: true; visible: window.currentWorkflow === "drr" && !window.compact; checkable: true; checked: window.state.drrView === "raw"; onClicked: window.appBridge.setParameter("drrView", "raw") }
                     AppButton { objectName: "drr_plot_second"; colors: window.colors; text: "Derivative"; compact: true; visible: window.currentWorkflow === "drr" && !window.compact; enabled: window.state.derivativeAvailable === true; checkable: true; checked: window.state.drrView === "second"; onClicked: window.appBridge.setParameter("drrView", "second") }
                     AppButton { objectName: "drr_plot_pair"; colors: window.colors; text: "Side by side"; compact: true; visible: window.currentWorkflow === "drr" && !window.compact; enabled: window.state.derivativeAvailable === true; checkable: true; checked: window.state.drrView === "pair"; onClicked: window.appBridge.setParameter("drrView", "pair") }
+                    AppButton { objectName: "drr_plot_original"; colors: window.colors; text: "Original…"; compact: true; visible: window.currentWorkflow === "drr" && !window.compact; enabled: window.state.canConfigureBackground === true; description: "View the original measured intensity, without ΔR/R or background processing"; onClicked: window.appBridge.invoke("raw-preview") }
                     AppComboBox {
                         colors: window.colors
                         objectName: "drr_plot_view_compact"

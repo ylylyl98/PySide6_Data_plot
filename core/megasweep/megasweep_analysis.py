@@ -31,6 +31,8 @@ from PIL import Image
 from scipy import optimize
 from scipy.signal import find_peaks, savgol_filter, medfilt2d
 
+from core.spectral_header import parse_spectral_column_name
+
 
 def _finite_min_max(values, label='values'):
     """Return finite min/max for plotting or raise a clear error."""
@@ -115,13 +117,16 @@ def _split_numeric_spectral_columns(columns, excluded=None):
         if column in excluded:
             metadata_cols.append(column)
             continue
-        try:
-            float(column)
-        except (TypeError, ValueError):
+        if parse_spectral_column_name(column) is None:
             metadata_cols.append(column)
         else:
             spectral_cols.append(column)
     return metadata_cols, spectral_cols
+
+
+def _spectral_column_wavelengths(spectral_cols):
+    """Wavelength (nm) named by each spectral header, e.g. '703.2' or 'nm_703.2'."""
+    return np.array([parse_spectral_column_name(column) for column in spectral_cols], dtype=float)
 
 
 def spectral_axes_match(left, right, atol=1e-3):
@@ -267,6 +272,11 @@ def guess_sweep_axis_columns(columns):
             bg_column = x_marked if classify_axis_role(x_marked) == 'bg' else y_marked
             tg_column = x_marked if classify_axis_role(x_marked) == 'tg' else y_marked
             return bg_column, tg_column
+        # Likewise Doping is always X, whichever axis the acquisition swept
+        # first (e.g. Vbias_axis_a_set with Doping_axis_b_set).
+        if marked_roles in ({'doping', 'vbias'}, {'doping', 'efield'}):
+            if classify_axis_role(x_marked) != 'doping':
+                return y_marked, x_marked
         return x_marked, y_marked
 
     def first_with_role(role, exclude=""):
@@ -414,7 +424,7 @@ def load_spectral_csv(csv_path):
         extra = f" Non-spectral columns seen: {metadata_cols[:5]}" if metadata_cols else ""
         raise ValueError("No numeric wavelength columns found in background CSV." + extra)
 
-    wavelength = np.asarray(spec_cols, dtype=float)
+    wavelength = _spectral_column_wavelengths(spec_cols)
     intensity = df[spec_cols].to_numpy(dtype=float)
     return {
         "df": df,
@@ -488,7 +498,7 @@ def load_megasweep_csv(csv_path, x_col=None, y_col=None):
             + extra
         )
 
-    wavelength = np.array(spec_cols, dtype=float)
+    wavelength = _spectral_column_wavelengths(spec_cols)
 
     energy = 1240.0 / wavelength  # eV
 

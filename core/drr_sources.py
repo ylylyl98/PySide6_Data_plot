@@ -24,6 +24,7 @@ import numpy as np
 
 from core.measurement_names import split_group_and_sort_key
 from core.load_cancellation import check_load_cancelled, check_load_checkpoint
+from core.spectral_header import parse_spectral_column_name
 from core.drr_background_regions import DrrBackgroundRegion, normalize_regions
 
 
@@ -527,7 +528,10 @@ def inspect_csv_wavelength_center(path: str | Path) -> float | None:
     row = next(csv.reader([first], delimiter=delimiter), [])
     header_is_text = any(_as_float(token) is None for token in row)
     spectral_tokens = row if header_is_text else row[4:]
-    values = [value for token in spectral_tokens if (value := _as_float(token)) is not None]
+    values = [
+        value for token in spectral_tokens
+        if (value := parse_spectral_column_name(token)) is not None
+    ]
     wavelength_values = [value for value in values if 200.0 <= value <= 2500.0]
     if len(wavelength_values) >= 2:
         return 0.5 * (min(wavelength_values) + max(wavelength_values))
@@ -557,10 +561,13 @@ def inspect_csv_spectral_grid(path: str | Path) -> tuple[float, ...]:
     row = next(csv.reader([first], delimiter=delimiter), [])
     header_is_text = any(_as_float(token) is None for token in row)
     if header_is_text:
-        indices = [index for index, token in enumerate(row) if _as_float(token) is not None]
+        indices = [
+            index for index, token in enumerate(row)
+            if parse_spectral_column_name(token) is not None
+        ]
     else:
         indices = [index for index, token in enumerate(row) if _as_float(token) is not None and float(_as_float(token)) > 50.0]
-    values = tuple(float(_as_float(row[index])) for index in indices)
+    values = tuple(float(parse_spectral_column_name(row[index])) for index in indices)
     if len(values) < 2 or not all(math.isfinite(value) for value in values):
         raise ValueError(f"DRR file {source.name} has no complete spectral grid")
     return values
@@ -1536,10 +1543,11 @@ def _read_csv_spectral_sample_uncached(
         if header_is_text:
             spectral_indices = [
                 index for index, token in enumerate(first_row)
-                if _as_float(token) is not None
+                if parse_spectral_column_name(token) is not None
             ]
             spectral_axis = np.asarray(
-                [float(_as_float(first_row[index])) for index in spectral_indices], float
+                [float(parse_spectral_column_name(first_row[index])) for index in spectral_indices],
+                float,
             )
             rows = csv.reader(handle, delimiter=delimiter)
         else:
@@ -1780,10 +1788,11 @@ def _inspect_csv_gate_rows(rows) -> DrrGateProfile:
             if name.startswith(("vbg", "vtg", "vbias"))
             or name in {"gate", "gatev", "field", "efield", "doping"}
         ]
+        named_values = [parse_spectral_column_name(value) for value in header]
         spectral_indices = [
-            index for index, value in enumerate(header_values) if value is not None
+            index for index, value in enumerate(named_values) if value is not None
         ]
-        spectral_grid = tuple(header_values[index] for index in spectral_indices)
+        spectral_grid = tuple(named_values[index] for index in spectral_indices)
         gate_labels = tuple(str(header[index]).strip() for index in gate_indices)
     else:
         gate_indices = [index for index in (0, 1) if index < len(header)]

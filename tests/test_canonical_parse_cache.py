@@ -48,6 +48,52 @@ class CanonicalParseTests(unittest.TestCase):
         result = self.load(y_axis='BG')
         np.testing.assert_array_equal(result['Z'], [[np.inf, 10], [np.nan, 40]])
 
+    def test_scientific_notation_spectrum_headers_are_parsed(self):
+        from core.drr_sources import inspect_csv_spectral_grid
+        self.path.write_text(
+            'Vbg,Vtg,1.0174e+03,1.1e+03,1.1825E3\n0,2,10,20,30\n1,3,40,50,60\n', encoding='utf-8')
+        result = self.load(y_axis='BG')
+        np.testing.assert_allclose(result['energy'], 1240 / np.array([1182.5, 1100.0, 1017.4]))
+        np.testing.assert_array_equal(result['Z'], [[30, 20, 10], [60, 50, 40]])
+        self.assertEqual(inspect_csv_spectral_grid(self.path), (1017.4, 1100.0, 1182.5))
+
+    def test_multi_detector_acquisition_headers_are_parsed(self):
+        from core.drr_sources import inspect_csv_spectral_grid, inspect_csv_wavelength_center
+        self.path.write_text(
+            'run_id,point_id,backend,started_at,center_nm,exposure_ms,frames,'
+            'Vbg_set,Vbg_meas,Vtg_set,Vtg_meas,Ibg,Itg,Ibias,nm_1180.5,nm_1100.25,nm_1020.0\n'
+            'abc,1,andor_ingaas,2026-11-20T16:17:41+00:00,1100.0,1000.0,4,'
+            '-7.0,-7.0,2.0,2.0,-5e-10,-9e-10,-2e-11,10,20,30\n'
+            'abc,2,andor_ingaas,2026-11-20T16:17:48+00:00,1100.0,1000.0,4,'
+            '-6.5,-6.5,2.0,2.0,-4e-10,-9e-10,-3e-11,40,50,60\n', encoding='utf-8')
+        result = self.load(y_axis='BG')
+        np.testing.assert_allclose(result['energy'], 1240 / np.array([1180.5, 1100.25, 1020.0]))
+        np.testing.assert_array_equal(result['Z'], [[10, 20, 30], [40, 50, 60]])
+        np.testing.assert_array_equal(result['gate_axis'], [-7.0, -6.5])
+        self.assertEqual(inspect_csv_spectral_grid(self.path), (1180.5, 1100.25, 1020.0))
+        self.assertAlmostEqual(inspect_csv_wavelength_center(self.path), 1100.25)
+        from core.drr_sources import inspect_csv_gate_profile
+        profile = inspect_csv_gate_profile(self.path)
+        self.assertEqual(profile.spectral_grid, (1180.5, 1100.25, 1020.0))
+        self.assertEqual(profile.gate_labels, ('Vbg_set', 'Vbg_meas', 'Vtg_set', 'Vtg_meas'))
+        self.assertTrue(profile.grid_complete)
+
+    def test_spectrum_column_names_match_float_forms(self):
+        cases = {'703.177': 703.177, '703.177.1': 703.177, '1.0486e+00': 1.0486,
+                 '1.0486e+00.1': 1.0486, '7E2': 700.0, '703.': 703.0, '.5': 0.5,
+                 '1.742 eV': 1.742, '1.742 EV': 1.742, '703 NM': 703.0,
+                 'nm_1182.53759765625': 1182.53759765625, 'nm_703.177.1': 703.177,
+                 'eV_1.742': 1.742, 'NM 703': 703.0}
+        for name, expected in cases.items():
+            self.assertEqual(P._parse_spec_axis_from_colname(name), expected, name)
+        for name in ('Vbg', 'nan', 'inf', 'e5', '1e', 'T (K)', '', 'center_nm', 'nm_', 'run_1'):
+            self.assertIsNone(P._parse_spec_axis_from_colname(name), name)
+
+    def test_missing_spectrum_columns_error_lists_found_columns(self):
+        self.path.write_text('Vbg,Vtg,px0,px1\n0,2,10,20\n', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, r"no spectrum columns found[\s\S]*'px0', 'px1'"):
+            self.load()
+
     def test_changed_file_invalidates_cache(self):
         with patch.object(P.pd, 'read_csv', wraps=P.pd.read_csv) as read:
             self.load()

@@ -106,6 +106,51 @@ class AxisRoleValidationTests(unittest.TestCase):
         self.assertEqual(2, len(set(data["x_data"])))
         self.assertEqual(2, len(set(data["y_data"])))
 
+    def test_doping_is_x_when_acquisition_swept_bias_as_axis_a(self):
+        self.assertEqual(
+            ("Doping_axis_b_set", "Vbias_axis_a_set"),
+            guess_sweep_axis_columns(["Vbias_axis_a_set", "Doping_axis_b_set", "Vtg_set"]),
+        )
+        self.assertEqual(
+            ("Doping_axis_b_set", "Efield_axis_a_set"),
+            guess_sweep_axis_columns(["Efield_axis_a_set", "Doping_axis_b_set"]),
+        )
+
+    def test_loads_multi_detector_file_with_nm_prefixed_columns(self):
+        from core import megasweep_catalog
+        from core.megasweep import workflow
+
+        frame = pd.DataFrame({
+            "run_id": ["abc"] * 4,
+            "point_id": [1, 2, 3, 4],
+            "backend": ["andor_ingaas"] * 4,
+            "center_nm": [1100.0] * 4,
+            "exposure_ms": [500.0] * 4,
+            "frames": [2] * 4,
+            "Vbias_axis_a_set": [-0.7, -0.7, -0.75, -0.75],
+            "Doping_axis_b_set": [-5.0, -4.95, -4.95, -5.0],
+            "Vtg_set": [-2.5, -2.475, -2.475, -2.5],
+            "Vbias_meas": [-0.7, -0.7, -0.75, -0.75],
+            "Ibias_A": [-1e-10, -2e-10, -3e-10, -4e-10],
+            "nm_1182.5": [1.0, 2.0, 3.0, 4.0],
+            "nm_1100.25": [5.0, 6.0, 7.0, 8.0],
+        })
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "pair_Andor_InGaAs.csv")
+            frame.to_csv(path, index=False)
+            data = workflow.load_dataset(path, "Reflection")
+            background = workflow.a.load_spectral_csv(path)
+            row = megasweep_catalog.scan(temp_dir)["files"][0]
+
+        self.assertEqual(("Doping_axis_b_set", "Vbias_axis_a_set"), (data["x_name"], data["y_name"]))
+        self.assertEqual("doping_bias", data["axis_validation"]["mode"])
+        self.assertEqual([1182.5, 1100.25], list(data["wavelength"]))
+        self.assertEqual((4, 2), data["Intensity"].shape)
+        self.assertEqual("Vbias_meas", data["vbias_name"])
+        self.assertEqual("Ibias_A", data["ibias_name"])
+        self.assertEqual([1182.5, 1100.25], list(background["wavelength"]))
+        self.assertEqual("Optical", row["kind"])
+
     def test_allows_unknown_custom_assignment_with_warning_mode(self):
         result = validate_axis_selection("axis_0", "axis_1")
         self.assertTrue(result["ok"])

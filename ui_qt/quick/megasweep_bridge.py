@@ -457,7 +457,9 @@ class MegasweepBridge(MegasweepPlotMixin, QObject):
                 values['y_column'] = values['y_column'] or suggestion.get('y') or ''
                 if suggestion.get('kind') == 'curve' and not values['y_column']: values['view'] = 'transport_curve'
                 candidates = [col for col in data.get('columns', []) if col not in (values['x_column'], values['y_column'])]
-                values['channel'] = values['channel'] or (candidates[0] if candidates else '')
+                suggested_channel = suggestion.get('channel')
+                if suggested_channel not in candidates: suggested_channel = ''
+                values['channel'] = values['channel'] or suggested_channel or (candidates[0] if candidates else '')
                 if values['cut_type'] not in data.get('columns', []):
                     values['cut_type'] = values['x_column'] or values['y_column']
                     if values['cut_type']:

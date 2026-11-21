@@ -1727,6 +1727,13 @@ class QuickApplicationBridge(PowerPointApplicationMixin, ShellServicesMixin, PlA
         if action in {"background-settings", "select-background"}:
             self.openDrrBackground()
             return
+        if action == "raw-preview":
+            # Shortcut to the read-only original-intensity view (no ΔR/R).
+            self.openDrrBackground()
+            background = self._drr_background_bridge
+            if self._background_open and background is not None:
+                background.show_original_data()
+            return
         if self._pl_invoke(action):
             return
         child = self._workflow_bridges.get(self._workflow)

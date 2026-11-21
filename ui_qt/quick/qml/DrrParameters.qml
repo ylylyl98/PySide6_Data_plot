@@ -88,6 +88,16 @@ Rectangle {
                     onClicked: root.bridge.invoke("saved-results")
                 }
             }
+            AppButton {
+                objectName: "drr_raw_preview"
+                Layout.fillWidth: true
+                colors: root.colors
+                compact: true
+                text: "View original data…"
+                description: "View the original measured intensity of the selected files, without ΔR/R or background processing"
+                enabled: !!root.state.canConfigureBackground
+                onClicked: root.bridge.invoke("raw-preview")
+            }
             Text {
                 objectName: "drr_background_summary"
                 Layout.fillWidth: true

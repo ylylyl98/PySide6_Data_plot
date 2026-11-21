@@ -245,6 +245,31 @@ def _run_isolated():
             drain_until(lambda: not background.snapshot["busy"])
             self.assertEqual(background.draft.files, ())
 
+        def test_original_data_button_opens_raw_preview_directly(self):
+            _source, background, dialog = self.open_drr_background()
+            dialog.close()
+            settle()
+            self.assertFalse(self.bridge._background_open)
+            window = dialog.transientParent()
+            self.click_item(window, self.qml_item(window, "drr_raw_preview"))
+            drain_until(lambda: not background.snapshot["busy"])
+            self.assertTrue(dialog.isVisible())
+            self.assertEqual(background.snapshot["page"], "raw")
+            self.assertEqual(background.snapshot["error"], "")
+            self.assertIsNotNone(background._raw_preview)
+            self.assertEqual(dialog.title(), "DRR original data")
+            # Stand-alone viewer: no background source tabs, tools or Apply.
+            self.assertTrue(background.snapshot["rawOnly"])
+            for name in ("drr_background_source_tabs", "drr_background_tools", "drr_background_apply"):
+                self.assertFalse(dialog.findChild(QObject, name).property("visible"), name)
+            dialog.close()
+            settle()
+            self.click_item(window, self.qml_item(window, "drr_background_settings"))
+            drain_until(lambda: not background.snapshot["busy"])
+            self.assertFalse(background.snapshot["rawOnly"])
+            self.assertEqual(background.snapshot["page"], "settings")
+            self.assertTrue(dialog.findChild(QObject, "drr_background_source_tabs").property("visible"))
+
         def test_generated_bn_switches_main_products_without_refit_and_preserves_view(self):
             import numpy as np
             from core.drr_bn_store import DrrBnStore, source_records

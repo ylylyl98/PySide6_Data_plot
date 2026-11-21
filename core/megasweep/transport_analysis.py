@@ -8,7 +8,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from core.spectral_header import parse_spectral_column_name
+
 from .transport_axes import suggest_transport_axes
+
+# Fewer numeric-named columns than this are treated as ordinary scalar channels.
+_MIN_SPECTRAL_COLUMNS = 8
 
 
 def load_transport_csv(path):
@@ -43,6 +48,15 @@ def load_transport_csv(path):
         frame[name] = numeric
         if name != 'PassIndex' and numeric.notna().any():
             columns.append(name)
+    # Optical acquisition files carry hundreds of per-wavelength intensity
+    # columns ('703.18', 'nm_703.18').  They stay in the frame but are not
+    # offered as scan coordinates or transport signals.
+    spectral = [name for name in columns if parse_spectral_column_name(name) is not None]
+    if len(spectral) >= _MIN_SPECTRAL_COLUMNS:
+        hidden = set(spectral)
+        columns = [name for name in columns if name not in hidden]
+    else:
+        spectral = []
     if not columns:
         raise ValueError('No numeric measurement columns found.')
     metadata = {}
@@ -55,8 +69,8 @@ def load_transport_csv(path):
         except (OSError, ValueError) as exc:
             warnings.append(f'Metadata could not be read: {exc}')
             metadata = {}
-    data = {'df': frame, 'columns': columns, 'units': units, 'metadata': metadata,
-            'warnings': warnings, 'source_path': str(path.resolve())}
+    data = {'df': frame, 'columns': columns, 'spectral_columns': spectral,
+            'units': units, 'metadata': metadata, 'warnings': warnings, 'source_path': str(path.resolve())}
     data['axis_suggestion'] = suggest_transport_axes(data)
     return data
 

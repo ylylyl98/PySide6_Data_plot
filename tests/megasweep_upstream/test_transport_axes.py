@@ -39,6 +39,38 @@ class TransportAxisTests(unittest.TestCase):
         self.assertEqual(result['source'], 'metadata')
         self.assertIn('plot_x_axis', result['reason'])
 
+    def _optical_frame(self, spectral=10):
+        frame = pd.DataFrame({
+            'point_id': [1, 2, 3, 4],
+            'Vbias_axis_a_set': [-0.7, -0.7, -0.75, -0.75],
+            'Doping_axis_b_set': [-5.0, -4.95, -4.95, -5.0],
+            'Vtg_set': [-2.5, -2.475, -2.475, -2.5],
+            'Vbias_meas': [-0.7, -0.7, -0.75, -0.75],
+            'Ibg_A': [1e-10, 2e-10, 3e-10, 4e-10],
+            'Ibias_A': [-1e-10, -2e-10, -3e-10, -4e-10],
+        })
+        for index in range(spectral):
+            frame[f'nm_{1180.5 - index}'] = [1.0, 2.0, 3.0, 4.0]
+        return frame
+
+    def test_optical_file_hides_spectra_and_uses_acquisition_axes(self):
+        data = self.load(self._optical_frame())
+        self.assertEqual(data['columns'], ['point_id', 'Vbias_axis_a_set', 'Doping_axis_b_set',
+                                           'Vtg_set', 'Vbias_meas', 'Ibg_A', 'Ibias_A'])
+        self.assertEqual(len(data['spectral_columns']), 10)
+        self.assertIn('nm_1180.5', data['df'])
+        result = self.suggestion(data)
+        self.assertEqual((result['kind'], result['x'], result['y'], result['source']),
+                         ('map', 'Doping_axis_b_set', 'Vbias_axis_a_set', 'acquisition'))
+        self.assertEqual(result['channel'], 'Ibias_A')
+        grid = analysis.transport_map(data, result['x'], result['y'], 'Ibg_A')
+        self.assertEqual(grid['Z2D'].shape, (2, 2))
+
+    def test_few_numeric_named_columns_remain_scalar_channels(self):
+        data = self.load(self._optical_frame(spectral=2))
+        self.assertIn('nm_1180.5', data['columns'])
+        self.assertEqual(data['spectral_columns'], [])
+
     def test_metadata_preserves_planned_slow_axis_on_partial_first_line(self):
         data = self.load(pd.DataFrame({'Doping': [-1, -1], 'Vds': [.9, .902], 'Ids_X': [2, 3]}),
                          {'axis_fast': 'Vds', 'axis_slow': 'Doping'})
