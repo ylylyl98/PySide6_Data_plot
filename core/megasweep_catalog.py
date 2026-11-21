@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import csv
-import math
 import os
 from pathlib import Path
+
+from core.spectral_header import parse_spectral_column_name
 
 
 _EXCLUDED = {"processed data", ".git", ".venv", "build", "dist", "archive", "__pycache__"}
@@ -59,10 +60,8 @@ def scan(folder, cancellation=None, *, recursive=True):
                     columns = next(csv.reader([line]))
                     spectral = 0
                     for column in columns:
-                        try:
-                            spectral += int(math.isfinite(float(column)) and float(column) > 0)
-                        except ValueError:
-                            pass
+                        value = parse_spectral_column_name(column)
+                        spectral += int(value is not None and value > 0)
                     kind = "Optical" if spectral >= 2 else "Transport"
                     detail = (f"{spectral} spectral channels" if spectral >= 2 else "Scalar CSV candidate")
                     detail += " · " + ", ".join(columns[:6])

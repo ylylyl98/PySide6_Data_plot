@@ -7,6 +7,7 @@ from typing import Optional, Tuple, Dict, List, Sequence, Literal
 import numpy as np
 import pandas as pd
 from .raw_spectrum_cache import RawSpectrumCache
+from .spectral_header import parse_spectral_column_name
 from .streaming_average import StreamingNanMean
 from .drr_axis_coordinates import CoordinateAccumulator
 from .load_cancellation import check_load_cancelled
@@ -1328,21 +1329,9 @@ def _find_col_by_priority(cols: list, candidates: list[str]) -> Optional[str]:
     return None
 
 
-_SPEC_COL_RE = re.compile(
-    r"^\s*([+-]?\d+(?:\.\d+)?)(?:\.\d+)?\s*(nm|ev|eV)?\s*$"
-)
-#                      ^^^^^^^^^^^
-# this optional (?:\.\d+)? allows pandas duplicate suffix like "703.177.1"
-
 def _parse_spec_axis_from_colname(col) -> Optional[float]:
-    s = str(col).strip()
-    m = _SPEC_COL_RE.match(s)
-    if not m:
-        return None
-    try:
-        return float(m.group(1))
-    except Exception:
-        return None
+    # Shared with the header-only inspectors in core.drr_sources so both agree.
+    return parse_spectral_column_name(col)
 
 
 # def _load_canonical(user_folder: str, origin_name: str) -> Dict:
@@ -1413,7 +1402,7 @@ def _parse_spec_axis_from_colname(col) -> Optional[float]:
     }
 
 # Increment when CSV parsing rules change; axis/background choices are not cached.
-_RAW_PARSE_VERSION = 1
+_RAW_PARSE_VERSION = 2
 _RAW_SPECTRUM_CACHE = RawSpectrumCache()
 
 
@@ -1471,9 +1460,12 @@ def _parse_raw_spectrum(csv_path):
                 spec_vals.append(v)
 
         if not spec_cols:
+            shown = ", ".join(repr(c) for c in cols[:8])
+            more = f" (+{len(cols) - 8} more)" if len(cols) > 8 else ""
             raise ValueError(
                 "Header CSV detected but no spectrum columns found.\n"
-                "Spectrum columns must have numeric names like '703.177' or '1.742 eV'."
+                "Spectrum columns must have numeric names like '703.177', '1.742 eV' or 'nm_703.177'.\n"
+                f"Found columns: {shown}{more}"
             )
 
         spec_vals = np.asarray(spec_vals, float)

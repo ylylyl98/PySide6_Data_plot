@@ -40,11 +40,11 @@ def suggest_transport_axes(data):
         params = {}
         notes.append('Invalid metadata parameters; inspected measured columns instead.')
 
-    def result(kind, x, y, source, reason, candidates=()):
-        return dict(kind=kind, x=x, y=y, source=source,
+    def result(kind, x, y, source, reason, candidates=(), channel=None):
+        return dict(kind=kind, x=x, y=y, source=source, channel=channel,
                     reason=' '.join(notes + [reason]), candidates=list(candidates))
 
-    fast = _resolve_header(params.get('axis_fast'), columns)
+    fast =_resolve_header(params.get('axis_fast'), columns)
     slow = _resolve_header(params.get('axis_slow'), columns)
     if fast and slow and fast != slow and not frame[[fast, slow]].dropna().empty:
         x, y = slow, fast
@@ -60,6 +60,19 @@ def suggest_transport_axes(data):
                       f'Suggested X={x}, Y={y}. A constant slow axis may be a partial scan.')
     if params.get('axis_fast') or params.get('axis_slow'):
         notes.append('Metadata does not identify two distinct available coordinate columns; inspected measured data instead.')
+
+    # Megasweep acquisition names its two sweep axes explicitly
+    # (<name>_axis_a_set / <name>_axis_b_set); use them before guessing.
+    axis_a = [name for name in columns if 'axisaset' in _normalized(name)]
+    axis_b = [name for name in columns if 'axisbset' in _normalized(name)]
+    if len(axis_a) == 1 and len(axis_b) == 1 and not frame[[axis_a[0], axis_b[0]]].dropna().empty:
+        # Same orientation as the optical views (e.g. Doping on X, Vbias on Y).
+        from .megasweep_analysis import find_ibias_column, guess_sweep_axis_columns
+        x, y = guess_sweep_axis_columns([axis_a[0], axis_b[0]])
+        signal = find_ibias_column([name for name in columns if name not in (x, y)])
+        return result('map', x, y, 'acquisition',
+                      f'Acquisition sweep axes: {axis_a[0]}, {axis_b[0]}. Suggested X={x}, Y={y}.',
+                      [(x, y)], channel=signal)
 
     candidates = [name for name in columns
                   if not _is_record_or_signal(name, data.get('units', {}).get(name))

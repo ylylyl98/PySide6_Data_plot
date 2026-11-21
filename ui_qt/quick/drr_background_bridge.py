@@ -133,6 +133,7 @@ class DrrBackgroundBridge(QObject):
         self._match_timer.timeout.connect(self._start_scheduled_match)
         self._status = "Choose original CSV measurements to configure a background."
         self._error = ""
+        self._raw_only = False
         self._busy = False
         self._applying = False
         self._opened = False
@@ -284,6 +285,7 @@ class DrrBackgroundBridge(QObject):
         self._raw_preview, self._raw_preview_key = None, None
         self._texts["rawSource"] = ""
         self._raw_role, self._raw_scope = "measurement", "single"
+        self._raw_only = False
         self._numbers["gate"] = 0
         if self._navigation is not None and self._navigation.mode.name == "PAN":
             self._navigation.pan()
@@ -520,7 +522,7 @@ class DrrBackgroundBridge(QObject):
                 training_files, training_summary = (), str(exc)
         elif self._generation == "pn-only":
             training_files, training_summary = (), "P/N-only generation does not use sample measurements."
-        self._snapshot = dict(opened=self._opened, busy=self._busy, page=self._page, status=self._status, error=self._error,
+        self._snapshot = dict(opened=self._opened, busy=self._busy, page=self._page, rawOnly=self._raw_only and self._page == "raw", status=self._status, error=self._error,
             measurementSummary=f"{len(self._context.measurements)} original measurements" if self._context else "No measurements",
             files=list(self._background_files() if self._draft.kind == "bn" and self._draft.calibration else self._draft.files), kind=self._draft.kind, method=self._method,
             recommendMatching=self._draft.kind in {"bn", "p", "n", "pn"} and self._method == "common" and len(self._draft.files) > 1 and self._draft.kind not in self._explicit_methods,
@@ -1516,6 +1518,14 @@ class DrrBackgroundBridge(QObject):
             relaxed_conditions=(), saved_matching_review=None, bn_candidates=None, pn_candidates=None,
             bn_plan=None, pn_plan=None, saved_assignments=(), batch_result=None, bn_warnings_acknowledged=False,
             pn_warnings_acknowledged=False, fixed=False, **changes)
+
+    def show_original_data(self):
+        """Open as a stand-alone original-intensity viewer, without background controls."""
+        if self._busy or not self._context:
+            return
+        self._raw_only = True
+        self.invoke("page:raw")
+        self.invoke("preview-raw")
 
     def set_current_background_label(self, label):
         """The owner supplies the applied background, not the generated draft."""

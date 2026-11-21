@@ -23,6 +23,8 @@ Rectangle {
     property bool pnManagedViewRequested: false
     property string pnContextKey: ""
     readonly property bool advancedPage: state.page !== "settings"
+    // Opened from "Original data…": a plain viewer without background controls.
+    readonly property bool rawOnly: state.rawOnly === true
     readonly property bool pnSimpleVisible: !advancedPage && state.kind === "pn" && !pnExternalFiles
         && (state.pnExternalReferenceActive !== true || pnManagedViewRequested)
     readonly property bool inlineReferencesVisible: !advancedPage && !pnSimpleVisible && ["bn", "p", "n", "pn", "custom"].indexOf(state.kind) >= 0
@@ -538,6 +540,7 @@ Rectangle {
         RowLayout {
             id: sourceTabs
             objectName: "drr_background_source_tabs"
+            visible: !root.rawOnly
             Layout.fillWidth: true
             spacing: 4
             readonly property int currentIndex: root.selectedSourceTab
@@ -576,10 +579,10 @@ Rectangle {
         }
         RowLayout {
             Layout.fillWidth: true
-            Heading { Layout.fillWidth: false; text: root.state.page === "bn" ? "BN calibration" : root.advancedPage ? (root.toolPages.find(page => page.key === root.state.page)?.title || "Background tools") : root.sourceTitle }
+            Heading { Layout.fillWidth: false; text: root.rawOnly ? "Original data (no ΔR/R, no background)" : root.state.page === "bn" ? "BN calibration" : root.advancedPage ? (root.toolPages.find(page => page.key === root.state.page)?.title || "Background tools") : root.sourceTitle }
             Note { Layout.fillWidth: false; text: root.state.measurementSummary || "" }
             Item { Layout.fillWidth: true }
-            Action { command: "page:settings"; text: "Back to background"; visible: root.advancedPage }
+            Action { command: "page:settings"; text: "Back to background"; visible: root.advancedPage && !root.rawOnly }
             AppButton {
                 colors: root.colors
                 compact: true
@@ -601,6 +604,7 @@ Rectangle {
                 objectName: "drr_background_tools"
                 colors: root.colors
                 text: "Advanced tools…"
+                visible: !root.rawOnly
                 description: "Generate, fit or inspect a background"
                 enabled: !root.state.busy && !root.invalid
                 onClicked: toolsMenu.open()
@@ -927,7 +931,7 @@ Rectangle {
                             objectName: "drr_background_empty_preview"
                             anchors.centerIn: parent
                             width: Math.max(100, parent.width - 40)
-                            text: root.state.page === "bn" ? "Generate a calibrated background, or compare plots without applying changes." : "Run this tool's preview to inspect the background. Use Back to background to choose and apply a reference."
+                            text: root.state.page === "bn" ? "Generate a calibrated background, or compare plots without applying changes." : root.rawOnly ? "Loading original data…" : "Run this tool's preview to inspect the background. Use Back to background to choose and apply a reference."
                             color: root.colors.muted
                             wrapMode: Text.Wrap
                             horizontalAlignment: Text.AlignHCenter
@@ -951,10 +955,10 @@ Rectangle {
         Note { objectName: "bn_running_status"; visible: !root.inlineReferencesVisible || root.state.busy || !!root.state.error; text: root.state.error || (root.state.page === "bn" && root.state.busy ? (root.state.status || "Running") + " · " + root.bnRunningSeconds + " s" : root.state.status || ""); color: root.state.error ? root.colors.error : root.colors.muted; maximumLineCount: 4; elide: Text.ElideRight }
         RowLayout {
             Layout.fillWidth: true
-            Note { objectName: "bn_current_background"; text: root.invalid ? "Correct the highlighted numeric draft before continuing." : root.inlineReferencesVisible && root.state.kind === "bn" ? "Current: " + (root.state.bnCurrentBackground || "Unchanged") : root.pnSimpleVisible ? "Generated versions are saved in history. Apply to current group updates the main result." : "Previews and saved drafts leave the applied background unchanged." }
+            Note { objectName: "bn_current_background"; text: root.rawOnly ? "Read-only view of the measured intensity. Nothing here changes the DRR result." : root.invalid ? "Correct the highlighted numeric draft before continuing." : root.inlineReferencesVisible && root.state.kind === "bn" ? "Current: " + (root.state.bnCurrentBackground || "Unchanged") : root.pnSimpleVisible ? "Generated versions are saved in history. Apply to current group updates the main result." : "Previews and saved drafts leave the applied background unchanged." }
             Action { command: "cancel-task"; text: "Stop task"; visible: root.state.busy || root.state.matching; enabled: true }
-            Action { command: "cancel"; text: "Close"; description: "Close without applying this background draft"; enabled: true }
-            Action { visible: root.state.page !== "bn" && !(root.state.kind === "bn" && root.state.bnHasComparison); command: root.pnSimpleVisible ? "pn-apply" : "apply"; text: root.pnSimpleVisible ? "Apply to current group" : root.state.method === "matched" ? "Apply matched backgrounds" : "Apply background"; primary: true; enabled: (root.pnSimpleVisible ? root.state.pnCanApply === true : root.state.applyEnabled) && !root.invalid; objectName: "drr_background_apply" }
+            Action { command: "cancel"; text: "Close"; description: root.rawOnly ? "Close the original data view" : "Close without applying this background draft"; enabled: true }
+            Action { visible: !root.rawOnly && root.state.page !== "bn" && !(root.state.kind === "bn" && root.state.bnHasComparison); command: root.pnSimpleVisible ? "pn-apply" : "apply"; text: root.pnSimpleVisible ? "Apply to current group" : root.state.method === "matched" ? "Apply matched backgrounds" : "Apply background"; primary: true; enabled: (root.pnSimpleVisible ? root.state.pnCanApply === true : root.state.applyEnabled) && !root.invalid; objectName: "drr_background_apply" }
         }
     }
     Loader { id: fileSelectionLoader; anchors.fill: parent }
