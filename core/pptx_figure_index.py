@@ -26,6 +26,11 @@ class FigureRecord:
     record_id: str
     metadata_path: Path | None = None
 
+    @property
+    def data_path(self):
+        """The exported numerical file, which is a CSV for Megasweep."""
+        return self.dat_path
+
 
 def _fingerprint(data):
     with Image.open(BytesIO(data)) as image:
@@ -138,7 +143,7 @@ class FigureIndex:
 
     def _add(self, png, dat, workflow, role, plot, snapshot, metadata_path=None, *, target_pixels=None):
         png, dat = Path(png), Path(dat)
-        if workflow not in ('pl', 'drr') or not role or not png.is_file() or not dat.is_file():
+        if workflow not in ('pl', 'drr', 'megasweep') or not role or not png.is_file() or not dat.is_file():
             return None
         # Sidecars and output symlinks must remain inside this experiment's
         # Processed Data tree, even when a metadata filename looks local.
@@ -182,6 +187,37 @@ class FigureIndex:
                 self._size_cache[key] = image.size
         return self._size_cache[key]
 
+    def _megasweep_candidates(self, directory, allowed, target, metadata_path, matching_files):
+        """Read only complete, same-stem Megasweep export trios."""
+        if target is not None:
+            if target.suffix.lower() != '.png':
+                return
+            expected = target.with_suffix('.json')
+            if metadata_path is not None and Path(metadata_path).resolve() != expected:
+                return
+            sidecars = (expected,)
+        elif matching_files is not None:
+            sidecars = (folder / Path(name).with_suffix('.json')
+                        for folder, names in matching_files.items() for name in names)
+        else:
+            sidecars = (directory / 'Megasweep').rglob('*.json')
+        for metadata in sidecars:
+            png, csv = metadata.with_suffix('.png'), metadata.with_suffix('.csv')
+            try:
+                if not all(path.is_file() and path.resolve().is_relative_to(allowed)
+                           for path in (metadata, png, csv)):
+                    continue
+                payload = self._metadata(metadata)
+                mode, kind = payload.get('mode'), payload.get('kind')
+                source, parameters = payload.get('source_path'), payload.get('parameters')
+                if (mode not in ('PL', 'Reflection', 'Transport') or kind not in ('map', 'slice', 'curve')
+                        or not isinstance(source, str) or Path(source).suffix.lower() != '.csv'
+                        or not isinstance(parameters, dict)):
+                    continue
+                yield (png, csv, 'megasweep', kind, parameters, payload, metadata)
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+
     def _candidates(self, png_path=None, *, metadata_path=None, matching_files=None):
         directory = self.root / 'Processed Data'
         if not directory.is_dir():
@@ -190,6 +226,7 @@ class FigureIndex:
         target = Path(png_path).resolve() if png_path is not None else None
         if target is not None and not target.is_relative_to(allowed):
             return
+        yield from self._megasweep_candidates(directory, allowed, target, metadata_path, matching_files)
         if metadata_path is not None:
             metadata = Path(metadata_path).resolve()
             # A completed export knows its exact sidecar. Keep the same
@@ -317,6 +354,7 @@ class FigureIndex:
         allowed = directory.resolve()
         matches = {}
         parents = dict.fromkeys(sidecar.parent for sidecar in directory.rglob('*.metadata.json'))
+        parents.update(dict.fromkeys(png.parent for png in (directory / 'Megasweep').rglob('*.png')))
         for parent in parents:
             try:
                 if not parent.resolve().is_relative_to(allowed):

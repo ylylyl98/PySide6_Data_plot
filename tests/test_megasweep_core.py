@@ -25,6 +25,32 @@ class MegasweepCoreTests(unittest.TestCase):
             self.assertEqual(result['z'].shape,(2,2)); self.assertTrue(np.isnan(result['z'][1,1]))
             np.testing.assert_array_equal(ds['x_data'],[0,0,1])
 
+    def test_color_limits_resist_outliers_and_preserve_manual_ranges(self):
+        from core.megasweep import megasweep_analysis as a
+
+        values = np.r_[-10000, np.arange(1, 99), 10000, np.nan, np.inf]
+        limits = a.resolve_color_limits(values)
+        self.assertEqual(limits, (2.0, 97.0))
+        coords = np.arange(values.size)
+        fig, ax = a.plot_map(coords, coords, values)
+        self.assertEqual(ax.collections[0].get_clim(), limits)
+        self.assertTrue(a.update_map_colors(fig, values, 'jet', 30.0, 60.0))
+        self.assertEqual(ax.collections[0].get_clim(), (30.0, 60.0))
+        self.assertTrue(a.update_map_colors(fig, values, 'jet'))
+        self.assertEqual(ax.collections[0].get_clim(), limits)
+
+        cut = {'energy': coords, 'axis_values': [0], 'spectra': values[None, :]}
+        _, ax = a.plot_line_cut_spectrogram(cut)
+        expected = np.percentile(values[np.isfinite(values)], (0.5, 99.5))
+        np.testing.assert_allclose(ax.collections[0].get_clim(), expected)
+        self.assertEqual(a.resolve_color_limits([np.nan, np.inf]), (0.0, 1.0))
+        self.assertEqual(a.resolve_color_limits([np.nan], -2.0, 3.0), (-2.0, 3.0))
+        self.assertEqual(a.resolve_color_limits([1e-12, 2e-12, np.nan]), (1e-12, 2e-12))
+        self.assertEqual(a.resolve_color_limits(np.r_[np.zeros(99), 1.0]), (0.0, 1.0))
+        low, high = a.resolve_color_limits([4.0, 4.0, np.nan])
+        self.assertLess(low, 4.0)
+        self.assertGreater(high, 4.0)
+
     def test_transport_and_transformed_topology(self):
         with TemporaryDirectory() as d:
             p=Path(d)/'t.csv'; pd.DataFrame({'Vbg':[0,0,1,1], 'Vtg':[0,1,0,1], 'current':[2,3,4,5]}).to_csv(p,index=False)
@@ -47,9 +73,32 @@ class MegasweepCoreTests(unittest.TestCase):
             oracle,info=upstream.estimate_global_baseline(ds['Intensity'],ds['energy'],1.49,1.53,return_info=True)
             self.assertEqual(result['diagnostics']['baseline'],oracle)
             ds['mode']='Reflection'
-            result=analyze(ds,{'view':'rc_energy','energy_target':1.5,'background_scale_windows':[(1.45,1.6)]},[p/'bg.csv'])
+            result=analyze(ds,{'view':'rc_energy','energy_target':1.5,'auto_background_scale':True,'background_scale_windows':[(1.45,1.6)]},[p/'bg.csv'])
             self.assertEqual(result['diagnostics']['background_scale_frame'],1)
             self.assertAlmostEqual(result['diagnostics']['background_scale'],4.0)
+
+    def test_background_windows_follow_measured_spectra_or_manual_recipe(self):
+        from core.megasweep.megasweep_analysis import estimate_background_scale
+
+        self.assertFalse(default_parameters()['auto_background_scale'])
+        energy = np.linspace(1.05, 1.21, 100)
+        background = np.ones(100)
+        sample = np.tile([1., 4.], 50)
+        sample[15:25] = sample[80:90] = 2.
+        background[0:10] = 0
+        scale, info = estimate_background_scale(sample, background, energy, None)
+        self.assertEqual(scale, 2.)
+        self.assertTrue(info['automatic_windows'])
+        expected_count = sum(np.count_nonzero((energy >= lo) & (energy <= hi)) for lo, hi in info['windows'])
+        self.assertEqual(info['channel_count'], expected_count)
+        for (lo, hi), (start, stop) in zip(info['windows'], [(15, 24), (80, 89)], strict=True):
+            self.assertTrue(energy[start] <= lo < hi <= energy[stop])
+        _, shifted = estimate_background_scale(sample[::-1], background[::-1], energy[::-1] + .7, None)
+        np.testing.assert_allclose(shifted['windows'], np.array(info['windows']) + .7)
+        with self.assertRaisesRegex(ValueError, 'found 0'):
+            estimate_background_scale(sample, background, energy, [(1.53, 1.545)])
+        with self.assertRaisesRegex(ValueError, 'at least three'):
+            estimate_background_scale(sample[:2], background[:2], energy[:2], None)
 
     def test_upstream_numeric_oracles(self):
         from core.megasweep import megasweep_analysis as a
@@ -74,6 +123,45 @@ class MegasweepCoreTests(unittest.TestCase):
             np.testing.assert_array_equal(ds['x_data'],[5,6])
             with self.assertRaisesRegex(ValueError,'swapped'):
                 load_dataset(p,x_col='Vtg',y_col='Vbg')
+
+    def test_gate_definitions_for_maps_cuts_and_export(self):
+        import json
+        from core.megasweep.workflow import slice_values, export_result
+
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / 'scan.csv'
+            bg = np.array([0, 2, 4])
+            tg = np.array([1, 2, 3])
+            pd.DataFrame({'Vbg_set': bg, 'Vtg_set': tg, '700': [10, 20, 30],
+                          '710': [9, 19, 29]}).to_csv(path, index=False)
+            data = load_dataset(path)
+            self.assertEqual(data['top_gate_axis'], 'y')
+            params = dict(transformed=True, tg_is_y=False, convention='rTG+BG', ratio=2.,
+                          energy_min=1.7, energy_max=1.8, auto_baseline=False, cut_type='efield',
+                          cut_value=2., min_points=2)
+            fixed = np.full(3, 2.)
+            for convention, doping, efield in [('TG+rBG', tg + 2*bg, tg - 2*bg),
+                                                ('rTG+BG', 2*tg + bg, fixed)]:
+                result = analyze(data, dict(params, convention=convention))
+                raw = result['data']
+                np.testing.assert_allclose(raw['x_flat'], doping[raw['idx_flat']])
+                np.testing.assert_allclose(raw['y_flat'], efield[raw['idx_flat']])
+                self.assertTrue(result['parameters']['tg_is_y'])
+            np.testing.assert_allclose(slice_values(data, params), [2.])
+            cut = analyze(data, dict(params, view='slice'))
+            np.testing.assert_allclose(cut['data']['axis_values'], 2*tg + bg)
+            paths = export_result(result, folder, parameters=dict(params, convention='TG+rBG', ratio=3.))
+            meta = json.loads(next(Path(p) for p in paths if Path(p).suffix == '.json').read_text(encoding='utf8'))
+            self.assertTrue(meta['parameters']['tg_is_y'])
+            self.assertEqual(meta['parameters']['convention'], 'rTG+BG')
+            self.assertEqual(meta['parameters']['ratio'], 2.)
+            for first, second, expected in [('Vtg_set', 'axis_b', 'x'), ('axis_a', 'axis_b', 'manual')]:
+                pd.DataFrame({first: tg, second: bg, '700': [10, 20, 30],
+                              '710': [9, 19, 29]}).to_csv(path, index=False)
+                data = load_dataset(path, x_col=first, y_col=second)
+                self.assertEqual(data['top_gate_axis'], expected)
+                result = analyze(data, dict(params, tg_is_y=expected == 'x'))
+                np.testing.assert_allclose(result['data']['y_flat'], fixed[result['data']['idx_flat']])
 
     def test_transport_labels_use_only_supplied_units(self):
         with TemporaryDirectory() as d:

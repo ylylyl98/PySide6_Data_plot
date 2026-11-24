@@ -39,6 +39,8 @@ with TemporaryDirectory() as directory:
         picker.selectFile(str(files['p']),True)
         assert bridge.snapshot['backgroundFiles'] == [str(files['p'])]
         assert bridge.snapshot['backgroundFolder'] == str(folders['p'])
+        # Check that rejecting a role mismatch leaves an existing, exportable map alone.
+        bridge._invalidate()
         bridge._result = {'title':'valid', 'diagnostics':{}}; bridge._result_sequence = bridge._sequence
         assert bridge.snapshot['canExport']
         picker.selectFile(str(files['n']),True)

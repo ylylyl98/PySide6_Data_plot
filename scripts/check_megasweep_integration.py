@@ -133,13 +133,24 @@ def main():
             child.selectFiles([str(optical)])
             # A new source restores its own saved backgrounds; set the explicit reference afterwards.
             child.openFiles('background', [str(background)])
+            wait(lambda: child.snapshot['reflectionPreviewVisible'], 'preview selected background')
+            assert child._reflection_preview['scale'] == 1.
+            child.setParameter('auto_background_scale', True)
+            wait(lambda: child.snapshot['reflectionPreviewVisible'], 'preview automatic background scaling')
+            info = child._reflection_preview['scale_info']
+            assert info['automatic_windows'] and info['channel_count'] >= 3
+            child.setParameter('auto_scale_windows', False)
+            wait(lambda: child.snapshot['reflectionPreviewVisible'], 'preview manual scale windows')
+            assert child._reflection_preview['scale_info']['windows'] == info['windows']
+            assert not child._reflection_preview['scale_info']['automatic_windows']
+            child.setParameter('auto_background_scale', False)
+            wait(lambda: child.snapshot['reflectionPreviewVisible'], 'preview unscaled background')
+            child.invoke('return-to-map')
             child.setParameter('energy_min', 1.6); child.setParameter('energy_max', 1.8)
             child.setParameter('auto_background_scale', False)
             loaded(child)
             bridge.invoke('theme-dark'); capture('reflection-dark')
-            child.invoke('choose-background')
-            workspace = window.findChild(QObject, 'quick_megasweep_workspace')
-            workspace.setProperty('backgroundOpen', True)
+            QMetaObject.invokeMethod(window.findChild(QObject, 'megasweep_background'), 'click')
             for width in (1000, 800, 640):
                 window.setWidth(width); window.setHeight(560)
                 capture(f'background-{width}')
@@ -164,6 +175,8 @@ def main():
                 references[role] = str(reference)
                 child.setParameter('background_role', role)
                 child.openFiles('background', [str(reference)])
+                wait(lambda: child.snapshot['reflectionPreviewVisible'], 'preview selected role')
+                child.invoke('return-to-map')
                 loaded(child)
                 assert child.snapshot['backgroundFiles'] == [str(reference)]
                 assert child._result['background_role'] == role
@@ -190,7 +203,8 @@ def main():
             loaded(child); capture('transport-dark')
             window.setWidth(640); window.setHeight(560); settle()
             controls = window.findChild(QObject, 'quick_megasweep_controls')
-            scroll = controls.findChild(QObject, 'app_parameter_scroll')
+            scan_parameters = controls.findChild(QObject, 'megasweep_scan_parameters')
+            scroll = scan_parameters.findChild(QObject, 'app_parameter_scroll')
             field = find_item('app_parameter_pass_index', controls)
             assert field is not None, 'Transport pass index editor missing'
             flick = scroll.property('contentItem')

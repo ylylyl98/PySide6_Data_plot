@@ -1,6 +1,7 @@
 """UI-independent Megasweep workflow; numerical routines originate at 2612f6f."""
 from pathlib import Path
 import numpy as np
+from . import DEFAULT_EXPORT_DPI, LEGACY_SCALE_WINDOWS, has_legacy_scale_windows
 from . import megasweep_analysis as a
 from . import transport_analysis as t
 from .spectral_processing import process_spectral_slice
@@ -11,13 +12,29 @@ def default_parameters():
                 baseline=595.0, auto_baseline=True, sg_window=31, sg_poly=3, ratio=1.0, tg_is_y=True,
                 convention='TG+rBG', transformed=False, cut_type='doping', cut_coordinates='explicit', cut_axis='first', batch_axes='selected', cut_value=0.0,
                 epsilon=0.03, min_points=2, exact_coordinates=False, derivative='spectrum',
-                derivative_window=9, background_role='custom', background_groups={}, background_average='all_frames', background_scale=1.0, auto_background_scale=True, background_scale_frame=None, background_scale_x=0.0, background_scale_y=0.0, background_scale_windows=[(1.53,1.545),(1.565,1.58)],
+                derivative_window=9, background_role='custom', background_groups={}, background_average='all_frames', background_scale=1.0, auto_background_scale=False, background_scale_frame=None, background_scale_x=0.0, background_scale_y=0.0, auto_scale_windows=None, background_scale_windows=list(LEGACY_SCALE_WINDOWS),
                 x_column='', y_column='', channel='', direction=None, pass_index=None,
-                rc_feature='auto', cmap='turbo', color_auto=True, vmin=0.0, vmax=1.0, x_auto=True, xmin=0.0, xmax=1.0, y_auto=True, ymin=0.0, ymax=1.0, export_dpi=300, movie_options={}, movie_ranges={}, movie_colors={})
+                rc_feature='auto', cmap='RdBu_r', color_auto=True, vmin=0.0, vmax=1.0, x_auto=True, x_reverse=False, xmin=0.0, xmax=1.0, y_auto=True, y_reverse=False, ymin=0.0, ymax=1.0, export_dpi=DEFAULT_EXPORT_DPI, movie_options={}, movie_ranges={}, movie_colors={})
 
 
-def _params(parameters):
+def _top_gate_axis(x_name, y_name):
+    """Resolve the orientation for a requested gate transform of these scan axes."""
+    x_role, y_role = a.classify_axis_role(x_name), a.classify_axis_role(y_name)
+    if x_role == y_role == 'unknown':
+        return 'manual'
+    if x_role in ('bg', 'unknown') and y_role in ('tg', 'unknown'):
+        return 'y'
+    if x_role in ('tg', 'unknown') and y_role in ('bg', 'unknown'):
+        return 'x'
+    return None
+
+
+def _params(parameters, dataset=None):
     p = default_parameters(); p.update(parameters or {})
+    if dataset is not None and dataset.get('top_gate_axis') in ('x', 'y'):
+        p['tg_is_y'] = dataset['top_gate_axis'] == 'y'
+    if p['auto_scale_windows'] is None:
+        p['auto_scale_windows'] = has_legacy_scale_windows(p['background_scale_windows'])
     coordinates=p['cut_coordinates']
     if coordinates != 'explicit':
         if coordinates not in ('follow_map','original','transformed'):
@@ -49,6 +66,7 @@ def load_dataset(path, mode='PL', x_col=None, y_col=None):
         if not status['ok']: raise ValueError(status['message'])
         data=a.load_megasweep_csv(path,x_col,y_col)
         data['axis_validation']=status
+        data['top_gate_axis'] = _top_gate_axis(x_col, y_col)
     data['mode'] = mode
     data['source_path'] = str(Path(path).resolve())
     return data
@@ -75,45 +93,77 @@ def load_background(paths, wavelength, average='all_frames', cancelled=None, *, 
     return np.mean(np.vstack(selected),axis=0)
 
 
+def _cut_axis_space(data):
+    if data.get('top_gate_axis') is not None:
+        return 'gate'
+    return data.get('axis_space', 'gate')
+
+
 def _cut(data,p,spectra):
     return a.extract_line_cut(None,data['x_data'],data['y_data'],data['energy'],
         cut_type=p['cut_type'],c_value=float(p['cut_value']),ratio=float(p['ratio']),
         epsilon=float(p['epsilon']),tg_is_y=bool(p['tg_is_y']),convention=p['convention'],
-        axis_space=data.get('axis_space','gate'),x_axis_name=data['x_name'],y_axis_name=data['y_name'],
+        axis_space=_cut_axis_space(data),x_axis_name=data['x_name'],y_axis_name=data['y_name'],
         exact_coordinates=bool(p['exact_coordinates']),spectra=spectra)
 
 
 def slice_values(dataset,parameters):
-    p=_params(parameters)
+    p=_params(parameters, dataset)
     if dataset['mode']=='Transport':
         col=p['cut_type'] if p['cut_type'] in dataset['columns'] else p['y_column']
         return sorted(float(x) for x in dataset['df'][col].dropna().unique())
     return a.find_all_cut_values(dataset['x_data'],dataset['y_data'],p['cut_type'],float(p['ratio']),float(p['epsilon']),
         min_points=int(p['min_points']),tg_is_y=bool(p['tg_is_y']),convention=p['convention'],
-        axis_space=dataset.get('axis_space','gate'),x_axis_name=dataset['x_name'],y_axis_name=dataset['y_name'],
+        axis_space=_cut_axis_space(dataset),x_axis_name=dataset['x_name'],y_axis_name=dataset['y_name'],
         exact_coordinates=bool(p['exact_coordinates']))
 
 
+def rc_map_labels(parameters):
+    """Describe the actual RC calculation for plot titles and compact filenames."""
+    def energy(key):
+        return f"{float(parameters[key]):.6f}".rstrip('0').rstrip('.')
+
+    view = parameters['view']
+    if view == 'rc_energy':
+        target = energy('energy_target')
+        return f'RC at {target} eV', f'rc_at_{target}eV'
+    low, high = energy('energy_min'), energy('energy_max')
+    if view == 'rc_p2p':
+        return f'RC peak-to-peak ({low}–{high} eV)', f'rc_p2p_{low}-{high}eV'
+    feature = str(parameters['rc_feature']).strip().lower()
+    description = {'peak': 'peak position', 'dip': 'dip position', 'auto': 'feature position (auto)'}[feature]
+    return f'RC {description}, {low}–{high} eV', f'rc_position_{feature}_{low}-{high}eV'
+
+
+def _estimate_reference_scale(p, sample, background, energy):
+    windows = None if p['auto_scale_windows'] else p['background_scale_windows']
+    scale, info = a.estimate_background_scale(sample, background, energy, windows)
+    p['background_scale_windows'] = info['windows']
+    return scale, info
+
+
 def analyze(dataset,parameters,background_paths=(),cancelled=None):
-    p=_params(parameters); _check(cancelled); mode=dataset['mode']; view=p['view']
+    p=_params(parameters, dataset); _check(cancelled); mode=dataset['mode']; view=p['view']
     base=dict(source_path=dataset['source_path'],mode=mode,background_paths=[str(Path(v).resolve()) for v in background_paths],diagnostics={},title=view,
               x_label='',y_label='',signal_label='',parameters=p)
     if mode=='Transport':
         x=p['x_column']; y=p['y_column']; channel=p['channel']
         units=dataset.get('units',{})
-        def label(name):
+        def label(name, *, axis=False):
             unit=str(units.get(name,'')).strip()
-            return f'{name} ({unit})' if unit else name
+            text=a.display_axis_name(name) if axis else name
+            return f'{text} ({unit})' if unit else text
         base['units']=dict(units)
+        signal_label=label(channel,axis=view in ('transport_curve','slice'))
         kw=dict(direction=p['direction'] or None,pass_index=p['pass_index'])
         if view=='transport_curve':
             raw=t.transport_curve(dataset,x,channel,**kw); rows=raw['samples']
-            return dict(base,kind='curve',x=rows[x].to_numpy(),values=rows[channel].to_numpy(),x_label=label(x),y_label=label(channel),signal_label=label(channel),data=raw)
+            return dict(base,kind='curve',x=rows[x].to_numpy(),values=rows[channel].to_numpy(),x_label=label(x,axis=True),y_label=signal_label,signal_label=signal_label,data=raw)
         raw=t.transport_map(dataset,x,y,channel,**kw)
         if view=='slice':
             cut=t.transport_cut(raw,p['cut_type'],p['cut_value'])
-            return dict(base,kind='curve',x=cut['coordinates'],values=cut['values'],x_label=label(cut['axis']),y_label=label(channel),signal_label=label(channel),data=cut)
-        return dict(base,kind='map',x=raw['X2D'],y=raw['Y2D'],z=raw['Z2D'],x_label=label(x),y_label=label(y),signal_label=label(channel),data=raw)
+            return dict(base,kind='curve',x=cut['coordinates'],values=cut['values'],x_label=label(cut['axis'],axis=True),y_label=signal_label,signal_label=signal_label,data=cut)
+        return dict(base,kind='map',x=raw['X2D'],y=raw['Y2D'],z=raw['Z2D'],x_label=label(x,axis=True),y_label=label(y,axis=True),signal_label=signal_label,data=raw)
     spectra=dataset['Intensity']; diagnostics={'background_average':p['background_average']} if mode=='Reflection' else {}
     if mode=='Reflection' and view not in ('ibias','resistance'):
         from .background_roles import inspect_background_roles
@@ -131,7 +181,7 @@ def analyze(dataset,parameters,background_paths=(),cancelled=None):
                 frame=int(indices[np.argmin((xs[valid]-float(p['background_scale_x']))**2+(ys[valid]-float(p['background_scale_y']))**2)])
             else: frame=int(p['background_scale_frame'])
             if frame < 0 or frame >= len(spectra): raise ValueError('Background scale frame is out of range')
-            scale,info=a.estimate_background_scale(spectra[frame],bg,dataset['energy'],p['background_scale_windows'])
+            scale,info=_estimate_reference_scale(p, spectra[frame], bg, dataset['energy'])
             diagnostics.update(background_scale=scale,background_scale_info=info,background_scale_frame=frame)
         diagnostics['background_scale']=float(scale)
         spectra=a.compute_rc_spectra(spectra,bg,scale)
@@ -141,7 +191,7 @@ def analyze(dataset,parameters,background_paths=(),cancelled=None):
         if not len(cut['axis_values']): raise ValueError('No measured points match this slice coordinate.')
         cut=process_spectral_slice(cut,p['derivative'],int(p['derivative_window']),is_rc=mode=='Reflection')
         x,y=np.meshgrid(cut['energy'],cut['axis_values'])
-        return dict(base,kind='slice',x=x,y=y,z=cut['spectra'],x_label='Energy (eV)',y_label=cut['axis_label'],signal_label=cut['signal_label'],diagnostics=diagnostics,data=cut)
+        return dict(base,kind='slice',x=x,y=y,z=cut['spectra'],x_label='Energy (eV)',y_label=a.display_axis_name(cut['axis_label']),signal_label=cut['signal_label'],diagnostics=diagnostics,data=cut)
     lo=float(p['energy_min']); hi=float(p['energy_max']); energy=dataset['energy']
     if view=='intensity':
         baseline=p['baseline']
@@ -163,11 +213,15 @@ def analyze(dataset,parameters,background_paths=(),cancelled=None):
             label='Resistance'
         else: values=current; label='Ibias'
     else: raise ValueError('Unknown analysis view: '+str(view))
+    if view in ('rc_p2p', 'rc_energy', 'rc_peak'):
+        base['title'], base['export_label'] = rc_map_labels(p)
     x,y=dataset['x_data'],dataset['y_data']; xl=dataset['x_name']; yl=dataset['y_name']
     raw=a.build_map_payload(x,y,values)
     if p['transformed']:
         if dataset.get('axis_space') == 'transformed':
             raise ValueError('Input axes are already transformed.')
+        if 'top_gate_axis' in dataset and dataset['top_gate_axis'] is None:
+            raise ValueError('Select two gate-voltage columns to transform the map.')
         tx,ty=a.compute_transformed_coords(x,y,p['ratio'],p['tg_is_y'],p['convention'])
         raw['x_flat']=np.asarray(tx)[raw['idx_flat']]
         raw['y_flat']=np.asarray(ty)[raw['idx_flat']]
@@ -176,7 +230,8 @@ def analyze(dataset,parameters,background_paths=(),cancelled=None):
         else:
             raw['X2D'],raw['Y2D']=raw['x_flat'],raw['y_flat']
         xl='Doping'; yl='Electric field'
-    return dict(base,kind='map',x=raw['X2D'],y=raw['Y2D'],z=raw['Z2D'],x_label=xl,y_label=yl,signal_label=label,diagnostics=dict(diagnostics,grid_kind=raw['grid_kind'],missing_count=raw['missing_count']),data=raw)
+    raw.update(x_name=xl,y_name=yl)
+    return dict(base,kind='map',x=raw['X2D'],y=raw['Y2D'],z=raw['Z2D'],x_label=a.display_axis_name(xl),y_label=a.display_axis_name(yl),signal_label=label,diagnostics=dict(diagnostics,grid_kind=raw['grid_kind'],missing_count=raw['missing_count']),data=raw)
 
 
 _export_lock = __import__('threading').RLock()
@@ -189,13 +244,54 @@ def _json_default(value):
     raise TypeError(f'Cannot encode {type(value).__name__}')
 
 
+def _export_stem(directory, source_path, label):
+    source_stem = Path(source_path).stem
+    # The desktop workflow already groups artifacts in a folder named for the scan.
+    if Path(directory).name.casefold() == source_stem.casefold():
+        return label
+    return f'{source_stem}_{label}'
+
+
+def _save_result_png(fig, ax, path, dpi):
+    """Keep the data rectangle aligned when exported pictures have the same width."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    canvas_width, canvas_height = 4.5, 3.05
+    left, bottom, plot_width, plot_height = 0.69, 0.49, 3.0, 2.25
+
+    def rectangle(x, width):
+        return (x / canvas_width, bottom / canvas_height,
+                width / canvas_width, plot_height / canvas_height)
+
+    fig.set_layout_engine('none')
+    fig.set_size_inches(canvas_width, canvas_height, forward=False)
+    ax.set_position(rectangle(left, plot_width))
+    ax.set_title(ax.get_title(), fontsize=9, pad=4)
+    for item in fig.axes:
+        item.tick_params(axis='both', labelsize=8, pad=2, length=3)
+        for axis in (item.xaxis, item.yaxis):
+            axis.label.set_fontsize(9)
+            axis.labelpad = 3
+            axis.get_offset_text().set_fontsize(8)
+    if len(fig.axes) > 1:
+        colorbar = fig.axes[1]
+        colorbar.set_box_aspect(None)
+        colorbar.set_aspect('auto')
+        colorbar.set_position(rectangle(left + plot_width + 0.05, 0.09))
+    FigureCanvasAgg(fig)
+    fig.savefig(path, dpi=dpi, bbox_inches=fig.bbox_inches, pad_inches=0)
+
+
 def export_result(result,directory,*,parameters=None):
     """Stage and publish CSV, PNG and provenance as a non-overwriting group."""
-    import json, os, shutil, tempfile
+    import filecmp, json, os, re, shutil, tempfile
     import pandas as pd
     from matplotlib.figure import Figure
-    from matplotlib.backends.backend_agg import FigureCanvasAgg
     p=_params(parameters if parameters is not None else result.get('parameters'))
+    # Export can override display settings; record the transform actually used for this result.
+    for key in ('transformed', 'tg_is_y', 'ratio', 'convention', 'auto_scale_windows', 'background_scale_windows'):
+        if key in result.get('parameters', {}):
+            p[key] = result['parameters'][key]
     def limits(auto,lo,hi,label):
         if auto: return None
         lo=float(lo); hi=float(hi)
@@ -207,7 +303,8 @@ def export_result(result,directory,*,parameters=None):
     dpi=int(p['export_dpi'])
     if dpi <= 0 or dpi > 2400: raise ValueError('Export DPI must be between 1 and 2400')
     folder=Path(directory); folder.mkdir(parents=True,exist_ok=True)
-    stem=Path(result['source_path']).stem+'_'+str(result['title']).replace('/','_').replace('\\','_')
+    label = str(result.get('export_label', result['title'])).replace('/', '_').replace('\\', '_')
+    stem = _export_stem(folder, result['source_path'], label)
     with tempfile.TemporaryDirectory(prefix='.megasweep-export-',dir=folder) as temporary:
         stage=Path(temporary); csv=stage/'output.csv'; png=stage/'output.png'; metadata=stage/'output.json'
         if result['kind']=='slice':
@@ -215,23 +312,41 @@ def export_result(result,directory,*,parameters=None):
             fig,ax=a.plot_line_cut_spectrogram(result['data'],title=result['title'],z_label=result['signal_label'],cmap=p['cmap'],vmin=clim[0] if clim else None,vmax=clim[1] if clim else None,ylim=ylim)
         elif result['kind']=='curve':
             pd.DataFrame({result['data'].get('x_name',result['data'].get('axis',result['x_label'])):result['x'],result['data'].get('channel',result['signal_label']):result['values']}).to_csv(csv,index=False)
-            fig=Figure(); ax=fig.add_subplot(111); ax.plot(result['x'],result['values']); ax.set_xlabel(result['x_label']); ax.set_ylabel(result['signal_label'])
+            fig=Figure(); ax=fig.add_subplot(111); ax.plot(result['x'],result['values']); ax.set_xlabel(result['x_label']); ax.set_ylabel(result['y_label'])
         else:
             raw=result['data']
             if 'samples' in raw: raw['samples'].to_csv(csv,index=False)
-            else: pd.DataFrame({result['x_label']:raw['x_flat'],result['y_label']:raw['y_flat'],result['signal_label']:raw['z_flat']}).to_csv(csv,index=False)
+            else: pd.DataFrame({raw.get('x_name',result['x_label']):raw['x_flat'],raw.get('y_name',result['y_label']):raw['y_flat'],result['signal_label']:raw['z_flat']}).to_csv(csv,index=False)
             fig,ax=a.plot_map(result['x'],result['y'],result['z'],x_label=result['x_label'],y_label=result['y_label'],z_label=result['signal_label'],title=result['title'],cmap=p['cmap'],vmin=clim[0] if clim else None,vmax=clim[1] if clim else None)
         if xlim: ax.set_xlim(xlim)
         if ylim: ax.set_ylim(ylim)
-        FigureCanvasAgg(fig); fig.savefig(png,dpi=dpi); fig.clear()
+        ax.xaxis.set_inverted(p['x_reverse'])
+        ax.yaxis.set_inverted(p['y_reverse'])
+        _save_result_png(fig, ax, png, dpi)
+        fig.clear()
         metadata.write_text(json.dumps(dict(source_path=result['source_path'],mode=result['mode'],kind=result['kind'],title=result['title'],background_paths=result.get('background_paths',[]),background_role=result.get('background_role'),background_sources=result.get('background_sources',[]),units=result.get('units',{}),parameters=p,diagnostics=result['diagnostics']),default=_json_default,indent=2,ensure_ascii=False),encoding='utf8')
         with _export_lock:
-            number=1
-            while True:
-                name=stem if number==1 else f'{stem}_{number:03d}'
-                targets=[folder/(name+ext) for ext in ('.csv','.png','.json')]
-                if not any(target.exists() for target in targets): break
-                number+=1
+            version_pattern = re.compile(re.escape(os.path.normcase(stem)) + r'(?:_(\d{3,}))?\.(csv|png|json)')
+            versions = set()
+            for entry in folder.iterdir():
+                match = version_pattern.fullmatch(os.path.normcase(entry.name))
+                if match:
+                    versions.add(int(match[1] or 1))
+
+            def group_paths(version):
+                name = stem if version == 1 else f'{stem}_{version:03d}'
+                return [folder / (name + ext) for ext in ('.csv', '.png', '.json')]
+
+            for version in sorted(versions):
+                targets = group_paths(version)
+                # Check the small recipe first, and reuse only a complete, byte-identical group.
+                pairs = ((metadata, targets[2]), (csv, targets[0]), (png, targets[1]))
+                if all(target.is_file() and filecmp.cmp(source, target, shallow=False) for source, target in pairs):
+                    return [str(target) for target in targets]
+            version = 1
+            while version in versions:
+                version += 1
+            targets = group_paths(version)
             created=[]
             try:
                 for source,target in zip((csv,png,metadata),targets):
@@ -254,7 +369,7 @@ def export_batch(dataset,parameters,background_paths,directory,cancelled=None):
     import json
     import os
     import tempfile
-    p=_params(parameters); paths=[]
+    p=_params(parameters, dataset); paths=[]
     if dataset['mode']=='Reflection':
         from .background_roles import validate_background_role
         validate_background_role(p['background_role'],background_paths)
@@ -271,7 +386,7 @@ def export_batch(dataset,parameters,background_paths,directory,cancelled=None):
             planned.append((dict(q,view='slice',cut_value=value), value))
     if not planned: raise ValueError('No measured slices are available for batch export.')
     out=Path(directory); out.mkdir(parents=True,exist_ok=True)
-    base=Path(dataset['source_path']).stem+'_batch_index'
+    base=_export_stem(out, dataset['source_path'], 'batch_index')
     index=out/(base+'.csv'); suffix=2
     while index.exists():
         index=out/(f'{base}_{suffix}.csv'); suffix+=1
@@ -321,7 +436,7 @@ def export_batch(dataset,parameters,background_paths,directory,cancelled=None):
 
 def export_video(dataset,parameters,background_paths,directory,cancelled=None):
     from .spectral_movie import MovieOptions, export_movie, select_values
-    p=_params(parameters)
+    p=_params(parameters, dataset)
     if dataset['mode']=='Transport': raise ValueError('Spectral movies require PL or Reflection data.')
     values=select_values(slice_values(dataset,p),p.get('movie_first'),p.get('movie_last'),p.get('movie_stride',1))
     options=MovieOptions(**p['movie_options'])
@@ -333,6 +448,8 @@ def export_video(dataset,parameters,background_paths,directory,cancelled=None):
     spectra=np.asarray(dataset['Intensity'])
     if dataset['mode']=='Reflection':
         reference=reflection_preview(dataset,p,background_paths,cancelled)
+        if reference['scale_info']:
+            p['background_scale_windows'] = reference['scale_info']['windows']
         metadata.update(background_role=reference['background_role'],background_sources=reference['background_sources'],background_scale=reference['scale'],background_scale_info=reference['scale_info'],background_scale_frame=reference['frame'])
         spectra=a.compute_rc_spectra(spectra,reference['background'],reference['scale'])
     def make_cut(value):
@@ -350,7 +467,7 @@ def preview_video(dataset,parameters,background_paths=(),cancelled=None,frame_in
     from .spectral_movie import MovieOptions,select_values,resolve_sequence_view,render_frame,timeline
     from .spectral_preview import preview_dimensions
     from dataclasses import replace
-    p=_params(parameters)
+    p=_params(parameters, dataset)
     if dataset['mode']=='Transport': raise ValueError('Spectral movies require PL or Reflection data.')
     values=select_values(slice_values(dataset,p),p.get('movie_first'),p.get('movie_last'),p.get('movie_stride',1))
     options=MovieOptions(**p['movie_options']); options.validate()
@@ -376,7 +493,7 @@ def preview_video(dataset,parameters,background_paths=(),cancelled=None,frame_in
 def reflection_preview(dataset,parameters,background_paths,cancelled=None):
     """Return raw, reference and RC spectra for the nearest measured sweep point."""
     if dataset['mode'] != 'Reflection': raise ValueError('Reflection data required.')
-    p=_params(parameters); _check(cancelled)
+    p=_params(parameters, dataset); _check(cancelled)
     from .background_roles import inspect_background_roles
     provenance=inspect_background_roles(background_paths,p['background_role'])
     bg=load_background(background_paths,dataset['wavelength'],p['background_average'],cancelled,role=p['background_role'])
@@ -391,7 +508,7 @@ def reflection_preview(dataset,parameters,background_paths,cancelled=None):
     if frame < 0 or frame >= len(xs): raise ValueError('Background scale frame is out of range')
     scale=float(p['background_scale']); info={}
     if p['auto_background_scale']:
-        scale,info=a.estimate_background_scale(dataset['Intensity'][frame],bg,dataset['energy'],p['background_scale_windows'])
+        scale,info=_estimate_reference_scale(p, dataset['Intensity'][frame], bg, dataset['energy'])
     raw=dataset['Intensity'][frame]
     return dict(background_role=provenance['role'],background_sources=provenance['sources'],frame=frame,x=float(xs[frame]),y=float(ys[frame]),energy=dataset['energy'],wavelength=dataset['wavelength'],raw=raw,background=bg,scaled_background=bg*scale,rc=a.compute_rc_spectra(raw,bg,scale),scale=scale,scale_info=info)
 
@@ -403,7 +520,7 @@ class MoviePreviewSession:
         from .spectral_movie import MovieOptions,select_values,timeline
         from .spectral_preview import SpectralPreviewSession
         self._lock=threading.RLock(); self._cancelled=cancelled; self._closed=False
-        self._dataset=dataset; self._params=_params(parameters); self._background_paths=tuple(background_paths)
+        self._dataset=dataset; self._params=_params(parameters, dataset); self._background_paths=tuple(background_paths)
         p=self._params
         if dataset['mode']=='Transport': raise ValueError('Spectral movies require PL or Reflection data.')
         self._values=select_values(slice_values(dataset,p),p.get('movie_first'),p.get('movie_last'),p.get('movie_stride',1))

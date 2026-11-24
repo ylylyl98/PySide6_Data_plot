@@ -17,8 +17,8 @@ from copy import deepcopy
 from time import monotonic
 import unittest
 
-from PySide6.QtCore import QMetaObject, QObject, QPoint, Property, QUrl, Qt, Signal, Slot
-from PySide6.QtGui import QFont, QFontDatabase
+from PySide6.QtCore import QMetaObject, QMimeData, QObject, QPoint, Property, QUrl, Qt, Signal, Slot
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont, QFontDatabase
 from PySide6.QtQml import QQmlApplicationEngine, QQmlComponent, qmlRegisterType
 from PySide6.QtQuick import QQuickItem, QQuickWindow
 from PySide6.QtTest import QTest
@@ -143,6 +143,11 @@ class _Bridge(QObject):
     def openFile(self, value):
         self.calls.append(("file", value.toString()))
 
+    @Slot("QVariantList", result=bool)
+    def dropSources(self, urls):
+        self.calls.append(("drop", list(urls)))
+        return True
+
     @Slot(str, result=QUrl)
     def localFileUrl(self, value):
         return QUrl.fromLocalFile(value)
@@ -237,6 +242,23 @@ class QuickApplicationShellTests(unittest.TestCase):
         point = item.mapToScene(item.boundingRect().center()).toPoint()
         QTest.mouseClick(self.window, Qt.LeftButton, Qt.NoModifier, point)
         QTest.qWait(20)
+
+    def test_file_drops_reach_bridge_from_plot_and_source_field(self):
+        url = QUrl.fromLocalFile(str(Path(self.temporary.name) / "measurement.dat"))
+        mime = QMimeData()
+        mime.setUrls([url])
+        for name in ("app_plot_surface", "app_source_path"):
+            with self.subTest(target=name):
+                item = self.item(name)
+                position = item.mapToScene(item.boundingRect().center())
+                self.bridge.calls.clear()
+                enter = QDragEnterEvent(position.toPoint(), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
+                self.app.sendEvent(self.window, enter)
+                self.assertTrue(enter.isAccepted())
+                drop = QDropEvent(position, Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
+                self.app.sendEvent(self.window, drop)
+                self.assertTrue(drop.isAccepted())
+                self.assertEqual(self.bridge.calls, [("drop", [url])])
 
     def type_text(self, text):
         for character in text:

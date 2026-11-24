@@ -93,6 +93,9 @@ def child(directory):
             assert not child_bridge.snapshot['backgroundSelectionError']
             chooser.selectFile(str(files['custom']),False); app.processEvents()
             settled()
+            assert child_bridge.snapshot['reflectionPreviewVisible']
+            assert not find('megasweep_background_dialog').property('visible')
+            click('megasweep_background')
             for next_role in ('n','bn'):
                 click('megasweep_background_role'); QTest.keyClick(window,Qt.Key_Down); QTest.keyClick(window,Qt.Key_Return)
                 wait(lambda:child_bridge.snapshot['backgroundRole']==next_role,next_role+' role')
