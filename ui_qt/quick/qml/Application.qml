@@ -416,6 +416,12 @@ Controls.ApplicationWindow {
         }
     }
 
+    component SourceDropArea: DropArea {
+        anchors.fill: parent
+        onEntered: function(drag) { drag.accepted = drag.hasUrls }
+        onDropped: function(drop) { drop.accepted = window.appBridge.dropSources(drop.urls) }
+    }
+
     header: Basic.ToolBar {
         id: sourceToolbar
         objectName: "app_source_toolbar"
@@ -437,11 +443,7 @@ Controls.ApplicationWindow {
                 Accessible.name: "Data source path"
                 Accessible.description: "Enter a data folder or use Folder and File to browse."
                 onAccepted: window.appBridge.setSourcePath(text)
-                DropArea {
-                    anchors.fill: parent
-                    onEntered: function(drag) { drag.accepted = drag.hasUrls }
-                    onDropped: function(drop) { drop.accepted = window.appBridge.dropSources(drop.urls) }
-                }
+                SourceDropArea {}
             }
             AppButton { objectName: "app_browse_folder"; colors: window.colors; text: "Folder…"; description: "Choose a data folder (Ctrl+Shift+O)"; onClicked: window.chooseFolder("source-folder") }
             AppButton { objectName: "app_open_file"; colors: window.colors; text: "File…"; description: "Open a measurement file (Ctrl+O)"; enabled: openFileAction.enabled; onClicked: openFileAction.trigger() }
@@ -491,6 +493,8 @@ Controls.ApplicationWindow {
             }
         }
     }
+
+    SourceDropArea {}
 
     RowLayout {
         anchors.fill: parent
