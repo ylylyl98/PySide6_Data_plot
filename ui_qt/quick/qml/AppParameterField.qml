@@ -26,6 +26,7 @@ ColumnLayout {
     Loader {
         Layout.fillWidth: true
         Layout.minimumWidth: 0
+        Layout.maximumWidth: field.descriptor.inputWidth ?? Number.POSITIVE_INFINITY
         active: field.descriptor.type !== undefined
         sourceComponent: field.descriptor.type === "number" ? numberEditor
                        : field.descriptor.type === "choice" ? choiceEditor
@@ -45,6 +46,14 @@ ColumnLayout {
                 objectName: "app_parameter_" + field.descriptor.key
                 implicitHeight: Math.max(30, (contentItem ? contentItem.implicitHeight : 0) + 10)
                 enabled: field.descriptor.enabled !== false && field.descriptor.readOnly !== true
+                contentItem: Text {
+                    text: choice.displayText
+                    font: choice.font
+                    leftPadding: 10
+                    color: choice.palette.buttonText
+                    verticalAlignment: Text.AlignVCenter
+                    elide: Text.ElideRight
+                }
                 model: JSON.parse(optionsSignature).map(function(option) {
                     return typeof option === "object" ? option.label : String(option)
                 })

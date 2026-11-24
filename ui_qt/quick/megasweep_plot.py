@@ -1,5 +1,12 @@
 """Agg-only plot presentation for Megasweep Quick."""
 class MegasweepPlotMixin:
+    def _map_color_limits(self):
+        values = self._state['values']
+        if values['color_auto']:
+            from core.megasweep.megasweep_analysis import resolve_color_limits
+            return resolve_color_limits(self._result['z'], spectral_slice=self._result['kind'] == 'slice')
+        return values['vmin'], values['vmax']
+
     def _render(self):
         if self._closed or not self._current(): return
         try:
@@ -16,24 +23,37 @@ class MegasweepPlotMixin:
             ax = fig.add_subplot(111)
             result = self._result
             values = self._state['values']
-            colors = dict(cmap=values['cmap'])
-            if not values['color_auto']: colors.update(vmin=values['vmin'], vmax=values['vmax'])
             if result.get('kind') in ('curve', 'line'):
                 ax.plot(result['x'], result.get('values', result.get('y')))
             else:
                 import numpy as np
-                if np.asarray(result['z']).ndim == 1:
-                    image = ax.scatter(result['x'], result['y'], c=result['z'], **colors)
+                z = np.asarray(result['z'])
+                low, high = self._map_color_limits()
+                colors = dict(cmap=values['cmap'], vmin=low, vmax=high)
+                if z.ndim == 1:
+                    image = ax.scatter(result['x'], result['y'], c=z, **colors)
                 else:
-                    image = ax.pcolormesh(result['x'], result['y'], result['z'], shading='auto', **colors)
+                    image = ax.pcolormesh(result['x'], result['y'], z, shading='auto', **colors)
                 fig.colorbar(image, ax=ax, label=result.get('signal_label', ''))
             ax.set(xlabel=result.get('x_label', ''), ylabel=result.get('y_label', ''), title=result.get('title', ''))
             if not values['x_auto']: ax.set_xlim(values['xmin'], values['xmax'])
             if not values['y_auto']: ax.set_ylim(values['ymin'], values['ymax'])
+            ax.xaxis.set_inverted(values['x_reverse'])
+            ax.yaxis.set_inverted(values['y_reverse'])
             self._style_axes(fig)
             self._canvas.draw_idle()
+            ax.callbacks.connect('xlim_changed', self._notify_map_axis_limits)
+            ax.callbacks.connect('ylim_changed', self._notify_map_axis_limits)
+            self.plotLimitsChanged.emit()
         except Exception as exc:
             self._message('Plot: ' + str(exc), error=True)
+
+    def _notify_map_axis_limits(self, axis):
+        if self._closed or self._reflection_visible or not self._current() or self._canvas is None:
+            return
+        axes = self._canvas.figure.axes
+        if axes and axes[0] is axis:
+            self.plotLimitsChanged.emit()
 
     def plotAction(self, action):
         if action in ('home', 'back', 'forward', 'pan', 'zoom') and self._navigation:
@@ -56,13 +76,66 @@ class MegasweepPlotMixin:
             data = self._reflection_preview; x = data['energy']
             top.plot(x, data['raw'], label='Measured')
             top.plot(x, data['background'], label='Reference')
-            top.plot(x, data['scaled_background'], label='Scaled reference')
+            if data.get('scale', 1.) != 1.:
+                top.plot(x, data['scaled_background'], label=f"Scaled reference (×{data['scale']:.5g})")
             top.legend(); top.set_ylabel('Intensity')
             bottom.plot(x, data['rc']); bottom.set(xlabel='Energy (eV)', ylabel='Reflection contrast')
-            fig.suptitle('Reference preview · frame ' + str(data['frame']))
+            title = 'Sample spectrum'
+            if 'dataset' in data:
+                from core.megasweep.megasweep_analysis import display_axis_name
+                from core.megasweep.workflow import rc_map_labels
+                if data['parameters']['view'] in ('rc_p2p', 'rc_energy', 'rc_peak'):
+                    metric, _ = rc_map_labels(data['parameters'])
+                    title = f'{metric} · {title}'
+                scan = data['dataset']
+                x_name, y_name = (display_axis_name(scan[f'{axis}_name']) for axis in ('x', 'y'))
+                title += f" · {x_name} = {data['x']:g}, {y_name} = {data['y']:g}"
+                self._mark_rc_measurement(bottom, data)
+            fig.suptitle(title)
             self._style_axes(fig)
             self._canvas.draw_idle()
         except Exception as exc: self._message('Preview: ' + str(exc), error=True)
+
+    @staticmethod
+    def _mark_rc_measurement(ax, preview):
+        import numpy as np
+        from core.megasweep.megasweep_analysis import compute_rc_at_energy_map, compute_rc_peak_position
+        params = preview['parameters']
+        view = params['view']
+        energy = preview['energy']
+        rc = preview['rc']
+        if view == 'rc_energy':
+            target = params['energy_target']
+            ax.axvline(target, linestyle='--', color='gray')
+            if energy.min() <= target <= energy.max() and np.isfinite(energy).sum() >= 2:
+                value = compute_rc_at_energy_map(rc[None, :], energy, target)[0]
+                ax.plot(target, value, 'o', label=f'{target:.5g} eV · RC {value:.5g}')
+                ax.legend()
+            else:
+                ax.set_title('Target energy outside usable spectrum')
+            return
+        if view not in ('rc_p2p', 'rc_peak'):
+            return
+        lo, hi = sorted((params['energy_min'], params['energy_max']))
+        ax.axvspan(lo, hi, alpha=0.10)
+        indices = np.flatnonzero((energy >= lo) & (energy <= hi) & np.isfinite(rc))
+        if not len(indices):
+            ax.set_title('No valid RC in the selected window')
+        elif view == 'rc_p2p':
+            low = indices[np.argmin(rc[indices])]
+            high = indices[np.argmax(rc[indices])]
+            ax.plot(energy[low], rc[low], 'v', label='Minimum')
+            ax.plot(energy[high], rc[high], '^', label='Maximum')
+            ax.set_title(f'Peak-to-peak RC = {rc[high] - rc[low]:.5g}')
+            ax.legend()
+        else:
+            position, value = compute_rc_peak_position(energy, rc, lo, hi, params['sg_window'],
+                                                       params['sg_poly'], params['rc_feature'])
+            if np.isfinite(position):
+                ax.plot(position, value, 'o', label=f'Feature at {position:.5g} eV')
+                ax.legend()
+            else:
+                ax.set_title('No feature found in the selected window')
 
     def _style_axes(self, figure):
         text = self._palette.get('text', '#172b4d'); background = self._palette.get('inset', '#ffffff')

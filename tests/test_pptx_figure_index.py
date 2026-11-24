@@ -19,6 +19,30 @@ def png(text=None):
 
 
 class FigureIndexTests(unittest.TestCase):
+    def test_megasweep_requires_complete_png_csv_json_trio(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            directory = root / 'Processed Data' / 'Megasweep' / 'scan'
+            directory.mkdir(parents=True)
+            picture = directory / 'rc_p2p_1-2eV.png'
+            picture.write_bytes(png())
+            data = picture.with_suffix('.csv')
+            data.write_text('Vbg,Vtg,RC\n1,2,0.5\n')
+            metadata = picture.with_suffix('.json')
+            recipe = dict(mode='Reflection', kind='map', source_path=str(root / 'scan.csv'),
+                          parameters={'view': 'rc_p2p', 'energy_min': 1, 'energy_max': 2})
+            metadata.write_text(json.dumps(recipe))
+
+            index = FigureIndex(root)
+            record, = index.lookup_image(png('different PNG metadata'))
+            self.assertEqual((record.workflow, record.role, record.data_path), ('megasweep', 'map', data.resolve()))
+            self.assertEqual(record.snapshot, recipe)
+            self.assertEqual(index.find_png(picture, metadata_path=metadata), [record])
+            self.assertEqual(index.scan(), [record])
+            data.unlink()
+            self.assertEqual(index.find_png(picture), [])
+            self.assertEqual(index.lookup_image(png()), [])
+
     def test_known_export_sidecar_skips_history_but_validates_content(self):
         from unittest.mock import patch
         with TemporaryDirectory() as tmp:

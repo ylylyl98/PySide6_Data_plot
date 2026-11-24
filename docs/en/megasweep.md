@@ -57,10 +57,22 @@ the available columns are ambiguous.
   second derivative on the measured energy grid. Batch export supports one or
   both fixed-axis series.
 
-The initial optical energy window follows the original Megasweep application.
-Set it to a range present in your measurement before calculating. An out-of-range
-window is an error, not a request to extrapolate data. Automatic background scaling
-likewise requires measured channels in its configured reference windows.
+Reflection peak-to-peak and peak-position maps start with **Auto Energy Window**
+enabled and use the full measured energy range. Editing either bound saves a
+manual window for that scan. Enable Auto Energy Window to restore the full range.
+PL retains its original initial window. Automatic background scaling uses separate
+reference windows that must contain usable measured channels.
+
+### Reflection workflow
+
+1. Use **Open scan…** below the mode tabs in the left sidebar. Check the resolved X and Y columns, then use **Background** to select a reference with matching wavelength channels.
+2. In **Analysis map**, select **Map quantity** to switch between peak-to-peak RC, RC at one energy, peak position or an available electrical signal. The automatic target for fixed-energy RC is the measured channel nearest the midpoint of the energy range. Edit it to use a specific energy. **Plot limits** above the plot groups the X, Y and color bounds. Type a bound and press Enter or leave the field to update that range. Each axis direction button immediately reverses that axis. Automatic map colors use the 2nd and 98th percentiles for at least 50 finite values and otherwise use the extrema, including when the percentiles coincide. Choose **RdBu_r** (default) or **RdBu** in the Color group. Turning on **Color → Auto** updates the color scale immediately.
+3. In **Reference spectra**, type an X or Y coordinate and press Enter or leave the field. The preview selects the nearest measured value on that axis, then the closest available value on the other axis. Both fields show the selected scan point. Use Repeat for duplicate measurements. The RC plot marks the selected measurement. Selecting a matching background opens this preview automatically. New scans use the measured background at scale 1. Under **Background → Normalization**, turn on **Auto Background Scale** to estimate one multiplier for the entire scan. **Auto-select scale windows** selects stable intervals of the calibration spectrum/background ratio from the current file and displays their energy bounds. Review them for broad features. Turn off automatic window selection to edit the intervals under **Advanced reference settings**. Reopening a scan restores its saved settings.
+4. In **Spectral cut**, choose the direction and fixed coordinate. To follow X, hold Y constant. To follow doping, hold E-field constant and choose the gate formula. The cut includes measured points within the coordinate tolerance. Previous and Next step through available cuts.
+
+**Gate coordinates** assigns TG and BG from the selected column names. If both names are ambiguous, enabling a gate transform reveals **Top gate (TG)**. Select one paired definition under **Doping (D) and E-field (E)**: either D = TG + r × BG and E = TG − r × BG, or D = r × TG + BG and E = r × TG − BG. Both equations use the same lever-arm ratio r. The same choice applies to maps and spectral cuts.
+
+Inside the per-scan folder, filenames use the analysis quantity, and its energy setting, for example `rc_at_1.65eV.csv` or `rc_p2p_1.6-1.7eV.png`. Map titles show the same setting. Peak-position exports also identify the peak, dip or automatic feature selection. Identical CSV, PNG and JSON exports reuse the existing files. Changed results add a suffix such as `_002`. The matching JSON records the full source path.
 
 ## Reflection backgrounds
 
@@ -97,12 +109,17 @@ implicitly applied to Megasweep measurements by sharing the browser.
 
 ## Exports and movies
 
+Use **Save CSV + PNG** in the upper right or press **Ctrl+Shift+S** to export the current result.
+Megasweep exports a 432-pixel-wide PNG at 96 DPI by default. Drag it onto a blank widescreen DeckCraft slide for a 4.5-inch picture with a 3 × 2.25 inch plotting area. The colorbar sits 0.05 inches from the right edge of the plot. When editing an existing slide picture, DeckCraft keeps its current size.
+
 New analyses write below `Processed Data/Megasweep/<source-stem>/` in the source's
 bound experiment folder. Imported custom output directories remain part of their
 analysis recipe. Review the actual output paths reported after exporting.
 PNG uses the selected display limits and color scale; CSV retains the numerical
 data. A JSON sidecar records processing and source/background provenance.
-Existing exports are preserved using versioned destinations.
+Saving the same CSV, PNG and JSON reuses the existing files. A changed export gets a new version.
+
+In a connected DeckCraft presentation, double-click a Megasweep picture to reopen the original scan with its saved background and analysis settings. After editing, use the upper-right save action to publish the revised figure and replace the selected picture. Press **Ctrl+S** in DeckCraft to save the presentation. Keep the PNG, CSV and JSON together in the experiment's Megasweep export folder, with the original measurement files available.
 
 For optical slices, **Export video…** opens coordinate-range, stride, playback,
 frame-rate, size, color and axis controls. Preview, play/pause and the timeline

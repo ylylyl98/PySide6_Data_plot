@@ -502,7 +502,8 @@ class PowerPointService(QObject):
                     if gen != generation or bind_root != root or self._closed: continue
                     try:
                         matches = future.result()
-                        if len(matches) != 1: raise ValueError('The selected PNG is not in the current experiment or has no unique metadata')
+                        if len(matches) != 1:
+                            raise ValueError('Choose an exported PL, DRR, or Megasweep PNG with its DAT or CSV and unique JSON metadata in the current experiment.')
                         record = matches[0]
                         self._bind_target(bindings, target, record)
                         expected[:] = [(t, h) for t, h in expected if t != target]

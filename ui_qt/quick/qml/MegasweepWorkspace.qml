@@ -4,6 +4,7 @@ import QtQuick.Controls.Basic as Basic
 import QtQuick.Layouts
 import QtQuick.Window
 import Dptk 1.0
+import "NumericFormat.js" as NumericFormat
 
 Rectangle {
     id: page
@@ -11,14 +12,6 @@ Rectangle {
     required property var bridge
     required property var colors
     readonly property var state: bridge ? bridge.snapshot : ({})
-    readonly property var roleOptions: state.backgroundRoleOptions || [{value:"custom",label:"Custom"},{value:"p",label:"P"},{value:"n",label:"N"},{value:"bn",label:"BN"}]
-    readonly property string currentRole: state.backgroundRole || "custom"
-    readonly property var roleGroups: state.backgroundGroups || ({})
-    function roleLabel(role) { for (let option of roleOptions) if (option.value === role) return option.label; return role }
-    function roleCount(role) { return (roleGroups[role] || []).length }
-    property bool backgroundOpen: false
-    property string lastMode: state.mode || ""
-    onStateChanged: { if ((state.mode || "") !== lastMode) { backgroundOpen = false; lastMode = state.mode || "" } }
     color: colors.inset
     Accessible.role: Accessible.Pane
     Accessible.name: "Megasweep plot and background references"
@@ -26,40 +19,10 @@ Rectangle {
     Component.onCompleted: if (bridge) bridge.setPalette(colors)
 
     MegasweepMovieDialog { id: movieDialog; parent: page.Window.window ? page.Window.window.contentItem : page; bridge: page.bridge; colors: page.colors }
-    Basic.Dialog {
-        id: backgroundDialog
-        objectName: "megasweep_background_dialog"
-        parent: page.Window.window ? page.Window.window.contentItem : page
-        anchors.centerIn: parent
-        width: Math.min(1000, parent.width - 24)
-        height: Math.min(640, parent.height - 24)
-        title: "Background references"
-        modal: true
-        visible: page.backgroundOpen && page.state.mode === "Reflection"
-        onClosed: page.backgroundOpen = false
-        background: Rectangle { color: page.colors.surface; border.color: page.colors.border; radius: 6 }
-        contentItem: ColumnLayout {
-            spacing: 7
-            RowLayout {
-                Layout.fillWidth: true
-                Basic.Label { text: "Reference role"; color: page.colors.text }
-                AppComboBox {
-                    id: roleSelector
-                    objectName: "megasweep_background_role"
-                    Layout.fillWidth: true
-                    colors: page.colors
-                    enabled: !page.state.busy
-                    model: page.roleOptions.map(option => option.label + " · " + page.roleCount(option.value))
-                    currentIndex: Math.max(0, page.roleOptions.findIndex(option => option.value === page.currentRole))
-                    Accessible.name: "Reference role and number of selected files"
-                    onActivated: index => page.bridge.setParameter("background_role", page.roleOptions[index].value)
-                }
-            }
-            Basic.Label { objectName: "megasweep_background_role_help"; Layout.fillWidth: true; text: "The selected role is used for all scan points. Assign unknown filenames to a role manually and verify their spectra."; color: page.colors.muted; wrapMode: Text.Wrap }
-            Basic.Label { objectName: "megasweep_background_status"; Layout.fillWidth: true; text: page.state.backgroundSelectionError || page.state.error || page.state.status || ""; color: (page.state.backgroundSelectionError || page.state.error) ? page.colors.error : page.colors.muted; visible: text.length > 0; wrapMode: Text.Wrap }
-            BackgroundFileBrowser { objectName: "megasweep_background_browser"; Layout.fillWidth: true; Layout.fillHeight: true; bridge: page.bridge ? page.bridge.backgroundSelectionBridge : null; colors: page.colors; chosenTitle: page.roleLabel(page.currentRole) + " backgrounds" }
-            AppButton { objectName: "megasweep_background_close"; Layout.alignment: Qt.AlignRight; colors: page.colors; text: "Close"; onClicked: backgroundDialog.close() }
-        }
+    component ToolbarButton: AppButton {
+        colors: page.colors
+        compact: true
+        implicitHeight: 26
     }
 
     ColumnLayout {
@@ -67,19 +30,94 @@ Rectangle {
         spacing: 0
         Flow {
             Layout.fillWidth: true
-            Layout.margins: 7
-            spacing: 4
-            AppButton { objectName: "megasweep_select_files"; colors: page.colors; text: "Open file…"; enabled: !page.state.busy; onClicked: page.bridge.invoke("select-files") }
-            AppButton { objectName: "megasweep_update"; colors: page.colors; text: "Update"; enabled: !page.state.busy && !!page.state.sourceFile; onClicked: page.bridge.invoke("update") }
-            AppButton { objectName: "megasweep_background"; colors: page.colors; text: "Background: " + page.roleLabel(page.currentRole) + " (" + page.roleCount(page.currentRole) + ")"; visible: page.state.mode === "Reflection"; checkable: true; checked: page.backgroundOpen; onClicked: { page.backgroundOpen = !page.backgroundOpen; if (page.backgroundOpen) page.bridge.invoke("choose-background") } }
-            AppButton { objectName: "megasweep_return_to_map"; colors: page.colors; text: "Return to map"; visible: page.state.mode === "Reflection" && page.state.reflectionPreviewVisible === true; enabled: !page.state.busy; onClicked: page.bridge.invoke("return-to-map") }
-            AppButton { objectName: "megasweep_reflection_preview"; colors: page.colors; text: "Preview reference spectra"; visible: page.state.mode === "Reflection" && page.state.reflectionPreviewVisible !== true; enabled: !page.state.busy && !!page.state.sourceFile; onClicked: page.bridge.invoke("reflection-preview") }
-            AppButton { objectName: "megasweep_slice_previous"; colors: page.colors; text: "Previous slice"; visible: page.state.values && page.state.values.view === "slice"; enabled: !page.state.busy && !!page.state.sourceFile; onClicked: page.bridge.invoke("slice-previous") }
-            AppButton { objectName: "megasweep_slice_next"; colors: page.colors; text: "Next slice"; visible: page.state.values && page.state.values.view === "slice"; enabled: !page.state.busy && !!page.state.sourceFile; onClicked: page.bridge.invoke("slice-next") }
-            AppButton { objectName: "megasweep_export"; colors: page.colors; text: "Export CSV / PNG…"; enabled: !page.state.busy && page.state.canExport; onClicked: page.bridge.invoke("export") }
-            AppButton { objectName: "megasweep_export_batch"; colors: page.colors; text: "Batch export…"; enabled: !page.state.busy && !!page.state.sourceFile; onClicked: page.bridge.invoke("export-batch") }
-            AppButton { objectName: "megasweep_export_video"; colors: page.colors; text: "Export video…"; visible: page.state.mode !== "Transport"; enabled: !page.state.busy && !!page.state.sourceFile; onClicked: movieDialog.open() }
-            AppButton { objectName: "megasweep_cancel"; colors: page.colors; text: "Cancel"; visible: page.state.busy; onClicked: page.bridge.invoke("cancel") }
+            Layout.margins: 4
+            spacing: 3
+            ToolbarButton { text: "Leave figure edit"; visible: page.state.savedFigureActive === true; onClicked: page.bridge.invoke("close-slide-figure") }
+            ToolbarButton { objectName: "megasweep_return_to_map"; text: "Analysis map"; visible: page.state.mode === "Reflection"; checked: !page.state.reflectionPreviewVisible && page.state.values?.view !== "slice"; enabled: !page.state.busy && !!page.state.sourceFile; onClicked: if (!checked) page.bridge.invoke("return-to-map") }
+            ToolbarButton { objectName: "megasweep_reflection_preview"; text: "Reference spectra"; visible: page.state.mode === "Reflection"; checked: page.state.reflectionPreviewVisible === true; enabled: !page.state.busy && !!page.state.sourceFile; onClicked: if (!page.state.reflectionPreviewVisible) page.bridge.invoke("reflection-preview") }
+            ToolbarButton { objectName: "megasweep_spectral_cut"; text: "Spectral cut"; visible: page.state.mode === "Reflection"; checked: !page.state.reflectionPreviewVisible && page.state.values?.view === "slice"; enabled: !page.state.busy && !!page.state.sourceFile; onClicked: if (!checked) page.bridge.invoke("show-spectral-cut") }
+            ToolbarButton { objectName: "megasweep_slice_previous"; text: "‹ Slice"; description: "Previous slice"; visible: page.state.values && page.state.values.view === "slice" && !page.state.reflectionPreviewVisible; enabled: !page.state.busy && !!page.state.sourceFile; onClicked: page.bridge.invoke("slice-previous") }
+            ToolbarButton { objectName: "megasweep_slice_next"; text: "Slice ›"; description: "Next slice"; visible: page.state.values && page.state.values.view === "slice" && !page.state.reflectionPreviewVisible; enabled: !page.state.busy && !!page.state.sourceFile; onClicked: page.bridge.invoke("slice-next") }
+            ToolbarButton { objectName: "megasweep_export_batch"; text: "Batch export"; enabled: !page.state.busy && !!page.state.sourceFile; onClicked: page.bridge.invoke("export-batch") }
+            ToolbarButton { objectName: "megasweep_export_video"; text: "Export video…"; visible: page.state.mode !== "Transport"; enabled: !page.state.busy && !!page.state.sourceFile; onClicked: movieDialog.open() }
+            ToolbarButton { objectName: "megasweep_cancel"; text: "Cancel"; visible: page.state.busy; onClicked: page.bridge.invoke("cancel") }
+            RowLayout {
+                spacing: 3
+                visible: page.state.mode === "Reflection" && (page.state.values?.view !== "slice" || page.state.reflectionPreviewVisible === true)
+                Basic.Label { text: "Map quantity"; color: page.colors.text }
+                AppComboBox {
+                    id: quantity
+                    objectName: "megasweep_map_quantity"
+                    Layout.preferredWidth: 174
+                    implicitHeight: 26
+                    colors: page.colors
+                    readonly property var options: (page.state.parameterGroups || []).find(g => g.key === "data")?.fields.find(f => f.key === "view")?.options.filter(o => o.value !== "slice") || []
+                    model: options.map(o => o.label)
+                    readonly property string metric: page.state.values?.view === "slice" ? (page.state.values.last_map_view || "rc_p2p") : (page.state.values?.view || "")
+                    currentIndex: options.findIndex(o => o.value === metric)
+                    enabled: !page.state.busy
+                    Accessible.name: "Map quantity"
+                    onActivated: index => page.bridge.setParameter("view", options[index].value)
+                }
+            }
+        }
+        MegasweepMapLimits {
+            Layout.fillWidth: true
+            Layout.leftMargin: 8
+            Layout.rightMargin: 8
+            bridge: page.bridge
+            colors: page.colors
+            active: !!page.state.inspectionVisible && !page.state.reflectionPreviewVisible && !page.state.error
+            enabled: !page.state.busy
+        }
+        Flow {
+            id: referencePicker
+            readonly property var point: page.state.referencePoint || ({})
+            visible: page.state.reflectionPreviewVisible === true
+            Layout.fillWidth: true
+            Layout.leftMargin: 8
+            spacing: 6
+            Repeater {
+                model: ["x", "y"]
+                delegate: RowLayout {
+                    id: coordinate
+                    required property string modelData
+                    readonly property string axis: modelData
+                    Basic.Label { text: coordinate.axis.toUpperCase() + " · " + (referencePicker.point[coordinate.axis + "Name"] || ""); color: page.colors.text }
+                    Basic.TextField {
+                        objectName: "megasweep_reference_" + coordinate.axis
+                        Layout.preferredWidth: 95
+                        selectByMouse: true
+                        inputMethodHints: Qt.ImhFormattedNumbersOnly
+                        Accessible.name: "Sample " + coordinate.axis.toUpperCase() + " " + (referencePicker.point[coordinate.axis + "Name"] || "")
+                        Accessible.description: "Enter a coordinate to preview the nearest measured value."
+                        readonly property string measured: NumericFormat.exact(referencePicker.point[coordinate.axis])
+                        property bool edited: false
+                        onMeasuredChanged: if (!edited) text = measured
+                        Component.onCompleted: text = measured
+                        onTextEdited: edited = true
+                        onEditingFinished: {
+                            if (!edited) return
+                            let value = NumericFormat.parse(text)
+                            edited = false
+                            if (value !== undefined && referencePicker.visible)
+                                page.bridge.setReferenceCoordinate(coordinate.axis, value)
+                            text = measured
+                        }
+                        Keys.onEscapePressed: { edited = false; text = measured }
+                    }
+                }
+            }
+            RowLayout {
+                visible: (referencePicker.point.repeats || 0) > 1
+                Basic.Label { text: "Repeat"; color: page.colors.text }
+                Basic.SpinBox {
+                    from: 1
+                    to: Math.max(1, referencePicker.point.repeats || 0)
+                    value: referencePicker.point.repeat || 1
+                    onValueModified: page.bridge.setReferencePoint(referencePicker.point.x, referencePicker.point.y, value)
+                }
+            }
         }
         Basic.SplitView {
             Layout.fillWidth: true
@@ -109,7 +147,7 @@ Rectangle {
             spacing: 3
             Text { objectName: "megasweep_source"; Layout.fillWidth: true; text: page.state.sourceFile || page.state.sourcePath || ""; color: page.colors.text; elide: Text.ElideMiddle; font.pixelSize: 12 }
             Text { objectName: "megasweep_summary"; Layout.fillWidth: true; text: page.state.summary || ""; visible: text.length > 0; color: page.colors.text; wrapMode: Text.Wrap; font.pixelSize: 12 }
-            Text { objectName: "megasweep_preview_notice"; Layout.fillWidth: true; visible: page.state.reflectionPreviewVisible === true; text: "Reference spectra preview. Return to the map to export the analysis."; color: page.colors.muted; wrapMode: Text.Wrap; font.pixelSize: 11 }
+            Text { objectName: "megasweep_preview_notice"; Layout.fillWidth: true; visible: page.state.reflectionPreviewVisible === true; text: "Reference spectra preview. Select Analysis map to export the analysis."; color: page.colors.muted; wrapMode: Text.Wrap; font.pixelSize: 11 }
             Text { objectName: "megasweep_status"; Layout.fillWidth: true; text: page.state.error || page.state.status || ""; color: page.state.error ? page.colors.error : page.colors.muted; wrapMode: Text.Wrap; font.pixelSize: 11; Accessible.name: text }
             Basic.ProgressBar { Layout.fillWidth: true; visible: page.state.busy === true; indeterminate: true }
         }

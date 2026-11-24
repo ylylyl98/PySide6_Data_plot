@@ -74,11 +74,23 @@ def resolve_dataset_output_dir(base_dir: str, csv_path: str) -> str:
     return os.path.join(resolved_base, folder_name)
 
 
-def _resolve_color_limits(values, vmin=None, vmax=None):
-    """Return stable color limits and whether the data are effectively flat."""
-    data_min, data_max = _finite_min_max(values, label='map data')
-    v0 = data_min if vmin is None else float(vmin)
-    v1 = data_max if vmax is None else float(vmax)
+def resolve_color_limits(values, vmin=None, vmax=None, *, spectral_slice=False):
+    """Return the color limits used by both the live view and exported plots."""
+    if vmin is None or vmax is None:
+        array = np.asarray(values, dtype=float)
+        finite = array[np.isfinite(array)]
+        low, high = (float(finite.min()), float(finite.max())) if finite.size else (0.0, 1.0)
+        lower, upper = low, high
+        if spectral_slice and high > low:
+            lower, upper = np.percentile(finite, (0.5, 99.5))
+        elif finite.size >= 50 and high > low:
+            # At 50 samples each tail can exclude at least one whole cell.
+            lower, upper = np.percentile(finite, (2, 98), method='nearest')
+        if low <= lower < upper <= high:
+            low, high = lower, upper
+        vmin = low if vmin is None else vmin
+        vmax = high if vmax is None else vmax
+    v0, v1 = float(vmin), float(vmax)
 
     if not np.isfinite(v0) or not np.isfinite(v1):
         raise ValueError("Color limits must be finite numbers.")
@@ -87,13 +99,12 @@ def _resolve_color_limits(values, vmin=None, vmax=None):
         v0, v1 = v1, v0
 
     # Absolute tolerances (e.g. np.isclose's 1e-8) erase nano/picoamp ranges.
-    is_flat = v0 == v1
-    if is_flat:
+    if v0 == v1:
         pad = max(abs(v0) * 1e-6, 1e-9)
         v0 -= pad
         v1 += pad
 
-    return v0, v1, is_flat
+    return v0, v1
 
 
 def _is_rectilinear_grid(X2D, Y2D):
@@ -166,6 +177,12 @@ def spectral_axes_match(left, right, atol=1e-3):
 def normalize_axis_name(name):
     """Normalize a column name for axis-role matching."""
     return ''.join(ch for ch in str(name).lower() if ch.isalnum())
+
+
+def display_axis_name(name):
+    """Remove the acquisition setpoint suffix from a displayed coordinate name."""
+    return re.sub(r'(?<=\S)(?:_axis_[ab])?_set(?=\s*(?:\([^()]+\))?\s*$)',
+                  '', str(name), flags=re.IGNORECASE)
 
 
 def find_ibias_column(columns) -> str | None:
@@ -541,6 +558,8 @@ def load_megasweep_csv(csv_path, x_col=None, y_col=None):
         'x_name': x_col,
         'y_name': y_col,
         'axis_space': _infer_axis_space(x_col, y_col),
+        'axis_columns': [col for col in metadata_cols if parse_spectral_column_name(col) is None
+                         and pd.api.types.is_numeric_dtype(df[col])],
         'x_data': x_data,
         'y_data': y_data,
         'wavelength': wavelength,
@@ -920,11 +939,51 @@ def compute_peak_energy_map(data, sg_window=31, sg_poly=3):
 # 5.  Reflection Mode (RC spectra and maps)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _stable_scale_windows(energy, ratios):
+    """Choose contiguous intervals with low relative variation in the calibration ratio."""
+    order = np.argsort(energy)
+    energy, ratios = energy[order], ratios[order]
+    usable = np.flatnonzero(np.isfinite(energy) & np.isfinite(ratios) & (ratios > 0))
+    if usable.size < 3:
+        raise ValueError("Automatic background scaling needs at least three usable sample/background channels. "
+                         "Check the reference file and calibration point, or use a manual background scale.")
+
+    # About 5% of the usable channels per window. A short spectrum can use one interval.
+    width = max(3, min(64, round(usable.size * 0.05)))
+    halves = np.array_split(usable, 2) if usable.size >= 6 else [usable]
+    windows = []
+    for half in halves:
+        best_score, best_window = None, None
+        for run in np.split(half, np.flatnonzero(np.diff(half) != 1) + 1):
+            if run.size < 3:
+                continue
+            size = min(width, run.size)
+            candidates = np.lib.stride_tricks.sliding_window_view(ratios[run], size)
+            low, high = np.percentile(candidates, [10, 90], axis=1)
+            spreads = (high - low) / np.median(candidates, axis=1)
+            for start, spread in enumerate(spreads):
+                first, last = run[start], run[start + size - 1]
+                score = (-size, spread, abs((first + last) - (half[0] + half[-1])))
+                if energy[first] < energy[last] and (best_score is None or score < best_score):
+                    best_score, best_window = score, (float(energy[first]), float(energy[last]))
+        if best_window is not None:
+            windows.append(best_window)
+    if not windows:
+        # A short valid run may straddle the split between the two halves.
+        runs = np.split(usable, np.flatnonzero(np.diff(usable) != 1) + 1)
+        run = max(runs, key=len)
+        if run.size < 3 or energy[run[0]] >= energy[run[-1]]:
+            raise ValueError("No continuous scale window contains three usable channels. "
+                             "Review the reference spectrum or choose normalization windows manually.")
+        windows.append((float(energy[run[0]]), float(energy[run[-1]])))
+    return windows
+
+
 def estimate_background_scale(
     spectrum: np.ndarray,
     background: np.ndarray,
     energy: np.ndarray,
-    windows: list[tuple[float, float]],
+    windows: list[tuple[float, float]] | None,
 ) -> tuple[float, dict]:
     """Estimate one robust scale from combined feature-free energy windows."""
     sample = np.asarray(spectrum, dtype=float).reshape(-1)
@@ -934,6 +993,12 @@ def estimate_background_scale(
         raise ValueError(
             "Spectrum, background, and energy must have the same channel count."
         )
+    automatic = windows is None
+    valid = np.isfinite(sample) & np.isfinite(reference) & (np.abs(reference) >= 1e-12)
+    with np.errstate(over='ignore', invalid='ignore'):
+        channel_ratios = np.divide(sample, reference, out=np.full(sample.shape, np.nan), where=valid)
+    if automatic:
+        windows = _stable_scale_windows(energy_axis, channel_ratios)
     if not windows:
         raise ValueError("At least one background-scale window is required.")
 
@@ -948,19 +1013,12 @@ def estimate_background_scale(
         window_mask |= (energy_axis >= lo) & (energy_axis <= hi)
         normalized_windows.append((lo, hi))
 
-    valid = (
-        window_mask
-        & np.isfinite(sample)
-        & np.isfinite(reference)
-        & np.isfinite(energy_axis)
-        & (np.abs(reference) >= 1e-12)
-    )
-    ratios = sample[valid] / reference[valid]
-    ratios = ratios[np.isfinite(ratios) & (ratios > 0)]
+    ratios = channel_ratios[window_mask & np.isfinite(channel_ratios) & (channel_ratios > 0)]
     if ratios.size < 3:
         raise ValueError(
             "The background-scale windows must contain at least three valid "
-            "positive sample/background channels."
+            f"positive sample/background channels (found {ratios.size}). Choose Auto-select scale windows "
+            "or edit the energy windows under Background → Normalization."
         )
 
     scale = float(np.median(ratios))
@@ -971,6 +1029,7 @@ def estimate_background_scale(
         "channel_count": int(ratios.size),
         "relative_mad": float(median_absolute_deviation / scale),
         "windows": normalized_windows,
+        "automatic_windows": automatic,
     }
 
 
@@ -1199,17 +1258,14 @@ def compute_transformed_coords(X2D, Y2D, ratio, tg_is_y=True, convention="TG+rBG
     -------
     Axis1_2D, Axis2_2D : same shape as X2D/Y2D
     """
-    if tg_is_y:
-        TG, BG = Y2D, X2D
-    else:
-        TG, BG = X2D, Y2D
-
-    if convention == "TG+rBG":
-        return TG + ratio * BG, TG - ratio * BG   # D, E
-    elif convention == "rTG+BG":
-        return ratio * TG + BG, ratio * TG - BG   # D, E
+    tg, bg = (Y2D, X2D) if tg_is_y else (X2D, Y2D)
+    if convention == 'TG+rBG':
+        bg = ratio * bg
+    elif convention == 'rTG+BG':
+        tg = ratio * tg
     else:
         raise ValueError(f"Unknown convention: {convention!r}. Use 'TG+rBG' or 'rTG+BG'.")
+    return tg + bg, tg - bg
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1253,24 +1309,9 @@ def _line_cut_coordinates(x_data, y_data, cut_type, ratio, tg_is_y,
         d_label = 'Doping (V)'
         e_label = 'Efield (V)'
     else:
-        if tg_is_y:
-            TG, BG = y_data, x_data
-        else:
-            TG, BG = x_data, y_data
-
-        r = ratio
-        if convention == 'TG+rBG':
-            D = TG + r * BG
-            E = TG - r * BG
-            d_label = f'TG + {r}·BG (V)'
-            e_label = f'TG − {r}·BG (V)'
-        elif convention == 'rTG+BG':
-            D = r * TG + BG
-            E = r * TG - BG
-            d_label = f'{r}·TG + BG (V)'
-            e_label = f'{r}·TG − BG (V)'
-        else:
-            raise ValueError(f"Unknown convention: {convention!r}")
+        D, E = compute_transformed_coords(x_data, y_data, ratio, tg_is_y, convention)
+        first, second = ('TG', f'{ratio}·BG') if convention == 'TG+rBG' else (f'{ratio}·TG', 'BG')
+        d_label, e_label = f'{first} + {second} (V)', f'{first} − {second} (V)'
     return D, E, d_label, e_label
 
 
@@ -1474,19 +1515,7 @@ def find_all_cut_values(x_data, y_data, cut_type, ratio, epsilon,
         D, E = _transformed_axis_arrays(x_vals, y_vals, x_axis_name=x_axis_name, y_axis_name=y_axis_name)
         candidate_mask = np.ones(x_vals.shape, dtype=bool)
     else:
-        if tg_is_y:
-            TG, BG = y_vals, x_vals
-        else:
-            TG, BG = x_vals, y_vals
-
-        if convention == 'TG+rBG':
-            D = TG + ratio * BG
-            E = TG - ratio * BG
-        elif convention == 'rTG+BG':
-            D = ratio * TG + BG
-            E = ratio * TG - BG
-        else:
-            raise ValueError(f"Unknown convention: {convention!r}")
+        D, E = compute_transformed_coords(x_vals, y_vals, ratio, tg_is_y, convention)
 
         if dominant_lattice_only:
             candidate_mask = (
@@ -1559,7 +1588,7 @@ def plot_map(X2D, Y2D, Z2D,
     x_arr = np.asarray(X2D, dtype=float)
     y_arr = np.asarray(Y2D, dtype=float)
     z_arr = np.asarray(Z2D, dtype=float)
-    v0, v1, is_flat = _resolve_color_limits(z_arr, vmin=vmin, vmax=vmax)
+    v0, v1 = resolve_color_limits(z_arr, vmin=vmin, vmax=vmax)
     map_cmap = mpl.colormaps.get_cmap(cmap).copy()
     map_cmap.set_bad("#e5e7eb")
 
@@ -1623,7 +1652,7 @@ def plot_map(X2D, Y2D, Z2D,
 
 def update_map_colors(figure, values, cmap, vmin=None, vmax=None):
     """Update the existing mesh and colorbar without rebuilding the figure."""
-    low, high, _ = _resolve_color_limits(values, vmin, vmax)
+    low, high = resolve_color_limits(values, vmin, vmax)
     changed = False
     for artist in [*figure.axes[0].collections, *figure.axes[0].images]:
         if artist.get_cmap().name != cmap:
@@ -1656,6 +1685,8 @@ def spectral_slice_title(line_cut, precision=6):
         label = 'D'
     elif kind == 'efield' or label.lower() == 'efield':
         label = 'E'
+    else:
+        label = display_axis_name(label)
     title = f"{label} = {line_cut['c_value_used']:.{precision}g}"
     if unit:
         title += ' ' + unit
@@ -1692,14 +1723,7 @@ def plot_line_cut_spectrogram(line_cut: dict,
     fig = Figure(figsize=figsize)
     ax = fig.add_subplot(111)
 
-    # Use percentile bounds by default so cosmic ray spikes don't dominate the scale.
-    # Explicit vmin/vmax override this.
-    if vmin is None or vmax is None:
-        finite = spectra[np.isfinite(spectra)]
-        if finite.size > 0:
-            vmin = vmin if vmin is not None else float(np.percentile(finite, 0.5))
-            vmax = vmax if vmax is not None else float(np.percentile(finite, 99.5))
-    v0, v1, _ = _resolve_color_limits(spectra, vmin=vmin, vmax=vmax)
+    v0, v1 = resolve_color_limits(spectra, vmin=vmin, vmax=vmax, spectral_slice=True)
 
     E_grid, Y_grid = np.meshgrid(energy, axis_values)
     artist = ax.pcolormesh(E_grid, Y_grid, spectra,
@@ -1707,7 +1731,7 @@ def plot_line_cut_spectrogram(line_cut: dict,
                            vmin=v0, vmax=v1)
     fig.colorbar(artist, ax=ax, label=z_label)
     ax.set_xlabel('Energy (eV)')
-    ax.set_ylabel(line_cut.get('axis_label', 'Axis'))
+    ax.set_ylabel(display_axis_name(line_cut.get('axis_label', 'Axis')))
     if ylim is not None:
         ax.set_ylim(ylim)
     if title:

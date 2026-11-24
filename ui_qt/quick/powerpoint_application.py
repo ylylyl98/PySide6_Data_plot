@@ -189,6 +189,10 @@ class PowerPointApplicationMixin:
         self._ppt_display_session = DisplaySession(display)
 
     def _ppt_leave_display(self, *, preserve_next_drr=True):
+        if self._ppt_megasweep_active():
+            self._ppt_record = self._ppt_params = self._deckcraft_target = None
+            self._workflow_bridges['megasweep'].close_saved_figure()
+            return
         session = self._ppt_display_session
         if session is None:
             return
@@ -203,6 +207,9 @@ class PowerPointApplicationMixin:
             self._pl_sync_scales()
         if not self._closed:
             self._schedule_plot()
+
+    def _ppt_megasweep_active(self):
+        return getattr(self._ppt_record, 'workflow', None) == 'megasweep'
 
     def _ppt_start(self):
         import sys
@@ -221,6 +228,8 @@ class PowerPointApplicationMixin:
     def _ppt_sync_root(self):
         if self._ppt_service is not None or self._deckcraft_service is not None:
             root = self._folder
+            if self._workflow == 'megasweep':
+                root = self._workflow_bridges['megasweep'].snapshot.get('experimentRoot') or root
             for parent in (Path(root), *Path(root).parents) if root else ():
                 if parent.name.casefold() == "processed data":
                     root = str(parent.parent)
@@ -301,6 +310,21 @@ class PowerPointApplicationMixin:
         except (ValueError, TypeError, KeyError) as exc:
             self._message(str(exc))
             return
+        if record.workflow == 'megasweep':
+            self.selectWorkflow('megasweep')
+            child = self._workflow_bridges['megasweep']
+            previous_record, previous_target = self._ppt_record, self._deckcraft_target
+            self._ppt_record, self._deckcraft_target = record, deckcraft_target
+            try:
+                child.open_saved_figure(record)
+            except (KeyError, OSError, TypeError, ValueError) as error:
+                self._ppt_record, self._deckcraft_target = previous_record, previous_target
+                self._message(f'{record.png_path.name}: {error}')
+                return
+            host = 'DeckCraft' if deckcraft_target is not None else 'PowerPoint'
+            self._message(f'{host}: {record.png_path.name} · edit the scan, then Save CSV + PNG.')
+            self._activate_figure_editor(deckcraft_target)
+            return
         # Validate display metadata and load imports/DAT in the worker. Keep the
         # current figure intact until the requested figure is ready to display.
         def load_matched_figure():
@@ -375,6 +399,10 @@ class PowerPointApplicationMixin:
         elif kind == "ppt-export":
             original, new_record, started, *deckcraft = result
             self._result = f"Saved {new_record.png_path}\n{new_record.dat_path}"
+            megasweep = getattr(original, 'workflow', None) == 'megasweep'
+            files = 'CSV + PNG' if megasweep else 'PNG + DAT'
+            if megasweep:
+                self._log_export_paths('megasweep', (new_record.data_path, new_record.png_path, new_record.metadata_path))
             if deckcraft:
                 target, message = deckcraft
                 if target is not None:
@@ -382,7 +410,7 @@ class PowerPointApplicationMixin:
                     self._deckcraft_target = target
                 self._message(f"Saved {new_record.png_path.name}. {message}")
                 return
-            self._message("PNG + DAT saved. Updating the associated PowerPoint picture…")
+            self._message(f"{files} saved. Updating the associated PowerPoint picture…")
             if self._ppt_service is not None:
                 self._ppt_save_record = new_record
                 self._ppt_update_timings[new_record.record_id] = (original.record_id, started)
@@ -396,7 +424,7 @@ class PowerPointApplicationMixin:
                     self._ppt_save_record = None
                     raise
             else:
-                self._message("PNG + DAT saved; PowerPoint is not connected.")
+                self._message(f"{files} saved; PowerPoint is not connected.")
 
     def _ppt_updated(self, old_id, record):
         if self._deckcraft_target is None and self._ppt_record is not None and self._ppt_record.record_id == old_id:
@@ -410,6 +438,9 @@ class PowerPointApplicationMixin:
 
     def _ppt_export(self):
         started = perf_counter()
+        if self._ppt_megasweep_active():
+            self._ppt_export_megasweep(started)
+            return
         from core.pptx_figure_edit import save_figure_edit
         record, cube = self._ppt_record, self._cube
         if record.workflow == "pl":
@@ -424,11 +455,35 @@ class PowerPointApplicationMixin:
                          png_width_scale=self._png_export_width())
         role = ("log" if params.log_scale else "linear") if record.workflow == "pl" else record.role.removesuffix("_wide")
         edited_record = replace(record, role=role + ("_wide" if params.png_width_scale > 1 else ""))
+        self._ppt_submit_export(record, lambda: save_figure_edit(edited_record, cube, params, snapshot), started)
+
+    def _ppt_export_megasweep(self, started):
+        from core.pptx_figure_edit import experiment_root
+        from core.pptx_figure_index import FigureIndex
+
+        record = self._ppt_record
+        try:
+            request = self._workflow_bridges['megasweep'].saved_figure_export_request()
+        except (OSError, TypeError, ValueError) as error:
+            self._message(str(error))
+            return
+
+        def save():
+            files = [Path(path) for path in request()]
+            png, = (path for path in files if path.suffix.lower() == '.png')
+            records = FigureIndex(experiment_root(record.png_path)).find_png(png, metadata_path=png.with_suffix('.json'))
+            if len(records) != 1 or records[0].workflow != 'megasweep':
+                raise ValueError(f'Saved {png.name}, but its export CSV and metadata could not be verified.')
+            return records[0]
+
+        self._ppt_submit_export(record, save, started)
+
+    def _ppt_submit_export(self, record, save, started):
         target = self._deckcraft_target
         service = self._deckcraft_service
 
         def export():
-            updated = save_figure_edit(edited_record, cube, params, snapshot)
+            updated = save()
             if target is None:
                 return record, updated, started
             try:
@@ -440,7 +495,7 @@ class PowerPointApplicationMixin:
         self._submit("ppt-export", export)
 
     def _ppt_guard_parameter(self, key):
-        if self._ppt_record is None:
+        if self._ppt_record is None or self._ppt_megasweep_active():
             return False
         blocked = key in {"backgroundMode", "backgroundFrame", "rawDerivative", "secondDerivative", "sgWindow", "sgPolyorder", "sgYWindow"}
         blocked = blocked or key in {"pl.yAxis", "pl.a", "pl.b", "pl.c", "pl.datChoice", "pl.datLabel", "pl.datUnit", "pl.processing", "pl.window", "pl.polynomial", "bnReference"}

@@ -254,6 +254,73 @@ def isolated():
             self.assertEqual(updated.plot["vmax"], 8.)
             self.assertEqual(updated.dat_path.read_bytes(), record.dat_path.read_bytes())
 
+        def test_deckcraft_megasweep_reopens_original_scan_and_replaces_repeatedly(self):
+            from unittest.mock import Mock
+            from core.megasweep.workflow import analyze, export_result, load_dataset
+
+            scan = self.root / 'scan.csv'
+            data = ('Vbg,Vtg,900,915,930\n-1,0,10,13,16\n-1,1,11,14,17\n'
+                    '1,0,15,22,25\n1,1,16,23,26\n')
+            scan.write_text(data)
+            other = self.root / 'other.csv'
+            other.write_text(data)
+            background = self.root / 'Pbackground.csv'
+            background.write_text('900,915,930\n4,5,6\n')
+            result = analyze(load_dataset(scan, 'Reflection'),
+                             dict(view='rc_p2p', background_role='p', auto_background_scale=False,
+                                  energy_min=1.33, energy_max=1.4), [background])
+            _, original_png, _ = export_result(result, self.root / 'Processed Data' / 'Megasweep' / 'scan')
+            original = Path(original_png).read_bytes()
+            record, = FigureIndex(self.root).lookup_image(original)
+
+            self.bridge.selectWorkflow('megasweep')
+            self.bridge.setSourcePath(str(self.root))
+            self.bridge.selectFiles([QUrl.fromLocalFile(str(other))])
+            child = self.bridge.workflowBridge
+            wait(lambda: child.snapshot['canExport'])
+            child.setParameter('cmap', 'RdBu')
+
+            service = self.bridge._deckcraft_service = Mock()
+            first, second, third = object(), object(), object()
+            service.replace_picture.side_effect = [(second, 'Updated in DeckCraft.'), (third, 'Updated in DeckCraft.')]
+            self.bridge._deckcraft_open('current-scope', first, record)
+            wait(lambda: child.snapshot['canExport'])
+            self.assertEqual(child.snapshot['sourceFile'], str(scan.resolve()))
+            self.assertTrue(child.snapshot['savedFigureActive'])
+            self.assertEqual(child.snapshot['backgroundFiles'], [str(background.resolve())])
+            self.assertIs(self.bridge._deckcraft_target, first)
+
+            child.setParameter('view', 'rc_energy')
+            child.setParameter('energy_target', 1.36)
+            wait(lambda: child.snapshot['canExport'])
+            self.bridge.invoke('export')
+            wait(lambda: not self.bridge._busy)
+            edited = self.bridge._ppt_record
+            self.assertEqual(edited.plot['view'], 'rc_energy')
+            self.assertEqual(edited.plot['energy_target'], 1.36)
+            self.assertNotEqual(edited.png_path, Path(original_png))
+            service.replace_picture.assert_called_once_with(first, edited.png_path)
+            self.assertIs(self.bridge._deckcraft_target, second)
+
+            child.setParameter('cmap', 'RdBu')
+            self.bridge.invoke('export')
+            wait(lambda: not self.bridge._busy)
+            revised = self.bridge._ppt_record
+            self.assertEqual(revised.plot['cmap'], 'RdBu', self.bridge._status)
+            service.replace_picture.assert_called_with(second, revised.png_path)
+            self.assertIs(self.bridge._deckcraft_target, third)
+            self.assertTrue(revised.data_path.is_file())
+            self.assertEqual(Path(original_png).read_bytes(), original)
+            self.assertEqual(self.service.updates, [])
+
+            child.invoke('close-slide-figure')
+            wait(lambda: child.snapshot['canExport'])
+            self.assertFalse(child.snapshot['savedFigureActive'])
+            self.assertEqual(child.snapshot['sourceFile'], str(other.resolve()))
+            self.assertEqual(child.snapshot['values']['cmap'], 'RdBu')
+            self.assertIsNone(self.bridge._ppt_record)
+            self.assertIsNone(self.bridge._deckcraft_target)
+
         def test_deckcraft_split_drr_opens_with_conflicting_measurement_x_fix(self):
             from unittest.mock import Mock
             from core.loader import DataCube

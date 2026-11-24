@@ -206,7 +206,7 @@ class DeckCraftService(QObject):
         root = experiment_root(path)
         matches = self._figure_index(root).find_png(path)
         if len(matches) != 1:
-            raise ValueError("Choose a PL/DRR PNG with its exported DAT and figure metadata.")
+            raise ValueError("Choose an exported PL, DRR, or Megasweep PNG with its DAT or CSV and JSON metadata in the current experiment.")
         if self.is_current(scope):
             self.figureRequested.emit(scope, target, matches[0])
 

@@ -216,6 +216,10 @@ class QuickApplicationBridge(PowerPointApplicationMixin, ShellServicesMixin, PlA
                 state["sourceSummary"] = child_state.get("sourceFile") or "No measurement selected"
                 state["exportLabel"] = "Save CSV + PNG"
                 state["workspaceTitle"] = "Megasweep · " + child_state.get("mode", "PL")
+                if self._ppt_megasweep_active():
+                    state["status"] = self._status
+                    state["busy"] = state["busy"] or self._busy
+                    state["canExport"] = state["canExport"] and not self._busy
                 background_folder = child_state.get("backgroundFolder", "")
                 state["backgroundRole"] = child_state.get("backgroundRole", "custom")
                 state["backgroundFolderUrl"] = QUrl.fromLocalFile(background_folder).toString() if background_folder else state["sourceFolderUrl"]
@@ -691,7 +695,8 @@ class QuickApplicationBridge(PowerPointApplicationMixin, ShellServicesMixin, PlA
             return
         self._catalog_child_busy = bool(state.get("busy", False))
         self._folder = state.get("sourcePath", self._folder)
-        self._remember_folder(self._folder)
+        if key != 'megasweep' or not self._ppt_megasweep_active():
+            self._remember_folder(self._folder)
         paired = self._child_side_by_side(state)
         if paired != self._child_paired:
             if paired:
@@ -757,6 +762,7 @@ class QuickApplicationBridge(PowerPointApplicationMixin, ShellServicesMixin, PlA
             elif key == "megasweep":
                 from ui_qt.quick.megasweep_bridge import MegasweepBridge
                 child = MegasweepBridge(settings=self.settings, parent=self)
+                child.savedFigureCloseRequested.connect(lambda: self.invoke('close-slide-figure'))
             elif key == "power":
                 from ui_qt.quick.power_bridge import PowerBridge
                 child = PowerBridge(settings=self.settings, parent=self)
@@ -1050,6 +1056,8 @@ class QuickApplicationBridge(PowerPointApplicationMixin, ShellServicesMixin, PlA
     def selectFiles(self, values):
         child = self._workflow_bridges.get(self._workflow)
         if child is not None:
+            if values and self._ppt_megasweep_active():
+                self._ppt_leave_display()
             child.openFiles("sources", values)
             return
         paths = tuple(str(_local_path(value).resolve()) for value in values)
@@ -1116,6 +1124,8 @@ class QuickApplicationBridge(PowerPointApplicationMixin, ShellServicesMixin, PlA
         if purpose == "catalog":
             self._source_catalog.addExternal(values)
         elif child is not None:
+            if purpose in {'source', 'sources', 'select-files'} and values and self._ppt_megasweep_active():
+                self._ppt_leave_display()
             child.openFiles("sources" if purpose == "select-files" else purpose, values)
         elif purpose == "select-background":
             self.selectBackgroundFiles(values)
@@ -1737,6 +1747,18 @@ class QuickApplicationBridge(PowerPointApplicationMixin, ShellServicesMixin, PlA
         if self._pl_invoke(action):
             return
         child = self._workflow_bridges.get(self._workflow)
+        if self._ppt_megasweep_active():
+            if action == 'export':
+                if not self._busy:
+                    self._ppt_export()
+                return
+            if action == 'close-slide-figure':
+                if not self._busy:
+                    self._ppt_leave_display()
+                    self._message('Returned to the measurement workspace.')
+                return
+            if action == 'clear-files':
+                self._ppt_leave_display()
         if child is not None and (action in {"select-files", "sources", "clear-files", "refresh", "refresh-catalog",
                 "load", "reload", "update", "auto-assign", "infer-angles", "swap-kk", "auto-x", "auto-y",
                 "auto-color", "auto-left", "auto-right", "previous-gate", "next-gate", "toggle-spectrum",
